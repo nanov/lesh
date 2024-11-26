@@ -34,13 +34,16 @@ const std::vector<std::string>& get_env_path() {
 static auto env_p = get_env_path();
 
 const std::optional<std::string> file_found(std::vector<std::string> &paths, std::string_view &file) {
+	std::optional<std::string> res = std::nullopt;
 	for (auto p:paths) {
 		std::filesystem::path ap = p;
 		ap.append(file);
-		if (std::filesystem::exists(ap))
-			return std::string(ap);
+		if (std::filesystem::exists(ap)) {
+			std::cout << ap << std::endl;
+			res =  std::string(ap);
+		}
 	}
-	return std::nullopt;
+	return res;
 }
 
 int main() {
