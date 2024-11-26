@@ -35,7 +35,6 @@ const std::vector<std::string>& get_env_path() {
 static auto env_p = get_env_path();
 
 const std::optional<std::string> file_found(std::vector<std::string> &paths, std::string_view &file) {
-	std::optional<std::string> res = std::nullopt;
 	for (auto p:paths) {
 		std::filesystem::path ap = p;
 		ap.append(file);
@@ -44,7 +43,7 @@ const std::optional<std::string> file_found(std::vector<std::string> &paths, std
 	}
 	return std::nullopt;
 }
-
+#include <unistd.h>
 int main() {
 	int exit_code = -1;
   // Flush after every std::cout / std:cerr
@@ -60,6 +59,10 @@ int main() {
 	while(true) {
 		std::cout << "$ ";
 		std::getline(std::cin, input);
+	  auto dl = input.rfind(' ');
+		auto c_v = std::string_view(input);
+		auto command = c_v.substr(0, dl);
+		auto params = c_v.substr(dl+1);
 		if (input == "exit 0")
 			return 0;
 		if (input.rfind("echo ", 0) == 0) {
@@ -79,10 +82,18 @@ int main() {
 			continue;
 		}
 	
+		if (auto ff = file_found(env_p, command)) {
+			auto e_p = ff->c_str();
+			if (!access(e_p, X_OK)) {
+				auto e_c = e_p + std::string(" ") + std::string(params);
+				system(e_c.c_str());
+				continue;
+			}
+		}
+
+
 		std::cout << input << ": command not found" << std::endl;
 	}
-
-
 
 	return exit_code; 
 	
