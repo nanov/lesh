@@ -23,7 +23,8 @@ const std::vector<std::string>& get_env_path() {
 	size_t pr = 0;
 	size_t in = pa.find(':');
 	while(in != std::string::npos) {
-		res.push_back(pa.substr(pr, in));
+		auto pd = pa.substr(pr, in - pr);
+		res.push_back(pd);
 		pr = in+1;
 		in = pa.find(':', pr);
 	}
@@ -38,12 +39,10 @@ const std::optional<std::string> file_found(std::vector<std::string> &paths, std
 	for (auto p:paths) {
 		std::filesystem::path ap = p;
 		ap.append(file);
-		if (std::filesystem::exists(ap)) {
-			std::cout << ap << std::endl;
-			res =  std::string(ap);
-		}
+		if (std::filesystem::exists(ap))
+			return std::string(ap);
 	}
-	return res;
+	return std::nullopt;
 }
 
 int main() {
