@@ -6,6 +6,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -89,15 +90,17 @@ class cd_built_in_command : public built_in_command {
 			if (params.find(' ') != std::string::npos) {
 				std::cout << "cd: too many arguments" << std::endl;
 				return -1;
-			}	
+			}
 
+			
 
-			auto new_path = std::filesystem::path(params);
-			if (!std::filesystem::is_directory(new_path)) {
-				std::cout << "cd: " << new_path.c_str() << ": No such file or directory" << std::endl;
+			std::error_code e;
+			std::filesystem::current_path(params, e);	
+			if (e) {
+				std::cout << "cd: " << params << ": " << e.message() << std::endl;
 				return -1;
 			}
-			_state.pwd = new_path;
+			_state.pwd = std::filesystem::current_path();
 			return -1;
 		}
 };
