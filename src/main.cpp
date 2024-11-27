@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// begin - tools
 int to_int(char const *s, int &r) {
 	if (s == NULL || *s == '\0')
 		return -1;
@@ -42,7 +44,12 @@ const std::optional<std::string> file_found(const std::vector<std::string> &path
 	return std::nullopt;
 }
 
-const auto built_in_commands = std::unordered_set<std::string_view>{"echo", "exit", "type"};
+// end tools
+
+
+struct shell_state {
+	std::filesystem::path pwd;
+};
 
 
 class built_in_command {
@@ -53,15 +60,46 @@ class built_in_command {
 };
 
 class pwd_built_in_command : public built_in_command {
+	private:
+		const shell_state &_state;
 	public:
+			pwd_built_in_command(const shell_state &state): _state(state) {}
+
 			int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
 				if (!params.empty()) {
 					std::cout << "pwd: too many arguments" << std::endl;
 					return -1;
 				}
-				std::cout << std::filesystem::current_path().c_str() << std::endl;
+				std::cout << _state.pwd.c_str() << std::endl;
 				return -1;
 			}
+};
+
+class cd_built_in_command : public built_in_command {
+	private:
+		shell_state &_state;
+	public:
+		cd_built_in_command(shell_state &state): _state(state) {}
+
+		int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+			if (params.empty()) {
+				std::cout << "cd: too little arguments" << std::endl;
+				return -1;
+			}
+			if (params.find(' ') != std::string::npos) {
+				std::cout << "cd: too many arguments" << std::endl;
+				return -1;
+			}	
+
+
+			auto new_path = std::filesystem::path(params);
+			if (!std::filesystem::is_directory(new_path)) {
+				std::cout << "cd: " << new_path.c_str() << ": No such file or directory" << std::endl;
+				return -1;
+			}
+			_state.pwd = new_path;
+			return -1;
+		}
 };
 
 class echo_built_in_command : public built_in_command {
@@ -105,12 +143,15 @@ class type_built_in_command : public built_in_command {
 					return -1;
 				}
 				
+
+				// somewhere in path?
 				if (auto f_o = file_found(_paths, params)) {
 					std::cout << params << " is " << f_o.value() << std::endl;
 					return  -1;
-				}else {
-					std::cout << params << ": not found" << std::endl;
 				}
+				
+				// idk
+				std::cout << params << ": not found" << std::endl;
 				return -1;
 			}
 };
@@ -139,13 +180,6 @@ const std::vector<std::string>& get_env_path() {
 static const auto env_p = get_env_path();
 
 
-static const std::unordered_map<std::string_view, built_in_command*> built_in_commands_executors = {
-	{"pwd", new pwd_built_in_command},
-	{"echo", new echo_built_in_command},
-	{"exit", new exit_built_in_command},
-	{"type", new type_built_in_command(built_in_commands_executors, env_p)}
-};
-
 #include <unistd.h>
 int main() {
 	int exit_code = -1;
@@ -157,6 +191,17 @@ int main() {
 
   std::string input = "";
 	auto paths = get_env_path(); 
+	shell_state state = { 
+		.pwd = std::filesystem::current_path()
+	};
+
+	static const std::unordered_map<std::string_view, built_in_command*> built_in_commands_executors = {
+		{"pwd", new pwd_built_in_command(state)},
+		{"cd", new cd_built_in_command(state)},
+		{"echo", new echo_built_in_command},
+		{"exit", new exit_built_in_command},
+		{"type", new type_built_in_command(built_in_commands_executors, env_p)}
+	};
 
 
 	while(true) {
