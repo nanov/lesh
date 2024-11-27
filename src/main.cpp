@@ -92,10 +92,21 @@ class cd_built_in_command : public built_in_command {
 				return -1;
 			}
 
-			
+		
+			auto t = std::string();
+			if (params.contains('~')) {
+				t = std::string(params);
+				std::string::size_type n = 0;
+				while((n = t.find("~", n)) != std::string::npos) {
+						t.replace(n, 1, getenv("HOME"));	
+				    n+=1;
+			 	}
+				params = t;
+			}
+		
 
 			std::error_code e;
-			std::filesystem::current_path(params, e);	
+			std::filesystem::current_path(_state.pwd / params, e);	
 			if (e) {
 				std::cout << "cd: " << params << ": " << e.message() << std::endl;
 				return -1;
