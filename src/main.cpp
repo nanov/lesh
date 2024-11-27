@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -5,11 +6,114 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+int to_int(char const *s, int &r) {
+	if (s == NULL || *s == '\0')
+		return -1;
 
+	bool negate = (s[0] == '-');
+	if ( *s == '+' || *s == '-' ) 
+		++s;
+
+	if ( *s == '\0')
+		return -1;
+
+	while(*s) {
+    if ( *s < '0' || *s > '9' )
+			return -1;
+		r = r * 10  - (*s - '0');  //assume negative number
+		++s;
+ 	}
+	if (!negate)
+		r *= -1;
+
+	return 0;
+}
+
+const std::optional<std::string> file_found(const std::vector<std::string> &paths, const std::string_view &file) noexcept{
+	for (auto p:paths) {
+		std::filesystem::path ap = p;
+		ap.append(file);
+		if (std::filesystem::exists(ap))
+			return std::string(ap);
+	}
+	return std::nullopt;
+}
 
 const auto built_in_commands = std::unordered_set<std::string_view>{"echo", "exit", "type"};
+
+
+class built_in_command {
+		public:
+			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+				return -1;
+			}
+};
+
+class pwd_built_in_command : public built_in_command {
+	public:
+			int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+				if (!params.empty()) {
+					std::cout << "pwd: too many arguments" << std::endl;
+					return -1;
+				}
+				std::cout << std::filesystem::current_path().c_str() << std::endl;
+				return -1;
+			}
+};
+
+class echo_built_in_command : public built_in_command {
+	public:
+			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+				std::cout << params << std::endl;
+				return -1;
+			}
+};
+
+class exit_built_in_command : public built_in_command {
+	public:
+			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+				int code = 0;
+				if (params.empty())
+					return 0;
+				if (params.find(' ') != std::string::npos) {
+					std::cout << "exit: too many arguments" << std::endl;
+					return -1;
+				}	
+				if (to_int(params.data(), code) != 0) {
+					std::cout << "exit: argument: " << params << " is not a valid exit code" << std::endl;
+					return -1;
+				}
+				// std::cout << "code: " << code << std::endl;
+				return code;
+			}
+};
+
+class type_built_in_command : public built_in_command {
+	private:
+		const std::unordered_map<std::string_view, built_in_command*> &_commands;
+		const std::vector<std::string> &_paths;
+	public:
+			type_built_in_command(const std::unordered_map<std::string_view, built_in_command*> &commands, const std::vector<std::string> &paths): _commands(commands), _paths(paths){}
+
+			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
+				// is it a builtin command?
+				if (_commands.contains(params)) {
+					std::cout << params << " is a shell builtin" << std::endl;
+					return -1;
+				}
+				
+				if (auto f_o = file_found(_paths, params)) {
+					std::cout << params << " is " << f_o.value() << std::endl;
+					return  -1;
+				}else {
+					std::cout << params << ": not found" << std::endl;
+				}
+				return -1;
+			}
+};
 
 const std::vector<std::string>& get_env_path() {
 	static std::vector<std::string> res;
@@ -32,17 +136,16 @@ const std::vector<std::string>& get_env_path() {
 	return  res;
 }
 
-static auto env_p = get_env_path();
+static const auto env_p = get_env_path();
 
-const std::optional<std::string> file_found(std::vector<std::string> &paths, std::string_view &file) {
-	for (auto p:paths) {
-		std::filesystem::path ap = p;
-		ap.append(file);
-		if (std::filesystem::exists(ap))
-			return std::string(ap);
-	}
-	return std::nullopt;
-}
+
+static const std::unordered_map<std::string_view, built_in_command*> built_in_commands_executors = {
+	{"pwd", new pwd_built_in_command},
+	{"echo", new echo_built_in_command},
+	{"exit", new exit_built_in_command},
+	{"type", new type_built_in_command(built_in_commands_executors, env_p)}
+};
+
 #include <unistd.h>
 int main() {
 	int exit_code = -1;
@@ -59,40 +162,29 @@ int main() {
 	while(true) {
 		std::cout << "$ ";
 		std::getline(std::cin, input);
-	  auto dl = input.rfind(' ');
+	  auto dl = input.find(' ');
 		auto c_v = std::string_view(input);
-		auto command = c_v.substr(0, dl);
-		auto params = c_v.substr(dl+1);
-		if (input == "exit 0")
-			return 0;
-		if (input.rfind("echo ", 0) == 0) {
-			std::cout << std::string_view(input).substr(5) << std::endl;
-			continue;
-		} 
-		if (input.rfind("type ") == 0) {
-			auto l = std::string_view(input).substr(5);
-			if (built_in_commands.contains(l)) {
-				std::cout << l << " is a shell builtin" << std::endl;
-			} else if (auto f_o = file_found(env_p, l)) {
-				std::cout << l << " is " << f_o.value() << std::endl;
 
-			}else {
-				std::cout << l << ": not found" << std::endl;
-			}
+		auto command = c_v.substr(0, dl);
+		auto params = dl == std::string::npos ? std::string_view() : c_v.substr(dl+1);
+
+		if (auto ex_search = built_in_commands_executors.find(command); ex_search != built_in_commands_executors.end()) {
+			auto e_c = ex_search->second->execute(input, command, params);
+			if (e_c >=0)
+				return e_c;
 			continue;
 		}
 	
 		if (auto ff = file_found(env_p, command)) {
 			auto e_p = ff->c_str();
 			if (!access(e_p, X_OK)) {
-				auto e_c = e_p + std::string(" ") + std::string(params);
-				system(e_c.c_str());
+				system(input.c_str());
 				continue;
 			}
 		}
 
 
-		std::cout << input << ": command not found" << std::endl;
+		std::cout << command << ": command not found" << std::endl;
 	}
 
 	return exit_code; 
