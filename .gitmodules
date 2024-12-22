@@ -1,0 +1,6 @@
+[submodule "include/abseil"]
+	path = include/abseil
+	url = https://github.com/abseil/abseil-cpp
+[submodule "include/cpp-linenoise"]
+	path = include/cpp-linenoise
+	url = https://github.com/yhirose/cpp-linenoise

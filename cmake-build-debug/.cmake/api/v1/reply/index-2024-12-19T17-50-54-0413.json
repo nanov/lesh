@@ -1,0 +1,108 @@
+{
+	"cmake" : 
+	{
+		"generator" : 
+		{
+			"multiConfig" : false,
+			"name" : "Ninja"
+		},
+		"paths" : 
+		{
+			"cmake" : "/Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake",
+			"cpack" : "/Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cpack",
+			"ctest" : "/Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/ctest",
+			"root" : "/Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30"
+		},
+		"version" : 
+		{
+			"isDirty" : false,
+			"major" : 3,
+			"minor" : 30,
+			"patch" : 5,
+			"string" : "3.30.5",
+			"suffix" : ""
+		}
+	},
+	"objects" : 
+	[
+		{
+			"jsonFile" : "codemodel-v2-f4ce33e1902fc77ebbd7.json",
+			"kind" : "codemodel",
+			"version" : 
+			{
+				"major" : 2,
+				"minor" : 7
+			}
+		},
+		{
+			"jsonFile" : "cache-v2-29bb3681d038eb8b6638.json",
+			"kind" : "cache",
+			"version" : 
+			{
+				"major" : 2,
+				"minor" : 0
+			}
+		},
+		{
+			"jsonFile" : "cmakeFiles-v1-973b2e2e64ec4f92337b.json",
+			"kind" : "cmakeFiles",
+			"version" : 
+			{
+				"major" : 1,
+				"minor" : 1
+			}
+		},
+		{
+			"jsonFile" : "toolchains-v1-2bbc2e4db796306e7966.json",
+			"kind" : "toolchains",
+			"version" : 
+			{
+				"major" : 1,
+				"minor" : 0
+			}
+		}
+	],
+	"reply" : 
+	{
+		"cache-v2" : 
+		{
+			"jsonFile" : "cache-v2-29bb3681d038eb8b6638.json",
+			"kind" : "cache",
+			"version" : 
+			{
+				"major" : 2,
+				"minor" : 0
+			}
+		},
+		"cmakeFiles-v1" : 
+		{
+			"jsonFile" : "cmakeFiles-v1-973b2e2e64ec4f92337b.json",
+			"kind" : "cmakeFiles",
+			"version" : 
+			{
+				"major" : 1,
+				"minor" : 1
+			}
+		},
+		"codemodel-v2" : 
+		{
+			"jsonFile" : "codemodel-v2-f4ce33e1902fc77ebbd7.json",
+			"kind" : "codemodel",
+			"version" : 
+			{
+				"major" : 2,
+				"minor" : 7
+			}
+		},
+		"toolchains-v1" : 
+		{
+			"jsonFile" : "toolchains-v1-2bbc2e4db796306e7966.json",
+			"kind" : "toolchains",
+			"version" : 
+			{
+				"major" : 1,
+				"minor" : 0
+			}
+		}
+	}
+}

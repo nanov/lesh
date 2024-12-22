@@ -1,0 +1,249 @@
+#ifndef ZSH_LEXER_H
+#define ZSH_LEXER_H
+
+#include <string>
+#include <vector>
+#include <cctype>
+#include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
+
+enum class TokenType {
+    WORD,           // Regular words/arguments
+    REDIRECTION,    // IO redirections like >, <, >>
+    PIPE,           // |
+    BACKGROUND,     // &
+    SEMICOLON,      // ;
+    COMMAND_SUB,    // $() or `command`
+    VARIABLE,       // $VAR or ${VAR}
+    GLOB_PATTERN,   // Wildcard patterns like *, ?, []
+    QUOTE,          // Single or double quotes
+    ESCAPE,         // Backslash escapes
+    SUBSHELL_START, // (
+    SUBSHELL_END,   // )
+    BRACE_START,    // {
+    BRACE_END,      // }
+    ASSIGNMENT,     // VAR=value
+    WHITESPACE,     // Spaces, tabs
+    EOL             // End of line
+};
+
+struct Token {
+    TokenType type;
+    std::string value;
+    size_t line;
+    size_t column;
+
+		std::string type_as_string() {
+			switch (type) {
+				case TokenType::WORD: return "WORD";
+				case TokenType::REDIRECTION: return "REDIRECTION";
+				case TokenType::PIPE  : return "PIPE,    ";
+				case TokenType::BACKGROUND: return "BACKGROUND";
+				case TokenType::SEMICOLON: return "SEMICOLON";
+				case TokenType::COMMAND_SUB: return "COMMAND_SUB";
+				case TokenType::VARIABLE: return "VARIABLE";
+				case TokenType::GLOB_PATTERN: return "GLOB_PATTERN";
+				case TokenType::QUOTE: return "QUOTE";
+				case TokenType::ESCAPE: return "ESCAPE";
+				case TokenType::SUBSHELL_START: return "SUBSHELL_START";
+				case TokenType::SUBSHELL_END: return "SUBSHELL_END";
+				case TokenType::BRACE_START: return "BRACE_START";
+				case TokenType::BRACE_END: return "BRACE_END";
+				case TokenType::ASSIGNMENT: return "ASSIGNMENT";
+				case TokenType::WHITESPACE: return "WHITESPACE";
+				case TokenType::EOL: return "EOL";
+			}
+		}
+};
+
+class ZshLexer {
+private:
+    std::string input;
+    size_t position;
+    size_t line;
+    size_t column;
+    std::unordered_map<std::string, std::string> aliases;
+    std::unordered_set<std::string> expanding_aliases;
+    const int MAX_EXPANSIONS = 20;
+    bool at_command_start;
+
+    char peek(int offset = 0) const {
+        if (position + offset < input.length()) {
+            return input[position + offset];
+        }
+        return '\0';
+    }
+
+    void advance(size_t steps = 1) {
+        for (size_t i = 0; i < steps; ++i) {
+            if (position < input.length()) {
+                if (input[position] == '\n') {
+                    line++;
+                    column = 1;
+                } else {
+                    column++;
+                }
+                position++;
+            }
+        }
+    }
+
+    bool isSpecialCharacter(char c) const {
+        return strchr("|&;()<> \t\n", c) != nullptr;
+    }
+
+    bool isValidWordChar(char c) const {
+        return !isSpecialCharacter(c) && 
+               c != '\'' && c != '"' && 
+               std::isgraph(c);
+    }
+
+		bool try_get_expansion(const std::string& word, std::string& expansion) {
+			if (auto it = aliases.find(word); it != aliases.end()) {
+				expansion = it->second;
+				return true;
+			}
+			return false;
+		}
+
+    Token lexWord() {
+        std::string word;
+        size_t startLine = line;
+        size_t startColumn = column;
+        bool isFirst = at_command_start;
+				 size_t wordStart = position;
+
+			while(true) {
+				word.clear();
+        // Capture the word
+        while (position < input.length() && 
+               (isValidWordChar(peek()) || peek() == '-' || 
+                peek() == '.' || peek() == '/')) {
+            word += peek();
+            advance();
+        }
+
+			 // Check for alias expansion only at command start
+		//
+				std::string expansion;
+				if(!at_command_start
+						|| expanding_aliases.find(word) != expanding_aliases.end()
+						|| !try_get_expansion(word, expansion))
+					break;
+
+				expanding_aliases.insert(word);
+				
+				size_t origLength = word.length();
+				
+				//  TODO: Work with std::string_view
+				input = input.substr(0, wordStart) + expansion + input.substr(position);
+
+				// Reset position to start of expansion
+				position = wordStart;
+      }
+			expanding_aliases.clear();
+			at_command_start = false;
+			return {TokenType::WORD, word, startLine, startColumn};
+		}
+
+    Token lexSpecialCharacter() {
+        size_t startLine = line;
+        size_t startColumn = column;
+        TokenType type;
+        std::string value(1, peek());
+
+        switch (peek()) {
+            case '|': 
+                type = TokenType::PIPE;
+                at_command_start = true;
+                break;
+            case '&': 
+                type = TokenType::BACKGROUND;
+                at_command_start = true;
+                break;
+            case ';': 
+                type = TokenType::SEMICOLON;
+                at_command_start = true;
+                break;
+            case '(': 
+                type = TokenType::SUBSHELL_START;
+                at_command_start = true;
+                break;
+            case ')': 
+                type = TokenType::SUBSHELL_END;
+                at_command_start = false;
+                break;
+            case '{': 
+                type = TokenType::BRACE_START;
+                break;
+            case '}': 
+                type = TokenType::BRACE_END;
+                break;
+            case '>':
+            case '<':
+                type = TokenType::REDIRECTION;
+                if (peek(1) == peek()) {
+                    value += peek();
+                    advance();
+                }
+                break;
+            case ' ':
+            case '\t':
+                type = TokenType::WHITESPACE;
+                while (position < input.length() && 
+                      (peek() == ' ' || peek() == '\t')) {
+                    advance();
+                }
+                break;
+            case '\n':
+                type = TokenType::EOL;
+                at_command_start = true;
+                break;
+            default:
+                throw std::runtime_error("Unexpected special character");
+        }
+
+        advance();
+        return {type, value, startLine, startColumn};
+    }
+
+public:
+    ZshLexer(const std::string& input) 
+        : input(input), position(0), line(1), column(1), at_command_start(true) {}
+
+    void defineAlias(const std::string& name, const std::string& expansion) {
+        aliases[name] = expansion;
+    }
+
+    void removeAlias(const std::string& name) {
+        aliases.erase(name);
+    }
+
+    std::vector<Token> tokenize() {
+        std::vector<Token> tokens;
+        at_command_start = true;
+        expanding_aliases.clear();
+
+        while (position < input.length()) {
+            // Skip whitespace but preserve at_command_start
+            while (position < input.length() && 
+                   (peek() == ' ' || peek() == '\t')) {
+                advance();
+            }
+
+            if (position >= input.length()) break;
+
+            if (isSpecialCharacter(peek())) {
+                tokens.push_back(lexSpecialCharacter());
+            } else {
+                tokens.push_back(lexWord());
+            }
+        }
+
+        tokens.push_back({TokenType::EOL, "", line, column});
+        return tokens;
+    }
+};
+
+#endif // ZSH_LEXER_H
