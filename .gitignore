@@ -47,3 +47,8 @@ _deps
 
 build/
 vcpkg_installed
+
+
+.idea/
+cmake-debug-build/
+.cache/
