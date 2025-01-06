@@ -4,3 +4,9 @@
 [submodule "include/cpp-linenoise"]
 	path = include/cpp-linenoise
 	url = https://github.com/yhirose/cpp-linenoise
+[submodule "tests/lib"]
+	path = tests/lib
+	url = https://github.com/google/googletest
+[submodule "include/replxx"]
+	path = include/replxx
+	url = https://github.com/AmokHuginnsson/replxx

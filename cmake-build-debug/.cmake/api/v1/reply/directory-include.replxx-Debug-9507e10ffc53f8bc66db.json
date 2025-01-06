@@ -1,0 +1,103 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"install"
+		],
+		"files" : 
+		[
+			"include/replxx/CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 138,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 145,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 151,
+				"parent" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 160,
+				"parent" : 0
+			}
+		]
+	},
+	"installers" : 
+	[
+		{
+			"backtrace" : 1,
+			"component" : "Unspecified",
+			"destination" : "lib",
+			"paths" : 
+			[
+				"include/replxx/libreplxx-d.a"
+			],
+			"targetId" : "replxx::@083f774aabf96a5268b7",
+			"targetIndex" : 0,
+			"type" : "target"
+		},
+		{
+			"backtrace" : 2,
+			"component" : "Unspecified",
+			"destination" : "share/cmake/replxx",
+			"exportName" : "replxx-targets",
+			"exportTargets" : 
+			[
+				{
+					"id" : "replxx::@083f774aabf96a5268b7",
+					"index" : 0
+				}
+			],
+			"paths" : 
+			[
+				"include/replxx/CMakeFiles/Export/c4e09753e41b6a7ff5db96aced3a93ff/replxx-targets.cmake"
+			],
+			"type" : "export"
+		},
+		{
+			"backtrace" : 3,
+			"component" : "Unspecified",
+			"destination" : "share/cmake/replxx",
+			"paths" : 
+			[
+				"cmake-build-debug/include/replxx/replxx-config-version.cmake",
+				"cmake-build-debug/include/replxx/replxx-config.cmake"
+			],
+			"type" : "file"
+		},
+		{
+			"backtrace" : 4,
+			"component" : "Unspecified",
+			"destination" : "include",
+			"paths" : 
+			[
+				"include/replxx/include/replxx.hxx",
+				"include/replxx/include/replxx.h"
+			],
+			"type" : "file"
+		}
+	],
+	"paths" : 
+	{
+		"build" : "include/replxx",
+		"source" : "include/replxx"
+	}
+}

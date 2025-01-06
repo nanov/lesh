@@ -1,34 +1,21 @@
-[![progress-banner](https://backend.codecrafters.io/progress/shell/9506abff-5936-477a-9832-b69e3984f6b1)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# lesh - a mess of a shell
 
-This is a starting point for C++ solutions to the
-["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview).
 
-In this challenge, you'll build your own POSIX compliant shell that's capable of
-interpreting shell commands, running external programs and builtin commands like
-cd, pwd, echo and more. Along the way, you'll learn about shell command parsing,
-REPLs, builtin commands, and more.
+## NOTES:
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+- https://zsh.sourceforge.io/Doc/Release/Prompt-Expansion.html#Prompt-Expansion - implement
+- https://github.com/AmokHuginnsson/replxx - read line but done right
+- https://edw.is/using-lua-with-cpp/ - future lua integration
 
-# Passing the first stage
+## TODOS:
 
-The entry point for your `shell` implementation is in `src/main.cpp`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+### Command parsing:
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
-
-Time to move on to the next stage!
-
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cmake` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.cpp`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+- [X] pipes ( ```ls -lA | grep R```)
+- [X] aliases
+- [ ] respect brackets (' or ")
+  - [X] basic brackets support
+  - [X] partial expansion support ( mi'tko' and 'mi'tko )
+  - [ ] Support escaping inside brackets
+- [ ] full subshell support with partial expanding ie: ```mi$(echo ko)```
+- [ ] list expansion : ```mi{tko,la,rovene} -> mitko, mila, mirovene```

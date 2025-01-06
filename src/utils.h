@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <filesystem>
 
 // begin - alias shit double hash == https://www.reddit.com/r/cpp_questions/comments/12xw3sn/find_stdstring_view_in_unordered_map_with/ == https://godbolt.org/z/789xv8Eeq
 template<typename ... Bases>
@@ -23,14 +24,6 @@ using transparent_string_hash = overload<
     char_pointer_hash
 >;
 
-template <typename T, const size_t limit>
-class hybrid_vector {
-	private:
-	std::array<T, limit> base_array;
-	std::vector<T> heap_vector;
-};
-
-
 class alias_container {
 		using alias_map = std::unordered_map<std::string, std::string, transparent_string_hash, std::equal_to<>>;
 
@@ -41,11 +34,23 @@ class alias_container {
 		alias_container(std::initializer_list<std::pair<const std::string, std::string>> l) noexcept : _aliases(alias_map(l)) {
 		}
 
+		void define_alias(std::string from, std::string to) {
+			_aliases[from] = to;
+		}
+
+
 		alias_container() noexcept {
 			_aliases = {};
 			_aliases.reserve(10);
 		}
 		
+		bool try_get_expansion(const char* word, std::string& expansion) const {
+			if (auto it = _aliases.find(word); it != _aliases.end()) {
+				expansion = it->second;
+				return true;
+			}
+			return false;
+		}
 		bool try_get_expansion(const std::string_view& word, std::string& expansion) const {
 			if (auto it = _aliases.find(word); it != _aliases.end()) {
 				expansion = it->second;
@@ -54,4 +59,113 @@ class alias_container {
 			return false;
 		}
 };
+
+class lesh_state {
+private:
+	std::filesystem::path _pwd;
+	std::string _display_pwd;
+	std::string prompt;
+	std::vector<std::filesystem::path> _path_env;
+	std::string _home;
+	alias_container _aliases;
+
+public:
+	lesh_state() {
+		load_home_directory();
+		set_path(std::filesystem::current_path());
+		load_env_path();
+	}
+
+	const char* pmt() const noexcept { return prompt.c_str(); };
+	void add_alias(std::string from, std::string to) {
+		_aliases.define_alias(from, to);
+	}
+	const std::filesystem::path& pwd() const noexcept { return _pwd; }
+	const std::string& home() const noexcept { return _home; }
+	const std::string& display_pwd() const noexcept { return _display_pwd; }
+	const std::vector<std::filesystem::path>& path_env() const noexcept { return _path_env; }
+	void tick() noexcept { set_path(std::filesystem::current_path()); }
+
+
+	size_t adjust_home(std::string& input, size_t from) {
+		size_t added = 0;
+		auto portion =  std::string_view(input).substr(from);
+		size_t n = 0;
+		while((n = portion.find("~", n)) != std::string_view::npos) {
+			input.replace(from + n, 1, _home);
+			added += _home.size() - 1;
+			portion = std::string_view(input).substr(from);
+			n += _home.size();
+		}
+		return  added;
+	}
+
+	size_t adjust_home(std::string& input, size_t from, size_t len) {
+		size_t added = 0;
+		auto portion =  std::string_view(input).substr(from, len);
+		size_t n = 0;
+		while((n = portion.find("~", n)) != std::string_view::npos) {
+			input.replace(from + n, 1, _home);
+			len = len - 1 + _home.size();
+			added += _home.size() - 1;
+			n++;
+			portion = std::string_view(input).substr(from, len);
+		}
+		return  added;
+	}
+
+	void adjust_home(std::string &input) noexcept {
+		while (true) {
+				std::string::size_type n = 0;
+				while((n = input.find("~", n)) != std::string::npos) {
+						input.replace(n, 1, _home);
+				    n+=1;
+			 	}
+		}
+	}
+
+	void set_path() {
+		set_path(_home);
+	}
+	void set_path(std::filesystem::path p) {
+		if (!p.compare(_pwd))
+			return;
+
+		_pwd = p;
+		_display_pwd = std::string(p);
+		auto h = _home;
+		if (_display_pwd.starts_with(h))
+			_display_pwd.replace(0, h.size(), "~");
+		prompt = std::string(_display_pwd);
+		prompt.append(" > ");
+	}
+
+private:
+	void load_env_path() {
+		_path_env.clear();
+		const auto p = std::getenv("PATH");
+		if (!p)
+			return;
+
+		_path_env.reserve(20);
+
+		// TODO: use strstr
+		const auto pa = std::string(p);
+		size_t pr = 0;
+		size_t in = pa.find(':');
+		while(in != std::string::npos) {
+			auto pd = pa.substr(pr, in - pr);
+			_path_env.push_back(pd);
+			pr = in+1;
+			in = pa.find(':', pr);
+		}
+		_path_env.push_back(pa.substr(pr));
+	}
+
+	void load_home_directory() {
+		const char* home = std::getenv("HOME");
+		_home = home ? std::string(home) : "";
+	}
+};
+
 

@@ -18,7 +18,7 @@
 #############################################
 # Minimal version of Ninja required by this file
 
-ninja_required_version = 1.5
+ninja_required_version = 1.8
 
 
 #############################################
@@ -47,19 +47,21 @@ cmake_ninja_workdir = /Users/dnanov/private/cpp/lesh/cmake-build-debug/
 #############################################
 # Order-only phony target for shell
 
-build cmake_object_order_depends_target_shell: phony || .
+build cmake_object_order_depends_target_shell: phony || cmake_object_order_depends_target_replxx
 
 build CMakeFiles/shell.dir/src/lolcat.cpp.o: CXX_COMPILER__shell_unscanned_Debug /Users/dnanov/private/cpp/lesh/src/lolcat.cpp || cmake_object_order_depends_target_shell
+  DEFINES = -DREPLXX_STATIC
   DEP_FILE = CMakeFiles/shell.dir/src/lolcat.cpp.o.d
   FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics
-  INCLUDES = -I"/Users/dnanov/private/cpp/lesh/include/*" -I/Users/dnanov/private/cpp/lesh/include/cpp-linenoise/.
+  INCLUDES = -I"/Users/dnanov/private/cpp/lesh/include/*" -I/Users/dnanov/private/cpp/lesh/include/cpp-linenoise/. -I/Users/dnanov/private/cpp/lesh/include/replxx/include
   OBJECT_DIR = CMakeFiles/shell.dir
   OBJECT_FILE_DIR = CMakeFiles/shell.dir/src
 
 build CMakeFiles/shell.dir/src/main.cpp.o: CXX_COMPILER__shell_unscanned_Debug /Users/dnanov/private/cpp/lesh/src/main.cpp || cmake_object_order_depends_target_shell
+  DEFINES = -DREPLXX_STATIC
   DEP_FILE = CMakeFiles/shell.dir/src/main.cpp.o.d
   FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics
-  INCLUDES = -I"/Users/dnanov/private/cpp/lesh/include/*" -I/Users/dnanov/private/cpp/lesh/include/cpp-linenoise/.
+  INCLUDES = -I"/Users/dnanov/private/cpp/lesh/include/*" -I/Users/dnanov/private/cpp/lesh/include/cpp-linenoise/. -I/Users/dnanov/private/cpp/lesh/include/replxx/include
   OBJECT_DIR = CMakeFiles/shell.dir
   OBJECT_FILE_DIR = CMakeFiles/shell.dir/src
 
@@ -71,9 +73,10 @@ build CMakeFiles/shell.dir/src/main.cpp.o: CXX_COMPILER__shell_unscanned_Debug /
 #############################################
 # Link the executable shell
 
-build shell: CXX_EXECUTABLE_LINKER__shell_Debug CMakeFiles/shell.dir/src/lolcat.cpp.o CMakeFiles/shell.dir/src/main.cpp.o
+build shell: CXX_EXECUTABLE_LINKER__shell_Debug CMakeFiles/shell.dir/src/lolcat.cpp.o CMakeFiles/shell.dir/src/main.cpp.o | include/replxx/libreplxx-d.a || include/replxx/libreplxx-d.a
   FLAGS = -g -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1
   LINK_FLAGS = -stdlib=libc++ -lc++abi
+  LINK_LIBRARIES = include/replxx/libreplxx-d.a
   OBJECT_DIR = CMakeFiles/shell.dir
   POST_BUILD = :
   PRE_LINK = :
@@ -103,6 +106,48 @@ build CMakeFiles/rebuild_cache.util: CUSTOM_COMMAND
 
 build rebuild_cache: phony CMakeFiles/rebuild_cache.util
 
+
+#############################################
+# Utility command for list_install_components
+
+build list_install_components: phony
+
+
+#############################################
+# Utility command for install
+
+build CMakeFiles/install.util: CUSTOM_COMMAND all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -P cmake_install.cmake
+  DESC = Install the project...
+  pool = console
+  restat = 1
+
+build install: phony CMakeFiles/install.util
+
+
+#############################################
+# Utility command for install/local
+
+build CMakeFiles/install/local.util: CUSTOM_COMMAND all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+  DESC = Installing only the local directory...
+  pool = console
+  restat = 1
+
+build install/local: phony CMakeFiles/install/local.util
+
+
+#############################################
+# Utility command for install/strip
+
+build CMakeFiles/install/strip.util: CUSTOM_COMMAND all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+  DESC = Installing the project stripped...
+  pool = console
+  restat = 1
+
+build install/strip: phony CMakeFiles/install/strip.util
+
 # =============================================================================
 # Write statements declared in CMakeLists.txt:
 # /Users/dnanov/private/cpp/lesh/CMakeLists.txt
@@ -131,8 +176,238 @@ build include/cpp-linenoise/CMakeFiles/rebuild_cache.util: CUSTOM_COMMAND
 
 build include/cpp-linenoise/rebuild_cache: phony include/cpp-linenoise/CMakeFiles/rebuild_cache.util
 
+
+#############################################
+# Utility command for list_install_components
+
+build include/cpp-linenoise/list_install_components: phony
+
+
+#############################################
+# Utility command for install
+
+build include/cpp-linenoise/CMakeFiles/install.util: CUSTOM_COMMAND include/cpp-linenoise/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/cpp-linenoise && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -P cmake_install.cmake
+  DESC = Install the project...
+  pool = console
+  restat = 1
+
+build include/cpp-linenoise/install: phony include/cpp-linenoise/CMakeFiles/install.util
+
+
+#############################################
+# Utility command for install/local
+
+build include/cpp-linenoise/CMakeFiles/install/local.util: CUSTOM_COMMAND include/cpp-linenoise/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/cpp-linenoise && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+  DESC = Installing only the local directory...
+  pool = console
+  restat = 1
+
+build include/cpp-linenoise/install/local: phony include/cpp-linenoise/CMakeFiles/install/local.util
+
+
+#############################################
+# Utility command for install/strip
+
+build include/cpp-linenoise/CMakeFiles/install/strip.util: CUSTOM_COMMAND include/cpp-linenoise/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/cpp-linenoise && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+  DESC = Installing the project stripped...
+  pool = console
+  restat = 1
+
+build include/cpp-linenoise/install/strip: phony include/cpp-linenoise/CMakeFiles/install/strip.util
+
+# =============================================================================
+# Write statements declared in CMakeLists.txt:
+# /Users/dnanov/private/cpp/lesh/CMakeLists.txt
+# =============================================================================
+
+# =============================================================================
+# Object build statements for STATIC_LIBRARY target replxx
+
+
+#############################################
+# Order-only phony target for replxx
+
+build cmake_object_order_depends_target_replxx: phony || .
+
+build include/replxx/CMakeFiles/replxx.dir/src/ConvertUTF.cpp.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/ConvertUTF.cpp || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/ConvertUTF.cpp.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/conversion.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/conversion.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/conversion.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/escape.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/escape.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/escape.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/history.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/history.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/history.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/prompt.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/prompt.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/prompt.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/replxx.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/replxx.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/replxx.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/replxx_impl.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/replxx_impl.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/replxx_impl.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/terminal.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/terminal.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/terminal.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/util.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/util.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/util.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/wcwidth.cpp.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/wcwidth.cpp || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/wcwidth.cpp.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+build include/replxx/CMakeFiles/replxx.dir/src/windows.cxx.o: CXX_COMPILER__replxx_unscanned_Debug /Users/dnanov/private/cpp/lesh/include/replxx/src/windows.cxx || cmake_object_order_depends_target_replxx
+  DEFINES = -DREPLXX_STATIC
+  DEP_FILE = include/replxx/CMakeFiles/replxx.dir/src/windows.cxx.o.d
+  FLAGS = -g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics -Wall -Wextra
+  INCLUDES = -I/Users/dnanov/private/cpp/lesh/include/replxx/include -I/Users/dnanov/private/cpp/lesh/include/replxx/src
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  OBJECT_FILE_DIR = include/replxx/CMakeFiles/replxx.dir/src
+
+
+# =============================================================================
+# Link build statements for STATIC_LIBRARY target replxx
+
+
+#############################################
+# Link the static library include/replxx/libreplxx-d.a
+
+build include/replxx/libreplxx-d.a: CXX_STATIC_LIBRARY_LINKER__replxx_Debug include/replxx/CMakeFiles/replxx.dir/src/ConvertUTF.cpp.o include/replxx/CMakeFiles/replxx.dir/src/conversion.cxx.o include/replxx/CMakeFiles/replxx.dir/src/escape.cxx.o include/replxx/CMakeFiles/replxx.dir/src/history.cxx.o include/replxx/CMakeFiles/replxx.dir/src/prompt.cxx.o include/replxx/CMakeFiles/replxx.dir/src/replxx.cxx.o include/replxx/CMakeFiles/replxx.dir/src/replxx_impl.cxx.o include/replxx/CMakeFiles/replxx.dir/src/terminal.cxx.o include/replxx/CMakeFiles/replxx.dir/src/util.cxx.o include/replxx/CMakeFiles/replxx.dir/src/wcwidth.cpp.o include/replxx/CMakeFiles/replxx.dir/src/windows.cxx.o
+  ARCH_FLAGS = -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1
+  LANGUAGE_COMPILE_FLAGS = -g
+  OBJECT_DIR = include/replxx/CMakeFiles/replxx.dir
+  POST_BUILD = :
+  PRE_LINK = :
+  TARGET_FILE = include/replxx/libreplxx-d.a
+  TARGET_PDB = replxx-d.a.dbg
+
+
+#############################################
+# Utility command for edit_cache
+
+build include/replxx/CMakeFiles/edit_cache.util: CUSTOM_COMMAND
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -E echo No\ interactive\ CMake\ dialog\ available.
+  DESC = No interactive CMake dialog available...
+  restat = 1
+
+build include/replxx/edit_cache: phony include/replxx/CMakeFiles/edit_cache.util
+
+
+#############################################
+# Utility command for rebuild_cache
+
+build include/replxx/CMakeFiles/rebuild_cache.util: CUSTOM_COMMAND
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake --regenerate-during-build -S/Users/dnanov/private/cpp/lesh -B/Users/dnanov/private/cpp/lesh/cmake-build-debug
+  DESC = Running CMake to regenerate build system...
+  pool = console
+  restat = 1
+
+build include/replxx/rebuild_cache: phony include/replxx/CMakeFiles/rebuild_cache.util
+
+
+#############################################
+# Utility command for list_install_components
+
+build include/replxx/list_install_components: phony
+
+
+#############################################
+# Utility command for install
+
+build include/replxx/CMakeFiles/install.util: CUSTOM_COMMAND include/replxx/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -P cmake_install.cmake
+  DESC = Install the project...
+  pool = console
+  restat = 1
+
+build include/replxx/install: phony include/replxx/CMakeFiles/install.util
+
+
+#############################################
+# Utility command for install/local
+
+build include/replxx/CMakeFiles/install/local.util: CUSTOM_COMMAND include/replxx/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+  DESC = Installing only the local directory...
+  pool = console
+  restat = 1
+
+build include/replxx/install/local: phony include/replxx/CMakeFiles/install/local.util
+
+
+#############################################
+# Utility command for install/strip
+
+build include/replxx/CMakeFiles/install/strip.util: CUSTOM_COMMAND include/replxx/all
+  COMMAND = cd /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx && /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+  DESC = Installing the project stripped...
+  pool = console
+  restat = 1
+
+build include/replxx/install/strip: phony include/replxx/CMakeFiles/install/strip.util
+
 # =============================================================================
 # Target aliases.
+
+build libreplxx-d.a: phony include/replxx/libreplxx-d.a
+
+build replxx: phony include/replxx/libreplxx-d.a
 
 # =============================================================================
 # Folder targets.
@@ -142,7 +417,7 @@ build include/cpp-linenoise/rebuild_cache: phony include/cpp-linenoise/CMakeFile
 #############################################
 # Folder: /Users/dnanov/private/cpp/lesh/cmake-build-debug
 
-build all: phony shell include/cpp-linenoise/all
+build all: phony shell include/cpp-linenoise/all include/replxx/all
 
 # =============================================================================
 
@@ -152,20 +427,41 @@ build all: phony shell include/cpp-linenoise/all
 build include/cpp-linenoise/all: phony
 
 # =============================================================================
+
+#############################################
+# Folder: /Users/dnanov/private/cpp/lesh/cmake-build-debug/include/replxx
+
+build include/replxx/all: phony include/replxx/libreplxx-d.a
+
+# =============================================================================
 # Built-in targets
+
+
+#############################################
+# Phony target to force glob verification run.
+
+build /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/VerifyGlobs.cmake_force: phony
+
+
+#############################################
+# Re-run CMake to check if globbed directories changed.
+
+build /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/cmake.verify_globs: VERIFY_GLOBS | /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/VerifyGlobs.cmake_force
+  pool = console
+  restat = 1
 
 
 #############################################
 # Re-run CMake if any of its inputs changed.
 
-build build.ninja: RERUN_CMAKE | /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCXXInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCommonLanguageInclude.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeGenericSystem.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeInitializeConfigs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeLanguageInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInitialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/CMakeCommonCompilerMacros.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/GNU.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin-Initialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/UnixPaths.cmake /Users/dnanov/private/cpp/lesh/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/cpp-linenoise/CMakeLists.txt CMakeCache.txt CMakeFiles/3.30.5/CMakeCCompiler.cmake CMakeFiles/3.30.5/CMakeCXXCompiler.cmake CMakeFiles/3.30.5/CMakeSystem.cmake
+build build.ninja: RERUN_CMAKE /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/cmake.verify_globs | /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/BasicConfigVersion-AnyNewerVersion.cmake.in /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCXXInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCheckCompilerFlagCommonPatterns.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCommonLanguageInclude.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeDependentOption.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeGenericSystem.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeInitializeConfigs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeLanguageInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakePackageConfigHelpers.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInitialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCXXCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCXXSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckIncludeFile.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckLibraryExists.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/CMakeCommonCompilerMacros.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/GNU.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindPackageHandleStandardArgs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindPackageMessage.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindThreads.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/GNUInstallDirs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/GenerateExportHeader.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckFlagCommonConfig.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin-Initialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/UnixPaths.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/WriteBasicConfigVersionFile.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/exportheader.cmake.in /Users/dnanov/private/cpp/lesh/CMakeLists.txt /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/VerifyGlobs.cmake /Users/dnanov/private/cpp/lesh/include/cpp-linenoise/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/replxx/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/replxx/replxx-config.cmake.in CMakeCache.txt CMakeFiles/3.30.5/CMakeCCompiler.cmake CMakeFiles/3.30.5/CMakeCXXCompiler.cmake CMakeFiles/3.30.5/CMakeSystem.cmake
   pool = console
 
 
 #############################################
 # A missing CMake input file is not an error.
 
-build /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCXXInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCommonLanguageInclude.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeGenericSystem.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeInitializeConfigs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeLanguageInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInitialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/CMakeCommonCompilerMacros.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/GNU.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin-Initialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/UnixPaths.cmake /Users/dnanov/private/cpp/lesh/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/cpp-linenoise/CMakeLists.txt CMakeCache.txt CMakeFiles/3.30.5/CMakeCCompiler.cmake CMakeFiles/3.30.5/CMakeCXXCompiler.cmake CMakeFiles/3.30.5/CMakeSystem.cmake: phony
+build /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/BasicConfigVersion-AnyNewerVersion.cmake.in /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCXXInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCheckCompilerFlagCommonPatterns.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeCommonLanguageInclude.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeDependentOption.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeGenericSystem.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeInitializeConfigs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeLanguageInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakePackageConfigHelpers.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInformation.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CMakeSystemSpecificInitialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCXXCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCXXSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckIncludeFile.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckLibraryExists.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/CheckSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/CMakeCommonCompilerMacros.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Compiler/GNU.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindPackageHandleStandardArgs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindPackageMessage.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/FindThreads.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/GNUInstallDirs.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/GenerateExportHeader.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckCompilerFlag.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckFlagCommonConfig.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Internal/CheckSourceCompiles.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-AppleClang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-C.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang-CXX.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Apple-Clang.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin-Initialize.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/Darwin.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/Platform/UnixPaths.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/WriteBasicConfigVersionFile.cmake /Users/dnanov/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/share/cmake-3.30/Modules/exportheader.cmake.in /Users/dnanov/private/cpp/lesh/CMakeLists.txt /Users/dnanov/private/cpp/lesh/cmake-build-debug/CMakeFiles/VerifyGlobs.cmake /Users/dnanov/private/cpp/lesh/include/cpp-linenoise/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/replxx/CMakeLists.txt /Users/dnanov/private/cpp/lesh/include/replxx/replxx-config.cmake.in CMakeCache.txt CMakeFiles/3.30.5/CMakeCCompiler.cmake CMakeFiles/3.30.5/CMakeCXXCompiler.cmake CMakeFiles/3.30.5/CMakeSystem.cmake: phony
 
 
 #############################################

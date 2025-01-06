@@ -11,8 +11,8 @@
 		"commands" : 
 		[
 			"add_executable",
-			"include_directories",
-			"target_link_libraries"
+			"target_link_libraries",
+			"include_directories"
 		],
 		"files" : 
 		[
@@ -26,19 +26,25 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 25,
+				"line" : 26,
 				"parent" : 0
 			},
 			{
 				"command" : 1,
 				"file" : 0,
-				"line" : 22,
+				"line" : 28,
 				"parent" : 0
 			},
 			{
 				"command" : 2,
 				"file" : 0,
-				"line" : 26,
+				"line" : 24,
+				"parent" : 0
+			},
+			{
+				"command" : 1,
+				"file" : 0,
+				"line" : 27,
 				"parent" : 0
 			}
 		]
@@ -52,15 +58,26 @@
 					"fragment" : "-g -std=gnu++2b -arch arm64 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.2.sdk -mmacosx-version-min=15.1 -fcolor-diagnostics"
 				}
 			],
-			"includes" : 
+			"defines" : 
 			[
 				{
 					"backtrace" : 2,
+					"define" : "REPLXX_STATIC"
+				}
+			],
+			"includes" : 
+			[
+				{
+					"backtrace" : 3,
 					"path" : "/Users/dnanov/private/cpp/lesh/include/*"
 				},
 				{
-					"backtrace" : 3,
+					"backtrace" : 4,
 					"path" : "/Users/dnanov/private/cpp/lesh/include/cpp-linenoise/."
+				},
+				{
+					"backtrace" : 2,
+					"path" : "/Users/dnanov/private/cpp/lesh/include/replxx/include"
 				}
 			],
 			"language" : "CXX",
@@ -79,6 +96,13 @@
 			]
 		}
 	],
+	"dependencies" : 
+	[
+		{
+			"backtrace" : 2,
+			"id" : "replxx::@083f774aabf96a5268b7"
+		}
+	],
 	"id" : "shell::@6890427a1f51a3e7e1df",
 	"link" : 
 	{
@@ -91,6 +115,11 @@
 			{
 				"fragment" : "-stdlib=libc++ -lc++abi",
 				"role" : "flags"
+			},
+			{
+				"backtrace" : 2,
+				"fragment" : "include/replxx/libreplxx-d.a",
+				"role" : "libraries"
 			}
 		],
 		"language" : "CXX"

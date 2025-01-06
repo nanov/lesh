@@ -24,10 +24,6 @@ x .d88"               z`    ^%    .uef^"
 	*/
 
 
-
-
-
-#include "zsh_executor.h"
 #include <algorithm>
 #include <charconv>
 #include <cstddef>
@@ -42,18 +38,23 @@ x .d88"               z`    ^%    .uef^"
 #include <optional>
 #include <ostream>
 #include <sstream>
+#include <stdlib.h>
 #include <string>
 #include <string_view>
 #include <sys/unistd.h>
 #include <system_error>
 #include <unordered_map>
-#include <vector>
 #include <unordered_set>
-#include <stdlib.h>
+#include <vector>
+#include "zsh_executor.h"
 
 #include <linenoise.hpp>
+#include <replxx.h>
+
 #include "utils.h"
 #include "zsh_parser_plus.h"
+
+#include "replxx.hxx"
 // #include <>
 
 // #include <absl/container/flat_hash_map.h>
@@ -99,105 +100,6 @@ const std::optional<std::string> file_found(const std::vector<std::filesystem::p
 // end tools
 
 
-class shell_state {
-private:
-	std::filesystem::path _pwd;
-	std::string _display_pwd;
-	std::vector<std::filesystem::path> _path_env;
-	std::string _home;
-
-public:
-	shell_state() {
-		load_home_directory();
-		set_path(std::filesystem::current_path());
-		load_env_path();
-	}
-
-	const std::filesystem::path& pwd() const noexcept { return _pwd; }
-	const std::string& home() const noexcept { return _home; }
-	const std::string& display_pwd() const noexcept { return _display_pwd; }
-	const std::vector<std::filesystem::path>& path_env() const noexcept { return _path_env; }
-	void tick() noexcept { set_path(std::filesystem::current_path()); }
-
-
-	size_t adjust_home(std::string& input, size_t from) {
-		size_t added = 0;
-		auto portion =  std::string_view(input).substr(from);
-		size_t n = 0;
-		while((n = portion.find("~", n)) != std::string_view::npos) {
-			input.replace(from + n, 1, _home);
-			added += _home.size() - 1;
-			portion = std::string_view(input).substr(from);
-			n += _home.size();
-		}
-		return  added;
-	}
-
-	size_t adjust_home(std::string& input, size_t from, size_t len) {
-		size_t added = 0;
-		auto portion =  std::string_view(input).substr(from, len);
-		size_t n = 0;
-		while((n = portion.find("~", n)) != std::string_view::npos) {
-			input.replace(from + n, 1, _home);
-			len = len - 1 + _home.size();
-			added += _home.size() - 1;
-			n++;
-			portion = std::string_view(input).substr(from, len);
-		}
-		return  added;
-	}
-
-	void adjust_home(std::string &input) noexcept {
-		while (true) {
-				std::string::size_type n = 0;
-				while((n = input.find("~", n)) != std::string::npos) {
-						input.replace(n, 1, _home);
-				    n+=1;
-			 	}
-		}
-	}
-
-	void set_path(std::filesystem::path p) {
-		if (!p.compare(_pwd))
-			return;
-
-		_pwd = p;
-		_display_pwd = std::string(p);
-		auto h = _home;
-		if (_display_pwd.starts_with(h))
-			_display_pwd.replace(0, h.size(), "~");
-	}
-
-private:
-	void load_env_path() {
-		_path_env.clear();
-		const auto p = std::getenv("PATH");
-		if (!p)
-			return;
-
-		_path_env.reserve(20);
-
-		// TODO: use strstr
-		const auto pa = std::string(p);
-		size_t pr = 0;
-		size_t in = pa.find(':');
-		while(in != std::string::npos) {
-			auto pd = pa.substr(pr, in - pr);
-			_path_env.push_back(pd);
-			pr = in+1;
-			in = pa.find(':', pr);
-		}
-		_path_env.push_back(pa.substr(pr));
-	}
-
-	void load_home_directory() {
-		const char* home = std::getenv("HOME");
-		_home = home ? std::string(home) : "";
-	}
-
-
-};
-
 
 class built_in_command {
 		public:
@@ -208,9 +110,9 @@ class built_in_command {
 
 class pwd_built_in_command : public built_in_command {
 	private:
-		const shell_state &_state;
+		const lesh_state &_state;
 	public:
-			pwd_built_in_command(const shell_state &state): _state(state) {}
+			pwd_built_in_command(const lesh_state &state): _state(state) {}
 
 			int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
 				if (!params.empty()) {
@@ -224,9 +126,9 @@ class pwd_built_in_command : public built_in_command {
 
 class cd_built_in_command : public built_in_command {
 	private:
-		shell_state &_state;
+		lesh_state &_state;
 	public:
-		cd_built_in_command(shell_state &state): _state(state) {}
+		cd_built_in_command(lesh_state &state): _state(state) {}
 
 		int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
 			if (params.empty()) {
@@ -301,9 +203,9 @@ class exit_built_in_command : public built_in_command {
 class type_built_in_command : public built_in_command {
 	private:
 		const std::unordered_map<std::string_view, std::unique_ptr<built_in_command>> &_commands;
-		const shell_state &_state;
+		const lesh_state &_state;
 	public:
-			type_built_in_command(const shell_state &state, const std::unordered_map<std::string_view, std::unique_ptr<built_in_command>> &commands): _commands(commands), _state(state){}
+			type_built_in_command(const lesh_state &state, const std::unordered_map<std::string_view, std::unique_ptr<built_in_command>> &commands): _commands(commands), _state(state){}
 
 			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
 				// is it a builtin command?
@@ -328,9 +230,9 @@ class type_built_in_command : public built_in_command {
 class alias_build_in_command : public built_in_command {
 	private:
 		alias_map &_aliases;
-		const shell_state &_state;
+		const lesh_state &_state;
 	public:
-			alias_build_in_command(const shell_state &state, alias_map &aliases): _aliases(aliases), _state(state){}
+			alias_build_in_command(const lesh_state &state, alias_map &aliases): _aliases(aliases), _state(state){}
 
 			virtual int execute(const std::string &raw_input, std::string_view &command, std::string_view &params) {
 			    if (params.empty()) {
@@ -361,7 +263,7 @@ class alias_build_in_command : public built_in_command {
 
 #include <unistd.h>
 
-
+/*
 void split_string(char* actual_command, char* input, std::vector<char*>& target) {
 	target.clear();
 
@@ -539,61 +441,6 @@ private:
 		}
 };*/
 
-struct command {
-	char* command;
-	char* params;
-};
-
-size_t prepare_commands(std::string& input, alias_map& aliases, shell_state& state, std::vector<std::vector<char*>>& cmds) {
-	std::unordered_set<std::string_view> executed_aliases;
-	size_t idx = 0;
-	size_t commands = 0;
-
-	parse_command:
-		auto i_v = std::string_view(input).substr(idx);
-	  auto dl = i_v.find(' ');
-		auto c_v = std::string_view(i_v);
-		auto command = c_v.substr(0, dl);
-
-
-		if (!executed_aliases.contains(command))
-			if(auto alias = aliases.find(command); alias != aliases.end()) {
-				executed_aliases.insert(alias->first);
-				input.replace(idx, command.size(), alias->second);
-				goto parse_command;
-			}
-
-		executed_aliases.clear();
-
-
-
-		auto pipe_idx = input.find("| ", idx);
-		if ( pipe_idx != std::string::npos && pipe_idx != input.size() + 1) {
-			auto a = state.adjust_home(input, idx, pipe_idx-idx);
-			input[pipe_idx+a-1] = '\0';
-			input[pipe_idx+a] = '\0';
-			auto &v = cmds.emplace_back();
-			if (auto ff = file_found(state.path_env(), command)) {
-				auto c_str_fcmd = ff->c_str();
-				if (!access(c_str_fcmd, X_OK)) {
-					split_string((char*)c_str_fcmd, &input[idx], v);
-				}
-			}
-			idx=pipe_idx+2+a;
-			commands += 1;
-			goto parse_command;
-	  }
-		state.adjust_home(input, idx);
-		auto &v = cmds.emplace_back();
-		if (auto ff = file_found(state.path_env(), command)) {
-			auto c_str_fcmd = ff->c_str();
-			if (!access(c_str_fcmd, X_OK)) {
-				split_string((char*)c_str_fcmd, &input[idx], v);
-			}
-		}
-		commands += 1;
-		return commands;
-}
 
 #include "lolcat.h"
 
@@ -618,7 +465,7 @@ void print_lesh(double gradient = 0.6) {
 }
 
 int main(int argc, char **argv, char **envp) {
-    setenv("TERM", "xterm-256color", 1);
+	setenv("TERM", "xterm-256color", 1);
 
 
 	int exit_code = -1;
@@ -628,7 +475,7 @@ int main(int argc, char **argv, char **envp) {
 
 
   std::string input = "";
-	shell_state state;
+	lesh_state state;
 
 	alias_container aliases {
 		{ ":q", "exit" },
@@ -639,16 +486,13 @@ int main(int argc, char **argv, char **envp) {
 		{ "lvim", "~/.local/bin/lvim"}
 	};
 
-	std::string in = ("cat $(cat test)");
+	std::string in = ("cat test");
 	// std::string in = ("cat test");
 	// std::string in = ("cat $(cat test) | grep shell"); // ("ls -l | time | ago | i | can | still | remmber");
 	// std::string in = ("cat CMakeCache.txt | grep shell"); // ("ls -l | time | ago | i | can | still | remmber");
 	// std::string in = ("ls -l | time | ago | i | can | still | remmber");
 	// std::string in = ("ls -l");
 
-	auto pa = ZshParserPlus::Parser();
-	auto d = pa.parse(in);
-	pa.execute(d);
 
 	std::unordered_map<std::string_view, std::unique_ptr<built_in_command>> built_in_commands_executors;
 	built_in_commands_executors.insert({"cd", std::make_unique<cd_built_in_command>(state)});
@@ -667,30 +511,49 @@ int main(int argc, char **argv, char **envp) {
 	linenoise::LoadHistory(".lesh_history");
 	print_lesh();
 
+
+	auto zsh_parser = ZshParserPlus::Parser(state);
+
+	replxx::Replxx rx;
+	rx.bind_key_internal(replxx::Replxx::KEY::UP,  "history_previous");
+	rx.bind_key_internal(replxx::Replxx::KEY::DOWN,  "history_next");
+	std::string history_file = ".lesh_history_new";
+	rx.history_load(history_file);
+
+	zsh_parser.init_aliases();
 	while(true) {
 		input.clear();
 		state.tick();
-		linenoise::Readline(" > ", input);
-		linenoise::AddHistory(input.c_str());
+		std::string dbg = "'t'ko";
+		zsh_parser.parse_and_execute(dbg);
+		// display the prompt and retrieve input from the user
+		char const* cinput{ nullptr };
+
+		do {
+			cinput = rx.input(state.pmt());
+		} while ( ( cinput == nullptr ) && ( errno == EAGAIN ) );
+
+		if (cinput == nullptr) {
+			break;
+		}
+
+		input.append(cinput);
+
+		if (input.empty())
+			continue;
+		rx.history_add(cinput);
+
+		std::string input = {cinput};
+
 
 		if (input == "exit") {
 			exit_code = 0;
 			break;
 		}
 
-		if (input.starts_with("pl")) {
-			if (input == "pl" || input == "pl ") {
-				print_lesh();
-			} else {
-				auto val = std::stod(input.substr(3));
-				std::cout << "p: " << val << std::endl;
-				print_lesh(val);
-			}
-			continue;
-		}
+		zsh_parser.parse_and_execute(input);
 
-
-		executeZshCommand(input, aliases);
+		// executeZshCommand(input, aliases);
 
 
 		// auto number_of_commands = prepare_commands(input, aliases, state, repl_chain);
@@ -745,8 +608,10 @@ int main(int argc, char **argv, char **envp) {
 		// std::cout << command << ": command not found" << std::endl;
 	}
 
-	linenoise::SaveHistory(".lesh_history");
+	// linenoise::SaveHistory(".lesh_history");
 
+	rx.history_sync(history_file);
 	return exit_code;
+
 
 }
