@@ -475,7 +475,7 @@ int main(int argc, char **argv, char **envp) {
 
 
   std::string input = "";
-	lesh_state state;
+	lesh_state state {envp};
 
 	alias_container aliases {
 		{ ":q", "exit" },
@@ -524,7 +524,7 @@ int main(int argc, char **argv, char **envp) {
 	while(true) {
 		input.clear();
 		state.tick();
-		std::string dbg = "'t'ko";
+		std::string dbg = "$PATH";
 		zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };

@@ -23,6 +23,7 @@ J88"
 - https://zsh.sourceforge.io/Doc/Release/Prompt-Expansion.html#Prompt-Expansion - implement
 - https://github.com/AmokHuginnsson/replxx - read line but done right
 - https://edw.is/using-lua-with-cpp/ - future lua integration
+- https://github.com/rothgar/mastering-zsh/blob/master/docs/helpers/aliases.md - important regarding aliases
 
 ## TODOS:
 

@@ -331,9 +331,6 @@ public:
 };
 
 namespace ZshParserPlus {
-
-;
-
 	class Parser {
 	public:
 		struct ASTNode {
@@ -484,6 +481,7 @@ namespace ZshParserPlus {
 		};
 	private:
 		alias_container _aliases;
+		lesh_state _lesh_state;
 		class built_in_commands {
 		private:
 			lesh_state& _state;
@@ -691,6 +689,7 @@ namespace ZshParserPlus {
 
 		class command_parser {
 		private:
+			lesh_state _lesh_state;
 			enum class parsing_state {
 				none = 0,
 				in_a_word = 1,
@@ -706,6 +705,7 @@ namespace ZshParserPlus {
 			char* _word_beginning;
 			char _expected_closing_bracket = 0;
 			char* _bracket_start;
+			bool _is_escape = false;
 
 			//
 		private:
@@ -738,8 +738,8 @@ namespace ZshParserPlus {
 				return special[static_cast<unsigned char>(c)];
 			}
 		public:
-			command_parser(SimpleParsingStare &state, const alias_container_plus &aliases, ASTPipe &pipe) :
-					_state(state), _pipe(pipe), _aliases_plus(aliases), _is_command(true),
+			command_parser(lesh_state lesh_state, SimpleParsingStare &state, const alias_container_plus &aliases, ASTPipe &pipe) :
+					_state(state), _pipe(pipe), _aliases_plus(aliases), _is_command(true), _lesh_state(lesh_state),
 					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr) {
 				_command = _pipe.emplace_command();
 			}
@@ -749,23 +749,30 @@ namespace ZshParserPlus {
 				while (true) {
 					auto c = _state.current();
 					if (_expected_closing_bracket) {
-						if (*c == _expected_closing_bracket) {
-							_expected_closing_bracket = 0;
-							// better case - not in a middle of a word
-							if (_p_state == parsing_state::none) {
-								// but wait a minute - we may be at the beginning of one :(
-								if (char *next; !_state.peek(next) || is_seperator(*next)) {
-									_word_beginning = ++_bracket_start;
-									_p_state = parsing_state::in_a_word;
-									ensure_word<is_executing>(c);
-								} else {
+						char ch = *c;
+						if (ch == _expected_closing_bracket) {
+							if (_is_escape) {
+								_is_escape = false;
+							} else {
+								_expected_closing_bracket = 0;
+								// better case - not in a middle of a word
+								if (_p_state == parsing_state::none) {
+									// but wait a minute - we may be at the beginning of one :(
+									if (char *next; !_state.peek(next) || is_seperator(*next)) {
+										_word_beginning = ++_bracket_start;
+										_p_state = parsing_state::in_a_word;
+										ensure_word<is_executing>(c);
+									} else {
+										_state.remove_brackets(_bracket_start, c);
+										_p_state = parsing_state::in_a_word;
+										_word_beginning = _bracket_start;
+									}
+								} else { // NOTE: for now mainuplating string seems simpler option
 									_state.remove_brackets(_bracket_start, c);
-									_p_state = parsing_state::in_a_word;
-									_word_beginning = _bracket_start;
 								}
-							} else { // NOTE: for now mainuplating string seems simpler option
-								_state.remove_brackets(_bracket_start, c);
 							}
+						} else if (ch == '/') {
+							_is_escape = true;
 						}
 					} else {
 						switch (*c) {
@@ -789,6 +796,28 @@ namespace ZshParserPlus {
 							} break;
 
 							case '$': {
+								char *p;
+								if (_state.peek(p)) {
+									if (*p == '(') {
+										// TODO: handle subshell
+									} else { // optimistic variable expansion
+										_state.plusplus();
+										auto w = _state.parse_word();
+										char* val;
+										if (_lesh_state.try_get_env(w, val)) {
+											if (_p_state == parsing_state::in_a_word) {
+												// todo
+											} else if (_p_state == parsing_state::none) {
+												_p_state = parsing_state::in_a_word;
+												_word_beginning = val;
+												c = _state.current();
+												ensure_word<is_executing>(c);
+											}
+										}
+
+									}
+
+								}
 								// todo: maybe subshell, maybe variable
 							} break;
 
@@ -814,7 +843,7 @@ namespace ZshParserPlus {
 
 		template<bool is_executing>
 		inline void parse_command(SimpleParsingStare& state, ASTPipe& ast_pipe) const {
-			command_parser parser(state, _aliases_plus, ast_pipe);
+			command_parser parser(_lesh_state, state, _aliases_plus, ast_pipe);
 			parser.parse<is_executing>();
 		}
 
@@ -842,16 +871,9 @@ namespace ZshParserPlus {
 					close(output_fd);
 				}
 
-				// // Handle redirections
-				// handleRedirections(cmd->redirections);
-				//
-				// // Prepare arguments
-				// ArgVector argv(cmd->command, cmd->arguments);
-
 				// TODO: Add error handling and bounds checking
 				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
 
-				printf("argv: %s - %d\n", argv[0], command->children.size());
 				// Execute command
 				execvp(argv[0], argv);
 
@@ -902,7 +924,7 @@ namespace ZshParserPlus {
 		}
 
 	public:
-		explicit inline Parser(lesh_state& state): built_ins(built_in_commands(state)), _aliases_plus() {}
+		explicit inline Parser(lesh_state& state): _lesh_state(state), built_ins(built_in_commands(state)), _aliases_plus() {}
 
 
 		void init_aliases() {

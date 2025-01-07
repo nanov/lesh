@@ -62,15 +62,24 @@ class alias_container {
 
 class lesh_state {
 private:
+	char** _envp;
 	std::filesystem::path _pwd;
 	std::string _display_pwd;
 	std::string prompt;
 	std::vector<std::filesystem::path> _path_env;
 	std::string _home;
 	alias_container _aliases;
+	std::unordered_map<std::string_view, char*> _env;
 
 public:
-	lesh_state() {
+	lesh_state(char** envp) noexcept : _envp(envp) {
+		for (auto it = _envp; *it; it++) {
+			const auto e = *it;
+			std::string_view v = {e};
+			const auto idx = v.find('=');
+			_env.emplace(v.substr(0, idx), (e +idx + 1));
+		}
+
 		load_home_directory();
 		set_path(std::filesystem::current_path());
 		load_env_path();
@@ -138,6 +147,14 @@ public:
 			_display_pwd.replace(0, h.size(), "~");
 		prompt = std::string(_display_pwd);
 		prompt.append(" > ");
+	}
+
+	bool try_get_env(std::string_view key, char*& val) const {
+		if (auto it = _env.find(key); it != _env.end()) {
+			val = it->second;
+			return true;
+		}
+		return false;
 	}
 
 private:
