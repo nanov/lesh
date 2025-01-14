@@ -5,6 +5,9 @@
 
 #include "util.h"
 
+#include <__ranges/split_view.h>
+#include <__ranges/views.h>
+
 template<typename T, size_t StackSize>
 class hybrid_continuous_vector {
 	union storage {
@@ -460,10 +463,6 @@ namespace ZshParserPlus {
 			}
 
 			ASTCommand* merge(ASTCommand*& current_command, const ASTPipe & other) {
-				if (other.size() == 1) {
-					*current_command = *other.commands[0];
-					return current_command;
-				}
 				ASTCommand* c = current_command;
 				current_command = &other.commands.get_at_reference(0);
 				commands.place_copy(*current_command);
@@ -699,6 +698,16 @@ namespace ZshParserPlus {
 				return res;
 			}
 
+			char* rent(std::string_view a, std::string_view b, std::string_view c) {
+				char* res;
+				if (!_buffer_pool.allocate(a.size() + b.size() + c.size() + 1, res))
+					_to_free.push_back(res);
+				memcpy(res, a.data(), a.size());
+				memcpy(res+a.size(), b.data(), b.size());
+				memcpy(res+a.size()+b.size(), c.data(), c.size());
+				res[a.size()+b.size()+c.size()]= '\0';
+				return res;
+			}
 			bool skip_whitespace() {
 				char _;
 				return skip_whitespace(_);
@@ -919,11 +928,31 @@ namespace ZshParserPlus {
 								_command = _pipe.emplace_command();
 								_is_command = true;
 							} break;
+							case '{': {
+								std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
+								_state.plusplus();
+								auto words = _state.match_charter('}');
+								_state.plusplus();
+								auto a = _state.parse_word();
+								for (auto wr : std::ranges::views::split(words, ',')) {
+									auto w = std::string_view(wr);
+									if (p.empty() && a.empty()) {
+										_p_state = parsing_state::in_a_word;
+										ensure_word<is_executing>(w.data(), const_cast<char*>(w.data()+w.size()));
+									} else {
+										auto wor = _state.rent(p, w, a);
+										_p_state = parsing_state::in_a_word;
+										c = _state.current();
+										ensure_word<is_executing>(wor, c);
+									}
+								}
+							} break;
 
 							case '$': {
 								char *p;
 								if (_state.peek(p)) {
 									if (*p == '(') {
+										std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
 										_state.plusplus();
 										_state.plusplus();
 										auto sub_input = _state.match_charter(')');
@@ -947,7 +976,7 @@ namespace ZshParserPlus {
 										total -= tb.trim_end('\n', total);
 
 										// detached
-										if (_p_state == parsing_state::none) {
+										if (char* next; _p_state == parsing_state::none && (!_state.peek(next) || is_seperator(*next))){
 											auto sub_result_input = _state.sub_state(tb.data(), total);
 											auto sub_result_pipe = ASTPipe{};
 											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);

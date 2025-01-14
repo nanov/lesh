@@ -524,7 +524,7 @@ int main(int argc, char **argv, char **envp) {
 	while(true) {
 		input.clear();
 		state.tick();
-		// std::string dbg = "$(echo -n ls)";
+		// std::string dbg = "{ls,la}";
 		// zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
