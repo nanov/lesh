@@ -194,6 +194,18 @@ class hybrid_vector {
 			_storage.heap[i].~T();
 	}
 public:
+	void foreach(std::function<void(const T&)> callback) {
+		if (_using_heap) {
+			for (size_t i = 0; i < StackSize; ++i)
+				callback(_storage.stack[i]);
+			for (size_t i = 0; i < (StackSize - _size); ++i)
+				callback(_storage.heap[i]);
+			return;
+		}
+		for (size_t i = 0; i<_size; ++i)
+			callback(_storage.stack[i]);
+
+	}
 	struct iterator {
 	private:
 		hybrid_vector<T, StackSize> _that;
@@ -331,6 +343,50 @@ public:
 };
 
 namespace ZshParserPlus {
+	class buffer_pool {
+	public:
+		buffer_pool(size_t size = 1024) {
+			_data = new char[size];
+			_end = _data + size;
+			_current = _data;
+		}
+
+		~buffer_pool() {
+			delete[] _data;
+		}
+
+		bool reallocate(char* at, size_t new_size,  char*& result) {
+			if (at+new_size > _end) {
+				result = static_cast<char *>(malloc(sizeof(char) * new_size));
+				memcpy(result, at, _current - at);
+				_current = at;
+				return false;
+			}
+			_current = at + new_size;
+			result = at;
+			return true;
+		}
+
+		bool allocate(size_t size, char*& result) {
+			if (_current+size > _end) {
+				result = new char[size];
+				return false;
+			}
+			result = _current;
+			_current += size;
+			return true;
+		}
+
+		void reset(char* to) {
+			_current = to;
+		}
+
+		char* at() const { return _current; }
+	private:
+		char* _data;
+		char* _current;
+		const char* _end;
+	};
 	class Parser {
 	public:
 		struct ASTNode {
@@ -370,7 +426,7 @@ namespace ZshParserPlus {
 
 			size_t num_references = 0;
 
-			ASTWord& emplace_child(char* value) { return children.emplace_back(value); }
+			ASTWord& emplace_child(const char* value) { return children.emplace_back(value); }
 			void push_child(ASTWord&& value) { children.push_back(value); }
 			[[nodiscard]] size_t number_of_children() const { return children.size(); }
 
@@ -411,6 +467,7 @@ namespace ZshParserPlus {
 				ASTCommand* c = current_command;
 				current_command = &other.commands.get_at_reference(0);
 				commands.place_copy(*current_command);
+
 				for (size_t i = 1; i < other.size(); ++i) {
 					auto cmd = other.commands.get_at_reference(i);
 					c = &commands.push_back_copy(cmd);
@@ -480,11 +537,12 @@ namespace ZshParserPlus {
 			}
 		};
 	private:
+		buffer_pool _buffer_pool = { 1024 };
 		alias_container _aliases;
-		lesh_state _lesh_state;
-		class built_in_commands {
+		lesh_state &_lesh_state;
+	class built_in_commands {
 		private:
-			lesh_state& _state;
+		lesh_state &_state;
 			// Define a type for builtin command functions
 			using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
 		  std::unordered_map<std::string, builtint> builtins;
@@ -560,16 +618,33 @@ namespace ZshParserPlus {
 
 			char* _current;
 
+			buffer_pool& _buffer_pool;
+			char* _buffer_start;
+			hybrid_vector<char*, 12> _to_free;
+
 		public:
+			[[nodiscard]] buffer_pool& pool() const { return _buffer_pool; }
 			enum class special_char {
 				NONE = 0,
 				PIPE,
 				DOLLAR,
 				COUNT,
 			};
-			explicit SimpleParsingStare(const char *input) : _input(strdup(input)), _length(strlen(input)+1), _current(_input) {}
-			SimpleParsingStare(char *input, size_t length) : _input(input), _length(length), _current(_input) {}
-			explicit SimpleParsingStare(std::string& input):  SimpleParsingStare(input.data(), input.size()+1) {}
+			explicit SimpleParsingStare(buffer_pool& pool, const char *input) : _buffer_pool(pool), _buffer_start(pool.at()), _input(strdup(input)), _length(strlen(input)+1), _current(_input) {}
+			SimpleParsingStare(buffer_pool& pool, char *input, size_t length) : _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length), _current(_input) {}
+			explicit SimpleParsingStare(buffer_pool& pool, std::string& input):  SimpleParsingStare(pool, input.data(), input.size()+1) {}
+			~SimpleParsingStare() {
+				_buffer_pool.reset(_buffer_start);
+				_to_free.foreach([](auto* ptr) { delete ptr; });
+			}
+
+
+			SimpleParsingStare sub_state(char* data, size_t length) {
+				return SimpleParsingStare(_buffer_pool, data, length);
+			}
+			SimpleParsingStare sub_state(std::string_view input) {
+				return SimpleParsingStare(_buffer_pool, const_cast<char*>(input.data()), input.size()+1);
+			}
 
 			void remove_brackets(char* brackets_open, char* brackets_close) {
 				auto brackets_open_pos = brackets_open - _input;
@@ -614,6 +689,16 @@ namespace ZshParserPlus {
 				_position++;
 			}
 
+			char* rent(std::string_view a, std::string_view b) {
+				char* res;
+				if (!_buffer_pool.allocate(a.size() + b.size() + 1, res))
+					_to_free.push_back(res);
+				memcpy(res, a.data(), a.size());
+				memcpy(res+a.size(), b.data(), b.size());
+				res[a.size()+b.size()]= '\0';
+				return res;
+			}
+
 			bool skip_whitespace() {
 				char _;
 				return skip_whitespace(_);
@@ -634,8 +719,21 @@ namespace ZshParserPlus {
 				return char_type(c) != special_char::NONE;
 			}
 
-		// TODO: add support for parantesis
-		inline char* parse_word() {
+		inline std::string_view match_charter(char bracket = ')') {
+			char* word = _current;
+
+			char c = *_current;
+			auto l = _length-1;
+			while (_position < l &&
+				     c != bracket) {
+				plusplus();
+				c = *_current;
+			}
+			*_current = '\0';
+
+			return std::string_view(word, _current-word);
+		}
+		inline std::string_view parse_word() {
 			char* word = _current;
 
 			char c = *_current;
@@ -649,38 +747,52 @@ namespace ZshParserPlus {
 			}
 			*_current = '\0';
 
-			return word;
+			return std::string_view(word, _current-word);
 		}
 
 		};
 
-		class TransferableBuffer {
+		class transfarable_buffer {
+		private:
+			buffer_pool& _buffer_pool;
+			char* buffer_start = nullptr;
 			char* ptr = nullptr;
 			size_t capacity = 0;
 
 		public:
-			TransferableBuffer(size_t initial_size) {
-				ptr = static_cast<char *>(malloc(initial_size * sizeof(char)));
-				capacity = initial_size;
+			transfarable_buffer(buffer_pool& pool, size_t inital_size): _buffer_pool(pool) {
+				capacity = inital_size;
+				buffer_start = _buffer_pool.at();
+				if (!_buffer_pool.allocate(inital_size, ptr))
+					buffer_start = nullptr;
 			};
 
+			size_t trim_end(char c, size_t end) {
+				auto p = ptr + end - 1;
+				auto bp = p;
+				while (*p==c) {
+					*(p--) = '\0';
+				}
+				return bp - p;
+			}
+
 			void resize(size_t new_size) {
-				if (new_size > capacity) {
+				if (new_size <= capacity)
+					return;
+				if (!buffer_start) {
 					ptr = static_cast<char *>(realloc(ptr, new_size * sizeof(char)));
 					capacity = new_size;
-				}
+				} else if (!_buffer_pool.reallocate(buffer_start, new_size, ptr))
+					buffer_start = nullptr;
+				capacity = new_size;
 			}
 
 			char* data() const { return ptr; }
-
-			// Prevent copying
-			TransferableBuffer(const TransferableBuffer&) = delete;
-			TransferableBuffer& operator=(const TransferableBuffer&) = delete;
 		};
 
 		alias_container_plus _aliases_plus;
 		void add_alias(const char* alias, char* value) {
-			auto state = SimpleParsingStare(value);
+			auto state = SimpleParsingStare(_buffer_pool, value);
 			ASTPipe pipe;
 			parse_command<false>(state, pipe);
 			_aliases_plus.emplace_alias(alias, pipe);
@@ -689,7 +801,7 @@ namespace ZshParserPlus {
 
 		class command_parser {
 		private:
-			lesh_state _lesh_state;
+			lesh_state &_lesh_state;
 			enum class parsing_state {
 				none = 0,
 				in_a_word = 1,
@@ -699,6 +811,7 @@ namespace ZshParserPlus {
 			ASTPipe &_pipe;
 			const alias_container_plus &_aliases_plus;
 
+			const built_in_commands& _build_in_commands;
 			ASTCommand* _command;
 			bool _is_command;
 			parsing_state _p_state;
@@ -710,23 +823,23 @@ namespace ZshParserPlus {
 			//
 		private:
 			template<bool is_executing>
-			void ensure_word(char *c) {
+			void ensure_word(const char* word_begin, char *word_end) {
 				if (_p_state != parsing_state::in_a_word)
 					return;
 
 				_p_state = parsing_state::none;
-				*c = '\0';
+				*word_end = '\0';
 				if constexpr (is_executing) {
-					if (ASTPipe aliased_pipe; _is_command && _aliases_plus.try_get_alias(_word_beginning, aliased_pipe)) {
+					if (ASTPipe aliased_pipe; _is_command && _aliases_plus.try_get_alias(word_begin, aliased_pipe)) {
 						_command = _pipe.merge(_command, aliased_pipe);
 					} else {
-						_command->emplace_child(_word_beginning);
+						_command->emplace_child(word_begin);
 					}
 					_is_command = false;
 				} else {
-					_command->emplace_child(_word_beginning);
+					_command->emplace_child(word_begin);
 				}
-				_word_beginning = nullptr;
+				word_begin = nullptr;
 			}
 			static bool is_seperator(char c) {
 				static constexpr bool special[256] = {
@@ -738,12 +851,25 @@ namespace ZshParserPlus {
 				return special[static_cast<unsigned char>(c)];
 			}
 		public:
-			command_parser(lesh_state lesh_state, SimpleParsingStare &state, const alias_container_plus &aliases, ASTPipe &pipe) :
-					_state(state), _pipe(pipe), _aliases_plus(aliases), _is_command(true), _lesh_state(lesh_state),
-					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr) {
-				_command = _pipe.emplace_command();
+
+			template<bool is_executing>
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe, ASTCommand* command) {
+				auto p = command_parser(lesh_state, state, bc, aliases, pipe, command);
+				return p.parse<is_executing>();
+			}
+			template<bool is_executing>
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state,const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe) {
+				auto p = command_parser(lesh_state, state, bc, aliases, pipe);
+				return p.parse<is_executing>();
+			}
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe) :
+			command_parser(lesh_state, state, bc, aliases, pipe, pipe.emplace_command()) {
 			}
 
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe, ASTCommand* command) :
+					_state(state), _pipe(pipe), _aliases_plus(aliases), _is_command(true), _lesh_state(lesh_state),
+					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr), _command(command), _build_in_commands(bc) {
+			}
 			template<bool is_executing>
 			ASTPipe& parse() {
 				while (true) {
@@ -759,9 +885,8 @@ namespace ZshParserPlus {
 								if (_p_state == parsing_state::none) {
 									// but wait a minute - we may be at the beginning of one :(
 									if (char *next; !_state.peek(next) || is_seperator(*next)) {
-										_word_beginning = ++_bracket_start;
 										_p_state = parsing_state::in_a_word;
-										ensure_word<is_executing>(c);
+										ensure_word<is_executing>(++_bracket_start, c);
 									} else {
 										_state.remove_brackets(_bracket_start, c);
 										_p_state = parsing_state::in_a_word;
@@ -784,13 +909,13 @@ namespace ZshParserPlus {
 							}
 							case ' ':
 							case '\0': {
-								ensure_word<is_executing>(c);
+								ensure_word<is_executing>(_word_beginning, c);
 							} break;
 
 							// pipe process one to another
 							case '|': {
 								*c = '\0';
-								ensure_word<is_executing>(c);
+								ensure_word<is_executing>(_word_beginning, c);
 								_command = _pipe.emplace_command();
 								_is_command = true;
 							} break;
@@ -799,19 +924,50 @@ namespace ZshParserPlus {
 								char *p;
 								if (_state.peek(p)) {
 									if (*p == '(') {
+										_state.plusplus();
+										_state.plusplus();
+										auto sub_input = _state.match_charter(')');
+										auto sub_parsing_state = _state.sub_state(sub_input);
+										auto sub_pipe = ASTPipe{};
+										parse<is_executing>(_lesh_state, sub_parsing_state, _build_in_commands, _aliases_plus, sub_pipe);
+										int pipe_fd[2];
+										pipe(pipe_fd); // todo handle error
+
+										execute(sub_pipe, 0, pipe_fd[1]);
+										close(pipe_fd[1]);
+										transfarable_buffer tb = { _state.pool(), 256 };
+										size_t total = 0;
+										size_t bytes_read = 0;
+
+										while ((bytes_read = read(pipe_fd[0], tb.data() + total, 256)) > 0) {
+											total += bytes_read;
+											tb.resize(total + 256);
+										}
+										close(pipe_fd[0]);
+										total -= tb.trim_end('\n', total);
+
+										// detached
+										if (_p_state == parsing_state::none) {
+											auto sub_result_input = _state.sub_state(tb.data(), total);
+											auto sub_result_pipe = ASTPipe{};
+											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);
+										}
+
+
 										// TODO: handle subshell
 									} else { // optimistic variable expansion
+										std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
+										*c = '\0';
 										_state.plusplus();
 										auto w = _state.parse_word();
-										char* val;
-										if (_lesh_state.try_get_env(w, val)) {
-											if (_p_state == parsing_state::in_a_word) {
-												// todo
+										if (std::string_view val; _lesh_state.try_get_env(w, val)) {
+											if (!p.empty()) {
+												auto con = _state.rent(p, val);
+												ensure_word<is_executing>(con, c);
 											} else if (_p_state == parsing_state::none) {
 												_p_state = parsing_state::in_a_word;
-												_word_beginning = val;
 												c = _state.current();
-												ensure_word<is_executing>(c);
+												ensure_word<is_executing>(val.data(), c);
 											}
 										}
 
@@ -833,7 +989,7 @@ namespace ZshParserPlus {
 					if (!_state.plusplus_s()) {
 						// TODO: handle non closing brackets
 						// NOTE: end of input shouldn't be inside of a word as input is expceted to be null-terminated
-						ensure_word<is_executing>(c);
+						ensure_word<is_executing>(_word_beginning, c);
 						break;
 					}
 				}
@@ -843,14 +999,14 @@ namespace ZshParserPlus {
 
 		template<bool is_executing>
 		inline void parse_command(SimpleParsingStare& state, ASTPipe& ast_pipe) const {
-			command_parser parser(_lesh_state, state, _aliases_plus, ast_pipe);
+			command_parser parser(_lesh_state, state, built_ins, _aliases_plus, ast_pipe);
 			parser.parse<is_executing>();
 		}
 
 		// Execute a single command
-		pid_t execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			if (built_ins.try_execute_built_in(command))
-				return 0;
+		pid_t static execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+			// if (built_ins.try_execute_built_in(command))
+			// 	return 0;
 
 			pid_t pid = fork();
 
@@ -887,7 +1043,7 @@ namespace ZshParserPlus {
 			return pid;
 		}
 
-		std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+		std::vector<pid_t> static execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
 			// TODO: use pool
 			std::vector<pid_t> pids;
 			int input_fd = p_input_fd;
@@ -929,18 +1085,18 @@ namespace ZshParserPlus {
 
 		void init_aliases() {
 			// add_alias("m", "l | grep");
-			// add_alias("l", "ls -lah");
-			// add_alias("ls", "ls -G");
-			// _aliases_plus.normalize_aliases();
+			add_alias("l", "ls -lah");
+			add_alias("ls", "ls -G");
+			_aliases_plus.normalize_aliases();
 		}
 		inline void parse_and_execute(std::string& input) {
-			auto state = SimpleParsingStare{input}; // ExpansionContainer{input};
+			auto state = SimpleParsingStare{_buffer_pool, input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
 			parse_command<true>(state, pipe);
 			execute(pipe);
 		}
 
-		inline void execute(const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+		inline static void execute(const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
 			switch (pipe.size()) {
 				// TODO: maybe error handling
 				case 0: break;;

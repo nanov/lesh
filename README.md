@@ -24,6 +24,7 @@ J88"
 - https://github.com/AmokHuginnsson/replxx - read line but done right
 - https://edw.is/using-lua-with-cpp/ - future lua integration
 - https://github.com/rothgar/mastering-zsh/blob/master/docs/helpers/aliases.md - important regarding aliases
+- Bash performs the expansion by executing command and replacing the command substitution with the standard output of the command, with any  trailing  newlines  deleted.
 
 ## TODOS:
 
@@ -37,3 +38,4 @@ J88"
   - [ ] Support escaping inside brackets
 - [ ] full subshell support with partial expanding ie: ```mi$(echo ko)```
 - [ ] list expansion : ```mi{tko,la,rovene} -> mitko, mila, mirovene```
+

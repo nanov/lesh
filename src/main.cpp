@@ -524,8 +524,8 @@ int main(int argc, char **argv, char **envp) {
 	while(true) {
 		input.clear();
 		state.tick();
-		std::string dbg = "$PATH";
-		zsh_parser.parse_and_execute(dbg);
+		// std::string dbg = "$(echo -n ls)";
+		// zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
 

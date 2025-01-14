@@ -13,6 +13,14 @@ struct overload : Bases ...{
     using Bases::operator() ... ;
 };
 
+struct string_part {
+private:
+	char* _data = nullptr;
+	size_t _size = 0;
+public:
+	string_part(char* data, size_t size) : _data(data), _size(size) {}
+};
+
 
 struct char_pointer_hash{
     auto operator()( const char* ptr ) const noexcept{ return std::hash<std::string_view>{}( ptr );}
@@ -69,7 +77,7 @@ private:
 	std::vector<std::filesystem::path> _path_env;
 	std::string _home;
 	alias_container _aliases;
-	std::unordered_map<std::string_view, char*> _env;
+	std::unordered_map<std::string_view, std::string_view> _env;
 
 public:
 	lesh_state(char** envp) noexcept : _envp(envp) {
@@ -149,7 +157,7 @@ public:
 		prompt.append(" > ");
 	}
 
-	bool try_get_env(std::string_view key, char*& val) const {
+	bool try_get_env(std::string_view key, std::string_view& val) const {
 		if (auto it = _env.find(key); it != _env.end()) {
 			val = it->second;
 			return true;
