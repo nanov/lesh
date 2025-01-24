@@ -56,3 +56,6 @@ cmake-build-debug/
 .DS_Store
 compile_commands.json
 
+.lesh_history
+
+
