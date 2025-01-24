@@ -6,6 +6,9 @@
 #include <vector>
 #include <filesystem>
 
+#define BUFFER_POOL_SIZE (1024*32)
+#define SUBSHELL_BUFFER_INITIAL_SIZE 1024
+
 // begin - alias shit double hash == https://www.reddit.com/r/cpp_questions/comments/12xw3sn/find_stdstring_view_in_unordered_map_with/ == https://godbolt.org/z/789xv8Eeq
 template<typename ... Bases>
 struct overload : Bases ...{
@@ -80,7 +83,7 @@ private:
 	std::unordered_map<std::string_view, std::string_view> _env;
 
 public:
-	lesh_state(char** envp) noexcept : _envp(envp) {
+	lesh_state(std::filesystem::path current_path, char** envp) noexcept : _envp(envp) {
 		for (auto it = _envp; *it; it++) {
 			const auto e = *it;
 			std::string_view v = {e};
@@ -89,7 +92,7 @@ public:
 		}
 
 		load_home_directory();
-		set_path(std::filesystem::current_path());
+		set_path(current_path);
 		load_env_path();
 	}
 
@@ -144,6 +147,7 @@ public:
 	void set_path() {
 		set_path(_home);
 	}
+
 	void set_path(std::filesystem::path p) {
 		if (!p.compare(_pwd))
 			return;
@@ -168,8 +172,8 @@ public:
 private:
 	void load_env_path() {
 		_path_env.clear();
-		const auto p = std::getenv("PATH");
-		if (!p)
+		std::string_view p;
+		if (!try_get_env("PATH", p))
 			return;
 
 		_path_env.reserve(20);
@@ -188,8 +192,10 @@ private:
 	}
 
 	void load_home_directory() {
-		const char* home = std::getenv("HOME");
-		_home = home ? std::string(home) : "";
+		std::string_view home_dir;
+		if (!try_get_env("HOME", home_dir))
+			home_dir = "/";
+		_home = std::string(home_dir);
 	}
 };
 

@@ -4,6 +4,8 @@ project(lesh)
 
 file(GLOB_RECURSE HEADER_FILES src/*.hpp)
 file(GLOB_RECURSE SOURCE_FILES src/*.cpp)
+file(GLOB_RECURSE TEST_FILES tests/*.cpp)
+list(REMOVE_ITEM SOURCE_FILES ${PROJECT_SOURCE_DIR}/src/main.cpp)
 
 set(CMAKE_CXX_STANDARD 23) # Enable the C++23 standard
 # set(CMAKE_CXX_COMPILER "/opt/homebrew/opt/llvm/bin/clang++")
@@ -21,8 +23,27 @@ set(CMAKE_BUILD_TYPE Debug)
 # include_directories("include/abseil")
 add_subdirectory("include/cpp-linenoise")
 add_subdirectory("include/replxx")
-include_directories("include/*")
 
-add_executable(shell ${SOURCE_FILES} ${HEADER_FILES})
-target_link_libraries(shell linenoise)
-target_link_libraries(shell replxx::replxx)
+# Key idea: SEPARATE OUT your main() function into its own file so it can be its
+# own executable. Separating out main() means you can add this library to be
+# used elsewhere (e.g linking to the test executable).
+
+
+# testing
+add_subdirectory("include/googletest")
+enable_testing()
+include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
+
+include_directories("include/*")
+include_directories("src")
+
+add_library(lesh_lib ${SOURCE_FILES} ${HEADER_FILES})
+target_link_libraries(lesh_lib linenoise replxx::replxx)
+
+add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp)
+target_link_libraries(lesh lesh_lib)
+
+add_executable(lesh_tests ${TEST_FILES} ${HEADER_FILES}
+        tests/lesh_state_tests.cpp
+)
+target_link_libraries(lesh_tests gtest gtest_main lesh_lib)

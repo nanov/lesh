@@ -10,3 +10,6 @@
 [submodule "include/replxx"]
 	path = include/replxx
 	url = https://github.com/AmokHuginnsson/replxx
+[submodule "include/googletest"]
+	path = include/googletest
+	url = https://github.com/google/googletest

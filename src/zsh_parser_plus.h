@@ -2,6 +2,7 @@
 
 #include <sys/wait.h>
 #include <unistd.h>
+#include <unordered_set>
 
 #include "util.h"
 
@@ -131,7 +132,7 @@ public:
 	void push_back(T&& value) { emplace_back(std::move(value)); }
 
 	[[nodiscard]] const T* data_null_terminated() {
-		emplace_back(nullptr);
+		// emplace_back(nullptr);
 		return _using_heap? _storage.heap : _storage.stack;
 	}
 	[[nodiscard]] const T* data() const { return _using_heap? _storage.heap : _storage.stack; }
@@ -443,6 +444,14 @@ namespace ZshParserPlus {
 				for (size_t i = 1; i < other.children.size(); ++i)
 					children.push_back(*other.children[i]);
 			}
+
+			void print() const {
+				std::cout << '[' << children.size() << "]: ";
+				for (size_t i = 0; i < children.size(); ++i) {
+					std::cout << ((*children[i]->value == '\0') ? "0" : children[i]->value) << ' ';
+				}
+				std::cout << std::endl;
+			}
 		};
 		struct ASTPipe {
 			hybrid_vector<ASTCommand, 3> commands;
@@ -450,6 +459,13 @@ namespace ZshParserPlus {
 			ASTPipe() : commands() {}
 			ASTPipe(const ASTPipe& other) {
 				commands = other.commands;
+			}
+
+			void print() const {
+				for (size_t i = 0; i < commands.size(); ++i) {
+					const auto c = commands[i];
+					c->print();
+				}
 			}
 
 			template<typename... Args>
@@ -536,7 +552,7 @@ namespace ZshParserPlus {
 			}
 		};
 	private:
-		buffer_pool _buffer_pool = { 1024 };
+		buffer_pool _buffer_pool = { BUFFER_POOL_SIZE };
 		alias_container _aliases;
 		lesh_state &_lesh_state;
 	class built_in_commands {
@@ -629,9 +645,9 @@ namespace ZshParserPlus {
 				DOLLAR,
 				COUNT,
 			};
-			explicit SimpleParsingStare(buffer_pool& pool, const char *input) : _buffer_pool(pool), _buffer_start(pool.at()), _input(strdup(input)), _length(strlen(input)+1), _current(_input) {}
-			SimpleParsingStare(buffer_pool& pool, char *input, size_t length) : _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length), _current(_input) {}
-			explicit SimpleParsingStare(buffer_pool& pool, std::string& input):  SimpleParsingStare(pool, input.data(), input.size()+1) {}
+			explicit SimpleParsingStare(buffer_pool& pool, char *input, size_t length) : _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length), _current(_input) {}
+			SimpleParsingStare(buffer_pool& pool, const char *input) : SimpleParsingStare(pool, strdup(input), strlen(input)) {}
+			explicit SimpleParsingStare(buffer_pool& pool, std::string& input):  SimpleParsingStare(pool, input.data(), input.size()) {}
 			~SimpleParsingStare() {
 				_buffer_pool.reset(_buffer_start);
 				_to_free.foreach([](auto* ptr) { delete ptr; });
@@ -964,13 +980,13 @@ namespace ZshParserPlus {
 
 										execute(sub_pipe, 0, pipe_fd[1]);
 										close(pipe_fd[1]);
-										transfarable_buffer tb = { _state.pool(), 256 };
+										transfarable_buffer tb = { _state.pool(), SUBSHELL_BUFFER_INITIAL_SIZE };
 										size_t total = 0;
 										size_t bytes_read = 0;
 
-										while ((bytes_read = read(pipe_fd[0], tb.data() + total, 256)) > 0) {
+										while ((bytes_read = read(pipe_fd[0], tb.data() + total, SUBSHELL_BUFFER_INITIAL_SIZE)) > 0) {
 											total += bytes_read;
-											tb.resize(total + 256);
+											tb.resize(total + SUBSHELL_BUFFER_INITIAL_SIZE);
 										}
 										close(pipe_fd[0]);
 										total -= tb.trim_end('\n', total);
@@ -1058,6 +1074,7 @@ namespace ZshParserPlus {
 
 				// TODO: Add error handling and bounds checking
 				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
+				// command->print();
 
 				// Execute command
 				execvp(argv[0], argv);
@@ -1130,6 +1147,7 @@ namespace ZshParserPlus {
 				// TODO: maybe error handling
 				case 0: break;;
 				case 1: {
+					pipe.print();
 					if (const auto pid = execute_command(pipe.commands[0], input_fd, output_fd)) {
 						int status;
 						waitpid(pid, &status, 0);

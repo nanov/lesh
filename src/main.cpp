@@ -475,7 +475,7 @@ int main(int argc, char **argv, char **envp) {
 
 
   std::string input = "";
-	lesh_state state {envp};
+	lesh_state state {std::filesystem::current_path(), envp};
 
 	alias_container aliases {
 		{ ":q", "exit" },
@@ -522,9 +522,10 @@ int main(int argc, char **argv, char **envp) {
 
 	zsh_parser.init_aliases();
 	while(true) {
-		input.clear();
 		state.tick();
-		// std::string dbg = "{ls,la}";
+		std::string dbg = "clear";
+		// zsh_parser.parse_and_execute(dbg);
+		// dbg = "ls";
 		// zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
@@ -537,14 +538,11 @@ int main(int argc, char **argv, char **envp) {
 			break;
 		}
 
-		input.append(cinput);
+		std::string input = {cinput};
 
 		if (input.empty())
 			continue;
 		rx.history_add(cinput);
-
-		std::string input = {cinput};
-
 
 		if (input == "exit") {
 			exit_code = 0;
