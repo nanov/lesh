@@ -10,7 +10,7 @@ list(REMOVE_ITEM SOURCE_FILES ${PROJECT_SOURCE_DIR}/src/main.cpp)
 set(CMAKE_CXX_STANDARD 23) # Enable the C++23 standard
 # set(CMAKE_CXX_COMPILER "/opt/homebrew/opt/llvm/bin/clang++")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer -fsanitize=address")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer -fsanitize=address")
 # set(CMAKE_LINKER_FLAGS "${CMAKE_LINKER_FLAGS} -fno-omit-frame-pointer -fsanitize=address")
 # set(CMAKE_CXX_FLAGS "-O3 -Wall -Wextra")
 # set(CMAKE_CXX_FLAGS "cmake-build-debug")
@@ -21,7 +21,6 @@ set(CMAKE_BUILD_TYPE Debug)
 # add_link_options(-fsanitize=address)
 # add_subdirectory("include/abseil")
 # include_directories("include/abseil")
-add_subdirectory("include/cpp-linenoise")
 add_subdirectory("include/replxx")
 
 # Key idea: SEPARATE OUT your main() function into its own file so it can be its
@@ -38,12 +37,12 @@ include_directories("include/*")
 include_directories("src")
 
 add_library(lesh_lib ${SOURCE_FILES} ${HEADER_FILES})
-target_link_libraries(lesh_lib linenoise replxx::replxx)
+target_link_libraries(lesh_lib replxx::replxx)
 
-add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp)
+add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp
+        src/auto_complete.h)
 target_link_libraries(lesh lesh_lib)
 
-add_executable(lesh_tests ${TEST_FILES} ${HEADER_FILES}
-        tests/lesh_state_tests.cpp
-)
+add_executable(lesh_tests ${TEST_FILES} ${HEADER_FILES})
+
 target_link_libraries(lesh_tests gtest gtest_main lesh_lib)

@@ -39,7 +39,7 @@ class hybrid_continuous_vector {
 
 	void grow_heap() {
 		_capacity += StackSize;
-		T* new_storage = new T[_capacity];
+		T* new_storage = new T[_capacity]();
 		for (size_t i = 0; i < _size; ++i)
 			new_storage[i] = std::move(_storage.heap[i]);
 
@@ -131,8 +131,8 @@ public:
 	void push_back(const T& value) { emplace_back(value); }
 	void push_back(T&& value) { emplace_back(std::move(value)); }
 
+	// TODO: ensure it's always null terminated :/
 	[[nodiscard]] const T* data_null_terminated() {
-		// emplace_back(nullptr);
 		return _using_heap? _storage.heap : _storage.stack;
 	}
 	[[nodiscard]] const T* data() const { return _using_heap? _storage.heap : _storage.stack; }
@@ -144,12 +144,19 @@ public:
 	[[nodiscard]] size_t size() const { return _size; }
 	[[nodiscard]] size_t capacity() const { return _capacity; }
 	[[nodiscard]] bool is_on_heap() const { return _using_heap; }
+	bool operator==(const hybrid_continuous_vector& other) const {
+		if (_size != other._size) return false;
+		for (size_t i = 0; i < _size; ++i)
+			if (get_at(i) != other.get_at(i))
+				return false;
+		return true;
+	}
 };
 template<typename T, size_t StackSize>
 class hybrid_vector {
 	struct  storage {
 		T stack[StackSize];
-		T* heap;
+		T* heap = nullptr;
 	};
 
 	storage _storage;
@@ -157,13 +164,11 @@ class hybrid_vector {
 	size_t _heap_capacity = 0;
 	size_t _capacity;
 	T* _location;
-	bool _using_heap;
 
 	void allocate_heap() {
 		T* new_storage = new T[StackSize];
 
 		_storage.heap = new_storage;
-		_using_heap = true;
 		_heap_capacity = StackSize;
 		_capacity += StackSize;
 		_location = _storage.heap;
@@ -171,8 +176,8 @@ class hybrid_vector {
 
 	void grow_heap() {
 		_heap_capacity += StackSize;
-		T* new_storage = new T[_heap_capacity];
-		if (_using_heap) {
+		T* new_storage = new T[_heap_capacity]();
+		if (_storage.heap) {
 			for (size_t i = 0; i < (StackSize - _size); ++i)
 				new_storage[i] = std::move(_storage.heap[i]);
 			delete[] _storage.heap;
@@ -182,10 +187,11 @@ class hybrid_vector {
 		_capacity += StackSize;
 		_location = _storage.heap + (StackSize - _size);
 	}
+
 	void clear() {
 		size_t stack_size;
 		size_t heap_size;
-		if (_using_heap) {
+		if (_storage.heap) {
 			stack_size = StackSize;
 			heap_size = _size - stack_size;
 		} else {
@@ -199,7 +205,7 @@ class hybrid_vector {
 	}
 public:
 	void foreach(std::function<void(const T&)> callback) {
-		if (_using_heap) {
+		if (_storage.heap) {
 			for (size_t i = 0; i < StackSize; ++i)
 				callback(_storage.stack[i]);
 			for (size_t i = 0; i < (StackSize - _size); ++i)
@@ -236,14 +242,14 @@ public:
 	iterator begin() { return iterator(*this, 0); }
 	iterator end() { return iterator(*this, _size); }
 
-	hybrid_vector() : _size(0), _capacity(StackSize), _using_heap(false) {
+	hybrid_vector() : _size(0), _capacity(StackSize) {
 		// Initialize stack array using placement new
 		new (_storage.stack) T[StackSize];
 		_location = _storage.stack;
 	}
 	~hybrid_vector() {
 		clear();
-		if (_using_heap) {
+		if (_storage.heap) {
 			delete[] _storage.heap;
 		}
 	}
@@ -254,7 +260,7 @@ public:
 		// First, ensure we have enough capacity
 		size_t required_capacity = _size + extra_elements;  // -1 because we replace first element
 		while (_capacity < required_capacity) {
-			if (_using_heap) {
+			if (_storage.heap) {
 				grow_heap();
 			} else {
 				allocate_heap();
@@ -265,7 +271,7 @@ public:
 			// Shift existing elements to make space
 			for (size_t i = _size - 1; i > index; --i) {
 				size_t new_pos = i + other.size() - 1;
-				if (!_using_heap || new_pos < StackSize) {
+				if (!_storage.heap || new_pos < StackSize) {
 					new (&_storage.stack[new_pos]) T(std::move(get_at_reference(i)));
 					get_at_reference(i).~T();
 				} else {
@@ -275,7 +281,7 @@ public:
 			}
 		}
 
-		if (!_using_heap || index < StackSize) {
+		if (!_storage.heap || index < StackSize) {
 			new (&_storage.stack[index]) T(other.get_at_reference(0));
 		} else {
 			new (&_storage.heap[index - StackSize]) T(other.get_at_reference(0));
@@ -284,7 +290,7 @@ public:
 		// Insert remaining elements
 		for (size_t i = 1; i < other.size(); ++i) {
 			size_t insert_pos = index + i;
-			if (!_using_heap || insert_pos < StackSize) {
+			if (!_storage.heap || insert_pos < StackSize) {
 				new (&_storage.stack[insert_pos]) T(other.get_at_reference(i));
 			} else {
 				new (&_storage.heap[insert_pos - StackSize]) T(other.get_at_reference(i));
@@ -292,7 +298,7 @@ public:
 		}
 
 		_size = _size + extra_elements;
-		_location = (!_using_heap || _size < StackSize) ?
+		_location = (!_storage.heap || _size < StackSize) ?
 				&_storage.stack[_size] :
 				&_storage.heap[_size - StackSize];
 
@@ -307,7 +313,7 @@ public:
 	template<typename... Args>
 	T* emplace_back(Args&&... args) {
 		if (_size == _capacity) {
-			if (_using_heap) {
+			if (_storage.heap) {
 				grow_heap();
 			} else {
 				allocate_heap();
@@ -332,65 +338,29 @@ public:
 	T& push_back(T&& value) { return emplace_back(std::move(value)); }
 
 	[[nodiscard]] T& get_at_reference(size_t idx) const {
-		return  (!_using_heap || idx < StackSize) ?  const_cast<T&>(_storage.stack[idx]) : _storage.heap[idx - StackSize];
+		return  (!_storage.heap || idx < StackSize) ?  const_cast<T&>(_storage.stack[idx]) : _storage.heap[idx - StackSize];
 	}
 
 	[[nodiscard]] T* get_at(size_t idx) const {
-		return  (!_using_heap || idx < StackSize) ? const_cast<T*>(&_storage.stack[idx]) : &_storage.heap[idx - StackSize];
+		return  (!_storage.heap || idx < StackSize) ? const_cast<T*>(&_storage.stack[idx]) : &_storage.heap[idx - StackSize];
 	}
 
 	T* operator [](size_t idx) const {return get_at(idx);}
+	bool operator==(const hybrid_vector<T, StackSize>& other) const {
+		if (_size != other._size)
+			return false;
+		for (size_t i = 0; i < _size; ++i)
+			if (get_at_reference(i) != other.get_at_reference(i))
+				return false;
+		return true;
+	}
 
 	[[nodiscard]] size_t size() const { return _size; }
 	[[nodiscard]] size_t capacity() const { return _capacity; }
-	[[nodiscard]] bool is_on_heap() const { return _using_heap; }
+	[[nodiscard]] bool is_on_heap() const { return _storage.heap; }
 };
 
 namespace ZshParserPlus {
-	class buffer_pool {
-	public:
-		buffer_pool(size_t size = 1024) {
-			_data = new char[size];
-			_end = _data + size;
-			_current = _data;
-		}
-
-		~buffer_pool() {
-			delete[] _data;
-		}
-
-		bool reallocate(char* at, size_t new_size,  char*& result) {
-			if (at+new_size > _end) {
-				result = static_cast<char *>(malloc(sizeof(char) * new_size));
-				memcpy(result, at, _current - at);
-				_current = at;
-				return false;
-			}
-			_current = at + new_size;
-			result = at;
-			return true;
-		}
-
-		bool allocate(size_t size, char*& result) {
-			if (_current+size > _end) {
-				result = new char[size];
-				return false;
-			}
-			result = _current;
-			_current += size;
-			return true;
-		}
-
-		void reset(char* to) {
-			_current = to;
-		}
-
-		char* at() const { return _current; }
-	private:
-		char* _data;
-		char* _current;
-		const char* _end;
-	};
 	class Parser {
 	public:
 		struct ASTNode {
@@ -552,30 +522,48 @@ namespace ZshParserPlus {
 			}
 		};
 	private:
-		buffer_pool _buffer_pool = { BUFFER_POOL_SIZE };
 		alias_container _aliases;
 		lesh_state &_lesh_state;
 	class built_in_commands {
 		private:
-		lesh_state &_state;
+			lesh_state &_state;
 			// Define a type for builtin command functions
 			using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
 		  std::unordered_map<std::string, builtint> builtins;
 
 			static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
+				// TODO: help
 				if (cmd->children.size() < 2)
 					return 0;
 
-				std::cout << cmd->children[1]->value;
-				for (size_t i = 2; i < cmd->children.size(); ++i) {
-					std::cout << ' ' << cmd->children[i]->value;
+				bool display_return = true;
+				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
+
+				if (strcmp(*argv,"-n") ==0) {
+					argv++;
+					display_return = false;
 				}
-				std::cout << std::endl;
+				auto val = *argv++;
+				if (!val)
+					return 0;
+
+				fputs(val, stdout);
+				while ((val = *argv++)) {
+					putchar(' ');
+					fputs(val, stdout);
+				}
+
+				if (display_return)
+					putchar('\n');
+
+				return 0;
 			}
+
 			static int builtin_cd(lesh_state& state, const ASTCommand* cmd) {
 				if (cmd->children.size() < 2) {
 					std::filesystem::current_path(state.home());
-					state.set_path(std::filesystem::current_path());
+					auto s = std::filesystem::current_path();
+					state.set_path(s);
 					return 0;
 				}
 
@@ -585,19 +573,63 @@ namespace ZshParserPlus {
 					std::cout << "cd: " << cmd->children[1]->value << ": " << e.message() << std::endl;
 					return -1;
 				}
-				state.set_path(std::filesystem::current_path());
+				auto s = std::filesystem::current_path();
+				state.set_path(s);
+				return 0;
+			}
+
+			static int builtin_info(lesh_state& state, const ASTCommand* cmd) {
+#ifdef VERBOSE_POOL_DATA
+				{
+					const auto &b = state.global_pool();
+					std::println(" - Global Buffer Pool");
+					std::println("  [ ] Pool Size {}", b.pool_size());
+					std::println("  [ ] Bytes Used {}", b.bytes_used());
+					std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+					std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
+				}
+				{
+					const auto &b = state.buffer_pool();
+					std::println(" - Buffer Pool");
+					std::println("  [ ] Pool Size {}", b.pool_size());
+					std::println("  [ ] Bytes Used {}", b.bytes_used());
+					std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+					std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
+				}
+#endif
 				return 0;
 			}
 		public:
 			explicit built_in_commands(lesh_state& state): _state(state) {
 				builtins.emplace("cd", builtin_cd);
 				builtins.emplace("echo", builtin_echo);
+				builtins.emplace("info", builtin_info);
 			}
 
-			bool try_execute_built_in(const ASTCommand* cmd) {
+			bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
 				if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
+					int saved_stdout = -1, saved_stdin = -1;
+					if (output_fd != STDOUT_FILENO) {
+						saved_stdout = dup(STDOUT_FILENO);
+						dup2(output_fd, STDOUT_FILENO);
+					}
+
+					if (input_fd != STDIN_FILENO) {
+						saved_stdin = dup(STDIN_FILENO);
+						dup2(input_fd, STDIN_FILENO);
+					}
+
+
 					it->second(_state, cmd);
-					return true;
+
+					if (saved_stdout != -1) {
+						dup2(saved_stdout, STDOUT_FILENO);
+						close(saved_stdout);
+					}
+					if (saved_stdin != -1) {
+						dup2(saved_stdin, STDIN_FILENO);
+						close(saved_stdin);
+					}					return true;
 				}
 				return false;
 			}
@@ -628,6 +660,7 @@ namespace ZshParserPlus {
 		struct SimpleParsingStare {
 		private:
 			char* _input;
+			bool _is_global;
 			size_t _length;
 			size_t _position = 0;
 
@@ -645,20 +678,25 @@ namespace ZshParserPlus {
 				DOLLAR,
 				COUNT,
 			};
-			explicit SimpleParsingStare(buffer_pool& pool, char *input, size_t length) : _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length), _current(_input) {}
-			SimpleParsingStare(buffer_pool& pool, const char *input) : SimpleParsingStare(pool, strdup(input), strlen(input)) {}
-			explicit SimpleParsingStare(buffer_pool& pool, std::string& input):  SimpleParsingStare(pool, input.data(), input.size()) {}
+			explicit SimpleParsingStare(bool is_global, buffer_pool& pool, char *input, size_t length) : _is_global(is_global), _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length+1), _current(_input) {}
+			SimpleParsingStare(bool is_global, buffer_pool& pool, const char *input) : SimpleParsingStare(is_global, pool, strdup(input), strlen(input)) {}
+			explicit SimpleParsingStare(bool is_global, buffer_pool& pool, std::string& input):  SimpleParsingStare(is_global, pool, input.data(), input.size()) {}
+
 			~SimpleParsingStare() {
+				if (_is_global)
+					return;
+
 				_buffer_pool.reset(_buffer_start);
-				_to_free.foreach([](auto* ptr) { delete ptr; });
+				_to_free.foreach([](auto* ptr) { free(ptr); });
 			}
 
 
-			SimpleParsingStare sub_state(char* data, size_t length) {
-				return SimpleParsingStare(_buffer_pool, data, length);
+			[[nodiscard]] SimpleParsingStare sub_state(char* data, size_t length) const {
+				return SimpleParsingStare(false, _buffer_pool, data, length);
 			}
-			SimpleParsingStare sub_state(std::string_view input) {
-				return SimpleParsingStare(_buffer_pool, const_cast<char*>(input.data()), input.size()+1);
+
+			[[nodiscard]] SimpleParsingStare sub_state(std::string_view input) const {
+				return sub_state(const_cast<char*>(input.data()), input.size());
 			}
 
 			void remove_brackets(char* brackets_open, char* brackets_close) {
@@ -679,7 +717,7 @@ namespace ZshParserPlus {
 			}
 			[[nodiscard]] char* current() const { return _current; }
 			bool plusplus_s() {
-				if (_position >= _length)
+				if (_position >= _length - 1)
 					return false;
 				_current++;
 				_position++;
@@ -729,7 +767,7 @@ namespace ZshParserPlus {
 				return skip_whitespace(_);
 			}
 
-			inline static special_char char_type(char c) {
+			inline static special_char char_type(const char c) {
 				static constexpr special_char special[256] = {
 					['|'] = special_char::PIPE,
 					['>'] = special_char::NONE, ['<'] = special_char::NONE,
@@ -740,11 +778,11 @@ namespace ZshParserPlus {
 				};
 				return special[static_cast<unsigned char>(c)];
 			}
-			inline static bool is_special(char c) {
+			inline static bool is_special(const char c) {
 				return char_type(c) != special_char::NONE;
 			}
 
-		inline std::string_view match_charter(char bracket = ')') {
+		inline std::string_view match_charter(const char bracket = ')') {
 			char* word = _current;
 
 			char c = *_current;
@@ -759,11 +797,10 @@ namespace ZshParserPlus {
 			return std::string_view(word, _current-word);
 		}
 		inline std::string_view parse_word() {
-			char* word = _current;
+			const char * word = _current;
 
 			char c = *_current;
-			auto l = _length-1;
-			while (_position < l &&
+			while (_position < _length &&
 				     c != '\0' &&
 			       !std::isspace(c) &&
 			       !is_special(c)) {
@@ -782,15 +819,19 @@ namespace ZshParserPlus {
 			buffer_pool& _buffer_pool;
 			char* buffer_start = nullptr;
 			char* ptr = nullptr;
-			size_t capacity = 0;
+			size_t _capacity = 0;
 
 		public:
 			transfarable_buffer(buffer_pool& pool, size_t inital_size): _buffer_pool(pool) {
-				capacity = inital_size;
+				_capacity = inital_size;
 				buffer_start = _buffer_pool.at();
 				if (!_buffer_pool.allocate(inital_size, ptr))
 					buffer_start = nullptr;
 			};
+
+			size_t capacity() const {
+				return _capacity;
+			}
 
 			size_t trim_end(char c, size_t end) {
 				auto p = ptr + end - 1;
@@ -802,14 +843,14 @@ namespace ZshParserPlus {
 			}
 
 			void resize(size_t new_size) {
-				if (new_size <= capacity)
+				if (new_size <= _capacity)
 					return;
 				if (!buffer_start) {
 					ptr = static_cast<char *>(realloc(ptr, new_size * sizeof(char)));
-					capacity = new_size;
+					_capacity = new_size;
 				} else if (!_buffer_pool.reallocate(buffer_start, new_size, ptr))
 					buffer_start = nullptr;
-				capacity = new_size;
+				_capacity = new_size;
 			}
 
 			char* data() const { return ptr; }
@@ -817,7 +858,7 @@ namespace ZshParserPlus {
 
 		alias_container_plus _aliases_plus;
 		void add_alias(const char* alias, char* value) {
-			auto state = SimpleParsingStare(_buffer_pool, value);
+			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
 			ASTPipe pipe;
 			parse_command<false>(state, pipe);
 			_aliases_plus.emplace_alias(alias, pipe);
@@ -968,35 +1009,53 @@ namespace ZshParserPlus {
 								char *p;
 								if (_state.peek(p)) {
 									if (*p == '(') {
-										std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
+										std::string_view before =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
 										_state.plusplus();
 										_state.plusplus();
-										auto sub_input = _state.match_charter(')');
-										auto sub_parsing_state = _state.sub_state(sub_input);
-										auto sub_pipe = ASTPipe{};
-										parse<is_executing>(_lesh_state, sub_parsing_state, _build_in_commands, _aliases_plus, sub_pipe);
 										int pipe_fd[2];
-										pipe(pipe_fd); // todo handle error
+										{
+											auto sub_input = _state.match_charter(')');
+											auto sub_parsing_state = _state.sub_state(sub_input);
+											auto sub_pipe = ASTPipe{};
+											parse<is_executing>(_lesh_state, sub_parsing_state, _build_in_commands, _aliases_plus, sub_pipe);
+											pipe(pipe_fd); // todo handle error
 
-										execute(sub_pipe, 0, pipe_fd[1]);
-										close(pipe_fd[1]);
+											execute(_build_in_commands, sub_pipe, 0, pipe_fd[1]);
+											close(pipe_fd[1]);
+										}
 										transfarable_buffer tb = { _state.pool(), SUBSHELL_BUFFER_INITIAL_SIZE };
 										size_t total = 0;
-										size_t bytes_read = 0;
+										{
+											size_t free_space = tb.capacity();
+											size_t bytes_read = 0;
 
-										while ((bytes_read = read(pipe_fd[0], tb.data() + total, SUBSHELL_BUFFER_INITIAL_SIZE)) > 0) {
-											total += bytes_read;
-											tb.resize(total + SUBSHELL_BUFFER_INITIAL_SIZE);
+											while ((bytes_read = read(pipe_fd[0], tb.data() + total, free_space)) > 0) {
+												total += bytes_read;
+												free_space -= bytes_read;
+												if (free_space < tb.capacity() - (SUBSHELL_BUFFER_INITIAL_SIZE/2))
+													tb.resize(tb.capacity() * 2);
+											}
 										}
 										close(pipe_fd[0]);
+										// TODO: handle empty output or output without that doesnt end in a new line
 										total -= tb.trim_end('\n', total);
+										_state.plusplus();
+										auto after = _state.parse_word();
 
 										// detached
-										if (char* next; _p_state == parsing_state::none && (!_state.peek(next) || is_seperator(*next))){
+										if (before.empty() && after.empty()) {
 											auto sub_result_input = _state.sub_state(tb.data(), total);
 											auto sub_result_pipe = ASTPipe{};
 											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);
+										} else {
+											auto input_data = _state.rent(before, std::string_view(tb.data(), total), after);
+											auto sub_result_input = _state.sub_state(input_data);
+											auto sub_result_pipe = ASTPipe{};
+											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);
+											// TODO: attached
 										}
+										_p_state = parsing_state::none;
+										c = _state.current();
 
 
 										// TODO: handle subshell
@@ -1049,9 +1108,9 @@ namespace ZshParserPlus {
 		}
 
 		// Execute a single command
-		pid_t static execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			// if (built_ins.try_execute_built_in(command))
-			// 	return 0;
+		pid_t static execute_command(const built_in_commands& built_ins, ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+			if (built_ins.try_execute_built_in(command, input_fd, output_fd))
+				return 0;
 
 			pid_t pid = fork();
 
@@ -1074,7 +1133,6 @@ namespace ZshParserPlus {
 
 				// TODO: Add error handling and bounds checking
 				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
-				// command->print();
 
 				// Execute command
 				execvp(argv[0], argv);
@@ -1089,11 +1147,10 @@ namespace ZshParserPlus {
 			return pid;
 		}
 
-		std::vector<pid_t> static execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+		std::vector<pid_t> static execute_pipeline(const built_in_commands& built_ins, const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
 			// TODO: use pool
 			std::vector<pid_t> pids;
 			int input_fd = p_input_fd;
-
 
 			// TODO: Handle no size 0
 			size_t last_child_index = pipeline.size() - 1;//  num_children - 1;
@@ -1106,7 +1163,7 @@ namespace ZshParserPlus {
 				}
 
 				// Execute command with current input and pipe output
-				pids.push_back(execute_command(pipeline.commands[i], input_fd, pipefd[1]));
+				pids.push_back(execute_command(built_ins, pipeline.commands[i], input_fd, pipefd[1]));
 
 				// Close write end of pipe
 				close(pipefd[1]);
@@ -1118,7 +1175,7 @@ namespace ZshParserPlus {
 				input_fd = pipefd[0];
 			}
 
-			pids.push_back(execute_command(pipeline.commands[last_child_index], input_fd, output_fd));
+			pids.push_back(execute_command(built_ins, pipeline.commands[last_child_index], input_fd, output_fd));
 			if (input_fd != STDIN_FILENO)
 				close(input_fd);
 
@@ -1128,34 +1185,34 @@ namespace ZshParserPlus {
 	public:
 		explicit inline Parser(lesh_state& state): _lesh_state(state), built_ins(built_in_commands(state)), _aliases_plus() {}
 
-
 		void init_aliases() {
-			// add_alias("m", "l | grep");
+			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
 			add_alias("l", "ls -lah");
 			add_alias("ls", "ls -G");
 			_aliases_plus.normalize_aliases();
 		}
+
 		inline void parse_and_execute(std::string& input) {
-			auto state = SimpleParsingStare{_buffer_pool, input}; // ExpansionContainer{input};
+			auto state = SimpleParsingStare{false, _lesh_state.buffer_pool(), input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
 			parse_command<true>(state, pipe);
-			execute(pipe);
+			execute(built_ins, pipe);
 		}
 
-		inline static void execute(const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+		inline static void execute(const built_in_commands& built_ins, const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
+			pipe.print();
 			switch (pipe.size()) {
 				// TODO: maybe error handling
 				case 0: break;;
 				case 1: {
-					pipe.print();
-					if (const auto pid = execute_command(pipe.commands[0], input_fd, output_fd)) {
+					if (const auto pid = execute_command(built_ins, pipe.commands[0], input_fd, output_fd)) {
 						int status;
 						waitpid(pid, &status, 0);
 					}
 				} break;;
 				default: {
 					// Wait for all processes in pipeline
-					for (const auto pids = execute_pipeline(pipe, input_fd, output_fd); const pid_t pid: pids) {
+					for (const auto pids = execute_pipeline(built_ins, pipe, input_fd, output_fd); const pid_t pid: pids) {
 						if (pid) {
 							int status;
 							waitpid(pid, &status, 0);

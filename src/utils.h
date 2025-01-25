@@ -9,6 +9,8 @@
 #define BUFFER_POOL_SIZE (1024*32)
 #define SUBSHELL_BUFFER_INITIAL_SIZE 1024
 
+#define VERBOSE_POOL_DATA
+
 // begin - alias shit double hash == https://www.reddit.com/r/cpp_questions/comments/12xw3sn/find_stdstring_view_in_unordered_map_with/ == https://godbolt.org/z/789xv8Eeq
 template<typename ... Bases>
 struct overload : Bases ...{
@@ -24,6 +26,70 @@ public:
 	string_part(char* data, size_t size) : _data(data), _size(size) {}
 };
 
+class buffer_pool {
+	public:
+		explicit buffer_pool(size_t size = 1024) : _data(new char[size]) {
+			_end = _data + size;
+			_current = _data;
+		}
+
+		~buffer_pool() {
+			delete[] _data;
+		}
+
+		bool reallocate(char* at, size_t new_size, char*& result) {
+			if (at+new_size > _end) {
+#ifdef VERBOSE_POOL_DATA
+				lifetime_pool_bytes_allocated += new_size;
+#endif
+				result = static_cast<char *>(malloc(sizeof(char) * new_size));
+				memcpy(result, at, _current - at);
+				_current = at;
+				return false;
+			}
+			_current = at + new_size;
+			result = at;
+#ifdef VERBOSE_POOL_DATA
+				lifetime_pool_bytes_allocated += _current - at;
+#endif
+			return true;
+		}
+		bool allocate(size_t size, char*& result) {
+			if (_current+size > _end) {
+#ifdef VERBOSE_POOL_DATA
+				lifetime_pool_bytes_allocated += size;
+#endif
+				result = new char[size];
+				return false;
+			}
+#ifdef VERBOSE_POOL_DATA
+			lifetime_pool_bytes_used += size;
+#endif
+			result = _current;
+			_current += size;
+			return true;
+		}
+		void reset(char* to) {
+			_current = to;
+		}
+
+		char* at() const { return _current; }
+
+#ifdef VERBOSE_POOL_DATA
+	  size_t lifetime_pool_bytes_used;
+		size_t lifetime_pool_bytes_allocated;
+		[[nodiscard]] size_t bytes_used() const {
+			return reinterpret_cast<size_t>(_current) - reinterpret_cast<size_t>(_data);
+		}
+		[[nodiscard]] size_t pool_size() const {
+			return reinterpret_cast<size_t>(_end) - reinterpret_cast<size_t>(_data);
+		}
+#endif
+	private:
+		char* _data;
+		char* _current;
+		const char* _end;
+};
 
 struct char_pointer_hash{
     auto operator()( const char* ptr ) const noexcept{ return std::hash<std::string_view>{}( ptr );}
@@ -73,6 +139,9 @@ class alias_container {
 
 class lesh_state {
 private:
+	buffer_pool _buffer_pool;
+	buffer_pool _global_pool;
+
 	char** _envp;
 	std::filesystem::path _pwd;
 	std::string _display_pwd;
@@ -83,7 +152,7 @@ private:
 	std::unordered_map<std::string_view, std::string_view> _env;
 
 public:
-	lesh_state(std::filesystem::path current_path, char** envp) noexcept : _envp(envp) {
+	lesh_state(std::filesystem::path current_path, char** envp) noexcept : _envp(envp), _buffer_pool(BUFFER_POOL_SIZE), _global_pool(0) {
 		for (auto it = _envp; *it; it++) {
 			const auto e = *it;
 			std::string_view v = {e};
@@ -96,15 +165,17 @@ public:
 		load_env_path();
 	}
 
-	const char* pmt() const noexcept { return prompt.c_str(); };
+	[[nodiscard]] const char* pmt() const noexcept { return prompt.c_str(); };
 	void add_alias(std::string from, std::string to) {
 		_aliases.define_alias(from, to);
 	}
-	const std::filesystem::path& pwd() const noexcept { return _pwd; }
-	const std::string& home() const noexcept { return _home; }
-	const std::string& display_pwd() const noexcept { return _display_pwd; }
-	const std::vector<std::filesystem::path>& path_env() const noexcept { return _path_env; }
-	void tick() noexcept { set_path(std::filesystem::current_path()); }
+	[[nodiscard]] const std::filesystem::path& pwd() const noexcept { return _pwd; }
+	[[nodiscard]] const std::string& home() const noexcept { return _home; }
+	[[nodiscard]] const std::string& display_pwd() const noexcept { return _display_pwd; }
+	[[nodiscard]] const std::vector<std::filesystem::path>& path_env() const noexcept { return _path_env; }
+
+	buffer_pool& global_pool() noexcept { return _global_pool; }
+	buffer_pool& buffer_pool() noexcept { return _buffer_pool; }
 
 
 	size_t adjust_home(std::string& input, size_t from) {
@@ -145,10 +216,11 @@ public:
 	}
 
 	void set_path() {
-		set_path(_home);
+		std::filesystem::path h = _home;
+		set_path(h);
 	}
 
-	void set_path(std::filesystem::path p) {
+	void set_path(std::filesystem::path& p) {
 		if (!p.compare(_pwd))
 			return;
 
