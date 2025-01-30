@@ -7,7 +7,6 @@
 #include "util.h"
 
 #include <__ranges/split_view.h>
-#include <__ranges/views.h>
 
 template<typename T, size_t StackSize>
 class hybrid_continuous_vector {
@@ -447,6 +446,7 @@ namespace ZshParserPlus {
 
 			[[nodiscard]] size_t size() const { return commands.size(); }
 		};
+
 		class alias_container {
 		private:
 			struct alias {
@@ -616,7 +616,7 @@ namespace ZshParserPlus {
 			};
 		class executor {
 		public:
-			executor(lesh_state& lesh_state) : _built_ins({lesh_state}) {}
+			explicit executor(lesh_state& lesh_state) : _built_ins({lesh_state}) {}
 
 			void execute(const ASTPipe& pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				switch (pipe.size()) {
@@ -642,7 +642,7 @@ namespace ZshParserPlus {
 		private:
 			built_in_commands _built_ins;
 
-			std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+			[[nodiscard]] std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				// TODO: use pool
 				std::vector<pid_t> pids;
 				int input_fd = p_input_fd;
@@ -1174,83 +1174,8 @@ namespace ZshParserPlus {
 			_aliases.emplace_alias(alias, pipe);
 		}
 
-		// Execute a single command
-		pid_t static execute_command(const built_in_commands& built_ins, ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			if (built_ins.try_execute_built_in(command, input_fd, output_fd))
-				return 0;
-
-			pid_t pid = fork();
-
-			if (pid == -1) {
-				throw std::runtime_error("Fork failed");
-			}
-
-			if (pid == 0) {
-				// Child process
-				// Set up input/output pipes if provided
-				if (input_fd != STDIN_FILENO) {
-					dup2(input_fd, STDIN_FILENO);
-					close(input_fd);
-				}
-
-				if (output_fd != STDOUT_FILENO) {
-					dup2(output_fd, STDOUT_FILENO);
-					close(output_fd);
-				}
-
-				// TODO: Add error handling and bounds checking
-				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
-
-				// Execute command
-				execvp(argv[0], argv);
-
-
-				// If execvp fails
-				perror("execvp");
-				exit(EXIT_FAILURE);
-			}
-
-			// Parent process
-			return pid;
-		}
-
-		std::vector<pid_t> static execute_pipeline(const built_in_commands& built_ins, const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			// TODO: use pool
-			std::vector<pid_t> pids;
-			int input_fd = p_input_fd;
-
-			// TODO: Handle no size 0
-			size_t last_child_index = pipeline.size() - 1;//  num_children - 1;
-
-			for (size_t i = 0; i < last_child_index; ++i) {
-				int pipefd[2];
-				// Create pipe
-				if (pipe(pipefd) == -1) {
-					throw std::runtime_error("Pipe creation failed");
-				}
-
-				// Execute command with current input and pipe output
-				pids.push_back(execute_command(built_ins, pipeline.commands[i], input_fd, pipefd[1]));
-
-				// Close write end of pipe
-				close(pipefd[1]);
-
-				if (input_fd != STDIN_FILENO)
-					close(input_fd);
-
-				// Next command will read from this pipe
-				input_fd = pipefd[0];
-			}
-
-			pids.push_back(execute_command(built_ins, pipeline.commands[last_child_index], input_fd, output_fd));
-			if (input_fd != STDIN_FILENO)
-				close(input_fd);
-
-			return pids;
-		}
-
 	public:
-		explicit inline Parser(lesh_state& state): _lesh_state(state), _executor(state), _aliases() {}
+		explicit inline Parser(lesh_state& state): _aliases(), _lesh_state(state), _executor({state}) {}
 
 		void init_aliases() {
 			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
@@ -1259,34 +1184,11 @@ namespace ZshParserPlus {
 			_aliases.normalize_aliases();
 		}
 
-		inline void parse_and_execute(std::string& input) {
+		inline void parse_and_execute(std::string& input) const {
 			auto state = SimpleParsingStare{false, _lesh_state.buffer_pool(), input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
 			command_parser::parse<true>(_lesh_state, state, _executor, _aliases, pipe);
 			_executor.execute(pipe);
-		}
-
-		inline static void a_execute(const built_in_commands& built_ins, const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			switch (pipe.size()) {
-				// TODO: maybe error handling
-				case 0: break;;
-				case 1: {
-					if (const auto pid = execute_command(built_ins, pipe.commands[0], input_fd, output_fd)) {
-						int status;
-						waitpid(pid, &status, 0);
-					}
-				} break;;
-				default: {
-					// Wait for all processes in pipeline
-					for (const auto pids = execute_pipeline(built_ins, pipe, input_fd, output_fd); const pid_t pid: pids) {
-						if (pid) {
-							int status;
-							waitpid(pid, &status, 0);
-						}
-					}
-				}
-					return;
-			}
 		}
 	};
 } // namespace ZshParserPlus

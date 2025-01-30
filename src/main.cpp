@@ -270,19 +270,22 @@ void print_lesh(double gradient = 0.6) {
 	lolfilter(ss, gradient);
 }
 
+// NOTICE : the wgole hint system is flawed in replxx - replace with something non allocating
+std::vector<std::string> _hint_callback_results = {};
 std::vector<std::string> hint_callback(replxx::Replxx& replxx, const std::string &input, int& contextLen, replxx::Replxx::Color &color) {
-	std::vector<std::string> result;
+	_hint_callback_results.clear();
 	auto hs = replxx.history_scan();
 	while (hs.next()) {
 		auto e = hs.get().text();
-		if (e.starts_with(input))
-			result.push_back(e);
+		if (e != input && e.starts_with(input))
+			_hint_callback_results.push_back(e);
 	}
 	color = replxx::Replxx::Color::GRAY;
-	return result;
+	return _hint_callback_results;
 }
 
 int main(int argc, char **argv, char **envp) {
+	_hint_callback_results.reserve(10);
 	setenv("TERM", "xterm-256color", 1);
 
 
@@ -293,16 +296,6 @@ int main(int argc, char **argv, char **envp) {
 
 	lesh_state state {std::filesystem::current_path(), envp};
 
-	/*
-	alias_container aliases {
-		{ ":q", "exit" },
-		{ "ls", "ls -G" },
-		{ "l", "ls -lah" },
-		{ "ll", "ls -lh" },
-		{ "grep", "grep --color=auto" }, // --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}" },
-		{ "lvim", "~/.local/bin/lvim"}
-	};
-	*/
 
 	print_lesh();
 
