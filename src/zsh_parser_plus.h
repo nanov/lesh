@@ -362,41 +362,18 @@ public:
 
 namespace ZshParserPlus {
 	class Parser {
-	public:
-		struct ASTNode {
-			enum class Type : uint8_t {
-				COMMAND,
-				PIPE,
-				REDIRECT,
-				VARIABLE,
-				WORD
-			};
-
-			static constexpr size_t MAX_CHILDREN = 32;
-
-			Type type;
-			const char *value; // Points to null-terminated string in buffer
-			uint8_t num_children;
-
-			explicit ASTNode(Type t, const char *v = nullptr)
-				: type(t), value(v), num_children(0) {
-			}
-		};
-
-
+	private:
 		// used for command parts (ex: ls -l  => [ls] [-l] )
 		struct ASTWord {
 			// null-terminated, not-owned
 			const char *value;
 		};
-		struct ASTSubShell;
+		// command is a part exectued by itself, it conatins a colletions of wrods whics are it's arhuments ( ls -l -gAH )
 		struct ASTCommand {
 			static constexpr size_t MAX_CHILDREN = 32;
 			static constexpr size_t INITIAL_REFERENCES = 3;
 			// those are essentially parameters
 			hybrid_continuous_vector<ASTWord, MAX_CHILDREN> children;
-			// used for subshell results, to keep alive and be able to free
-			hybrid_vector<const char*, INITIAL_REFERENCES> references;
 
 			size_t num_references = 0;
 
@@ -404,7 +381,6 @@ namespace ZshParserPlus {
 			void push_child(ASTWord&& value) { children.push_back(value); }
 			[[nodiscard]] size_t number_of_children() const { return children.size(); }
 
-			inline void add_reference(const char* ref) { references.push_back(ref);}
 
 			void expand_with(ASTCommand& other) {
 				children.replace_front(other.children.data(), other.children.size());
@@ -423,6 +399,14 @@ namespace ZshParserPlus {
 				std::cout << std::endl;
 			}
 		};
+		// a pipe is a collection/conatiner of commands which needs to be executed separate or by itslef and connected somehow ( pipe, redirect )
+		// essentially pipe is the main execution unit
+		//             PIPE
+		//              |
+		//           /     \
+		//     Command    Command
+		//      | | |      | | |
+	  //      W W W      W W W
 		struct ASTPipe {
 			hybrid_vector<ASTCommand, 3> commands;
 
@@ -463,8 +447,7 @@ namespace ZshParserPlus {
 
 			[[nodiscard]] size_t size() const { return commands.size(); }
 		};
-
-		class alias_container_plus {
+		class alias_container {
 		private:
 			struct alias {
 				const ASTPipe original;
@@ -474,7 +457,7 @@ namespace ZshParserPlus {
 
 
 		public:
-			alias_container_plus() : _aliases() {}
+			alias_container() : _aliases() {}
 			bool try_get_alias(const char * command, ASTPipe& alias) const {
 				if (const auto it = _aliases.find(command); it != _aliases.end()) {
 					alias = it->second.expanded;
@@ -521,120 +504,221 @@ namespace ZshParserPlus {
 
 			}
 		};
-	private:
-		alias_container _aliases;
-		lesh_state &_lesh_state;
-	class built_in_commands {
-		private:
-			lesh_state &_state;
-			// Define a type for builtin command functions
-			using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
-		  std::unordered_map<std::string, builtint> builtins;
+		class built_in_commands {
+			private:
+				lesh_state &_state;
+				// Define a type for builtin command functions
+				using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
+				std::unordered_map<std::string, builtint> builtins;
 
-			static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
-				// TODO: help
-				if (cmd->children.size() < 2)
-					return 0;
+				static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
+					// TODO: help
+					if (cmd->children.size() < 2)
+						return 0;
 
-				bool display_return = true;
-				auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
+					bool display_return = true;
+					auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
 
-				if (strcmp(*argv,"-n") ==0) {
-					argv++;
-					display_return = false;
-				}
-				auto val = *argv++;
-				if (!val)
-					return 0;
+					if (strcmp(*argv,"-n") ==0) {
+						argv++;
+						display_return = false;
+					}
+					auto val = *argv++;
+					if (!val)
+						return 0;
 
-				fputs(val, stdout);
-				while ((val = *argv++)) {
-					putchar(' ');
 					fputs(val, stdout);
+					while ((val = *argv++)) {
+						putchar(' ');
+						fputs(val, stdout);
+					}
+
+					if (display_return)
+						putchar('\n');
+
+					return 0;
 				}
 
-				if (display_return)
-					putchar('\n');
+				static int builtin_cd(lesh_state& state, const ASTCommand* cmd) {
+					if (cmd->children.size() < 2) {
+						std::filesystem::current_path(state.home());
+						auto s = std::filesystem::current_path();
+						state.set_path(s);
+						return 0;
+					}
 
-				return 0;
-			}
-
-			static int builtin_cd(lesh_state& state, const ASTCommand* cmd) {
-				if (cmd->children.size() < 2) {
-					std::filesystem::current_path(state.home());
+					std::error_code e;
+					std::filesystem::current_path(state.pwd() / cmd->children[1]->value, e);
+					if (e) {
+						std::cout << "cd: " << cmd->children[1]->value << ": " << e.message() << std::endl;
+						return -1;
+					}
 					auto s = std::filesystem::current_path();
 					state.set_path(s);
 					return 0;
 				}
 
-				std::error_code e;
-				std::filesystem::current_path(state.pwd() / cmd->children[1]->value, e);
-				if (e) {
-					std::cout << "cd: " << cmd->children[1]->value << ": " << e.message() << std::endl;
-					return -1;
+				static int builtin_info(lesh_state& state, const ASTCommand* cmd) {
+	#ifdef VERBOSE_POOL_DATA
+					{
+						const auto &b = state.global_pool();
+						std::println(" - Global Buffer Pool");
+						std::println("  [ ] Pool Size {}", b.pool_size());
+						std::println("  [ ] Bytes Used {}", b.bytes_used());
+						std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+						std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
+					}
+					{
+						const auto &b = state.buffer_pool();
+						std::println(" - Buffer Pool");
+						std::println("  [ ] Pool Size {}", b.pool_size());
+						std::println("  [ ] Bytes Used {}", b.bytes_used());
+						std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+						std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
+					}
+	#endif
+					return 0;
 				}
-				auto s = std::filesystem::current_path();
-				state.set_path(s);
-				return 0;
-			}
+			public:
+				explicit built_in_commands(lesh_state& state): _state(state) {
+					builtins.emplace("cd", builtin_cd);
+					builtins.emplace("echo", builtin_echo);
+					builtins.emplace("info", builtin_info);
+				}
 
-			static int builtin_info(lesh_state& state, const ASTCommand* cmd) {
-#ifdef VERBOSE_POOL_DATA
-				{
-					const auto &b = state.global_pool();
-					std::println(" - Global Buffer Pool");
-					std::println("  [ ] Pool Size {}", b.pool_size());
-					std::println("  [ ] Bytes Used {}", b.bytes_used());
-					std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
-					std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
+				bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
+					if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
+						int saved_stdout = -1, saved_stdin = -1;
+						if (output_fd != STDOUT_FILENO) {
+							saved_stdout = dup(STDOUT_FILENO);
+							dup2(output_fd, STDOUT_FILENO);
+						}
+
+						if (input_fd != STDIN_FILENO) {
+							saved_stdin = dup(STDIN_FILENO);
+							dup2(input_fd, STDIN_FILENO);
+						}
+
+
+						it->second(_state, cmd);
+
+						if (saved_stdout != -1) {
+							dup2(saved_stdout, STDOUT_FILENO);
+							close(saved_stdout);
+						}
+						if (saved_stdin != -1) {
+							dup2(saved_stdin, STDIN_FILENO);
+							close(saved_stdin);
+						}					return true;
+					}
+					return false;
 				}
-				{
-					const auto &b = state.buffer_pool();
-					std::println(" - Buffer Pool");
-					std::println("  [ ] Pool Size {}", b.pool_size());
-					std::println("  [ ] Bytes Used {}", b.bytes_used());
-					std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
-					std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
-				}
-#endif
-				return 0;
-			}
+			};
+		class executor {
 		public:
-			explicit built_in_commands(lesh_state& state): _state(state) {
-				builtins.emplace("cd", builtin_cd);
-				builtins.emplace("echo", builtin_echo);
-				builtins.emplace("info", builtin_info);
-			}
+			executor(lesh_state& lesh_state) : _built_ins({lesh_state}) {}
 
-			bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
-				if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
-					int saved_stdout = -1, saved_stdin = -1;
-					if (output_fd != STDOUT_FILENO) {
-						saved_stdout = dup(STDOUT_FILENO);
-						dup2(output_fd, STDOUT_FILENO);
+			void execute(const ASTPipe& pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+				switch (pipe.size()) {
+					// TODO: maybe error handling
+					case 0: break;;
+					case 1: {
+						if (const auto pid = execute_command(pipe.commands[0], input_fd, output_fd)) {
+							int status;
+							waitpid(pid, &status, 0);
+						}
+					} break;;
+					default: {
+						// Wait for all processes in pipeline
+						for (const auto pids = execute_pipeline(pipe, input_fd, output_fd); const pid_t pid: pids) {
+							if (pid) {
+								int status;
+								waitpid(pid, &status, 0);
+							}
+						}
 					}
-
-					if (input_fd != STDIN_FILENO) {
-						saved_stdin = dup(STDIN_FILENO);
-						dup2(input_fd, STDIN_FILENO);
-					}
-
-
-					it->second(_state, cmd);
-
-					if (saved_stdout != -1) {
-						dup2(saved_stdout, STDOUT_FILENO);
-						close(saved_stdout);
-					}
-					if (saved_stdin != -1) {
-						dup2(saved_stdin, STDIN_FILENO);
-						close(saved_stdin);
-					}					return true;
 				}
-				return false;
+			}
+		private:
+			built_in_commands _built_ins;
+
+			std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+				// TODO: use pool
+				std::vector<pid_t> pids;
+				int input_fd = p_input_fd;
+
+				// TODO: Handle no size 0
+				size_t last_child_index = pipeline.size() - 1;//  num_children - 1;
+
+				for (size_t i = 0; i < last_child_index; ++i) {
+					int pipefd[2];
+					// Create pipe
+					if (pipe(pipefd) == -1) {
+						throw std::runtime_error("Pipe creation failed");
+					}
+
+					// Execute command with current input and pipe output
+					pids.push_back(execute_command(pipeline.commands[i], input_fd, pipefd[1]));
+
+					// Close write end of pipe
+					close(pipefd[1]);
+
+					if (input_fd != STDIN_FILENO)
+						close(input_fd);
+
+					// Next command will read from this pipe
+					input_fd = pipefd[0];
+				}
+
+				pids.push_back(execute_command(pipeline.commands[last_child_index], input_fd, output_fd));
+				if (input_fd != STDIN_FILENO)
+					close(input_fd);
+
+				return pids;
+			}
+			pid_t execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+				if (_built_ins.try_execute_built_in(command, input_fd, output_fd))
+					return 0;
+
+				pid_t pid = fork();
+
+				if (pid == -1) {
+					throw std::runtime_error("Fork failed");
+				}
+
+				if (pid == 0) {
+					// Child process
+					// Set up input/output pipes if provided
+					if (input_fd != STDIN_FILENO) {
+						dup2(input_fd, STDIN_FILENO);
+						close(input_fd);
+					}
+
+					if (output_fd != STDOUT_FILENO) {
+						dup2(output_fd, STDOUT_FILENO);
+						close(output_fd);
+					}
+
+					// TODO: Add error handling and bounds checking
+					auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
+
+					// Execute command
+					execvp(argv[0], argv);
+
+
+					// If execvp fails
+					perror("execvp");
+					exit(EXIT_FAILURE);
+				}
+
+				// Parent process
+				return pid;
 			}
 		};
-		built_in_commands built_ins;
+
+		alias_container _aliases;
+		lesh_state &_lesh_state;
+		executor _executor;
 
 		static constexpr uint16_t MAX_ALIAS_DEPTH = 32;
 		static constexpr size_t MAX_STATES = 64;
@@ -648,15 +732,6 @@ namespace ZshParserPlus {
 			return special[static_cast<unsigned char>(c)];
 		}
 
-
-		struct ExpansionPart {
-			char* value;
-			size_t size;
-			size_t capacity;
-		};
-
-
-	public:
 		struct SimpleParsingStare {
 		private:
 			char* _input;
@@ -813,7 +888,6 @@ namespace ZshParserPlus {
 		}
 
 		};
-
 		class transfarable_buffer {
 		private:
 			buffer_pool& _buffer_pool;
@@ -855,16 +929,6 @@ namespace ZshParserPlus {
 
 			char* data() const { return ptr; }
 		};
-
-		alias_container_plus _aliases_plus;
-		void add_alias(const char* alias, char* value) {
-			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
-			ASTPipe pipe;
-			parse_command<false>(state, pipe);
-			_aliases_plus.emplace_alias(alias, pipe);
-		}
-
-
 		class command_parser {
 		private:
 			lesh_state &_lesh_state;
@@ -875,9 +939,9 @@ namespace ZshParserPlus {
 
 			SimpleParsingStare &_state;
 			ASTPipe &_pipe;
-			const alias_container_plus &_aliases_plus;
+			const alias_container &_aliases;
 
-			const built_in_commands& _build_in_commands;
+			const executor &_executor;
 			ASTCommand* _command;
 			bool _is_command;
 			parsing_state _p_state;
@@ -896,7 +960,7 @@ namespace ZshParserPlus {
 				_p_state = parsing_state::none;
 				*word_end = '\0';
 				if constexpr (is_executing) {
-					if (ASTPipe aliased_pipe; _is_command && _aliases_plus.try_get_alias(word_begin, aliased_pipe)) {
+					if (ASTPipe aliased_pipe; _is_command && _aliases.try_get_alias(word_begin, aliased_pipe)) {
 						_command = _pipe.merge(_command, aliased_pipe);
 					} else {
 						_command->emplace_child(word_begin);
@@ -919,22 +983,22 @@ namespace ZshParserPlus {
 		public:
 
 			template<bool is_executing>
-			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe, ASTCommand* command) {
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state, const executor& bc, const alias_container &aliases, ASTPipe &pipe, ASTCommand* command) {
 				auto p = command_parser(lesh_state, state, bc, aliases, pipe, command);
 				return p.parse<is_executing>();
 			}
 			template<bool is_executing>
-			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state,const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe) {
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state,const executor& bc, const alias_container &aliases, ASTPipe &pipe) {
 				auto p = command_parser(lesh_state, state, bc, aliases, pipe);
 				return p.parse<is_executing>();
 			}
-			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe) :
-			command_parser(lesh_state, state, bc, aliases, pipe, pipe.emplace_command()) {
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, const alias_container &aliases, ASTPipe &pipe) :
+			command_parser(lesh_state, state, executor, aliases, pipe, pipe.emplace_command()) {
 			}
 
-			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const built_in_commands& bc, const alias_container_plus &aliases, ASTPipe &pipe, ASTCommand* command) :
-					_state(state), _pipe(pipe), _aliases_plus(aliases), _is_command(true), _lesh_state(lesh_state),
-					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr), _command(command), _build_in_commands(bc) {
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, const alias_container &aliases, ASTPipe &pipe, ASTCommand* command) :
+					_state(state), _pipe(pipe), _aliases(aliases), _is_command(true), _lesh_state(lesh_state),
+					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr), _command(command), _executor(executor) {
 			}
 			template<bool is_executing>
 			ASTPipe& parse() {
@@ -1017,10 +1081,11 @@ namespace ZshParserPlus {
 											auto sub_input = _state.match_charter(')');
 											auto sub_parsing_state = _state.sub_state(sub_input);
 											auto sub_pipe = ASTPipe{};
-											parse<is_executing>(_lesh_state, sub_parsing_state, _build_in_commands, _aliases_plus, sub_pipe);
+											parse<is_executing>(_lesh_state, sub_parsing_state, _executor, _aliases, sub_pipe);
 											pipe(pipe_fd); // todo handle error
+											_executor.execute(sub_pipe, 0, pipe_fd[1]);
 
-											execute(_build_in_commands, sub_pipe, 0, pipe_fd[1]);
+											// execute(_build_in_commands, sub_pipe, 0, pipe_fd[1]);
 											close(pipe_fd[1]);
 										}
 										transfarable_buffer tb = { _state.pool(), SUBSHELL_BUFFER_INITIAL_SIZE };
@@ -1046,12 +1111,12 @@ namespace ZshParserPlus {
 										if (before.empty() && after.empty()) {
 											auto sub_result_input = _state.sub_state(tb.data(), total);
 											auto sub_result_pipe = ASTPipe{};
-											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);
+											parse<false>(_lesh_state, sub_result_input, _executor, _aliases, _pipe, _command);
 										} else {
 											auto input_data = _state.rent(before, std::string_view(tb.data(), total), after);
 											auto sub_result_input = _state.sub_state(input_data);
 											auto sub_result_pipe = ASTPipe{};
-											parse<false>(_lesh_state, sub_result_input, _build_in_commands, _aliases_plus, _pipe, _command);
+											parse<false>(_lesh_state, sub_result_input, _executor, _aliases, _pipe, _command);
 											// TODO: attached
 										}
 										_p_state = parsing_state::none;
@@ -1100,11 +1165,13 @@ namespace ZshParserPlus {
 				return _pipe;
 			}
 		};
+;
 
-		template<bool is_executing>
-		inline void parse_command(SimpleParsingStare& state, ASTPipe& ast_pipe) const {
-			command_parser parser(_lesh_state, state, built_ins, _aliases_plus, ast_pipe);
-			parser.parse<is_executing>();
+		void add_alias(const char* alias, char* value) {
+			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
+			ASTPipe pipe;
+			command_parser::parse<false>(_lesh_state, state, _executor, _aliases, pipe);
+			_aliases.emplace_alias(alias, pipe);
 		}
 
 		// Execute a single command
@@ -1183,24 +1250,23 @@ namespace ZshParserPlus {
 		}
 
 	public:
-		explicit inline Parser(lesh_state& state): _lesh_state(state), built_ins(built_in_commands(state)), _aliases_plus() {}
+		explicit inline Parser(lesh_state& state): _lesh_state(state), _executor(state), _aliases() {}
 
 		void init_aliases() {
 			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
 			add_alias("l", "ls -lah");
 			add_alias("ls", "ls -G");
-			_aliases_plus.normalize_aliases();
+			_aliases.normalize_aliases();
 		}
 
 		inline void parse_and_execute(std::string& input) {
 			auto state = SimpleParsingStare{false, _lesh_state.buffer_pool(), input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
-			parse_command<true>(state, pipe);
-			execute(built_ins, pipe);
+			command_parser::parse<true>(_lesh_state, state, _executor, _aliases, pipe);
+			_executor.execute(pipe);
 		}
 
-		inline static void execute(const built_in_commands& built_ins, const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
-			pipe.print();
+		inline static void a_execute(const built_in_commands& built_ins, const ASTPipe &pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) {
 			switch (pipe.size()) {
 				// TODO: maybe error handling
 				case 0: break;;

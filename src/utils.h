@@ -101,42 +101,6 @@ using transparent_string_hash = overload<
     char_pointer_hash
 >;
 
-class alias_container {
-		using alias_map = std::unordered_map<std::string, std::string, transparent_string_hash, std::equal_to<>>;
-
-	private:
-			alias_map _aliases;
-
-	public:
-		alias_container(std::initializer_list<std::pair<const std::string, std::string>> l) noexcept : _aliases(alias_map(l)) {
-		}
-
-		void define_alias(std::string from, std::string to) {
-			_aliases[from] = to;
-		}
-
-
-		alias_container() noexcept {
-			_aliases = {};
-			_aliases.reserve(10);
-		}
-		
-		bool try_get_expansion(const char* word, std::string& expansion) const {
-			if (auto it = _aliases.find(word); it != _aliases.end()) {
-				expansion = it->second;
-				return true;
-			}
-			return false;
-		}
-		bool try_get_expansion(const std::string_view& word, std::string& expansion) const {
-			if (auto it = _aliases.find(word); it != _aliases.end()) {
-				expansion = it->second;
-				return true;
-			}
-			return false;
-		}
-};
-
 class lesh_state {
 private:
 	buffer_pool _buffer_pool;
@@ -148,7 +112,6 @@ private:
 	std::string prompt;
 	std::vector<std::filesystem::path> _path_env;
 	std::string _home;
-	alias_container _aliases;
 	std::unordered_map<std::string_view, std::string_view> _env;
 
 public:
@@ -166,9 +129,6 @@ public:
 	}
 
 	[[nodiscard]] const char* pmt() const noexcept { return prompt.c_str(); };
-	void add_alias(std::string from, std::string to) {
-		_aliases.define_alias(from, to);
-	}
 	[[nodiscard]] const std::filesystem::path& pwd() const noexcept { return _pwd; }
 	[[nodiscard]] const std::string& home() const noexcept { return _home; }
 	[[nodiscard]] const std::string& display_pwd() const noexcept { return _display_pwd; }

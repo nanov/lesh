@@ -46,7 +46,6 @@ x .d88"               z`    ^%    .uef^"
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "zsh_executor.h"
 
 #include "utils.h"
 #include "zsh_parser_plus.h"
@@ -322,7 +321,7 @@ int main(int argc, char **argv, char **envp) {
 
 	zsh_parser.init_aliases();
 	while(true) {
-		// std::string dbg ="cd ..";
+		// std::string dbg ="l";
 		// zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
