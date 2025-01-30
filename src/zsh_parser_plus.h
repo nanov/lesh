@@ -359,6 +359,8 @@ public:
 	[[nodiscard]] bool is_on_heap() const { return _storage.heap; }
 };
 
+
+
 namespace ZshParserPlus {
 	class Parser {
 	private:
@@ -449,6 +451,7 @@ namespace ZshParserPlus {
 
 		class alias_container {
 		private:
+			bool normalized = true;
 			struct alias {
 				const ASTPipe original;
 				ASTPipe expanded;
@@ -469,9 +472,12 @@ namespace ZshParserPlus {
 			void emplace_alias(const char* alias, const ASTPipe & pipe) {
 				auto p = pipe;
 				_aliases.emplace(alias, p);
+				normalized = false;
 			}
 
 			void normalize_aliases() {
+				if (normalized)
+					return;
 				std::unordered_set<std::string> expaded_alises;
 				std::unordered_map<std::string, alias>::iterator expanded;
 
@@ -707,7 +713,9 @@ namespace ZshParserPlus {
 
 
 					// If execvp fails
-					perror("execvp");
+					// important, in order to get, my)_stupid_command: not found
+					perror(argv[0]);
+
 					exit(EXIT_FAILURE);
 				}
 
@@ -1167,7 +1175,7 @@ namespace ZshParserPlus {
 		};
 ;
 
-		void add_alias(const char* alias, char* value) {
+		void add_alias(const char* alias, const char* value) {
 			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
 			ASTPipe pipe;
 			command_parser::parse<false>(_lesh_state, state, _executor, _aliases, pipe);
@@ -1181,6 +1189,20 @@ namespace ZshParserPlus {
 			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
 			add_alias("l", "ls -lah");
 			add_alias("ls", "ls -G");
+			_aliases.normalize_aliases();
+		}
+
+		void set_alias(const char* alias, const char* value) {
+			add_alias(alias, value);
+			_aliases.normalize_aliases();
+		}
+
+		void set_alias_lazy(const char* alias, const char* value) {
+			add_alias(alias, value);
+			_aliases.normalize_aliases();
+		}
+
+		void normalize_aliases() {
 			_aliases.normalize_aliases();
 		}
 

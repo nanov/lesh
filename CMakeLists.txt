@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.13)
 
 project(lesh)
 
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LUA REQUIRED IMPORTED_TARGET lua>=5.2)
+
 file(GLOB_RECURSE HEADER_FILES src/*.hpp)
 file(GLOB_RECURSE SOURCE_FILES src/*.cpp)
 file(GLOB_RECURSE TEST_FILES tests/*.cpp)
@@ -22,10 +25,7 @@ set(CMAKE_BUILD_TYPE Debug)
 # add_subdirectory("include/abseil")
 # include_directories("include/abseil")
 add_subdirectory("include/replxx")
-
-# Key idea: SEPARATE OUT your main() function into its own file so it can be its
-# own executable. Separating out main() means you can add this library to be
-# used elsewhere (e.g linking to the test executable).
+add_subdirectory("include/sol2")
 
 
 # testing
@@ -37,7 +37,7 @@ include_directories("include/*")
 include_directories("src")
 
 add_library(lesh_lib ${SOURCE_FILES} ${HEADER_FILES})
-target_link_libraries(lesh_lib replxx::replxx)
+target_link_libraries(lesh_lib replxx::replxx sol2::sol2 PkgConfig::LUA)
 
 add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp
         src/auto_complete.h)

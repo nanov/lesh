@@ -51,6 +51,7 @@ x .d88"               z`    ^%    .uef^"
 #include "zsh_parser_plus.h"
 
 #include "replxx.hxx"
+#include <sol/sol.hpp>
 
 /*
 const std::optional<std::string> file_found(const std::vector<std::filesystem::path> &paths, const std::string_view &file) noexcept{
@@ -284,7 +285,26 @@ std::vector<std::string> hint_callback(replxx::Replxx& replxx, const std::string
 	return _hint_callback_results;
 }
 
+class lesh_lua_api {
+	public:
+		lesh_lua_api(lesh_state& lesh_state, ZshParserPlus::Parser& parser): _lesh_state(lesh_state), _parser(parser) {}
+		void init(sol::state& lua) {
+			lua.create_named_table("lesh",
+				"set_alias",  [&](const char* k, const char* v) { _parser.set_alias(k, v); },
+				"set_alias_lazy",  [&](const char* k, const char* v) { _parser.set_alias_lazy(k, v); },
+				"echo",  [&](const char* k) { printf("%s", k ); });
+		}
+private:
+	lesh_state &_lesh_state;
+	ZshParserPlus::Parser& _parser;
+};
+
 int main(int argc, char **argv, char **envp) {
+	sol::state lua;
+
+
+
+
 	_hint_callback_results.reserve(10);
 	setenv("TERM", "xterm-256color", 1);
 
@@ -295,7 +315,6 @@ int main(int argc, char **argv, char **envp) {
   std::cerr << std::unitbuf;
 
 	lesh_state state {std::filesystem::current_path(), envp};
-
 
 	print_lesh();
 
@@ -312,9 +331,29 @@ int main(int argc, char **argv, char **envp) {
 	std::string history_file = ".lesh_history";
 	rx.history_load(history_file);
 
-	zsh_parser.init_aliases();
+	// Lua shit!
+	auto lua_a = lesh_lua_api(state, zsh_parser);
+	lua_a.init(lua);
+	lua.
+	{
+		auto lua_rc = lua.load_file("leshrc.lua");
+		if (lua_rc.valid()) {
+			auto a = lua_rc();
+			if (!a.valid()) {
+				sol::error err{a};
+				std::cerr << err.what() << std::endl;
+			}
+		} else {
+			sol::error err{lua_rc};
+			std::cerr << err.what() << std::endl;
+		}
+		lua.script("show('hello')");
+	}
+
+
+
 	while(true) {
-		// std::string dbg ="l";
+		// std::string dbg ="m";
 		// zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };

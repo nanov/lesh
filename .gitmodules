@@ -7,3 +7,9 @@
 [submodule "include/googletest"]
 	path = include/googletest
 	url = https://github.com/google/googletest
+[submodule "include/sol2"]
+	path = include/sol2
+	url = https://github.com/ThePhD/sol2
+[submodule "include/lua"]
+	path = include/lua
+	url = https://github.com/lua/lua
