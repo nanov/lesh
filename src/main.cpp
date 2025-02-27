@@ -277,8 +277,7 @@ std::vector<std::string> hint_callback(replxx::Replxx& replxx, const std::string
 	_hint_callback_results.clear();
 	auto hs = replxx.history_scan();
 	while (hs.next()) {
-		auto e = hs.get().text();
-		if (e != input && e.starts_with(input))
+		if (auto& e = hs.get().text();e != input && e.starts_with(input))
 			_hint_callback_results.push_back(e);
 	}
 	color = replxx::Replxx::Color::GRAY;
@@ -288,11 +287,12 @@ std::vector<std::string> hint_callback(replxx::Replxx& replxx, const std::string
 class lesh_lua_api {
 	public:
 		lesh_lua_api(lesh_state& lesh_state, ZshParserPlus::Parser& parser): _lesh_state(lesh_state), _parser(parser) {}
-		void init(sol::state& lua) {
-			lua.create_named_table("lesh",
+		void init(sol::state& lua, sol::environment& env) {
+			env.create_named("lesh",
+			// lua.create_named_table("lesh",
 				"set_alias",  [&](const char* k, const char* v) { _parser.set_alias(k, v); },
 				"set_alias_lazy",  [&](const char* k, const char* v) { _parser.set_alias_lazy(k, v); },
-				"echo",  [&](const char* k) { printf("%s", k ); });
+				"echo",  [&](const char* k) { printf("%s\n", k ); });
 		}
 private:
 	lesh_state &_lesh_state;
@@ -300,19 +300,14 @@ private:
 };
 
 int main(int argc, char **argv, char **envp) {
-	sol::state lua;
-
-
-
-
 	_hint_callback_results.reserve(10);
 	setenv("TERM", "xterm-256color", 1);
 
 
 	int exit_code = -1;
-  // Flush after every std::cout / std:cerr
-  std::cout << std::unitbuf;
-  std::cerr << std::unitbuf;
+	// Flush after every std::cout / std:cerr
+	std::cout << std::unitbuf;
+	std::cerr << std::unitbuf;
 
 	lesh_state state {std::filesystem::current_path(), envp};
 
@@ -330,31 +325,37 @@ int main(int argc, char **argv, char **envp) {
 	rx.set_max_hint_rows(1);
 	std::string history_file = ".lesh_history";
 	rx.history_load(history_file);
+	std::vector<const char*> p = {"mitko"};
+	const char* p2[] = {"mitko", nullptr};
 
+	/*
 	// Lua shit!
 	auto lua_a = lesh_lua_api(state, zsh_parser);
-	lua_a.init(lua);
-	lua.
+	auto lua_env = sol::environment(lua, sol::create);
+	lua_a.init(lua, lua_env);
 	{
-		auto lua_rc = lua.load_file("leshrc.lua");
-		if (lua_rc.valid()) {
-			auto a = lua_rc();
-			if (!a.valid()) {
-				sol::error err{a};
-				std::cerr << err.what() << std::endl;
-			}
-		} else {
+		// auto lua_rc = lua.load_file("leshrc.lua");
+		auto lua_rc = lua.script_file("leshrc.lua", lua_env, [](lua_State*, sol::protected_function_result pfr) {
+			std::cerr << sol::error(pfr).what() << std::endl;
+			return pfr;
+		});
+		if (!lua_rc.valid()) {
 			sol::error err{lua_rc};
 			std::cerr << err.what() << std::endl;
 		}
-		lua.script("show('hello')");
+		auto f = lua_env.get<std::optional<sol::function>>("show");
+		if (f.has_value()) {
+			f.value()(sol::as_args(p2));
+		}
+		lua.script("show('hello')", lua_env);
 	}
+	*/
 
 
 
 	while(true) {
-		// std::string dbg ="m";
-		// zsh_parser.parse_and_execute(dbg);
+		std::string dbg ="hi dd";
+		zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
 

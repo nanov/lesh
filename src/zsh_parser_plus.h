@@ -5,624 +5,144 @@
 #include <unordered_set>
 
 #include "util.h"
+#include "executor.h"
 
 #include <__ranges/split_view.h>
-
-template<typename T, size_t StackSize>
-class hybrid_continuous_vector {
-	union storage {
-		T stack[StackSize];
-		T* heap;
-
-		storage() { /* Default constructor needed for union */ }
-		~storage() { /* Destructor needed for union */ }
-	};
-
-	storage _storage;
-	size_t _size;
-	size_t _capacity;
-	T* _location = _storage.stack;
-	bool _using_heap;
-
-	void allocate_heap() {
-		_capacity += StackSize;
-		T* new_storage = static_cast<T*>(::operator new(_capacity * sizeof(T)));
-		for (size_t i = 0; i < _size; ++i) {
-			new (new_storage + i) T(std::move(_storage.stack[i]));
-			_storage.stack[i].~T();
-		}
-		_storage.heap = new_storage;
-		_using_heap = true;
-		_location = _storage.heap + _size;
-	}
-
-	void grow_heap() {
-		_capacity += StackSize;
-		T* new_storage = new T[_capacity]();
-		for (size_t i = 0; i < _size; ++i)
-			new_storage[i] = std::move(_storage.heap[i]);
-
-		delete[] _storage.heap;
-		_storage.heap = new_storage;
-		_location = _storage.heap + _size;
-	}
-	void clear() {
-		auto storage = _using_heap ? _storage.heap : _storage.stack;
-		for (size_t i = 0; i < _size; ++i, ++storage)
-			storage->~T();
-	}
-
-public:
-	hybrid_continuous_vector(const hybrid_continuous_vector& other) {
-		_size = other._size;
-		_capacity = other._capacity;
-		_using_heap = other._using_heap;
-		// TODO: proper storage copy
-		if (_using_heap) {
-			_storage.heap = static_cast<T *>(memcpy(new T[other._capacity], other._storage.heap, other._capacity * sizeof(T)));
-		} else {
-			memcpy(&_storage.stack[0], other._storage.stack, other.size() * sizeof(T));
-		}
-		_location = (_using_heap ? _storage.heap : _storage.stack) + _size;
-	}
-
-	T* data() {
-		return _using_heap ? _storage.heap : _storage.stack;
-	}
-
-	hybrid_continuous_vector() : _size(0), _capacity(StackSize), _using_heap(false) {
-		// Initialize stack array using placement new
-		new (_storage.stack) T[StackSize];
-	}
-	~hybrid_continuous_vector() {
-		clear();
-		if (_using_heap) { delete[] _storage.heap;}
-	}
-	template<typename... Args>
-	T& emplace_back(Args&&... args) {
-		if (_size == _capacity) {
-			if (_using_heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
-
-		new (_location) T(std::forward<Args>(args)...);
-		_size++;
-		return *_location++;
-	}
-
-	void replace_front(const T * addition, size_t addition_size) {
-		size_t extra_elements = addition_size > 1 ? addition_size - 1 : 0;
-
-		// Check if we need to grow
-		if (_size + extra_elements > _capacity) {
-			if (_using_heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
-
-		T* storage = _using_heap ? _storage.heap : _storage.stack;
-		const T* other_storage = addition;
-
-		if (extra_elements > 0) {
-			for (size_t i = _size - 1; i >= 1; --i) {
-				new (storage + i + extra_elements) T(std::move(storage[i]));
-				storage[i].~T();
-			}
-		}
-
-		for (size_t i = 0; i < addition_size; ++i) {
-			if (i < _size) {
-				storage[i].~T();
-			}
-			new (storage + i) T(other_storage[i]);
-		}
-
-		_size += extra_elements;
-		_location = _using_heap ? _storage.heap + _size : _storage.stack + _size;
-	}
-
-
-	void push_back(const T& value) { emplace_back(value); }
-	void push_back(T&& value) { emplace_back(std::move(value)); }
-
-	// TODO: ensure it's always null terminated :/
-	[[nodiscard]] const T* data_null_terminated() {
-		return _using_heap? _storage.heap : _storage.stack;
-	}
-	[[nodiscard]] const T* data() const { return _using_heap? _storage.heap : _storage.stack; }
-
-	[[nodiscard]] const T* get_at(const size_t idx) const { return (_using_heap? _storage.heap : _storage.stack) + idx; }
-	[[nodiscard]] const T* operator [](const size_t idx) const {return get_at(idx);}
-
-
-	[[nodiscard]] size_t size() const { return _size; }
-	[[nodiscard]] size_t capacity() const { return _capacity; }
-	[[nodiscard]] bool is_on_heap() const { return _using_heap; }
-	bool operator==(const hybrid_continuous_vector& other) const {
-		if (_size != other._size) return false;
-		for (size_t i = 0; i < _size; ++i)
-			if (get_at(i) != other.get_at(i))
-				return false;
-		return true;
-	}
-};
-template<typename T, size_t StackSize>
-class hybrid_vector {
-	struct  storage {
-		T stack[StackSize];
-		T* heap = nullptr;
-	};
-
-	storage _storage;
-	size_t _size = 0;
-	size_t _heap_capacity = 0;
-	size_t _capacity;
-	T* _location;
-
-	void allocate_heap() {
-		T* new_storage = new T[StackSize];
-
-		_storage.heap = new_storage;
-		_heap_capacity = StackSize;
-		_capacity += StackSize;
-		_location = _storage.heap;
-	}
-
-	void grow_heap() {
-		_heap_capacity += StackSize;
-		T* new_storage = new T[_heap_capacity]();
-		if (_storage.heap) {
-			for (size_t i = 0; i < (StackSize - _size); ++i)
-				new_storage[i] = std::move(_storage.heap[i]);
-			delete[] _storage.heap;
-		}
-
-		_storage.heap = new_storage;
-		_capacity += StackSize;
-		_location = _storage.heap + (StackSize - _size);
-	}
-
-	void clear() {
-		size_t stack_size;
-		size_t heap_size;
-		if (_storage.heap) {
-			stack_size = StackSize;
-			heap_size = _size - stack_size;
-		} else {
-			heap_size = 0;
-			stack_size = _size;
-		}
-		for (size_t i = 0; i < stack_size; ++i)
-			_storage.stack[i].~T();
-		for (size_t i = 0; i < heap_size; ++i)
-			_storage.heap[i].~T();
-	}
-public:
-	void foreach(std::function<void(const T&)> callback) {
-		if (_storage.heap) {
-			for (size_t i = 0; i < StackSize; ++i)
-				callback(_storage.stack[i]);
-			for (size_t i = 0; i < (StackSize - _size); ++i)
-				callback(_storage.heap[i]);
-			return;
-		}
-		for (size_t i = 0; i<_size; ++i)
-			callback(_storage.stack[i]);
-
-	}
-	struct iterator {
-	private:
-		hybrid_vector<T, StackSize> _that;
-		T* location;
-		size_t _index;
-	public:
-		iterator(hybrid_vector<T, StackSize>& that) : _that(that), _index(0) {
-			location = that._storage[0];
-		}
-		T& operator*() {
-			return *_that.get_at(_index);
-		}
-		iterator& operator++() {
-			++_index;
-			return *this;
-		}
-
-		bool operator!=(const iterator& other) const {
-			return _index != other._index;
-		}
-
-	};
-
-	iterator begin() { return iterator(*this, 0); }
-	iterator end() { return iterator(*this, _size); }
-
-	hybrid_vector() : _size(0), _capacity(StackSize) {
-		// Initialize stack array using placement new
-		new (_storage.stack) T[StackSize];
-		_location = _storage.stack;
-	}
-	~hybrid_vector() {
-		clear();
-		if (_storage.heap) {
-			delete[] _storage.heap;
-		}
-	}
-
-	template<size_t OtherStackSize>
-	T& replace_at(const hybrid_vector<T, OtherStackSize>& other, size_t index) {
-		size_t extra_elements = other.size() > 1 ? other.size() - 1 : 0;
-		// First, ensure we have enough capacity
-		size_t required_capacity = _size + extra_elements;  // -1 because we replace first element
-		while (_capacity < required_capacity) {
-			if (_storage.heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
-
-		if (extra_elements) {
-			// Shift existing elements to make space
-			for (size_t i = _size - 1; i > index; --i) {
-				size_t new_pos = i + other.size() - 1;
-				if (!_storage.heap || new_pos < StackSize) {
-					new (&_storage.stack[new_pos]) T(std::move(get_at_reference(i)));
-					get_at_reference(i).~T();
-				} else {
-					new (&_storage.heap[new_pos - StackSize]) T(std::move(get_at_reference(i)));
-					get_at_reference(i).~T();
-				}
-			}
-		}
-
-		if (!_storage.heap || index < StackSize) {
-			new (&_storage.stack[index]) T(other.get_at_reference(0));
-		} else {
-			new (&_storage.heap[index - StackSize]) T(other.get_at_reference(0));
-		}
-
-		// Insert remaining elements
-		for (size_t i = 1; i < other.size(); ++i) {
-			size_t insert_pos = index + i;
-			if (!_storage.heap || insert_pos < StackSize) {
-				new (&_storage.stack[insert_pos]) T(other.get_at_reference(i));
-			} else {
-				new (&_storage.heap[insert_pos - StackSize]) T(other.get_at_reference(i));
-			}
-		}
-
-		_size = _size + extra_elements;
-		_location = (!_storage.heap || _size < StackSize) ?
-				&_storage.stack[_size] :
-				&_storage.heap[_size - StackSize];
-
-		return get_at_reference(index+extra_elements);
-	}
-
-	template<typename... Args>
-	T* place(Args&&... args) {
-		new (_location -1) T(std::forward<Args>(args)...);
-		return _location - 1;
-	}
-	template<typename... Args>
-	T* emplace_back(Args&&... args) {
-		if (_size == _capacity) {
-			if (_storage.heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
-
-		new (_location) T(std::forward<Args>(args)...);
-		_size++;
-		return _location++;
-	}
-
-	T& push_back_copy(const T& value) {
-		T copy = value;  // Make explicit copy
-		return *emplace_back(std::move(copy));
-	}
-
-	T& place_copy(const T& value) {
-		T copy = value;  // Make explicit copy
-		return *place(std::move(copy));
-	}
-	T& push_back(const T& value) { return *emplace_back(value); }
-	T& push_back(T&& value) { return emplace_back(std::move(value)); }
-
-	[[nodiscard]] T& get_at_reference(size_t idx) const {
-		return  (!_storage.heap || idx < StackSize) ?  const_cast<T&>(_storage.stack[idx]) : _storage.heap[idx - StackSize];
-	}
-
-	[[nodiscard]] T* get_at(size_t idx) const {
-		return  (!_storage.heap || idx < StackSize) ? const_cast<T*>(&_storage.stack[idx]) : &_storage.heap[idx - StackSize];
-	}
-
-	T* operator [](size_t idx) const {return get_at(idx);}
-	bool operator==(const hybrid_vector<T, StackSize>& other) const {
-		if (_size != other._size)
-			return false;
-		for (size_t i = 0; i < _size; ++i)
-			if (get_at_reference(i) != other.get_at_reference(i))
-				return false;
-		return true;
-	}
-
-	[[nodiscard]] size_t size() const { return _size; }
-	[[nodiscard]] size_t capacity() const { return _capacity; }
-	[[nodiscard]] bool is_on_heap() const { return _storage.heap; }
-};
-
+#include <sol/as_args.hpp>
+#include <sol/variadic_args.hpp>
 
 
 namespace ZshParserPlus {
-	class Parser {
+	// forward declaration
+	class Parser;
+	class built_in_commands {
 	private:
-		// used for command parts (ex: ls -l  => [ls] [-l] )
-		struct ASTWord {
-			// null-terminated, not-owned
-			const char *value;
-		};
-		// command is a part exectued by itself, it conatins a colletions of wrods whics are it's arhuments ( ls -l -gAH )
-		struct ASTCommand {
-			static constexpr size_t MAX_CHILDREN = 32;
-			static constexpr size_t INITIAL_REFERENCES = 3;
-			// those are essentially parameters
-			hybrid_continuous_vector<ASTWord, MAX_CHILDREN> children;
+		lesh_state &_state;
+		// Define a type for builtin command functions
+		using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
+		std::unordered_map<std::string, builtint> builtins;
 
-			size_t num_references = 0;
+		static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
+			// TODO: help
+			if (cmd->children.size() < 2)
+				return 0;
 
-			ASTWord& emplace_child(const char* value) { return children.emplace_back(value); }
-			void push_child(ASTWord&& value) { children.push_back(value); }
-			[[nodiscard]] size_t number_of_children() const { return children.size(); }
+			bool display_return = true;
+			auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
 
+			if (strcmp(*argv,"-n") ==0) {
+				argv++;
+				display_return = false;
+			}
+			auto val = *argv++;
+			if (!val)
+				return 0;
 
-			void expand_with(ASTCommand& other) {
-				children.replace_front(other.children.data(), other.children.size());
+			fputs(val, stdout);
+			while ((val = *argv++)) {
+				putchar(' ');
+				fputs(val, stdout);
 			}
 
-			void enrich_wth(const ASTCommand & other) {
-				for (size_t i = 1; i < other.children.size(); ++i)
-					children.push_back(*other.children[i]);
+			if (display_return)
+				putchar('\n');
+
+			return 0;
+		}
+		static int builtin_cd(lesh_state& state, const ASTCommand* cmd) {
+			if (cmd->children.size() < 2) {
+				std::filesystem::current_path(state.home());
+				auto s = std::filesystem::current_path();
+				state.set_path(s);
+				return 0;
 			}
 
-			void print() const {
-				std::cout << '[' << children.size() << "]: ";
-				for (size_t i = 0; i < children.size(); ++i) {
-					std::cout << ((*children[i]->value == '\0') ? "0" : children[i]->value) << ' ';
-				}
-				std::cout << std::endl;
+			std::error_code e;
+			std::filesystem::current_path(state.pwd() / cmd->children[1]->value, e);
+			if (e) {
+				std::cout << "cd: " << cmd->children[1]->value << ": " << e.message() << std::endl;
+				return -1;
 			}
-		};
-		// a pipe is a collection/conatiner of commands which needs to be executed separate or by itslef and connected somehow ( pipe, redirect )
-		// essentially pipe is the main execution unit
-		//             PIPE
-		//              |
-		//           /     \
-		//     Command    Command
-		//      | | |      | | |
-	  //      W W W      W W W
-		struct ASTPipe {
-			hybrid_vector<ASTCommand, 3> commands;
-
-			ASTPipe() : commands() {}
-			ASTPipe(const ASTPipe& other) {
-				commands = other.commands;
+			auto s = std::filesystem::current_path();
+			state.set_path(s);
+			return 0;
+		}
+		static int builtin_info(lesh_state& state, const ASTCommand* cmd) {
+#ifdef VERBOSE_POOL_DATA
+			{
+				const auto &b = state.global_pool();
+				std::println(" - Global Buffer Pool");
+				std::println("  [ ] Pool Size {}", b.pool_size());
+				std::println("  [ ] Bytes Used {}", b.bytes_used());
+				std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+				std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
 			}
-
-			void print() const {
-				for (size_t i = 0; i < commands.size(); ++i) {
-					const auto c = commands[i];
-					c->print();
-				}
+			{
+				const auto &b = state.buffer_pool();
+				std::println(" - Buffer Pool");
+				std::println("  [ ] Pool Size {}", b.pool_size());
+				std::println("  [ ] Bytes Used {}", b.bytes_used());
+				std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
+				std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
 			}
-
-			template<typename... Args>
-			ASTCommand* emplace_command(Args&&... args) { return commands.emplace_back(std::forward<Args>(args)...); }
-
-			ASTCommand* expand_with_at(const ASTPipe& other, size_t idx) {
-				auto first_command = *commands[idx];
-				auto& last_command = commands.replace_at(other.commands, idx);
-				last_command.enrich_wth(last_command);
-				return &last_command;
-			}
-
-			ASTCommand* merge(ASTCommand*& current_command, const ASTPipe & other) {
-				ASTCommand* c = current_command;
-				current_command = &other.commands.get_at_reference(0);
-				commands.place_copy(*current_command);
-
-				for (size_t i = 1; i < other.size(); ++i) {
-					auto cmd = other.commands.get_at_reference(i);
-					c = &commands.push_back_copy(cmd);
-				}
-				return c;
-			}
-
-
-			[[nodiscard]] size_t size() const { return commands.size(); }
+#endif
+			return 0;
+		}
+		static int builtin_lua(lesh_state& state, const ASTCommand* cmd) {
+			return 0;
 		};
 
-		class alias_container {
-		private:
-			bool normalized = true;
-			struct alias {
-				const ASTPipe original;
-				ASTPipe expanded;
-			};
-			std::unordered_map<std::string, alias> _aliases;
+	public:
+		explicit built_in_commands(lesh_state& state): _state(state) {
+			builtins.emplace("cd", builtin_cd);
+			builtins.emplace("echo", builtin_echo);
+			builtins.emplace("info", builtin_info);
+		}
+
+		bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
+			if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
+				int saved_stdout = -1, saved_stdin = -1;
+				if (output_fd != STDOUT_FILENO) {
+					saved_stdout = dup(STDOUT_FILENO);
+					dup2(output_fd, STDOUT_FILENO);
+				}
+
+				if (input_fd != STDIN_FILENO) {
+					saved_stdin = dup(STDIN_FILENO);
+					dup2(input_fd, STDIN_FILENO);
+				}
 
 
+				it->second(_state, cmd);
+
+				if (saved_stdout != -1) {
+					dup2(saved_stdout, STDOUT_FILENO);
+					close(saved_stdout);
+				}
+				if (saved_stdin != -1) {
+					dup2(saved_stdin, STDIN_FILENO);
+					close(saved_stdin);
+				}					return true;
+			}
+			return false;
+		}
+	};
+	class lua_engine {
+	public:
+		lua_engine(lesh_state& state, Parser& parser);
+		bool try_execute_lua_function(const ASTCommand* cmd, int input_fd, int output_fd) const;
+
+	private:
+		Parser& _parser;
+		lesh_state& _lesh_state;
+		sol::state _lua;
+		sol::environment _base_env;
+		void init();
+	};
+
+	class executor {
 		public:
-			alias_container() : _aliases() {}
-			bool try_get_alias(const char * command, ASTPipe& alias) const {
-				if (const auto it = _aliases.find(command); it != _aliases.end()) {
-					alias = it->second.expanded;
-					return true;
-				}
-				return false;
-			}
-
-			void emplace_alias(const char* alias, const ASTPipe & pipe) {
-				auto p = pipe;
-				_aliases.emplace(alias, p);
-				normalized = false;
-			}
-
-			void normalize_aliases() {
-				if (normalized)
-					return;
-				std::unordered_set<std::string> expaded_alises;
-				std::unordered_map<std::string, alias>::iterator expanded;
-
-				for (auto defined_alias = _aliases.begin(); defined_alias != _aliases.end(); ++defined_alias) {
-					defined_alias->second.expanded = defined_alias->second.original;
-
-					size_t cmd_idx = 0;
-					do {
-						expaded_alises.clear();
-						auto command = defined_alias->second.expanded.commands[cmd_idx];
-						auto command_str = command->children[0]->value;
-						expaded_alises.emplace(defined_alias->first);
-						while (
-							!expaded_alises.contains(command_str)
-							&& ((expanded = _aliases.find(command_str)) != _aliases.end())
-							) {
-								if (expanded->second.original.size() == 1) {
-									command->expand_with(*expanded->second.original.commands[0]);
-								} else {
-									command = defined_alias->second.expanded.expand_with_at(expanded->second.original, cmd_idx);
-									// cmd_idx += expanded->second.original.size();
-									// todo
-								}
-								expaded_alises.emplace(expanded->first);
-								command_str = command->children[0]->value;
-							}
-							cmd_idx++;
-					} while (cmd_idx < defined_alias->second.expanded.size());
-				}
-
-			}
-		};
-		class built_in_commands {
-			private:
-				lesh_state &_state;
-				// Define a type for builtin command functions
-				using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
-				std::unordered_map<std::string, builtint> builtins;
-
-				static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
-					// TODO: help
-					if (cmd->children.size() < 2)
-						return 0;
-
-					bool display_return = true;
-					auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
-
-					if (strcmp(*argv,"-n") ==0) {
-						argv++;
-						display_return = false;
-					}
-					auto val = *argv++;
-					if (!val)
-						return 0;
-
-					fputs(val, stdout);
-					while ((val = *argv++)) {
-						putchar(' ');
-						fputs(val, stdout);
-					}
-
-					if (display_return)
-						putchar('\n');
-
-					return 0;
-				}
-
-				static int builtin_cd(lesh_state& state, const ASTCommand* cmd) {
-					if (cmd->children.size() < 2) {
-						std::filesystem::current_path(state.home());
-						auto s = std::filesystem::current_path();
-						state.set_path(s);
-						return 0;
-					}
-
-					std::error_code e;
-					std::filesystem::current_path(state.pwd() / cmd->children[1]->value, e);
-					if (e) {
-						std::cout << "cd: " << cmd->children[1]->value << ": " << e.message() << std::endl;
-						return -1;
-					}
-					auto s = std::filesystem::current_path();
-					state.set_path(s);
-					return 0;
-				}
-
-				static int builtin_info(lesh_state& state, const ASTCommand* cmd) {
-	#ifdef VERBOSE_POOL_DATA
-					{
-						const auto &b = state.global_pool();
-						std::println(" - Global Buffer Pool");
-						std::println("  [ ] Pool Size {}", b.pool_size());
-						std::println("  [ ] Bytes Used {}", b.bytes_used());
-						std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
-						std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
-					}
-					{
-						const auto &b = state.buffer_pool();
-						std::println(" - Buffer Pool");
-						std::println("  [ ] Pool Size {}", b.pool_size());
-						std::println("  [ ] Bytes Used {}", b.bytes_used());
-						std::println("  [ ] Lifetime Bytes Used {}", b.lifetime_pool_bytes_used);
-						std::println("  [ ] Lifetime Bytes Allocated {}", b.lifetime_pool_bytes_allocated);
-					}
-	#endif
-					return 0;
-				}
-			public:
-				explicit built_in_commands(lesh_state& state): _state(state) {
-					builtins.emplace("cd", builtin_cd);
-					builtins.emplace("echo", builtin_echo);
-					builtins.emplace("info", builtin_info);
-				}
-
-				bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
-					if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
-						int saved_stdout = -1, saved_stdin = -1;
-						if (output_fd != STDOUT_FILENO) {
-							saved_stdout = dup(STDOUT_FILENO);
-							dup2(output_fd, STDOUT_FILENO);
-						}
-
-						if (input_fd != STDIN_FILENO) {
-							saved_stdin = dup(STDIN_FILENO);
-							dup2(input_fd, STDIN_FILENO);
-						}
-
-
-						it->second(_state, cmd);
-
-						if (saved_stdout != -1) {
-							dup2(saved_stdout, STDOUT_FILENO);
-							close(saved_stdout);
-						}
-						if (saved_stdin != -1) {
-							dup2(saved_stdin, STDIN_FILENO);
-							close(saved_stdin);
-						}					return true;
-					}
-					return false;
-				}
-			};
-		class executor {
-		public:
-			explicit executor(lesh_state& lesh_state) : _built_ins({lesh_state}) {}
+			explicit executor(lesh_state& lesh_state, Parser& parser) : _built_ins({lesh_state}), _lua_engine(lesh_state, parser) {}
 
 			void execute(const ASTPipe& pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				switch (pipe.size()) {
@@ -647,6 +167,7 @@ namespace ZshParserPlus {
 			}
 		private:
 			built_in_commands _built_ins;
+			lua_engine _lua_engine;
 
 			[[nodiscard]] std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				// TODO: use pool
@@ -685,6 +206,8 @@ namespace ZshParserPlus {
 			pid_t execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				if (_built_ins.try_execute_built_in(command, input_fd, output_fd))
 					return 0;
+				if (_lua_engine.try_execute_lua_function(command, input_fd, output_fd))
+					return 0;
 
 				pid_t pid = fork();
 
@@ -722,9 +245,11 @@ namespace ZshParserPlus {
 				// Parent process
 				return pid;
 			}
-		};
+	};
 
-		alias_container _aliases;
+	class Parser {
+	private:
+
 		lesh_state &_lesh_state;
 		executor _executor;
 
@@ -947,7 +472,6 @@ namespace ZshParserPlus {
 
 			SimpleParsingStare &_state;
 			ASTPipe &_pipe;
-			const alias_container &_aliases;
 
 			const executor &_executor;
 			ASTCommand* _command;
@@ -968,7 +492,7 @@ namespace ZshParserPlus {
 				_p_state = parsing_state::none;
 				*word_end = '\0';
 				if constexpr (is_executing) {
-					if (ASTPipe aliased_pipe; _is_command && _aliases.try_get_alias(word_begin, aliased_pipe)) {
+					if (ASTPipe aliased_pipe; _is_command && _lesh_state.try_get_alias(word_begin, aliased_pipe)) {
 						_command = _pipe.merge(_command, aliased_pipe);
 					} else {
 						_command->emplace_child(word_begin);
@@ -991,21 +515,21 @@ namespace ZshParserPlus {
 		public:
 
 			template<bool is_executing>
-			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state, const executor& bc, const alias_container &aliases, ASTPipe &pipe, ASTCommand* command) {
-				auto p = command_parser(lesh_state, state, bc, aliases, pipe, command);
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state, const executor& bc, ASTPipe &pipe, ASTCommand* command) {
+				auto p = command_parser(lesh_state, state, bc, pipe, command);
 				return p.parse<is_executing>();
 			}
 			template<bool is_executing>
-			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state,const executor& bc, const alias_container &aliases, ASTPipe &pipe) {
-				auto p = command_parser(lesh_state, state, bc, aliases, pipe);
+			static ASTPipe& parse(lesh_state& lesh_state, SimpleParsingStare &state,const executor& bc, ASTPipe &pipe) {
+				auto p = command_parser(lesh_state, state, bc, pipe);
 				return p.parse<is_executing>();
 			}
-			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, const alias_container &aliases, ASTPipe &pipe) :
-			command_parser(lesh_state, state, executor, aliases, pipe, pipe.emplace_command()) {
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, ASTPipe &pipe) :
+			command_parser(lesh_state, state, executor, pipe, pipe.emplace_command()) {
 			}
 
-			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, const alias_container &aliases, ASTPipe &pipe, ASTCommand* command) :
-					_state(state), _pipe(pipe), _aliases(aliases), _is_command(true), _lesh_state(lesh_state),
+			command_parser(lesh_state& lesh_state, SimpleParsingStare &state, const executor& executor, ASTPipe &pipe, ASTCommand* command) :
+					_state(state), _pipe(pipe), _is_command(true), _lesh_state(lesh_state),
 					_p_state(parsing_state::none), _word_beginning(nullptr), _bracket_start(nullptr), _command(command), _executor(executor) {
 			}
 			template<bool is_executing>
@@ -1089,7 +613,7 @@ namespace ZshParserPlus {
 											auto sub_input = _state.match_charter(')');
 											auto sub_parsing_state = _state.sub_state(sub_input);
 											auto sub_pipe = ASTPipe{};
-											parse<is_executing>(_lesh_state, sub_parsing_state, _executor, _aliases, sub_pipe);
+											parse<is_executing>(_lesh_state, sub_parsing_state, _executor, sub_pipe);
 											pipe(pipe_fd); // todo handle error
 											_executor.execute(sub_pipe, 0, pipe_fd[1]);
 
@@ -1119,12 +643,12 @@ namespace ZshParserPlus {
 										if (before.empty() && after.empty()) {
 											auto sub_result_input = _state.sub_state(tb.data(), total);
 											auto sub_result_pipe = ASTPipe{};
-											parse<false>(_lesh_state, sub_result_input, _executor, _aliases, _pipe, _command);
+											parse<false>(_lesh_state, sub_result_input, _executor, _pipe, _command);
 										} else {
 											auto input_data = _state.rent(before, std::string_view(tb.data(), total), after);
 											auto sub_result_input = _state.sub_state(input_data);
 											auto sub_result_pipe = ASTPipe{};
-											parse<false>(_lesh_state, sub_result_input, _executor, _aliases, _pipe, _command);
+											parse<false>(_lesh_state, sub_result_input, _executor, _pipe, _command);
 											// TODO: attached
 										}
 										_p_state = parsing_state::none;
@@ -1175,42 +699,82 @@ namespace ZshParserPlus {
 		};
 ;
 
-		void add_alias(const char* alias, const char* value) {
+		void add_alias(const char* alias, const char* value, bool normalize_after = false) {
 			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
 			ASTPipe pipe;
-			command_parser::parse<false>(_lesh_state, state, _executor, _aliases, pipe);
-			_aliases.emplace_alias(alias, pipe);
+			command_parser::parse<false>(_lesh_state, state, _executor, pipe);
+			_lesh_state.emplace_alias(alias, pipe, normalize_after);
 		}
 
 	public:
-		explicit inline Parser(lesh_state& state): _aliases(), _lesh_state(state), _executor({state}) {}
+		explicit inline Parser(lesh_state& state): _lesh_state(state), _executor(state, *this) {}
+
 
 		void init_aliases() {
 			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
 			add_alias("l", "ls -lah");
-			add_alias("ls", "ls -G");
-			_aliases.normalize_aliases();
+			add_alias("ls", "ls -G", true);
 		}
 
 		void set_alias(const char* alias, const char* value) {
-			add_alias(alias, value);
-			_aliases.normalize_aliases();
+			add_alias(alias, value, true);
 		}
 
 		void set_alias_lazy(const char* alias, const char* value) {
 			add_alias(alias, value);
-			_aliases.normalize_aliases();
-		}
-
-		void normalize_aliases() {
-			_aliases.normalize_aliases();
 		}
 
 		inline void parse_and_execute(std::string& input) const {
 			auto state = SimpleParsingStare{false, _lesh_state.buffer_pool(), input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
-			command_parser::parse<true>(_lesh_state, state, _executor, _aliases, pipe);
+			command_parser::parse<true>(_lesh_state, state, _executor, pipe);
 			_executor.execute(pipe);
 		}
 	};
+
+	inline lua_engine::lua_engine(lesh_state &state, Parser &parser):
+		_lesh_state(state), _parser(parser) {
+		_base_env = sol::environment(_lua, sol::create);
+		init();
+	}
+	inline bool lua_engine::try_execute_lua_function(const ASTCommand *cmd, int input_fd, int output_fd) const {
+		auto f_o = _base_env.get<std::optional<sol::function>>(cmd->children[0]->value);
+		if (!f_o.has_value())
+			return false;
+		auto f = f_o.value();
+		if (cmd->children.size() == 1) {
+			f();
+			return true;
+		}
+		const auto s = cmd->children.size();
+		const auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(cmd->children.data())) + 1;
+		auto it = char_iteratable(argv, argv + s - 1);
+		f(sol::as_args(it));
+		return true;
+	}
+
+
+	static void hi(const char* in) {
+		std::println("lua: {}", in);
+	}
+	static void hi_you(sol::variadic_args args) {
+		std::print("lua_v: ");
+
+		auto arg = args.begin();
+		std::print("{}", arg->as<const char*>());
+		for (++arg; arg != args.end(); ++arg)
+			std::print(", {}", arg->as<const char*>());
+
+		std::println("");
+	}
+	inline void lua_engine::init() {
+		_base_env.set_function("hi", hi);
+		_base_env.set_function("hi_you", hi_you);
+		_base_env.create_named("lesh",
+				"set_alias",  [&](const char* k, const char* v) { _parser.set_alias(k, v); },
+				"set_alias_lazy",  [&](const char* k, const char* v) { _parser.set_alias_lazy(k, v); }
+		);
+	}
+
+
 } // namespace ZshParserPlus
