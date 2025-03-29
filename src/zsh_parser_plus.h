@@ -13,6 +13,7 @@
 
 
 namespace ZshParserPlus {
+	bool s = true;
 	// forward declaration
 	class Parser;
 	class built_in_commands {
@@ -21,6 +22,52 @@ namespace ZshParserPlus {
 		// Define a type for builtin command functions
 		using builtint = int (*)(lesh_state& state, const ASTCommand* cmd);
 		std::unordered_map<std::string, builtint> builtins;
+
+		static int builtin_typeset(lesh_state& state, const ASTCommand* cmd) {
+			if (cmd->children.size() < 2)
+				return 0;
+
+
+			auto key = cmd->children[1]->value;
+			int mode=0;
+			if (cmd->children.size() > 2) {
+				if (*key == '-') {
+					if (*(key+1) == 'A' && *(key+2) == '\0') {
+						mode = 1;
+					} else if (*(key+1) == 'a' && *(key+2) == '\0') {
+						mode = 2;
+					} else {
+						return 1;
+					}
+					key = cmd->children[2]->value;
+				}
+			}
+			char* val = const_cast<char*>(key);
+			while (*val != '=' && *val != '\0')
+				val++;
+
+			if (*val == '=')
+				*val++ = '\0';
+
+			auto s = state.scope();
+			if (mode == 1)
+				s->typeset_map(std::string_view(key), std::string_view(val));
+		}
+
+		static int builtin_export(lesh_state& state, const ASTCommand* cmd) {
+			if (cmd->children.size() < 2)
+				return 0;
+
+			auto key = cmd->children[1]->value;
+			char* val = const_cast<char*>(key);
+			while (*val != '=')
+				val++;
+
+			*val++ = '\0';
+			auto s = state.scope();
+			std::println("{} - {}", key, val);
+			s->typeset(std::string_view(key), std::string_view(val));
+		}
 
 		static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
 			// TODO: help
@@ -96,6 +143,8 @@ namespace ZshParserPlus {
 		explicit built_in_commands(lesh_state& state): _state(state) {
 			builtins.emplace("cd", builtin_cd);
 			builtins.emplace("echo", builtin_echo);
+			builtins.emplace("export", builtin_export);
+			builtins.emplace("typeset", builtin_typeset);
 			builtins.emplace("info", builtin_info);
 		}
 
@@ -217,6 +266,7 @@ namespace ZshParserPlus {
 
 				if (pid == 0) {
 					// Child process
+					// Setup
 					// Set up input/output pipes if provided
 					if (input_fd != STDIN_FILENO) {
 						dup2(input_fd, STDIN_FILENO);
@@ -284,7 +334,7 @@ namespace ZshParserPlus {
 				NONE = 0,
 				PIPE,
 				DOLLAR,
-				COUNT,
+				COUNT,k,
 			};
 			explicit SimpleParsingStare(bool is_global, buffer_pool& pool, char *input, size_t length) : _is_global(is_global), _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length+1), _current(_input) {}
 			SimpleParsingStare(bool is_global, buffer_pool& pool, const char *input) : SimpleParsingStare(is_global, pool, strdup(input), strlen(input)) {}
@@ -394,8 +444,8 @@ namespace ZshParserPlus {
 			char* word = _current;
 
 			char c = *_current;
-			auto l = _length-1;
-			while (_position < l &&
+			while (_position < _length &&
+				     c != '\0' &&
 				     c != bracket) {
 				plusplus();
 				c = *_current;
@@ -403,6 +453,23 @@ namespace ZshParserPlus {
 			*_current = '\0';
 
 			return std::string_view(word, _current-word);
+		}
+		bool parse_word_until_key(std::string_view* output) {
+			const char * word = _current;
+
+			char c = *_current;
+			while (_position < _length &&
+				     c != '\0' &&
+			       !std::isspace(c) &&
+			       !is_special(c) &&
+			       c != '[') {
+				plusplus();
+				c = *_current;
+			}
+			*_current = '\0';
+
+			*output = std::string_view(word, _current-word);
+			return (c=='[');
 		}
 		inline std::string_view parse_word() {
 			const char * word = _current;
@@ -658,10 +725,19 @@ namespace ZshParserPlus {
 										// TODO: handle subshell
 									} else { // optimistic variable expansion
 										std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
-										*c = '\0';
 										_state.plusplus();
-										auto w = _state.parse_word();
-										if (std::string_view val; _lesh_state.try_get_env(w, val)) {
+										std::string_view w; // = _state.parse_word();
+										std::string_view k;
+										auto has_key = _state.parse_word_until_key(&w);
+										if (has_key) {
+											_state.plusplus();
+											// TODO: error handling
+											k = _state.match_charter(']');
+										}
+
+										// TODO: error handling
+										if (std::string_view val; has_key ? _lesh_state.try_get_env(w, k, val) : _lesh_state.try_get_env(w, k)) {
+											*c = '\0';
 											if (!p.empty()) {
 												auto con = _state.rent(p, val);
 												ensure_word<is_executing>(con, c);
@@ -711,7 +787,6 @@ namespace ZshParserPlus {
 
 
 		void init_aliases() {
-			// add_alias("grep", "grep --color=auto --exclude-dir={.bzr,CVS,.git,.hg,.svn,.idea,.tox,.venv,venv}"),
 			add_alias("l", "ls -lah");
 			add_alias("ls", "ls -G", true);
 		}

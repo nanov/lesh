@@ -41,7 +41,8 @@ target_link_libraries(lesh_lib replxx::replxx sol2::sol2 PkgConfig::LUA)
 
 add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp
         src/auto_complete.h
-        src/executor.h)
+        src/executor.h
+        src/prompt.h)
 target_link_libraries(lesh lesh_lib)
 
 add_executable(lesh_tests ${TEST_FILES} ${HEADER_FILES})

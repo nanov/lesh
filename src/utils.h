@@ -1,5 +1,6 @@
 #pragma once
 
+#include <__ranges/split_view.h>
 #include <array>
 #include <filesystem>
 #include <sol/state.hpp>
@@ -19,7 +20,18 @@ struct overload : Bases ...{
     using is_transparent = void;
     using Bases::operator() ... ;
 };
-
+struct char_pointer_hash
+{
+	auto operator()( const char* ptr ) const noexcept
+	{
+		return std::hash<std::string_view>{}( ptr );
+	}
+};
+using transparent_string_hash = overload<
+    std::hash<std::string>,
+    std::hash<std::string_view>,
+    char_pointer_hash
+>;
 struct char_iteratable {
 private:
 	char** _stack;
@@ -628,20 +640,232 @@ class buffer_pool {
 		const char* _end;
 };
 
-struct char_pointer_hash{
-    auto operator()( const char* ptr ) const noexcept{ return std::hash<std::string_view>{}( ptr );}
-};
+class lesh_scope_variable {
+	enum class lech_variable_type {
+		NORMAL = 0,
+		ARRAY = 1,
+		MAP = 2,
+	};
+	union {
+			std::unordered_map<std::string, const char*, transparent_string_hash, std::equal_to<>> map;
+			std::vector<const char *> array;
+	} var_union;
+	public:
+	virtual ~lesh_scope_variable() = default;
+	virtual const char* value(const std::string_view& key) const = 0;
+	virtual void set(const std::string_view& key, std::string_view& value) = 0;
+private:
+	lech_variable_type _type;
 
-using transparent_string_hash = overload<
-    std::hash<std::string>,
-    std::hash<std::string_view>,
-    char_pointer_hash
->;
+};
+class lesh_scope_map_variable: public lesh_scope_variable {
+private:
+	std::unordered_map<std::string, const char*, transparent_string_hash, std::equal_to<>> _data;
+public:
+	~lesh_scope_map_variable() override {
+		for (const auto &it : _data)
+			free(const_cast<char*>(it.second));
+	}
+	const char* value(const std::string_view& key) const override {
+		if (const auto &it = _data.find(key); it != _data.end()) {
+			if (it->second == nullptr)
+				return "";
+			return it->second;
+		}
+		return "";
+	}
+	void set(const std::string_view& key, std::string_view& value) override {
+		_data[std::string(key)] = strdup(value.data());
+	}
+	size_t size() const { return _data.size(); }
+};
+class lesh_scope_array_variable: public lesh_scope_variable {
+private:
+	std::vector<const char *> _data;
+	bool try_get_size(const char* t, size_t& res) const {
+		char* p = const_cast<char*>(t);
+		char c = *p;
+		size_t i = 0;
+		res = 0;
+		while (c != '\0') {
+			if (!isdigit(c))
+				return false;
+			res += (c - '0')*(i++);
+			c = *++p;
+		}
+		return true;
+	}
+public:
+	lesh_scope_array_variable() : lesh_scope_variable() {}
+	void push(const char* value) {
+		_data.push_back(value);
+	}
+
+	const char* value(const std::string_view& key) const override {
+		size_t i = 0;
+		if (!try_get_size(key.data(), i))
+			return "";
+		if (i >= _data.size())
+			return "";
+		const auto v = _data[i];
+		if (v == nullptr)
+			return "";
+		return v;
+	}
+	void set(const std::string_view& key, std::string_view& value) override {
+		size_t i = 0;
+		if (!try_get_size(key.data(), i))
+			return;
+		if (i >= _data.capacity())
+			_data.reserve(i+1);
+		if (i >= _data.size())
+			for (auto c = i; c < _data.size(); c++)
+				_data.emplace_back(nullptr);
+		_data[i] = const_cast<char*>(value.data());
+	}
+	size_t size() const { return _data.size(); }
+};
+class lesh_state_scope {
+private:
+		const lesh_state_scope* _parent;
+		const lesh_state_scope* _exporting_parent;
+		const bool _in_export_mode = false;
+		std::unordered_map<const std::string, std::unique_ptr<lesh_scope_variable>, transparent_string_hash, std::equal_to<>> _vars;
+
+public:
+	lesh_state_scope(lesh_state_scope* parent, lesh_state_scope* exporting_parent) : _parent(parent), _exporting_parent(exporting_parent) {}
+
+
+	bool try_get_var_value(const std::string_view& var, const std::string_view& key, std::string_view& val) const {
+		auto s = this;
+		while (s) {
+			if (const auto &it = s->_vars.find(var); it != s->_vars.end()) {
+				val = it->second->value(key);
+				std::println("found {} in {} is {}", key, var, val);
+				return true;
+			}
+			s = s->_parent;
+		}
+		return false;
+	}
+
+	bool get_map_values(char* v, size_t len, std::function<void(std::string_view, std::string_view)> callback) const {
+		size_t i = 0;
+		char* c = const_cast<char*>(v);
+		char* lw = c;
+		size_t wl = 0;
+		std::string_view k;
+		char mode = 0;
+		for (i = 0; *c != ')' && i < len; c++, i++) {
+			if (isspace(*c)) {
+				if (mode == 0) {
+					lw++;
+					continue;
+				}
+
+				if (mode == 1 || mode == 2)
+					return false;
+
+				if (mode == 3) {
+					*c='\0';
+					callback(k, std::string_view(lw, wl));
+					mode = 0;
+				}
+			}
+			else if (*c == '[') {
+				if (mode == 0) {
+					mode = 1;
+					lw = c + 1;
+					wl = 0;
+				}
+			} else if (*c == ']') {
+				if (mode == 1) {
+					*c= '\0';
+					k = std::string_view(lw, wl);
+					mode = 2;
+				}
+			} else if (*c == '=') {
+				if (mode == 2) {
+					mode = 3;
+					wl = 0;
+					lw = c+1;
+				}
+			} else {
+				wl++;
+			}
+		}
+		if (*c != ')')
+			return false;
+
+		*c = '\0';
+		if (mode== 1 || mode == 2) {
+			callback(k, std::string_view());
+		} else if (mode == 3) {
+			callback(k, std::string_view(lw));
+		}
+	}
+	bool get_array_values(char* v, size_t len, std::function<void(char*, size_t)> callback) const {
+		size_t i = 0;
+		char* c = const_cast<char*>(v);
+		char* lw = c;
+		size_t word_len = 0;
+		for (i = 0; *c != ')' && i < len; c++, i++) {
+			if (isspace(*c)) {
+				if (word_len == 0) {
+					lw++;
+					continue;
+				}
+				*c = '\0';
+				callback(lw, word_len);
+				lw = c+1;
+				word_len = 0;
+			} else {
+				word_len++;
+			}
+		}
+		if (*c != ')')
+			return false;
+		if (word_len>0) {
+			*c = '\0';
+			callback(lw, word_len);
+		}
+		return true;
+	}
+
+	void typeset_map(const std::string_view& key, const std::string_view& val) {
+		char* v = const_cast<char*>(val.data());
+		auto s =std::make_unique<lesh_scope_map_variable> ();
+		if (*v == '(') {
+			auto p = get_map_values(v+1, val.size()-1, [s=s.get()](auto k, auto v) {
+				s->set(k, v);
+			});
+		}
+		_vars.emplace(key, std::move(s));
+	}
+	void typeset(const std::string_view& key, const std::string_view& val) {
+		char* v = const_cast<char*>(val.data());
+		if (*v == '(') {// array
+			auto s =std::make_unique<lesh_scope_array_variable> ();
+			auto p = get_array_values(v+1, val.size()-1, [s = s.get()](const char * word, size_t len) {
+				auto const ws = new char[len+1];
+				memcpy(ws, word, len+1);
+				s->push(ws);
+			});
+			if (p)
+				_vars.emplace(key, std::move(s));
+		} else { // env variable
+
+		}
+	}
+};
 class lesh_state {
+	// https://gist.github.com/ClementNerma/1dd94cb0f1884b9c20d1ba0037bdcde2
+
 private:
 	alias_container _aliases;
 	buffer_pool _buffer_pool;
 	buffer_pool _global_pool;
+	lesh_state_scope _lesh_scope;
 
 	char** _envp;
 	std::filesystem::path _pwd;
@@ -652,7 +876,7 @@ private:
 	std::unordered_map<std::string_view, std::string_view> _env;
 
 public:
-	lesh_state(std::filesystem::path current_path, char** envp) noexcept : _envp(envp), _buffer_pool(BUFFER_POOL_SIZE), _global_pool(0), _aliases() {
+	lesh_state(std::filesystem::path current_path, char** envp) noexcept : _lesh_scope(nullptr, nullptr), _envp(envp), _buffer_pool(BUFFER_POOL_SIZE), _global_pool(0), _aliases() {
 		for (auto it = _envp; *it; it++) {
 			const auto e = *it;
 			std::string_view v = {e};
@@ -730,6 +954,11 @@ public:
 		prompt.append(" > ");
 	}
 
+	bool try_get_env(std::string_view key, std::string_view index, std::string_view& val) const {
+		if (index.empty())
+			return try_get_env(key, val);
+		return _lesh_scope.try_get_var_value(key, index, val);
+	}
 	bool try_get_env(std::string_view key, std::string_view& val) const {
 		if (auto it = _env.find(key); it != _env.end()) {
 			val = it->second;
@@ -737,6 +966,8 @@ public:
 		}
 		return false;
 	}
+
+	lesh_state_scope* scope() noexcept { return &_lesh_scope; }
 
 	bool try_get_alias(const char* key, ASTPipe& val) const {
 		return _aliases.try_get_alias(key, val);
