@@ -315,6 +315,7 @@ int main(int argc, char **argv, char **envp) {
 
 
 	auto zsh_parser = ZshParserPlus::Parser(state);
+	zsh_parser.init_aliases();
 
 	replxx::Replxx rx;
 	rx.bind_key_internal(replxx::Replxx::KEY::UP,  "history_previous");
@@ -354,10 +355,11 @@ int main(int argc, char **argv, char **envp) {
 
 
 	while(true) {
-		std::string dbg ="hi dd";
+		std::string dbg ="mi t";
 		zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
+		// break;
 
 		do {
 			cinput = rx.input(state.pmt());

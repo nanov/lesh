@@ -2,6 +2,7 @@
 
 #include <__ranges/split_view.h>
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <sol/state.hpp>
 #include <string>
@@ -59,105 +60,123 @@ public:
 };
 
 template<typename T, size_t StackSize>
-class hybrid_continuous_vector {
-	union storage {
-		T stack[StackSize];
-		T* heap;
+class hybrid_continuous_simple_vector {
+	alignas(T) char _stack_buffer[sizeof(T) * StackSize];
+	T* _storage;
 
-		storage() { /* Default constructor needed for union */ }
-		~storage() { /* Destructor needed for union */ }
-	};
-
-	storage _storage;
+	// storage _storage;
 	size_t _size;
 	size_t _capacity;
-	T* _location = _storage.stack;
+	T* _location;
 	bool _using_heap;
 
-	void allocate_heap() {
-		_capacity += StackSize;
-		T* new_storage = static_cast<T*>(::operator new(_capacity * sizeof(T)));
+
+	void grow_heap(size_t by_size = StackSize) {
+		_capacity += by_size;
+		auto old_storage = _storage;
+		_storage = static_cast<T*>(::operator new[](_capacity * sizeof(T)));
 		for (size_t i = 0; i < _size; ++i) {
-			new (new_storage + i) T(std::move(_storage.stack[i]));
-			_storage.stack[i].~T();
+			new (&_storage[i]) T(std::move(old_storage[i]));
+			old_storage[i].~T();
 		}
-		_storage.heap = new_storage;
+
+		if (_using_heap)
+			  ::operator delete[](old_storage);
 		_using_heap = true;
-		_location = _storage.heap + _size;
+		_location = _storage + _size;
 	}
-
-	void grow_heap() {
-		_capacity += StackSize;
-		T* new_storage = new T[_capacity]();
-		for (size_t i = 0; i < _size; ++i)
-			new_storage[i] = std::move(_storage.heap[i]);
-
-		delete[] _storage.heap;
-		_storage.heap = new_storage;
-		_location = _storage.heap + _size;
-	}
+	/*
 	void clear() {
-		auto storage = _using_heap ? _storage.heap : _storage.stack;
+		/* it's simple no need to iterate and call, it is belived emelents won't have destructor
+		auto storage = _storage;
 		for (size_t i = 0; i < _size; ++i, ++storage)
 			storage->~T();
-		if (_using_heap)
-			delete[] _storage.heap;
 	}
+	*/
 
 public:
-	hybrid_continuous_vector(const hybrid_continuous_vector& other) {
-		_size = other._size;
-		_capacity = other._capacity;
-		_using_heap = other._using_heap;
-		// TODO: proper storage copy
-		if (_using_heap) {
-			_storage.heap = static_cast<T *>(memcpy(new T[other._capacity], other._storage.heap, other._capacity * sizeof(T)));
-		} else {
-			memcpy(&_storage.stack[0], other._storage.stack, other.size() * sizeof(T));
-		}
-		_location = (_using_heap ? _storage.heap : _storage.stack) + _size;
-	}
-
 	T* data() {
-		return _using_heap ? _storage.heap : _storage.stack;
+		return _storage; //  _using_heap ? _storage.heap : _storage.stack;
 	}
 
-	hybrid_continuous_vector() : _size(0), _capacity(StackSize), _using_heap(false) {
-		// Initialize stack array using placement new
-		new (_storage.stack) T[StackSize];
+	hybrid_continuous_simple_vector() :
+			_stack_buffer{},
+			_storage(reinterpret_cast<T *>(_stack_buffer)),
+			_size(0),
+	    _capacity(StackSize),
+			_location(_storage), _using_heap(false) {}
+
+	hybrid_continuous_simple_vector(const hybrid_continuous_simple_vector& other):
+			_stack_buffer{},
+			// _storage(reinterpret_cast<T *>(_stack_buffer)),
+			_size(other._size),
+	    _capacity(other._capacity),
+			_using_heap(other._using_heap)
+	{
+		if (_using_heap)
+			_storage = static_cast<T*>(::operator new[](_capacity * sizeof(T)));
+		else
+			_storage = reinterpret_cast<T *>(_stack_buffer);
+		for (size_t i = 0; i < _size; ++i)
+			new (&_storage[i]) T(other._storage[i]);
+		_location = _storage + _size;
+	};
+
+	~hybrid_continuous_simple_vector() {
+		// clear();
+		if (_using_heap) { ::operator delete[](_storage); }
 	}
-	~hybrid_continuous_vector() {
-		clear();
-		if (_using_heap) { delete[] _storage.heap;}
-	}
+
 	template<typename... Args>
 	T& emplace_back(Args&&... args) {
-		if (_size == _capacity) {
-			if (_using_heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
+		if (_size == _capacity)
+			grow_heap();
 
 		new (_location) T(std::forward<Args>(args)...);
 		_size++;
 		return *_location++;
 	}
 
+	[[nodiscard]] bool is_full() const { return _size == _capacity; }
+
+	T& next_unsafe() {
+		return *(_location);
+	}
+
+	template<typename... Args>
+	T& temporary_emplace_once_back(Args&&... args) {
+		if (_size == _capacity)
+			grow_heap(1);
+
+		new (_location) T(std::forward<Args>(args)...);
+		return *_location++;
+	}
+
+	// copy
+	void push_back(const T& value) {
+		if (_size == _capacity)
+			grow_heap();
+		new (_location) T(value);
+		_size++;
+	}
+
+
+	// move
+	void push_back(T&& value) {
+		if (_size == _capacity)
+			grow_heap();
+		new (_location) T(std::move(value));
+		_size++;
+	}
+
 	void replace_front(const T * addition, size_t addition_size) {
 		size_t extra_elements = addition_size > 1 ? addition_size - 1 : 0;
 
 		// Check if we need to grow
-		if (_size + extra_elements > _capacity) {
-			if (_using_heap) {
-				grow_heap();
-			} else {
-				allocate_heap();
-			}
-		}
+		if (_size + extra_elements > _capacity)
+			grow_heap();
 
-		T* storage = _using_heap ? _storage.heap : _storage.stack;
+		T* storage = _storage; //_using_heap ? _storage.heap : _storage.stack;
 		const T* other_storage = addition;
 
 		if (extra_elements > 0) {
@@ -175,27 +194,21 @@ public:
 		}
 
 		_size += extra_elements;
-		_location = _using_heap ? _storage.heap + _size : _storage.stack + _size;
+		_location = _storage + _size; //  : _storage.stack + _size;
 	}
 
 
-	void push_back(const T& value) { emplace_back(value); }
-	void push_back(T&& value) { emplace_back(std::move(value)); }
 
-	// TODO: ensure it's always null terminated :/
-	[[nodiscard]] const T* data_null_terminated() {
-		return _using_heap? _storage.heap : _storage.stack;
-	}
-	[[nodiscard]] const T* data() const { return _using_heap? _storage.heap : _storage.stack; }
+	[[nodiscard]] const T* data() const { return _storage; }
 
-	[[nodiscard]] const T* get_at(const size_t idx) const { return (_using_heap? _storage.heap : _storage.stack) + idx; }
+	[[nodiscard]] const T* get_at(const size_t idx) const { return ( _storage + idx ); }
 	[[nodiscard]] const T* operator [](const size_t idx) const {return get_at(idx);}
 
 
 	[[nodiscard]] size_t size() const { return _size; }
 	[[nodiscard]] size_t capacity() const { return _capacity; }
 	[[nodiscard]] bool is_on_heap() const { return _using_heap; }
-	bool operator==(const hybrid_continuous_vector& other) const {
+	bool operator==(const hybrid_continuous_simple_vector& other) const {
 		if (_size != other._size) return false;
 		for (size_t i = 0; i < _size; ++i)
 			if (get_at(i) != other.get_at(i))
@@ -203,15 +216,23 @@ public:
 		return true;
 	}
 };
+
 template<typename T, size_t StackSize>
 class hybrid_vector {
+
 	struct  storage {
-		T stack[StackSize];
+	private:
+		alignas(T) char stack_buffer[sizeof(T) * StackSize];
+	public:
+		T* stack = reinterpret_cast<T*>(stack_buffer);
 		T* heap = nullptr;
 		T* stack_end;
 		public:
-			storage(): heap(nullptr), stack_end(stack + StackSize - 1) {}
+			storage() : stack_buffer{}, heap(nullptr), stack_end(stack + StackSize - 1) {}
+			storage(const storage &other) :
+					stack_buffer{}, stack(reinterpret_cast<T *>(stack_buffer)), heap(nullptr), stack_end(stack + StackSize - 1) {}
 	};
+	constexpr static auto grow_by_default = std::max(StackSize, static_cast<size_t>(1));
 
 	storage _storage;
 	size_t _size = 0;
@@ -219,32 +240,48 @@ class hybrid_vector {
 	size_t _capacity;
 	T* _location;
 
-	[[nodiscard]] T* grow_heap(size_t by_amount = StackSize) {
+	T* grow_heap() { return grow_heap(grow_by_default); };
+	T* grow_heap(const size_t by_amount) {
 		_heap_capacity += by_amount;
 		auto old_store = _storage.heap;
-		_storage.heap = new T[_heap_capacity]();
+		_storage.heap = static_cast<T*>(::operator new[](_heap_capacity * sizeof(T)));
 		if (old_store) {
-			std::move(old_store, _location, _storage.heap);
-			delete[] old_store;
+			if (_size > StackSize) {
+				const size_t heap_elements = _size - StackSize;
+				for (size_t i = 0; i < heap_elements; ++i) {
+					// Placement new to move construct only the existing elements
+					new (&_storage.heap[i]) T(std::move(old_store[i]));
+					// Properly destruct the old elements
+					old_store[i].~T();
+				}
+			  // Free the old raw memory
+			  ::operator delete[](old_store);
+			}
 		}
 
 		_capacity += by_amount;
-		return  _storage.heap + (StackSize - _size);
+		return  _storage.heap + (_size - StackSize);
 	}
 
 	void clear() {
-		T* stack_end = nullptr;
-		if (_storage.heap) {
-			stack_end = _storage.stack + (StackSize -1);
-			for (auto b = _storage.heap; b <= _location; ++b)
-				b->~T();
+		if (_size < 1)
+			return;
+		if (_size > StackSize) {
+				if constexpr (StackSize > 0) {
+					for (auto b = _storage.stack; b <= _storage.stack_end; ++b)
+						b->~T();
+				}
+				for (auto b = _storage.heap; b <= _location; ++b)
+					b->~T();
 		} else {
-			stack_end = _location;
+				if constexpr (StackSize > 0) {
+					for (auto b = _storage.stack; b <= _location; ++b)
+						b->~T();
+				}
 		}
-		for (auto b = _storage.stack; b <= stack_end; ++b)
-			b->~T();
 	}
 public:
+	size_t size() const { return _size; }
 	void reserve_free_slots(size_t requiered_free_slots) {
 		if (_capacity - _size >= requiered_free_slots)
 			return;
@@ -253,55 +290,70 @@ public:
 	void reserve(size_t new_cap) {
 		if (new_cap <= _capacity)
 			return;
-		_location = grow_heap(new_cap - _capacity);
+		grow_heap(new_cap - _capacity);
 	}
+
 	void foreach(std::function<void(const T&)> callback) {
-		if (_storage.heap) {
-			for (size_t i = 0; i < StackSize; ++i)
-				callback(_storage.stack[i]);
-			for (size_t i = 0; i < (StackSize - _size); ++i)
-				callback(_storage.heap[i]);
+		if (_size == 0)
+			return;
+		if (_size > StackSize) {
+			if constexpr (StackSize > 0) {
+				auto stack_end = _storage.stack + StackSize - 1;
+				for (auto s = _storage.stack; s <= stack_end; ++s)
+					callback(*s);
+			}
+			for (auto h = _storage.heap; h <= _location; ++h)
+				callback(*h);
 			return;
 		}
-		for (size_t i = 0; i<_size; ++i)
-			callback(_storage.stack[i]);
+		if constexpr (StackSize > 0) {
+			for (auto s = _storage.stack; s <= _location; ++s)
+				callback(*s);
+		}
 
 	}
-	struct iterator {
-	private:
-		hybrid_vector<T, StackSize> _that;
-		T* location;
-		size_t _index;
-	public:
-		iterator(hybrid_vector<T, StackSize>& that) : _that(that), _index(0) {
-			location = that._storage[0];
-		}
-		T& operator*() {
-			return *_that.get_at(_index);
-		}
-		iterator& operator++() {
-			++_index;
-			return *this;
-		}
 
-		bool operator!=(const iterator& other) const {
-			return _index != other._index;
-		}
-
-	};
-
-	iterator begin() { return iterator(*this, 0); }
-	iterator end() { return iterator(*this, _size); }
-
-	hybrid_vector() : _size(0), _capacity(StackSize) {
-		// Initialize stack array using placement new
-		new (_storage.stack) T[StackSize];
+	hybrid_vector() : _size(0), _capacity(StackSize){
 		_location = _storage.stack - 1;
 	}
+
+	hybrid_vector<T, StackSize>& operator=(const hybrid_vector<T, StackSize>& other) {
+	// hybrid_vector(const hybrid_vector<T, StackSize>& other) : _size(other._size), _capacity(other._capacity) {
+		_size = other._size;
+		_capacity = other._capacity;
+		_heap_capacity = other._heap_capacity;
+		if (other._size < 1) {
+			_location = _storage.stack - 1;
+			return *this;
+		}
+		if (other._storage.heap)
+			_storage.heap = static_cast<T*>(::operator new[](_heap_capacity * sizeof(T)));
+
+		if (_size > StackSize) {
+				if constexpr (StackSize > 0) {
+					for (auto b = other._storage.stack, bc = _storage.stack; b <= other._storage.stack_end; ++b, ++bc)
+						new (bc) T(*b);
+				}
+				for (auto b = other._storage.heap, bc = _storage.heap; b <= other._location; ++b, ++bc)
+						_location = new (bc) T(*b);
+		} else {
+				if constexpr (StackSize > 0) {
+					_location = _storage.stack - 1;
+					// auto bc = _storage.stack;
+					for (auto b = other._storage.stack, bc = _storage.stack; b <= other._location; ++b, ++bc)
+						_location = new (bc) T(*b);
+				}
+		}
+		return *this;
+
+
+	}
+
 	~hybrid_vector() {
 		clear();
 		if (_storage.heap) {
-			delete[] _storage.heap;
+			::operator delete[](_storage.heap);
+			_storage.heap = nullptr;
 		}
 	}
 
@@ -351,15 +403,16 @@ public:
 	}
 
 	template<typename... Args>
-	T* place(Args&&... args) {
-		new (++_location) T(std::forward<Args>(args)...);
+	T* place(const T& val) {
+		new (_location) T(val);
 		return _location;
 	}
+
 	template<typename... Args>
 	T* emplace_back(Args&&... args) {
 		if (_size == _capacity) {
 			_location = grow_heap();
-		} else if ( _size == StackSize ) {
+		} else if(_size == StackSize) {
 			_location = _storage.heap;
 		} else {
 			_location += 1;
@@ -370,20 +423,23 @@ public:
 		return _location;
 	}
 
-	T& push_back_copy(const T& value) {
-		T copy = value;  // Make explicit copy
-		return *emplace_back(std::move(copy));
-	}
+	T* push_back(const T& value) {
+		if (_size == _capacity) {
+			_location = grow_heap();
+		} else if(_size == StackSize) {
+			_location = _storage.heap;
+		} else {
+			_location += 1;
+		}
 
-	T& place_copy(const T& value) {
-		T copy = value;  // Make explicit copy
-		return *place(std::move(copy));
+		new (_location) T(value);
+		_size++;
+		return _location;
 	}
-	T& push_back(const T& value) { return *emplace_back(value); }
-	T& push_back(T&& value) { return emplace_back(std::move(value)); }
+	// T& push_back(T&& value) { return emplace_back(std::move(value)); }
 
 	void pop_back() {
-		if (_size < 0)
+		if (_size < 1)
 			return;
 
 		_size--;
@@ -391,9 +447,11 @@ public:
 		_location.~T();
 
 		// is size is exactly the stack size, it means we need to downgrade from heap location to stack one
-		if (_size == StackSize) {
-			_location = _storage.stack + StackSize -1;
-			return;
+		if constexpr (StackSize > 0) {
+			if (_size == StackSize) {
+				_location = _storage.stack + StackSize -1;
+				return;
+			}
 		}
 
 		_location -= 1;
@@ -417,7 +475,6 @@ public:
 		return true;
 	}
 
-	[[nodiscard]] size_t size() const { return _size; }
 	[[nodiscard]] size_t capacity() const { return _capacity; }
 	[[nodiscard]] bool is_on_heap() const { return _storage.heap; }
 };
@@ -426,20 +483,78 @@ public:
 struct ASTWord {
     // null-terminated, not-owned
     const char *value;
+		explicit ASTWord(const char* inval): value(inval) {
+		}
+		ASTWord(const ASTWord& other): value(other.value) {}
+		ASTWord(const ASTWord&& other) noexcept : value(other.value) {
+			printf("move ASTWord::ASTWord()\n");
+		}
+		~ASTWord() {
+			printf("~ASTWord::ASTWord()\n");
+		}
 };
+struct ASTPipe;
+//
+struct ASTCommandSubstitution {
+	char *before;
+	char *after;
+	char *command;
+	const ASTPipe* pipe;
+};
+struct ASTAssigment {
+	const char *key;
+	const char *value;
+};
+
+static size_t command_id=0;
+
 // command is a part exectued by itself, it conatins a colletions of wrods whics are it's arhuments ( ls -l -gAH )
 struct ASTCommand {
-    static constexpr size_t MAX_CHILDREN = 32;
-    static constexpr size_t INITIAL_REFERENCES = 3;
-    // those are essentially parameters
-    hybrid_continuous_vector<ASTWord, MAX_CHILDREN> children;
+	static constexpr size_t MAX_CHILDREN = 32;
+	static constexpr size_t INITIAL_ASSIGNMENTS = 0;
 
-    size_t num_references = 0;
+	// those are essentially parameters
+	hybrid_continuous_simple_vector<ASTWord, MAX_CHILDREN> children;
+	hybrid_vector<ASTAssigment, INITIAL_ASSIGNMENTS> assignments;
 
-    ASTWord& emplace_child(const char* value) { return children.emplace_back(value); }
-    void push_child(ASTWord&& value) { children.push_back(value); }
-    [[nodiscard]] size_t number_of_children() const { return children.size(); }
+	size_t _id;
+	bool is_sealed = false;
 
+	ASTCommand(): _id(command_id++) {
+		printf("command const called %d\n", _id);
+	}
+
+	// copy
+	ASTCommand(const ASTCommand& other):
+	children(other.children),
+	assignments(other.assignments),
+	_id(command_id++) {
+		printf("copy ASTCommand::ASTCommand() %lu -> %lu\n", other._id, _id);
+	}
+	// move
+	ASTCommand(const ASTCommand&& other) noexcept : children(other.children), assignments(other.assignments), _id(other._id) {
+		printf("move ASTCommand::ASTCommand()\n");
+	}
+
+	~ASTCommand() {
+		printf("command dest called %d\n", _id);
+	}
+
+	char** args_null_terminated() {
+		if (children.is_full() || children.next_unsafe().value != nullptr)
+			children.temporary_emplace_once_back(nullptr);
+		return  reinterpret_cast<char**>(children.data());
+	}
+
+	ASTWord& emplace_child(const char* value) { return children.emplace_back(value); }
+	void push_child(ASTWord&& value) { children.push_back(value); }
+
+	[[nodiscard]] size_t number_of_children() const { return children.size(); }
+	[[nodiscard]] size_t size() const { return number_of_children(); }
+
+		void add_assignment(const char* key, const char* value) {
+	    assignments.emplace_back(key, value);
+    }
 
     void expand_with(ASTCommand& other) {
         children.replace_front(other.children.data(), other.children.size());
@@ -467,7 +582,7 @@ struct ASTCommand {
 //      | | |      | | |
 //      W W W      W W W
 struct ASTPipe {
-    hybrid_vector<ASTCommand, 3> commands;
+    hybrid_vector<ASTCommand, 1> commands;
 
     ASTPipe() : commands() {}
     ASTPipe(const ASTPipe& other) {
@@ -485,26 +600,29 @@ struct ASTPipe {
     ASTCommand* emplace_command(Args&&... args) { return commands.emplace_back(std::forward<Args>(args)...); }
 
     ASTCommand* expand_with_at(const ASTPipe& other, size_t idx) {
-        auto first_command = *commands[idx];
+        auto first_command = commands[idx];
         auto& last_command = commands.replace_at(other.commands, idx);
         last_command.enrich_wth(last_command);
         return &last_command;
     }
 
-    ASTCommand* merge(ASTCommand*& current_command, const ASTPipe & other) {
-        ASTCommand* c = current_command;
-        current_command = &other.commands.get_at_reference(0);
-        commands.place_copy(*current_command);
+    ASTCommand* merge(const ASTPipe * other) {
+    		ASTCommand* result = nullptr;
+        result = commands.place(other->commands.get_at_reference(0));
 
-        for (size_t i = 1; i < other.size(); ++i) {
-            auto cmd = other.commands.get_at_reference(i);
-            c = &commands.push_back_copy(cmd);
+        for (size_t i = 1; i < other->size(); ++i) {
+            auto& cmd = other->commands.get_at_reference(i);
+            result = commands.push_back(cmd);
         }
-        return c;
+        return result;
     }
 
 
-    [[nodiscard]] size_t size() const { return commands.size(); }
+    [[nodiscard]] size_t size() const {
+    	if (commands.size() == 1)
+    		return commands[0]->children.size() ? 1 : 0;
+    	return commands.size();
+    }
 };
 struct string_part {
 private:
@@ -517,7 +635,7 @@ class alias_container {
 private:
 	bool normalized = true;
 	struct alias {
-		const ASTPipe original;
+		ASTPipe original;
 		ASTPipe expanded;
 	};
 	std::unordered_map<std::string, alias> _aliases;
@@ -525,15 +643,21 @@ private:
 
 public:
 	alias_container() : _aliases() {}
-	bool try_get_alias(const char * command, ASTPipe& alias) const {
+	bool try_get_alias(const char * command, ASTPipe const ** alias) const {
 		if (const auto it = _aliases.find(command); it != _aliases.end()) {
-			alias = it->second.expanded;
+			*alias = &it->second.expanded;
 			return true;
 		}
 		return false;
 	}
 
-	void emplace_alias(const char* alias, const ASTPipe & pipe) {
+	ASTPipe& emplace_alias(const char* alias_key) {
+		alias a;
+		auto [it, op] = _aliases.insert_or_assign(alias_key, a);
+		normalized = false;
+		return it->second.original;
+	}
+	void emplace_alias_o(const char* alias, const ASTPipe & pipe) {
 		auto p = pipe;
 		_aliases.emplace(alias, p);
 		normalized = false;
@@ -641,22 +765,10 @@ class buffer_pool {
 };
 
 class lesh_scope_variable {
-	enum class lech_variable_type {
-		NORMAL = 0,
-		ARRAY = 1,
-		MAP = 2,
-	};
-	union {
-			std::unordered_map<std::string, const char*, transparent_string_hash, std::equal_to<>> map;
-			std::vector<const char *> array;
-	} var_union;
 	public:
 	virtual ~lesh_scope_variable() = default;
 	virtual const char* value(const std::string_view& key) const = 0;
-	virtual void set(const std::string_view& key, std::string_view& value) = 0;
-private:
-	lech_variable_type _type;
-
+		virtual void set(const std::string_view& key, std::string_view& value) = 0;
 };
 class lesh_scope_map_variable: public lesh_scope_variable {
 private:
@@ -969,15 +1081,21 @@ public:
 
 	lesh_state_scope* scope() noexcept { return &_lesh_scope; }
 
-	bool try_get_alias(const char* key, ASTPipe& val) const {
+	bool try_get_alias(const char* key, ASTPipe const ** val) const {
 		return _aliases.try_get_alias(key, val);
 	}
 
-	void emplace_alias(const char* key, const ASTPipe& val, bool normalize_after = false) {
-		_aliases.emplace_alias(key, val);
-		if (normalize_after)
-			_aliases.normalize_aliases();
+	void normalize_aliases() {
+		_aliases.normalize_aliases();
 	}
+	ASTPipe& emplace_alias(const char* key) {
+		return _aliases.emplace_alias(key);
+	}
+	// void emplace_alias_o(const char* key, const ASTPipe& val, bool normalize_after = false) {
+	// 	_aliases.emplace_alias(key, val);
+	// 	if (normalize_after)
+	// 		_aliases.normalize_aliases();
+	// }
 
 private:
 	void load_env_path() {

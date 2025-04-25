@@ -6,6 +6,7 @@
 
 #include "util.h"
 #include "executor.h"
+#include "lesh_string_utils.h"
 
 #include <__ranges/split_view.h>
 #include <sol/as_args.hpp>
@@ -13,7 +14,6 @@
 
 
 namespace ZshParserPlus {
-	bool s = true;
 	// forward declaration
 	class Parser;
 	class built_in_commands {
@@ -52,6 +52,7 @@ namespace ZshParserPlus {
 			auto s = state.scope();
 			if (mode == 1)
 				s->typeset_map(std::string_view(key), std::string_view(val));
+			return 1;
 		}
 
 		static int builtin_export(lesh_state& state, const ASTCommand* cmd) {
@@ -279,7 +280,13 @@ namespace ZshParserPlus {
 					}
 
 					// TODO: Add error handling and bounds checking
-					auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
+					// auto argv = reinterpret_cast<char**>(const_cast<ASTWord*>(command->children.data_null_terminated()));
+
+					command->assignments.foreach([](auto& asg) -> void {
+						setenv(asg.key, asg.value, true);
+					});
+
+					auto argv = command->args_null_terminated();
 
 					// Execute command
 					execvp(argv[0], argv);
@@ -395,9 +402,9 @@ namespace ZshParserPlus {
 				return _position < _length;
 			}
 
-			void plusplus() {
-				_current++;
+			char* plusplus() {
 				_position++;
+				return ++_current;
 			}
 
 			char* rent(std::string_view a, std::string_view b) {
@@ -454,6 +461,30 @@ namespace ZshParserPlus {
 
 			return std::string_view(word, _current-word);
 		}
+		bool parse_var_substition_until(const char bracket, std::string_view* output) {
+			const char * word = _current;
+
+			char c = *_current;
+			if (!lesh::string_utils::is_valid_var_name_fist_char(c))
+				return false;
+
+			plusplus();
+			c = *_current;
+
+			while (c != bracket) {
+				if (_position == _length)
+					return false;
+				if (!lesh::string_utils::is_valid_var_name_non_fist_char(c))
+					return false;
+				plusplus();
+				c = *_current;
+			}
+			*_current = '\0';
+
+			*output = std::string_view(word, _current-word);
+			return true;
+		}
+
 		bool parse_word_until_key(std::string_view* output) {
 			const char * word = _current;
 
@@ -535,6 +566,7 @@ namespace ZshParserPlus {
 			enum class parsing_state {
 				none = 0,
 				in_a_word = 1,
+				had_word = 2,
 			};
 
 			SimpleParsingStare &_state;
@@ -545,12 +577,41 @@ namespace ZshParserPlus {
 			bool _is_command;
 			parsing_state _p_state;
 			char* _word_beginning;
+			char* _word_end;
+			std::string_view _last_word;
 			char _expected_closing_bracket = 0;
 			char* _bracket_start;
 			bool _is_escape = false;
 
 			//
 		private:
+			void ensure_last_word(char* c) {
+				if (_p_state == parsing_state::in_a_word && _last_word.empty()) {
+					*c = '\0';
+					_last_word = std::string_view(_word_beginning,  c - _word_beginning);
+				}
+			}
+			void add_to_last_word(std::string_view value) {
+				if (!_last_word.empty()) {
+					auto con = _state.rent(_last_word, value);
+					_last_word = con;
+				} else {
+					_last_word = value;
+				}
+			}
+			void commit_last_word(char* c) {
+				if (_p_state == parsing_state::in_a_word && _last_word.empty()) {
+					*c = '\0';
+					_last_word = std::string_view(_word_beginning,  c - _word_beginning);
+				}
+				if (_last_word.empty())
+					return;
+				// _is_command = false;
+				_command->emplace_child(_last_word.data());
+				_last_word = std::string_view();
+				_word_beginning = c;
+				_p_state = parsing_state::none;
+			}
 			template<bool is_executing>
 			void ensure_word(const char* word_begin, char *word_end) {
 				if (_p_state != parsing_state::in_a_word)
@@ -559,16 +620,26 @@ namespace ZshParserPlus {
 				_p_state = parsing_state::none;
 				*word_end = '\0';
 				if constexpr (is_executing) {
-					if (ASTPipe aliased_pipe; _is_command && _lesh_state.try_get_alias(word_begin, aliased_pipe)) {
-						_command = _pipe.merge(_command, aliased_pipe);
+					if (ASTPipe const * aliased_pipe; _is_command && _lesh_state.try_get_alias(word_begin, &aliased_pipe)) {
+						_command = _pipe.merge(aliased_pipe);
 					} else {
-						_command->emplace_child(word_begin);
+						// _word = word_begin;
+						// _command->emplace_child(word_begin);
+						_last_word = word_begin;
 					}
 					_is_command = false;
 				} else {
+					// _word = word_begin;
 					_command->emplace_child(word_begin);
+					_last_word = word_begin;
 				}
 				word_begin = nullptr;
+			}
+			std::string_view get_last_word() const {
+				if (_p_state == parsing_state::in_a_word)
+					return std::string_view(_word_beginning, _state.current() - _word_beginning);
+
+				return _last_word;
 			}
 			static bool is_seperator(char c) {
 				static constexpr bool special[256] = {
@@ -636,9 +707,27 @@ namespace ZshParserPlus {
 								_bracket_start = c;
 								break;
 							}
+							case '(': {
+								if (_p_state == parsing_state::in_a_word) {
+									char *p;
+									if (_state.peek(p) && *p == ')') {
+										*c = '\0';
+										_state.plusplus();
+										if (*_state.plusplus() == '{') {
+											_state.plusplus();
+											auto sub_input = _state.match_charter('}');
+											auto sub_parsing_state = _state.sub_state(sub_input);
+											auto sub_pipe = ASTPipe{};
+											parse<false>(_lesh_state, sub_parsing_state, _executor, sub_pipe);
+											printf("function %s : %s\n", _word_beginning, sub_input.data());
+
+										}
+									}
+								}
+							} break;
 							case ' ':
 							case '\0': {
-								ensure_word<is_executing>(_word_beginning, c);
+								commit_last_word(c);
 							} break;
 
 							// pipe process one to another
@@ -675,6 +764,20 @@ namespace ZshParserPlus {
 										std::string_view before =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
 										_state.plusplus();
 										_state.plusplus();
+										/*
+										auto sub_input = _state.match_charter(')');
+										auto sub_parsing_state = _state.sub_state(sub_input);
+										_state.plusplus();
+										auto after = _state.parse_word();
+										_p_state = parsing_state::none;
+										c = _state.current();
+										auto cmd = _command->emplace_child(nullptr);
+										auto sub = _command->substitutions.emplace_back(before, after, sub_input.data(), new ASTPipe, _command->children.size() - 1);
+										*/
+
+
+
+
 										int pipe_fd[2];
 										{
 											auto sub_input = _state.match_charter(')');
@@ -709,12 +812,10 @@ namespace ZshParserPlus {
 										// detached
 										if (before.empty() && after.empty()) {
 											auto sub_result_input = _state.sub_state(tb.data(), total);
-											auto sub_result_pipe = ASTPipe{};
 											parse<false>(_lesh_state, sub_result_input, _executor, _pipe, _command);
 										} else {
 											auto input_data = _state.rent(before, std::string_view(tb.data(), total), after);
 											auto sub_result_input = _state.sub_state(input_data);
-											auto sub_result_pipe = ASTPipe{};
 											parse<false>(_lesh_state, sub_result_input, _executor, _pipe, _command);
 											// TODO: attached
 										}
@@ -723,8 +824,33 @@ namespace ZshParserPlus {
 
 
 										// TODO: handle subshell
+									} else
+									if (*p == '{') {
+										std::string_view before =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
+										_state.plusplus();
+										_state.plusplus();
+										std::string_view w; // = _state.parse_word();
+										// TOTO: error_handling
+										_state.parse_var_substition_until('}',&w);
+										_state.plusplus();
+										auto after = _state.parse_word();
+										std::string_view val;
+										if (!_lesh_state.try_get_env(w, val))
+											val = "";
+
+										c = _state.current();
+										if (before.empty() && after.empty()) {
+											if (!val.empty()) {
+												_p_state = parsing_state::in_a_word;
+												ensure_word<false>(val.data(), c);
+											}
+										} else {
+											auto input_data = _state.rent(before, val, after); // std::string_view(val.data(), val.size()));
+											_p_state = parsing_state::in_a_word;
+											ensure_word<is_executing>(input_data, c);
+										}
 									} else { // optimistic variable expansion
-										std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
+										// std::string_view p =  (_p_state == parsing_state::in_a_word)? std::string_view(_word_beginning, c - _word_beginning) : std::string_view();
 										_state.plusplus();
 										std::string_view w; // = _state.parse_word();
 										std::string_view k;
@@ -736,7 +862,7 @@ namespace ZshParserPlus {
 										}
 
 										// TODO: error handling
-										if (std::string_view val; has_key ? _lesh_state.try_get_env(w, k, val) : _lesh_state.try_get_env(w, k)) {
+										if (std::string_view val; has_key ? _lesh_state.try_get_env(w, k, val) : _lesh_state.try_get_env(w, val)) {
 											*c = '\0';
 											if (!p.empty()) {
 												auto con = _state.rent(p, val);
@@ -753,10 +879,29 @@ namespace ZshParserPlus {
 								}
 								// todo: maybe subshell, maybe variable
 							} break;
+							// assigment
+							case '=': {
+								if (_is_command) {
+									*c = '\0';
+									_state.plusplus();
+									if constexpr (is_executing) {
+										if (_p_state == parsing_state::in_a_word) {
+											auto var = _word_beginning;
+											auto val = _state.parse_word();
+											// _state.plusplus();
+											printf("v a: %s=%s\n", var, val.data());
+											_command->add_assignment(var, val.data());
+											_p_state = parsing_state::none;
+										}
+									}
+								}
+							} break;
 
 							// we are somewhere in a word
 							default: {
 								if (_p_state == parsing_state::none) {
+									// commit word
+									commit_last_word(c);
 									_p_state = parsing_state::in_a_word;
 									_word_beginning = c;
 								}
@@ -764,9 +909,11 @@ namespace ZshParserPlus {
 						}
 					}
 					if (!_state.plusplus_s()) {
+						printf("im handlnig command \n");
 						// TODO: handle non closing brackets
 						// NOTE: end of input shouldn't be inside of a word as input is expceted to be null-terminated
-						ensure_word<is_executing>(_word_beginning, c);
+						commit_last_word(c);
+						// ensure_word<is_executing>(_word_beginning, c);
 						break;
 					}
 				}
@@ -777,9 +924,10 @@ namespace ZshParserPlus {
 
 		void add_alias(const char* alias, const char* value, bool normalize_after = false) {
 			auto state = SimpleParsingStare(true, _lesh_state.global_pool(), value);
-			ASTPipe pipe;
+			ASTPipe& pipe = _lesh_state.emplace_alias(alias);
 			command_parser::parse<false>(_lesh_state, state, _executor, pipe);
-			_lesh_state.emplace_alias(alias, pipe, normalize_after);
+			if (normalize_after)
+				_lesh_state.normalize_aliases();
 		}
 
 	public:
@@ -809,11 +957,12 @@ namespace ZshParserPlus {
 
 	inline lua_engine::lua_engine(lesh_state &state, Parser &parser):
 		_lesh_state(state), _parser(parser) {
+		auto st = sol::create;
 		_base_env = sol::environment(_lua, sol::create);
 		init();
 	}
 	inline bool lua_engine::try_execute_lua_function(const ASTCommand *cmd, int input_fd, int output_fd) const {
-		auto f_o = _base_env.get<std::optional<sol::function>>(cmd->children[0]->value);
+		const auto f_o = _base_env.get<std::optional<sol::function>>(cmd->children[0]->value);
 		if (!f_o.has_value())
 			return false;
 		auto f = f_o.value();

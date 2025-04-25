@@ -26,6 +26,7 @@ set(CMAKE_BUILD_TYPE Debug)
 # include_directories("include/abseil")
 add_subdirectory("include/replxx")
 add_subdirectory("include/sol2")
+add_subdirectory("tools")
 
 
 # testing
@@ -42,7 +43,8 @@ target_link_libraries(lesh_lib replxx::replxx sol2::sol2 PkgConfig::LUA)
 add_executable(lesh ${PROJECT_SOURCE_DIR}/src/main.cpp
         src/auto_complete.h
         src/executor.h
-        src/prompt.h)
+        src/prompt.h
+        src/lesh_string_utils.h)
 target_link_libraries(lesh lesh_lib)
 
 add_executable(lesh_tests ${TEST_FILES} ${HEADER_FILES})
