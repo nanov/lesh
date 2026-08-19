@@ -1,6 +1,5 @@
 #pragma once
 
-#include <__ranges/split_view.h>
 #include <array>
 #include <atomic>
 #include <filesystem>
@@ -85,14 +84,10 @@ class hybrid_continuous_simple_vector {
 		_using_heap = true;
 		_location = _storage + _size;
 	}
-	/*
-	void clear() {
-		/* it's simple no need to iterate and call, it is belived emelents won't have destructor
-		auto storage = _storage;
-		for (size_t i = 0; i < _size; ++i, ++storage)
-			storage->~T();
-	}
-	*/
+	// NOTE: there is deliberately no clear() that runs destructors - elements are
+	// assumed trivially destructible. That assumption has never been verified;
+	// the substrate hardening phase either enforces it with a static_assert or
+	// makes destructors run.
 
 public:
 	T* data() {
@@ -836,7 +831,6 @@ public:
 		while (s) {
 			if (const auto &it = s->_vars.find(var); it != s->_vars.end()) {
 				val = it->second->value(key);
-				std::println("found {} in {} is {}", key, var, val);
 				return true;
 			}
 			s = s->_parent;
@@ -898,6 +892,7 @@ public:
 		} else if (mode == 3) {
 			callback(k, std::string_view(lw));
 		}
+		return true;
 	}
 	bool get_array_values(char* v, size_t len, std::function<void(char*, size_t)> callback) const {
 		size_t i = 0;

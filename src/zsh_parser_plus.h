@@ -8,7 +8,7 @@
 #include "executor.h"
 #include "lesh_string_utils.h"
 
-#include <__ranges/split_view.h>
+#include <ranges>
 #include <sol/as_args.hpp>
 #include <sol/variadic_args.hpp>
 
@@ -66,8 +66,8 @@ namespace ZshParserPlus {
 
 			*val++ = '\0';
 			auto s = state.scope();
-			std::println("{} - {}", key, val);
 			s->typeset(std::string_view(key), std::string_view(val));
+			return 1;
 		}
 
 		static int builtin_echo(lesh_state& state, const ASTCommand* cmd) {
