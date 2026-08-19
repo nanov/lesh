@@ -1,4 +1,4 @@
-#include "lolcat.h"
+#include "ui/lolcat.h"
 
 static const int noColors = 30;
 static const std::string c_white  =  "\033[0m";

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
-#include <utils.h>
-#include <zsh_parser_plus.h>
+#include "legacy/shell_state.h"
+#include "legacy/zsh_parser_plus.h"
 
 // fixture
 class LeshStateTests : public::testing::Test {

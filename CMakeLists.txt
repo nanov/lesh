@@ -109,31 +109,72 @@ add_subdirectory("include/googletest")
 enable_testing()
 
 # ---------------------------------------------------------------------------
-# Targets. Sources are listed explicitly: file(GLOB) does not re-run when a
-# file is added, so new sources are silently missed until CMake is re-run.
+# Modules.
+#
+# One target per module, with dependencies expressed through
+# target_link_libraries. This is what makes the dependency rules in the scope
+# spec enforceable rather than merely documented: a module can only use what its
+# target links, so a violation is a build failure instead of a review comment.
+#
+# Sources are listed explicitly. file(GLOB) does not re-run when a file is added,
+# so new sources are silently missed until CMake is re-run by hand.
+#
+# Current graph:
+#
+#   lesh_options ──► lesh_substrate ──► lesh_legacy ──► lesh
+#                            │                │           ▲
+#                            └──► lesh_ui ────┴───────────┘
+#
+# lesh_legacy is the strangler quarantine (ADR-0002): everything scheduled for
+# replacement lives there and nothing new may be added to it. The modules that
+# replace it - syntax/ and runtime/ - become targets of their own as they land,
+# and legacy shrinks until it is empty and the target is deleted.
 # ---------------------------------------------------------------------------
-set(LESH_HEADERS
-	src/auto_complete.h
-	src/executor.h
-	src/lesh_assert.h
-	src/lesh_string_utils.h
-	src/lolcat.h
-	src/prompt.h
-	src/utils.h
-	src/zsh_parser_plus.h)
 
-add_library(lesh_lib
-	src/lolcat.cpp
-	${LESH_HEADERS})
-target_link_libraries(lesh_lib PUBLIC lesh_options replxx::replxx sol2::sol2 lua)
+# substrate: arena, containers, assertions, character classification.
+# Depends on nothing. Header-only, so an INTERFACE target.
+add_library(lesh_substrate INTERFACE)
+target_link_libraries(lesh_substrate INTERFACE lesh_options)
+target_sources(lesh_substrate INTERFACE
+	src/substrate/arena.h
+	src/substrate/assert.h
+	src/substrate/char_utils.h
+	src/substrate/hybrid_vector.h
+	src/substrate/inline_vector.h
+	src/substrate/traits.h)
+
+# ui: terminal presentation. Depends only on the substrate.
+add_library(lesh_ui STATIC
+	src/ui/lolcat.cpp
+	src/ui/lolcat.h)
+target_link_libraries(lesh_ui PUBLIC lesh_substrate)
+
+# legacy: the single-pass parser, its AST, and shell state. Being replaced.
+# Header-only today, hence INTERFACE. Third-party dependencies are attached here
+# rather than globally, so what replaces legacy does not silently inherit them.
+add_library(lesh_legacy INTERFACE)
+target_link_libraries(lesh_legacy INTERFACE
+	lesh_substrate
+	replxx::replxx
+	sol2::sol2
+	lua)
+target_sources(lesh_legacy INTERFACE
+	src/legacy/ast.h
+	src/legacy/auto_complete.h
+	src/legacy/executor.h
+	src/legacy/prompt.h
+	src/legacy/shell_state.h
+	src/legacy/substrate_bridge.h
+	src/legacy/zsh_parser_plus.h)
 
 add_executable(lesh src/main.cpp)
-target_link_libraries(lesh PRIVATE lesh_lib)
+target_link_libraries(lesh PRIVATE lesh_legacy lesh_ui)
 
 add_executable(lesh_tests
 	tests/base_tests.cpp
 	tests/lesh_state_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_lib gtest gtest_main)
+target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_ui gtest gtest_main)
+
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
 # Differential conformance: every snippet in tests/spec runs through lesh and

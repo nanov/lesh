@@ -4,9 +4,12 @@
 #include <unistd.h>
 #include <unordered_set>
 
-#include "utils.h"
-#include "executor.h"
-#include "lesh_string_utils.h"
+#include "legacy/shell_state.h"
+
+#include <sol/environment.hpp>
+#include <sol/state.hpp>
+#include "legacy/executor.h"
+#include "substrate/char_utils.h"
 
 #include <ranges>
 #include <sol/as_args.hpp>

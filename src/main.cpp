@@ -48,8 +48,8 @@ x .d88"               z`    ^%    .uef^"
 #include <unordered_set>
 #include <vector>
 
-#include "utils.h"
-#include "zsh_parser_plus.h"
+#include "legacy/shell_state.h"
+#include "legacy/zsh_parser_plus.h"
 
 #include "replxx.hxx"
 #include <sol/sol.hpp>
@@ -73,7 +73,7 @@ const std::optional<std::string> file_found(const std::vector<std::filesystem::p
 #include <replxx.h>
 
 
-#include "lolcat.h"
+#include "ui/lolcat.h"
 
 void print_lesh(double gradient = 0.6) {
 	std::stringstream ss;
