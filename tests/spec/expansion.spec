@@ -42,3 +42,9 @@ echo ${HOME}x${HOME}
 
 --- parameters and literals alternating [xfail: both name-scan and accumulation defects]
 echo a$HOME-$HOME-b
+
+--- braced parameter as the last word of a pipeline stage
+echo ${HOME} | cat
+
+--- braced parameter alone
+echo ${HOME}

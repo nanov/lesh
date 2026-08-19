@@ -36,8 +36,8 @@ echo $(echo inner)
 --- command substitution with a prefix [xfail: partial expansion around $() is unfinished]
 echo pre$(echo inner)
 
---- expansion of an argument inside a pipeline [xfail: the expanded word replaces the command name instead of becoming an argument]
+--- expansion of an argument inside a pipeline
 echo $HOME | cat
 
---- expansion with a prefix inside a pipeline [xfail: same defect as above]
+--- expansion with a prefix inside a pipeline
 echo pre$HOME | cat

@@ -770,6 +770,15 @@ namespace ZshParserPlus {
 							case '|': {
 								*c = '\0';
 								ensure_word<is_executing>(_word_beginning, c);
+								// Flush the pending word onto THIS command before switching.
+								// ensure_word only makes a word pending; commit_last_word is
+								// what attaches it. Normally the blank before `|` does that,
+								// but an expansion overwrites its own delimiter with '\0' and
+								// leaves the cursor on it, so plusplus_s steps past and that
+								// commit never happens - and the word lands on the NEXT
+								// command as its command name. `echo $HOME | cat` tried to
+								// execute the home directory.
+								commit_last_word(c);
 								_command = _pipe.emplace_command();
 								_is_command = true;
 							} break;
@@ -878,7 +887,11 @@ namespace ZshParserPlus {
 										if (before.empty() && after.empty()) {
 											if (!val.empty()) {
 												_p_state = parsing_state::in_a_word;
-												ensure_word<false>(val.data(), c);
+												// <is_executing>, not <false>: the <false> branch of
+												// ensure_word emplaces the word AND leaves it pending,
+												// so it gets attached twice as soon as anything commits.
+												// Every sibling call here already passes is_executing.
+												ensure_word<is_executing>(val.data(), c);
 											}
 										} else {
 											auto input_data = _state.rent(before, val, after); // std::string_view(val.data(), val.size()));
