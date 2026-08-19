@@ -2,7 +2,9 @@
 
 // Vector with inline capacity. NOTE: elements live across the inline buffer
 // AND the heap, so data() is not contiguous - see issue #13.
+#include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <new>
 #include <utility>
 

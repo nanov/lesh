@@ -183,7 +183,9 @@ target_link_libraries(lesh PRIVATE lesh_legacy lesh_syntax lesh_ui)
 add_executable(lesh_tests
 	tests/base_tests.cpp
 	tests/lesh_state_tests.cpp
-	tests/unit/lexer_tests.cpp)
+	tests/unit/arena_tests.cpp
+	tests/unit/lexer_tests.cpp
+	tests/unit/substrate_contract_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_syntax lesh_ui gtest gtest_main)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
@@ -193,6 +195,28 @@ add_test(NAME lesh_tests COMMAND lesh_tests)
 # authoritative for the POSIX floor (ADR-0001); zsh only for the curated layer.
 # Skipped rather than failed when the reference shell is absent, so a machine
 # without dash does not report a false regression.
+# Header self-containment. Every header must compile on its own, with nothing
+# included before it. Splitting the monolith turned up two headers that only
+# compiled because something else had already pulled in <algorithm> and
+# <functional> - the kind of defect that stays invisible until an unrelated
+# include is removed, and then breaks a file nobody touched.
+file(GLOB_RECURSE LESH_PUBLIC_HEADERS
+	RELATIVE ${PROJECT_SOURCE_DIR}/src
+	${PROJECT_SOURCE_DIR}/src/substrate/*.h
+	${PROJECT_SOURCE_DIR}/src/syntax/*.h)
+set(SELF_CONTAINMENT_DIR ${CMAKE_CURRENT_BINARY_DIR}/self_containment)
+file(MAKE_DIRECTORY ${SELF_CONTAINMENT_DIR})
+set(SELF_CONTAINMENT_SOURCES "")
+foreach(header ${LESH_PUBLIC_HEADERS})
+	string(REPLACE "/" "_" stem "${header}")
+	string(REPLACE ".h" "" stem "${stem}")
+	set(generated ${SELF_CONTAINMENT_DIR}/selftest_${stem}.cpp)
+	file(WRITE ${generated} "#include \"${header}\"\n")
+	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
+endforeach()
+add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_substrate lesh_syntax)
+
 find_program(DASH_EXECUTABLE dash)
 find_package(Python3 COMPONENTS Interpreter)
 if(DASH_EXECUTABLE AND Python3_Interpreter_FOUND)

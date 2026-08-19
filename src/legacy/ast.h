@@ -17,6 +17,13 @@ struct ASTWord {
 		explicit ASTWord(const char* inval): value(inval) {
 		}
 		ASTWord(const ASTWord& other): value(other.value) {}
+		// DEFECT, frozen deliberately (issue #13): `const T&&` is not a move
+		// constructor. You cannot move out of a const object, so this performs a
+		// copy - and every other "move" below does the same. Correcting the
+		// signature would make hybrid_vector genuinely move, which invokes a copy
+		// path that is itself broken, so it would change behaviour in code ADR-0002
+		// deletes, for no gain. The replacement AST (#10) gets this right by
+		// construction.
 		ASTWord(const ASTWord&& other) noexcept : value(other.value) {}
 };
 struct ASTPipe;
@@ -51,6 +58,7 @@ struct ASTCommand {
 	assignments(other.assignments) {
 	}
 	// move
+	// See the note on ASTWord's move constructor: `const T&&` cannot move.
 	ASTCommand(const ASTCommand&& other) noexcept : children(other.children), assignments(other.assignments) {
 	}
 
