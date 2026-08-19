@@ -566,10 +566,16 @@ namespace ZshParserPlus {
 				return _capacity;
 			}
 
+			// Trims trailing `c` from the first `end` bytes, returning how many went.
+			// Both bounds matter: end == 0 would start the scan one byte before the
+			// buffer, and a buffer consisting entirely of `c` would walk off the
+			// front. ASan caught the first of these during command substitution.
 			size_t trim_end(char c, size_t end) {
+				if (end == 0)
+					return 0;
 				auto p = ptr + end - 1;
 				auto bp = p;
-				while (*p==c) {
+				while (p >= ptr && *p == c) {
 					*(p--) = '\0';
 				}
 				return bp - p;

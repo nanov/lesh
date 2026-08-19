@@ -135,3 +135,20 @@ add_executable(lesh_tests
 	tests/lesh_state_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_lib gtest gtest_main)
 add_test(NAME lesh_tests COMMAND lesh_tests)
+
+# Differential conformance: every snippet in tests/spec runs through lesh and
+# through a reference shell, and stdout plus exit status must match. dash is
+# authoritative for the POSIX floor (ADR-0001); zsh only for the curated layer.
+# Skipped rather than failed when the reference shell is absent, so a machine
+# without dash does not report a false regression.
+find_program(DASH_EXECUTABLE dash)
+find_package(Python3 COMPONENTS Interpreter)
+if(DASH_EXECUTABLE AND Python3_Interpreter_FOUND)
+	add_test(NAME spec_dash
+		COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/spec_run.py
+			--shell $<TARGET_FILE:lesh>
+			--ref ${DASH_EXECUTABLE}
+			${PROJECT_SOURCE_DIR}/tests/spec)
+else()
+	message(STATUS "spec_dash test skipped: need dash and python3")
+endif()
