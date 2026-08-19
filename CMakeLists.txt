@@ -167,13 +167,24 @@ target_sources(lesh_legacy INTERFACE
 	src/legacy/substrate_bridge.h
 	src/legacy/zsh_parser_plus.h)
 
+# syntax: lexer, tokens, and (later) the parser. The replacement front end.
+# Depends only on the substrate - never on legacy, never on the executor. That is
+# the dependency rule from the scope spec, made enforceable: this target does not
+# link them, so reaching for them will not compile.
+add_library(lesh_syntax STATIC
+	src/syntax/lexer.cpp
+	src/syntax/lexer.h
+	src/syntax/token.h)
+target_link_libraries(lesh_syntax PUBLIC lesh_substrate)
+
 add_executable(lesh src/main.cpp)
-target_link_libraries(lesh PRIVATE lesh_legacy lesh_ui)
+target_link_libraries(lesh PRIVATE lesh_legacy lesh_syntax lesh_ui)
 
 add_executable(lesh_tests
 	tests/base_tests.cpp
-	tests/lesh_state_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_ui gtest gtest_main)
+	tests/lesh_state_tests.cpp
+	tests/unit/lexer_tests.cpp)
+target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_syntax lesh_ui gtest gtest_main)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
