@@ -367,6 +367,11 @@ namespace ZshParserPlus {
 				COUNT,
 			};
 			explicit SimpleParsingState(bool is_global, buffer_pool& pool, char *input, size_t length) : _is_global(is_global), _buffer_pool(pool), _buffer_start(pool.at()), _input(input), _length(length+1), _current(_input) {}
+			// NOTE: this overload strdup()s its input and never frees it, deliberately.
+			// Alias ASTs point into that buffer, so it must outlive the parsing state -
+			// it is process-lifetime storage, not a leak, even though LeakSanitizer
+			// reports it as one. Freeing it produces a use-after-free in
+			// normalize_aliases(). Giving it a real owner is substrate work.
 			SimpleParsingState(bool is_global, buffer_pool& pool, const char *input) : SimpleParsingState(is_global, pool, strdup(input), strlen(input)) {}
 			explicit SimpleParsingState(bool is_global, buffer_pool& pool, std::string& input):  SimpleParsingState(is_global, pool, input.data(), input.size()) {}
 

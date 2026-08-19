@@ -710,7 +710,12 @@ class buffer_pool {
 #ifdef VERBOSE_POOL_DATA
 				lifetime_pool_bytes_allocated += size;
 #endif
-				result = new char[size];
+				// malloc, not new char[]: returning false means "this came from the
+				// heap, the caller owns it", and every such caller releases it with
+				// free() or grows it with realloc(). Allocating with new[] here made
+				// both of those undefined. reallocate()'s overflow path below already
+				// uses malloc; this keeps one family behind one protocol.
+				result = static_cast<char *>(malloc(sizeof(char) * size));
 				return false;
 			}
 #ifdef VERBOSE_POOL_DATA
