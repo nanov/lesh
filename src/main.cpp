@@ -32,6 +32,7 @@ x .d88"               z`    ^%    .uef^"
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -122,23 +123,112 @@ private:
 	ZshParserPlus::Parser& _parser;
 };
 
+namespace {
+
+// One command line, from whatever source. Returns its exit status.
+// `exit` is still matched here as a string rather than being a real built-in;
+// that moves when the executor gains proper built-in dispatch.
+int run_line(ZshParserPlus::Parser& parser, std::string& line, bool& should_exit, int& last_status) {
+	if (line.empty())
+		return last_status;
+	if (line == "exit") {
+		should_exit = true;
+		return last_status;
+	}
+	last_status = parser.parse_and_execute(line);
+	return last_status;
+}
+
+// Feed a script line by line.
+//
+// NOTE: this reads through a buffered stream, so a script that itself consumes
+// stdin cannot see what the shell has already buffered ahead. POSIX requires a
+// script to be consumed incrementally for exactly that reason. Fixing it needs a
+// read(2)-based input source, which belongs with the lexer's input model rather
+// than here.
+int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
+	std::string line;
+	bool should_exit = false;
+	int last_status = 0;
+	while (!should_exit && std::getline(in, line))
+		run_line(parser, line, should_exit, last_status);
+	return last_status;
+}
+
+[[noreturn]] void usage_error(const char* message) {
+	std::fprintf(stderr, "lesh: %s\n", message);
+	std::fprintf(stderr, "usage: lesh [-i] [-c command | script] [args...]\n");
+	// POSIX: a shell that cannot parse its own invocation exits >0; 2 is the
+	// conventional choice, matching a syntax error.
+	std::exit(2);
+}
+
+} // namespace
+
 int main(int argc, char **argv, char **envp) {
-	_hint_callback_results.reserve(10);
+	const char* command_string = nullptr;
+	const char* script_path = nullptr;
+	bool force_interactive = false;
+
+	int i = 1;
+	for (; i < argc; ++i) {
+		const std::string_view arg = argv[i];
+		if (arg == "--") { ++i; break; }
+		if (arg.size() < 2 || arg[0] != '-') break;
+		if (arg == "-c") {
+			if (++i >= argc) usage_error("-c requires an argument");
+			command_string = argv[i];
+		} else if (arg == "-i") {
+			force_interactive = true;
+		} else if (arg == "-s") {
+			// Read commands from stdin. This is the default already; accepted so
+			// harnesses that pass it explicitly are not rejected.
+		} else {
+			usage_error("unknown option");
+		}
+	}
+	if (!command_string && i < argc)
+		script_path = argv[i++];
+
+	// POSIX: interactive means -i, or no operands with both stdin and stderr
+	// attached to a terminal. Everything user-facing hangs off this one decision
+	// rather than off separate ad-hoc checks.
+	const bool interactive = force_interactive ||
+		(!command_string && !script_path && isatty(STDIN_FILENO) && isatty(STDERR_FILENO));
+
 	setenv("TERM", "xterm-256color", 1);
 
-
-	int exit_code = -1;
-	// Flush after every std::cout / std:cerr
+	// Flush after every std::cout / std::cerr
 	std::cout << std::unitbuf;
 	std::cerr << std::unitbuf;
 
 	lesh_state state {std::filesystem::current_path(), envp};
-
-	print_lesh();
-
-
 	auto zsh_parser = ZshParserPlus::Parser(state);
 	zsh_parser.init_aliases();
+
+	if (command_string) {
+		std::string line{command_string};
+		bool should_exit = false;
+		int last_status = 0;
+		return run_line(zsh_parser, line, should_exit, last_status);
+	}
+
+	if (script_path) {
+		std::ifstream script{script_path};
+		if (!script) {
+			std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
+			return 127;
+		}
+		return run_stream(zsh_parser, script);
+	}
+
+	if (!interactive)
+		return run_stream(zsh_parser, std::cin);
+
+	// Interactive from here down. The banner, the prompt, history and replxx
+	// itself all belong to this branch and must never touch a pipe or a script.
+	_hint_callback_results.reserve(10);
+	print_lesh();
 
 	replxx::Replxx rx;
 	rx.bind_key_internal(replxx::Replxx::KEY::UP,  "history_previous");
@@ -149,62 +239,25 @@ int main(int argc, char **argv, char **envp) {
 	rx.set_max_hint_rows(1);
 	std::string history_file = ".lesh_history";
 	rx.history_load(history_file);
-	std::vector<const char*> p = {"mitko"};
-	const char* p2[] = {"mitko", nullptr};
 
-	/*
-	// Lua shit!
-	auto lua_a = lesh_lua_api(state, zsh_parser);
-	auto lua_env = sol::environment(lua, sol::create);
-	lua_a.init(lua, lua_env);
-	{
-		// auto lua_rc = lua.load_file("leshrc.lua");
-		auto lua_rc = lua.script_file("leshrc.lua", lua_env, [](lua_State*, sol::protected_function_result pfr) {
-			std::cerr << sol::error(pfr).what() << std::endl;
-			return pfr;
-		});
-		if (!lua_rc.valid()) {
-			sol::error err{lua_rc};
-			std::cerr << err.what() << std::endl;
-		}
-		auto f = lua_env.get<std::optional<sol::function>>("show");
-		if (f.has_value()) {
-			f.value()(sol::as_args(p2));
-		}
-		lua.script("show('hello')", lua_env);
-	}
-	*/
-
-
-
-	while(true) {
-		// display the prompt and retrieve input from the user
+	int last_status = 0;
+	bool should_exit = false;
+	while (!should_exit) {
 		char const* cinput{ nullptr };
-		// break;
-
 		do {
 			cinput = rx.input(state.pmt());
-		} while ( ( cinput == nullptr ) && ( errno == EAGAIN ) );
+		} while ((cinput == nullptr) && (errno == EAGAIN));
 
-		if (cinput == nullptr) {
+		if (cinput == nullptr)
 			break;
-		}
 
-		// TODO: prevent copy
 		std::string input = {cinput};
-
 		if (input.empty())
 			continue;
 		rx.history_add(cinput);
-
-		if (input == "exit") {
-			exit_code = 0;
-			break;
-		}
-
-		zsh_parser.parse_and_execute(input);
+		run_line(zsh_parser, input, should_exit, last_status);
 	}
 
 	rx.history_sync(history_file);
-	return exit_code;
+	return last_status;
 }

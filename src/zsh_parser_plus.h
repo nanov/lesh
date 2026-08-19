@@ -149,7 +149,7 @@ namespace ZshParserPlus {
 			builtins.emplace("info", builtin_info);
 		}
 
-		bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd) const {
+		bool try_execute_built_in(const ASTCommand* cmd, int input_fd, int output_fd, int& status) const {
 			if (auto const it = builtins.find(cmd->children[0]->value); it != builtins.end()) {
 				int saved_stdout = -1, saved_stdin = -1;
 				if (output_fd != STDOUT_FILENO) {
@@ -163,7 +163,7 @@ namespace ZshParserPlus {
 				}
 
 
-				it->second(_state, cmd);
+				status = it->second(_state, cmd);
 
 				if (saved_stdout != -1) {
 					dup2(saved_stdout, STDOUT_FILENO);
@@ -194,32 +194,44 @@ namespace ZshParserPlus {
 		public:
 			explicit executor(lesh_state& lesh_state, Parser& parser) : _built_ins({lesh_state}), _lua_engine(lesh_state, parser) {}
 
-			void execute(const ASTPipe& pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+			// Returns the exit status of the last command, which is what `$?` and a
+			// non-interactive shell's own exit status are defined to be.
+			int execute(const ASTPipe& pipe, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+				int last_status = 0;
 				switch (pipe.size()) {
 					// TODO: maybe error handling
-					case 0: break;;
+					case 0: break;
 					case 1: {
-						if (const auto pid = execute_command(pipe.commands[0], input_fd, output_fd)) {
-							int status;
+						if (const auto pid = execute_command(pipe.commands[0], input_fd, output_fd, last_status)) {
+							int status = 0;
 							waitpid(pid, &status, 0);
+							last_status = WIFEXITED(status) ? WEXITSTATUS(status)
+							            : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+							            : 0;
 						}
-					} break;;
+					} break;
 					default: {
-						// Wait for all processes in pipeline
-						for (const auto pids = execute_pipeline(pipe, input_fd, output_fd); const pid_t pid: pids) {
+						// Wait for every process, but the pipeline's status is the last one's.
+						for (const auto pids = execute_pipeline(pipe, last_status, input_fd, output_fd); const pid_t pid: pids) {
 							if (pid) {
-								int status;
+								int status = 0;
 								waitpid(pid, &status, 0);
+								last_status = WIFEXITED(status) ? WEXITSTATUS(status)
+								            : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+								            : 0;
 							}
 						}
 					}
 				}
+				return last_status;
 			}
 		private:
 			built_in_commands _built_ins;
 			lua_engine _lua_engine;
 
-			[[nodiscard]] std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
+			// last_in_process_status receives the status of the final command when it
+			// runs in this process (a built-in), where there is no pid to wait on.
+			[[nodiscard]] std::vector<pid_t> execute_pipeline(const ASTPipe &pipeline, int& last_in_process_status, int p_input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
 				// TODO: use pool
 				std::vector<pid_t> pids;
 				int input_fd = p_input_fd;
@@ -235,7 +247,8 @@ namespace ZshParserPlus {
 					}
 
 					// Execute command with current input and pipe output
-					pids.push_back(execute_command(pipeline.commands[i], input_fd, pipefd[1]));
+					int ignored_status = 0;
+					pids.push_back(execute_command(pipeline.commands[i], input_fd, pipefd[1], ignored_status));
 
 					// Close write end of pipe
 					close(pipefd[1]);
@@ -247,17 +260,19 @@ namespace ZshParserPlus {
 					input_fd = pipefd[0];
 				}
 
-				pids.push_back(execute_command(pipeline.commands[last_child_index], input_fd, output_fd));
+				pids.push_back(execute_command(pipeline.commands[last_child_index], input_fd, output_fd, last_in_process_status));
 				if (input_fd != STDIN_FILENO)
 					close(input_fd);
 
 				return pids;
 			}
-			pid_t execute_command(ASTCommand *command, int input_fd = STDIN_FILENO, int output_fd = STDOUT_FILENO) const {
-				if (_built_ins.try_execute_built_in(command, input_fd, output_fd))
+			pid_t execute_command(ASTCommand *command, int input_fd, int output_fd, int& in_process_status) const {
+				if (_built_ins.try_execute_built_in(command, input_fd, output_fd, in_process_status))
 					return 0;
-				if (_lua_engine.try_execute_lua_function(command, input_fd, output_fd))
+				if (_lua_engine.try_execute_lua_function(command, input_fd, output_fd)) {
+					in_process_status = 0;
 					return 0;
+				}
 
 				// Built-ins above run in *this* process, so their output sits in our
 				// stdout buffer. Flush before forking, otherwise the child inherits a
@@ -301,8 +316,10 @@ namespace ZshParserPlus {
 					// important, in order to get, my)_stupid_command: not found
 					perror(argv[0]);
 
+					// POSIX: 127 if the command was not found, 126 if it was found but
+					// could not be executed.
 					// _exit, not exit: never flush stdio buffers inherited from the parent.
-					_exit(EXIT_FAILURE);
+					_exit(errno == ENOENT ? 127 : 126);
 				}
 
 				// Parent process
@@ -950,11 +967,11 @@ namespace ZshParserPlus {
 			add_alias(alias, value);
 		}
 
-		inline void parse_and_execute(std::string& input) const {
+		inline int parse_and_execute(std::string& input) const {
 			auto state = SimpleParsingState{false, _lesh_state.buffer_pool(), input}; // ExpansionContainer{input};
 			auto pipe = ASTPipe{};
 			command_parser::parse<true>(_lesh_state, state, _executor, pipe);
-			_executor.execute(pipe);
+			return _executor.execute(pipe);
 		}
 	};
 
