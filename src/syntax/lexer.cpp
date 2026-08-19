@@ -1,5 +1,7 @@
 #include "syntax/lexer.h"
 
+#include "substrate/char_utils.h"
+
 namespace lesh::syntax {
 
 namespace {
@@ -152,6 +154,43 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			continue;
 		}
 
+		// `$(...)` is part of the word, not an operator followed by one. Without
+		// this the '(' terminates the word and `echo $(x)` lexes as `$`, `(`, `x`,
+		// `)` - which is how the expander first came to receive a bare `$`.
+		// Parens are counted so nesting works: $(a $(b) c).
+		if (c == '$' && peek(1) == '(') {
+			literal = false;
+			_position += 2;
+			int depth = 1;
+			while (!at_end() && depth > 0) {
+				if (peek() == '(') ++depth;
+				else if (peek() == ')') --depth;
+				++_position;
+			}
+			if (depth > 0) {
+				_incomplete = true;
+				return finish();
+			}
+			continue;
+		}
+
+		if (c == '`') {
+			literal = false;
+			const uint32_t tick_at = _position;
+			++_position;
+			while (!at_end() && peek() != '`') {
+				if (peek() == '\\' && _position + 1 < _source.size())
+					++_position;
+				++_position;
+			}
+			if (at_end()) {
+				_incomplete = true;
+				return finish(token_error::unterminated_backquote, tick_at);
+			}
+			++_position;
+			continue;
+		}
+
 		if (operators_terminate && is_word_terminator(c))
 			break;
 
@@ -163,8 +202,161 @@ token lexer::lex_word(lex_mode mode) noexcept {
 	return finish();
 }
 
+// Lexes one segment of a word's interior. The caller has already established
+// where the word starts and ends; this decomposes it.
+//
+// Segments are delimited, not interpreted: seg_parameter spans `${x:-y}` without
+// deciding what `:-` means, and seg_command_sub spans `$(...)` without parsing
+// its contents. Interpretation belongs to the expander, and the contents of a
+// command substitution belong to a fresh parse. Keeping the split here means the
+// lexer never needs to know what an expansion *does*.
+token lexer::lex_word_segment() noexcept {
+	const uint32_t start = _position;
+
+	token t;
+	t.offset = start;
+
+	auto finish = [&](token_kind kind, token_error error = token_error::none,
+	                  uint32_t error_at = 0) {
+		t.kind = kind;
+		t.length = _position - start;
+		t.error = error;
+		t.error_offset = (error != token_error::none) ? error_at : 0;
+		return t;
+	};
+
+	const char c = peek();
+
+	if (c == '\'') {
+		++_position;
+		while (!at_end() && peek() != '\'')
+			++_position;
+		if (at_end()) {
+			_incomplete = true;
+			return finish(token_kind::seg_single_quoted, token_error::unterminated_single_quote, start);
+		}
+		++_position;
+		return finish(token_kind::seg_single_quoted);
+	}
+
+	if (c == '"') {
+		++_position;
+		while (!at_end() && peek() != '"') {
+			if (peek() == '\\' && _position + 1 < _source.size())
+				++_position;
+			++_position;
+		}
+		if (at_end()) {
+			_incomplete = true;
+			return finish(token_kind::seg_double_quoted, token_error::unterminated_double_quote, start);
+		}
+		++_position;
+		return finish(token_kind::seg_double_quoted);
+	}
+
+	if (c == '~' && start == 0) {
+		// Only a leading tilde is eligible. POSIX confines tilde expansion to the
+		// start of a word (and after ':' in assignments, which is #12's problem).
+		++_position;
+		while (!at_end() && peek() != '/' && !is_blank(peek()))
+			++_position;
+		return finish(token_kind::seg_tilde);
+	}
+
+	if (c == '`') {
+		++_position;
+		while (!at_end() && peek() != '`') {
+			if (peek() == '\\' && _position + 1 < _source.size())
+				++_position;
+			++_position;
+		}
+		if (at_end()) {
+			_incomplete = true;
+			return finish(token_kind::seg_command_sub, token_error::unterminated_backquote, start);
+		}
+		++_position;
+		return finish(token_kind::seg_command_sub);
+	}
+
+	if (c == '$') {
+		const char next = peek(1);
+		if (next == '(' && peek(2) == '(') {
+			_position += 3;
+			int depth = 1;
+			while (!at_end() && depth > 0) {
+				if (peek() == '(') ++depth;
+				else if (peek() == ')') --depth;
+				++_position;
+			}
+			if (!at_end() && peek() == ')')
+				++_position;
+			else if (at_end())
+				_incomplete = true;
+			return finish(token_kind::seg_arithmetic);
+		}
+		if (next == '(') {
+			_position += 2;
+			int depth = 1;
+			while (!at_end() && depth > 0) {
+				if (peek() == '(') ++depth;
+				else if (peek() == ')') --depth;
+				++_position;
+			}
+			if (depth > 0)
+				_incomplete = true;
+			return finish(token_kind::seg_command_sub);
+		}
+		if (next == '{') {
+			_position += 2;
+			while (!at_end() && peek() != '}')
+				++_position;
+			if (at_end())
+				_incomplete = true;
+			else
+				++_position;
+			return finish(token_kind::seg_parameter);
+		}
+		if (lesh::string_utils::is_valid_var_name_first_char(static_cast<unsigned char>(next))) {
+			_position += 2;
+			while (!at_end() &&
+			       lesh::string_utils::is_valid_var_name_non_first_char(
+			           static_cast<unsigned char>(peek())))
+				++_position;
+			return finish(token_kind::seg_parameter);
+		}
+		// A lone '$' is an ordinary character, as are $? $# $@ for now - the
+		// special parameters land with shell state in #12.
+		++_position;
+		return finish(token_kind::seg_literal);
+	}
+
+	// A literal run: everything up to the next byte that starts a segment.
+	while (!at_end()) {
+		const char ch = peek();
+		if (ch == '\\' && _position + 1 < _source.size()) {
+			_position += 2;
+			continue;
+		}
+		if (ch == '\'' || ch == '"' || ch == '$' || ch == '`')
+			break;
+		++_position;
+	}
+	return finish(token_kind::seg_literal);
+}
+
 token lexer::next(lex_mode mode) noexcept {
 	_incomplete = false;
+
+	if (mode == lex_mode::word_interior) {
+		if (at_end()) {
+			token t;
+			t.kind = token_kind::end;
+			t.offset = _position;
+			return t;
+		}
+		return lex_word_segment();
+	}
+
 	const bool skipped = skip_blanks_and_comments();
 
 	if (at_end()) {

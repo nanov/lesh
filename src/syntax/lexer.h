@@ -70,6 +70,7 @@ private:
 	bool skip_blanks_and_comments() noexcept;  // returns whether anything was skipped
 	token lex_operator() noexcept;
 	token lex_word(lex_mode mode) noexcept;
+	token lex_word_segment() noexcept;
 };
 
 // True for bytes that end an unquoted word in command position.

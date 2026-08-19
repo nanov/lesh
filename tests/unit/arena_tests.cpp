@@ -234,3 +234,22 @@ TEST(ArenaArray, MoveLeavesTheSourceHarmless) {
 	EXPECT_EQ(a.size(), 0u);
 	EXPECT_EQ(a.data(), nullptr);
 }
+
+TEST(Arena, ReturnsSuitablyAlignedMemory) {
+	// Regression test. The arena bump-allocated raw positions, which is fine for
+	// byte buffers and undefined for anything with an alignment requirement.
+	// UBSan caught a 4-byte-aligned type landing on an odd address; the arena
+	// tests missed it because they only ever allocated chars.
+	lesh::buffer_pool pool{4096};
+	char* pad = nullptr;
+	ASSERT_TRUE(pool.allocate(1, pad, 1));  // deliberately misalign the cursor
+
+	struct alignas(8) Wide { double a; double b; };
+	char* raw = nullptr;
+	ASSERT_TRUE(pool.allocate(sizeof(Wide), raw, alignof(Wide)));
+	EXPECT_EQ(reinterpret_cast<uintptr_t>(raw) % alignof(Wide), 0u);
+
+	char* second = nullptr;
+	ASSERT_TRUE(pool.allocate(sizeof(uint32_t), second, alignof(uint32_t)));
+	EXPECT_EQ(reinterpret_cast<uintptr_t>(second) % alignof(uint32_t), 0u);
+}

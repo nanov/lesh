@@ -2,6 +2,7 @@
 
 // Bump allocator. Hands out memory and reclaims it in one shot.
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -38,7 +39,18 @@ class buffer_pool {
 #endif
 			return true;
 		}
-		bool allocate(size_t size, char*& result) {
+		// Bump-allocates `size` bytes aligned to `alignment`.
+		//
+		// Alignment defaults to the strictest the platform requires, because an
+		// allocator that returns suitably-aligned memory by default is the only
+		// kind that is safe to use generically. Without it this returned raw bump
+		// positions, which is fine for byte buffers and undefined for everything
+		// else - UBSan caught a token landing on an odd address. Callers that
+		// genuinely want packed bytes can ask for alignment 1.
+		bool allocate(size_t size, char*& result, size_t alignment = alignof(std::max_align_t)) {
+			const auto misalign = reinterpret_cast<uintptr_t>(_current) % alignment;
+			if (misalign != 0)
+				_current += alignment - misalign;
 			if (_current+size > _end) {
 #ifdef VERBOSE_POOL_DATA
 				lifetime_pool_bytes_allocated += size;

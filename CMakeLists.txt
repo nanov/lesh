@@ -180,17 +180,25 @@ add_library(lesh_syntax STATIC
 	src/syntax/token.h)
 target_link_libraries(lesh_syntax PUBLIC lesh_substrate)
 
+# runtime: expansion, and later shell state and execution. Depends on syntax and
+# the substrate; never on legacy, never on the editor.
+add_library(lesh_runtime STATIC
+	src/runtime/expander.cpp
+	src/runtime/expander.h)
+target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
+
 add_executable(lesh src/main.cpp)
-target_link_libraries(lesh PRIVATE lesh_legacy lesh_syntax lesh_ui)
+target_link_libraries(lesh PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui)
 
 add_executable(lesh_tests
 	tests/base_tests.cpp
 	tests/lesh_state_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/expander_tests.cpp
 	tests/unit/parser_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_syntax lesh_ui gtest gtest_main)
+target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
@@ -207,7 +215,8 @@ add_test(NAME lesh_tests COMMAND lesh_tests)
 file(GLOB_RECURSE LESH_PUBLIC_HEADERS
 	RELATIVE ${PROJECT_SOURCE_DIR}/src
 	${PROJECT_SOURCE_DIR}/src/substrate/*.h
-	${PROJECT_SOURCE_DIR}/src/syntax/*.h)
+	${PROJECT_SOURCE_DIR}/src/syntax/*.h
+	${PROJECT_SOURCE_DIR}/src/runtime/*.h)
 set(SELF_CONTAINMENT_DIR ${CMAKE_CURRENT_BINARY_DIR}/self_containment)
 file(MAKE_DIRECTORY ${SELF_CONTAINMENT_DIR})
 set(SELF_CONTAINMENT_SOURCES "")
@@ -219,7 +228,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE lesh_substrate lesh_syntax)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_runtime lesh_substrate lesh_syntax)
 
 find_program(DASH_EXECUTABLE dash)
 find_package(Python3 COMPONENTS Interpreter)

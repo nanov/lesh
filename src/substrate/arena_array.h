@@ -93,7 +93,7 @@ private:
 		char* raw = nullptr;
 		// The arena's return value says where the block came from. Pooled blocks are
 		// reclaimed on rewind; heap fallbacks are ours to free.
-		const bool from_pool = _pool.allocate(wanted * sizeof(T), raw);
+		const bool from_pool = _pool.allocate(wanted * sizeof(T), raw, alignof(T));
 		T* fresh = reinterpret_cast<T*>(raw);
 		if (_size > 0)
 			std::memcpy(fresh, _data, _size * sizeof(T));

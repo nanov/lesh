@@ -35,6 +35,21 @@ enum class token_kind : uint16_t {
 	great_and,    // >&
 	less_great,   // <>
 	clobber,      // >|
+
+	// --- word interior -------------------------------------------------------
+	// Emitted only in lex_mode::word_interior. A word is not one rich token (see
+	// issue #9): it is a run of flat segments, which is what keeps the token small
+	// and the lexer allocation-free. The expander consumes these rather than
+	// re-scanning the word itself, so shell quoting rules live in exactly one
+	// place. Two scanners for one grammar is how zsh ended up maintaining a second
+	// parser for its line editor.
+	seg_literal,        // plain bytes, possibly containing backslash escapes
+	seg_single_quoted,  // '...' - no expansion inside, ever
+	seg_double_quoted,  // "..." - expansion inside, but no field splitting
+	seg_parameter,      // $name or ${...}
+	seg_command_sub,    // $(...) or `...`
+	seg_arithmetic,     // $((...))
+	seg_tilde,          // a leading ~ eligible for tilde expansion
 };
 
 // Errors are data, not failures. Lexing always produces a token; a malformed one
