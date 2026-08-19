@@ -4,7 +4,7 @@
 namespace lesh {
 	class string_utils {
 	public:
-		static bool is_valid_var_name_fist_char(const unsigned char c) {
+		static bool is_valid_var_name_first_char(const unsigned char c) {
 			constexpr bool VALID_FIRST_CHAR[256] = {
 				['A'] = true, ['B'] = true, ['C'] = true, ['D'] = true, ['E'] = true,
 				['F'] = true, ['G'] = true, ['H'] = true, ['I'] = true, ['J'] = true,
@@ -23,7 +23,7 @@ namespace lesh {
 			return VALID_FIRST_CHAR[c];
 		}
 
-		static bool is_valid_var_name_non_fist_char(const unsigned char c) {
+		static bool is_valid_var_name_non_first_char(const unsigned char c) {
 			constexpr bool VALID_NON_FIRST_CHAR[256] = {
 				// Include all the values from VALID_FIRST_CHAR
 				['A'] = true, ['B'] = true, ['C'] = true, ['D'] = true, ['E'] = true,

@@ -16,7 +16,7 @@ TEST_F(LeshStateTests, HomeDirExtraction) {
 	EXPECT_EQ("users/lesh", state.home());
 }
 
-TEST_F(LeshStateTests, EnvVarExtration) {
+TEST_F(LeshStateTests, EnvVarExtraction) {
 	std::string_view envv;
 	auto there = state.try_get_env("ENV", envv);
 	EXPECT_EQ(there, true);

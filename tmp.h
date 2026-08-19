@@ -52,10 +52,10 @@ class hybrid_vector {
 	}
 public:
 	size_t size() const { return _size; }
-	void reserve_free_slots(size_t requiered_free_slots) {
-		if (_capacity - _size >= requiered_free_slots)
+	void reserve_free_slots(size_t required_free_slots) {
+		if (_capacity - _size >= required_free_slots)
 			return;
-		reserve(requiered_free_slots - (_capacity - _size));
+		reserve(required_free_slots - (_capacity - _size));
 	}
 	void reserve(size_t new_cap) {
 		if (new_cap <= _capacity)

@@ -355,8 +355,6 @@ int main(int argc, char **argv, char **envp) {
 
 
 	while(true) {
-		std::string dbg ="mi t";
-		zsh_parser.parse_and_execute(dbg);
 		// display the prompt and retrieve input from the user
 		char const* cinput{ nullptr };
 		// break;

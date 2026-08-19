@@ -33,12 +33,12 @@ using transparent_string_hash = overload<
     std::hash<std::string_view>,
     char_pointer_hash
 >;
-struct char_iteratable {
+struct char_iterable {
 private:
 	char** _stack;
 	char** _end;
 public:
-	char_iteratable(char** self, char** end): _stack(self), _end(end) {}
+	char_iterable(char** self, char** end): _stack(self), _end(end) {}
 	struct iterator {
 	private:
 		char** _location;
@@ -282,10 +282,10 @@ class hybrid_vector {
 	}
 public:
 	size_t size() const { return _size; }
-	void reserve_free_slots(size_t requiered_free_slots) {
-		if (_capacity - _size >= requiered_free_slots)
+	void reserve_free_slots(size_t required_free_slots) {
+		if (_capacity - _size >= required_free_slots)
 			return;
-		reserve(requiered_free_slots - (_capacity - _size));
+		reserve(required_free_slots - (_capacity - _size));
 	}
 	void reserve(size_t new_cap) {
 		if (new_cap <= _capacity)
@@ -486,12 +486,7 @@ struct ASTWord {
 		explicit ASTWord(const char* inval): value(inval) {
 		}
 		ASTWord(const ASTWord& other): value(other.value) {}
-		ASTWord(const ASTWord&& other) noexcept : value(other.value) {
-			printf("move ASTWord::ASTWord()\n");
-		}
-		~ASTWord() {
-			printf("~ASTWord::ASTWord()\n");
-		}
+		ASTWord(const ASTWord&& other) noexcept : value(other.value) {}
 };
 struct ASTPipe;
 //
@@ -501,12 +496,10 @@ struct ASTCommandSubstitution {
 	char *command;
 	const ASTPipe* pipe;
 };
-struct ASTAssigment {
+struct ASTAssignment {
 	const char *key;
 	const char *value;
 };
-
-static size_t command_id=0;
 
 // command is a part exectued by itself, it conatins a colletions of wrods whics are it's arhuments ( ls -l -gAH )
 struct ASTCommand {
@@ -515,29 +508,19 @@ struct ASTCommand {
 
 	// those are essentially parameters
 	hybrid_continuous_simple_vector<ASTWord, MAX_CHILDREN> children;
-	hybrid_vector<ASTAssigment, INITIAL_ASSIGNMENTS> assignments;
+	hybrid_vector<ASTAssignment, INITIAL_ASSIGNMENTS> assignments;
 
-	size_t _id;
 	bool is_sealed = false;
 
-	ASTCommand(): _id(command_id++) {
-		printf("command const called %d\n", _id);
-	}
+	ASTCommand() = default;
 
 	// copy
 	ASTCommand(const ASTCommand& other):
 	children(other.children),
-	assignments(other.assignments),
-	_id(command_id++) {
-		printf("copy ASTCommand::ASTCommand() %lu -> %lu\n", other._id, _id);
+	assignments(other.assignments) {
 	}
 	// move
-	ASTCommand(const ASTCommand&& other) noexcept : children(other.children), assignments(other.assignments), _id(other._id) {
-		printf("move ASTCommand::ASTCommand()\n");
-	}
-
-	~ASTCommand() {
-		printf("command dest called %d\n", _id);
+	ASTCommand(const ASTCommand&& other) noexcept : children(other.children), assignments(other.assignments) {
 	}
 
 	char** args_null_terminated() {
@@ -560,7 +543,7 @@ struct ASTCommand {
         children.replace_front(other.children.data(), other.children.size());
     }
 
-    void enrich_wth(const ASTCommand & other) {
+    void enrich_with(const ASTCommand & other) {
         for (size_t i = 1; i < other.children.size(); ++i)
             children.push_back(*other.children[i]);
     }
@@ -602,7 +585,7 @@ struct ASTPipe {
     ASTCommand* expand_with_at(const ASTPipe& other, size_t idx) {
         auto first_command = commands[idx];
         auto& last_command = commands.replace_at(other.commands, idx);
-        last_command.enrich_wth(last_command);
+        last_command.enrich_with(last_command);
         return &last_command;
     }
 
@@ -666,7 +649,7 @@ public:
 	void normalize_aliases() {
 		if (normalized)
 			return;
-		std::unordered_set<std::string> expaded_alises;
+		std::unordered_set<std::string> expanded_aliases;
 		std::unordered_map<std::string, alias>::iterator expanded;
 
 		for (auto defined_alias = _aliases.begin(); defined_alias != _aliases.end(); ++defined_alias) {
@@ -674,12 +657,12 @@ public:
 
 			size_t cmd_idx = 0;
 			do {
-				expaded_alises.clear();
+				expanded_aliases.clear();
 				auto command = defined_alias->second.expanded.commands[cmd_idx];
 				auto command_str = command->children[0]->value;
-				expaded_alises.emplace(defined_alias->first);
+				expanded_aliases.emplace(defined_alias->first);
 				while (
-					!expaded_alises.contains(command_str)
+					!expanded_aliases.contains(command_str)
 					&& ((expanded = _aliases.find(command_str)) != _aliases.end())
 					) {
 					if (expanded->second.original.size() == 1) {
@@ -689,7 +672,7 @@ public:
 						// cmd_idx += expanded->second.original.size();
 						// todo
 					}
-					expaded_alises.emplace(expanded->first);
+					expanded_aliases.emplace(expanded->first);
 					command_str = command->children[0]->value;
 					}
 				cmd_idx++;

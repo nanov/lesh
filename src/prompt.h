@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 
-namespace LeshPromptl {
+namespace LeshPrompt {
 	class SimpleString {
 		public:
 			SimpleString(const char* str, size_t size) {
@@ -18,12 +18,12 @@ namespace LeshPromptl {
 			char* _data;
 			size_t _size;
 	};
-	class PropmptExpansion {
+	class PromptExpansion {
 		public:
 			virtual const SimpleString prompt() const = 0;
 			virtual bool is_static() const = 0;
 	};
-	class RawStringPrompt : public PropmptExpansion {
+	class RawStringPrompt : public PromptExpansion {
 		private:
 			const SimpleString _str;
 		public:
@@ -34,7 +34,7 @@ namespace LeshPromptl {
 
 	class Prompt {
 		private:
-			std::vector<PropmptExpansion*> _expansions;
+			std::vector<PromptExpansion*> _expansions;
 
 
 		/*
