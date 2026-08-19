@@ -172,8 +172,11 @@ target_sources(lesh_legacy INTERFACE
 # the dependency rule from the scope spec, made enforceable: this target does not
 # link them, so reaching for them will not compile.
 add_library(lesh_syntax STATIC
+	src/syntax/ast.h
 	src/syntax/lexer.cpp
 	src/syntax/lexer.h
+	src/syntax/parser.cpp
+	src/syntax/parser.h
 	src/syntax/token.h)
 target_link_libraries(lesh_syntax PUBLIC lesh_substrate)
 
@@ -185,6 +188,7 @@ add_executable(lesh_tests
 	tests/lesh_state_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/parser_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_syntax lesh_ui gtest gtest_main)
 

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 // The arena is the one substrate component kept rather than replaced (issue #13),
@@ -173,4 +174,63 @@ TEST(Arena, ManyAllocationsUpToCapacity) {
 	}
 	EXPECT_GT(from_pool_count, 0);
 	EXPECT_LT(from_pool_count, 200) << "1024 bytes cannot satisfy 200 allocations of 8";
+}
+
+// --- arena_array -------------------------------------------------------------
+
+#include "substrate/arena_array.h"
+
+TEST(ArenaArray, AppendAndIndexRoundTrip) {
+	lesh::buffer_pool pool{4096};
+	lesh::arena_array<int> a{pool, 4};
+	for (int i = 0; i < 50; ++i)
+		EXPECT_EQ(a.push(i), static_cast<uint32_t>(i));
+	ASSERT_EQ(a.size(), 50u);
+	for (int i = 0; i < 50; ++i)
+		EXPECT_EQ(a[i], i) << "element " << i << " lost while growing";
+}
+
+TEST(ArenaArray, TruncateUnwindsWithoutLosingWhatRemains) {
+	lesh::buffer_pool pool{4096};
+	lesh::arena_array<int> a{pool, 4};
+	for (int i = 0; i < 10; ++i)
+		a.push(i);
+	a.truncate(3);
+	ASSERT_EQ(a.size(), 3u);
+	for (int i = 0; i < 3; ++i)
+		EXPECT_EQ(a[i], i);
+	a.push(99);
+	EXPECT_EQ(a[3], 99);
+}
+
+TEST(ArenaArray, ReleasesBlocksTakenFromTheArenaHeapFallback) {
+	// Regression test. Growth abandons pooled blocks deliberately - the arena
+	// reclaims those on rewind - but blocks from the arena's HEAP fallback are not
+	// tracked by the arena, so the array owns them. Getting that distinction wrong
+	// leaked 13 KB across 17 blocks, and LeakSanitizer is what caught it.
+	//
+	// The pool here is deliberately far too small, so every growth overflows.
+	lesh::buffer_pool pool{8};
+	for (int round = 0; round < 20; ++round) {
+		lesh::arena_array<int> a{pool, 2};
+		for (int i = 0; i < 100; ++i)
+			a.push(i);
+		EXPECT_EQ(a[99], 99);
+	}
+	SUCCEED() << "clean under LeakSanitizer means the fallback blocks were released";
+}
+
+TEST(ArenaArray, MoveLeavesTheSourceHarmless) {
+	// A defaulted move would leave both objects holding the same pointer and both
+	// destructors would free it.
+	lesh::buffer_pool pool{8};
+	lesh::arena_array<int> a{pool, 2};
+	for (int i = 0; i < 40; ++i)
+		a.push(i);
+
+	lesh::arena_array<int> b{std::move(a)};
+	EXPECT_EQ(b.size(), 40u);
+	EXPECT_EQ(b[39], 39);
+	EXPECT_EQ(a.size(), 0u);
+	EXPECT_EQ(a.data(), nullptr);
 }
