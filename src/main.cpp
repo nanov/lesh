@@ -125,6 +125,29 @@ private:
 
 namespace {
 
+// The strangler seam (issue #8, ADR-0002).
+//
+// Both front ends are compiled in and chosen at runtime, so neither rots while
+// the other is being worked on - a compile-time switch guarantees the idle one
+// breaks silently. Selection is by environment rather than a flag because POSIX
+// constrains argv, and because it lets the differential harness compare the two
+// by spawning the same binary twice with LESH_FRONTEND set differently.
+//
+// Parity is measured against the reference shell, not against the legacy parser:
+// legacy is wrong in known ways, and bug-compatibility would be the wrong target.
+// Legacy's score is the baseline to beat.
+enum class front_end { legacy, next };
+
+front_end select_front_end() {
+	const char* choice = std::getenv("LESH_FRONTEND");
+	if (choice == nullptr || *choice == '\0' || std::string_view{choice} == "legacy")
+		return front_end::legacy;
+	if (std::string_view{choice} == "next")
+		return front_end::next;
+	std::fprintf(stderr, "lesh: LESH_FRONTEND must be 'legacy' or 'next', got '%s'\n", choice);
+	std::exit(2);
+}
+
 // One command line, from whatever source. Returns its exit status.
 // `exit` is still matched here as a string rather than being a real built-in;
 // that moves when the executor gains proper built-in dispatch.
@@ -166,6 +189,14 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 } // namespace
 
 int main(int argc, char **argv, char **envp) {
+	if (select_front_end() == front_end::next) {
+		// The replacement front end (issues #9 through #12) is not built yet. Fail
+		// loudly rather than silently falling back, so a harness run against
+		// LESH_FRONTEND=next can never be mistaken for a passing legacy run.
+		std::fprintf(stderr, "lesh: LESH_FRONTEND=next is not implemented yet\n");
+		return 2;
+	}
+
 	const char* command_string = nullptr;
 	const char* script_path = nullptr;
 	bool force_interactive = false;
