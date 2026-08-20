@@ -132,3 +132,52 @@ trap "echo a" USR1; trap - USR1; trap
 
 --- a subshell keeps an ignored trap [xfail(legacy): legacy has no signal handling]
 trap "" USR1; (trap)
+
+# `read`, whose input source was the bug: it read the stdio `stdin` rather than
+# fd 0, so every `read` in a script fed on STANDARD INPUT saw a latched EOF and
+# assigned nothing. That path cannot be written here - this harness always runs
+# `shell -c code` - so it is asserted in tests/unit/read_tests.cpp instead. What
+# follows is the semantics, which `-c` can reach.
+
+--- read assigns at end of input and still fails [xfail(legacy): not implemented in legacy]
+printf 'foo bar baz' | { read a b; printf '%s [%s] [%s]\n' "$?" "$a" "$b"; }
+
+--- read at end of input assigns the empty string rather than leaving it unset [xfail(legacy): not implemented in legacy]
+read a </dev/null; printf '%s [%s]\n' "$?" "${a-unset}"
+
+--- read consumes no more of its input than the line it needs [xfail(legacy): not implemented in legacy]
+{ read a; echo B; cat; } <<\END
+\
+A
+C
+END
+
+--- an assignment prefix is visible to read [xfail(legacy): not implemented in legacy]
+printf 'A-B-C\n' | { IFS=' -' read a b; printf '[%s][%s]\n' "$a" "$b"; }
+
+--- a delimiter running to the end of the line yields no empty field [xfail(legacy): not implemented in legacy]
+printf 'A-B-C - \n' | { IFS=' -' read a b c; printf '[%s][%s][%s]\n' "$a" "$b" "$c"; }
+
+--- a non-whitespace IFS character at the start yields an empty field [xfail(legacy): not implemented in legacy]
+printf -- '--CC--\n' | { IFS=' -' read a b c d e; printf '[%s][%s][%s][%s][%s]\n' "$a" "$b" "$c" "$d" "$e"; }
+
+--- read joins surplus fields into the last variable, keeping a trailing delimiter [xfail(legacy): not implemented in legacy]
+printf 'A B C-C D -  \n' | { IFS=' -' read a b c; printf '[%s][%s][%s]\n' "$a" "$b" "$c" ; }
+
+--- a backslash prevents field splitting [xfail(legacy): not implemented in legacy]
+printf 'A\\ A B\n' | { read a b; printf '[%s][%s]\n' "$a" "$b"; }
+
+--- read -r takes every backslash literally [xfail(legacy): not implemented in legacy]
+printf 'A\\ A B\n' | { read -r a b; printf '[%s][%s]\n' "$a" "$b"; }
+
+--- read joins a continued line and stops at the one after it [xfail(legacy): not implemented in legacy]
+printf 'A\\\nB\nC\n' | { read a; printf '[%s]\n' "$a"; cat; }
+
+--- an empty IFS splits nothing and strips nothing [xfail(legacy): not implemented in legacy]
+printf ' A B \n' | { IFS= read a b; printf '[%s][%s]\n' "$a" "$b"; }
+
+--- an assignment prefix does not outlive a regular builtin [xfail(legacy): not implemented in legacy]
+x=outer; x=inner read v </dev/null; printf '[%s]\n' "$x"
+
+--- an assignment prefix persists on a special builtin [xfail(legacy): legacy has no export builtin]
+x=outer; x=inner export y; printf '[%s]\n' "$x"

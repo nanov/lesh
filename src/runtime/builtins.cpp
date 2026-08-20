@@ -949,37 +949,167 @@ builtin_result builtin_kill(shell_state&, char** argv) {
 	return {status};
 }
 
+// --- read --------------------------------------------------------------------
+
+// One byte at a time, from FD 0, never through stdio. Two bugs in one line.
+//
+// `read` used to call std::fgetc(stdin). `main` slurps a script with
+// read_all(std::cin), which drains fd 0 to EOF and latches the FILE*'s EOF
+// indicator; a here-document then dup2()s a fresh pipe onto fd 0, but fgetc kept
+// reporting EOF and kept its own stale buffer position. Every `read` in a script
+// fed on STANDARD INPUT therefore failed with nothing assigned, while the same
+// script run as a FILE worked - which is what scored read-p.tst 1/32 against
+// dash's 31/32, since the yash harness always pipes the script in.
+//
+// And a buffered FILE* over-reads: POSIX requires `read` to consume no more of
+// its input than the line it needs, which read-p.tst's "read does not read more
+// than needed" asserts by running `cat` straight after it. A block-buffered
+// stream would have swallowed that line too.
+bool read_byte(char& c) {
+	for (;;) {
+		const ssize_t n = ::read(STDIN_FILENO, &c, 1);
+		if (n == 1)
+			return true;
+		if (n == 0 || errno != EINTR)
+			return false;  // handlers carry SA_RESTART, so EINTR here is rare
+	}
+}
+
+// One line of input, as `read` needs it: the delimiter removed, backslashes
+// resolved, and a parallel flag per character saying whether it came from an
+// escape.
+//
+// The flags are not decoration. A backslash prevents field splitting, so
+// `IFS=' -' read a b` on `A\ A B` must yield the fields `A A` and `B`: splitting
+// has to know that this space arrived as `\ ` and is not a delimiter. Resolving
+// the escapes first and splitting afterwards loses exactly that.
+struct input_line {
+	std::string text;
+	std::string escaped;  // '\1' where text[i] came from a backslash escape
+	bool at_eof = false;  // input ended before the delimiter was seen
+};
+
+input_line read_input_line(char delimiter, bool raw) {
+	input_line line;
+	for (;;) {
+		char c = '\0';
+		if (!read_byte(c)) {
+			line.at_eof = true;
+			break;
+		}
+		if (c == delimiter)
+			break;
+		if (!raw && c == '\\') {
+			char next = '\0';
+			if (!read_byte(next)) {
+				// "orphan backslash is ignored": a trailing backslash at end of input
+				// contributes nothing rather than being kept as a literal.
+				line.at_eof = true;
+				break;
+			}
+			if (next == '\n')
+				continue;  // line continuation: the pair vanishes from the line
+			line.text += next;
+			line.escaped += '\1';
+			continue;
+		}
+		line.text += c;
+		line.escaped += '\0';
+	}
+	return line;
+}
+
+bool is_ifs_at(const input_line& line, std::string_view ifs, size_t i) {
+	return line.escaped[i] == '\0' && ifs.find(line.text[i]) != std::string_view::npos;
+}
+
+// "IFS white space" is the subset of IFS that is space, tab or newline. POSIX
+// treats it differently from the rest of IFS at both ends of the line and around
+// a delimiter, which is the whole reason read-p.tst has twelve field-splitting
+// cases rather than one.
+bool is_ifs_space_at(const input_line& line, std::string_view ifs, size_t i) {
+	const char c = line.text[i];
+	return is_ifs_at(line, ifs, i) && (c == ' ' || c == '\t' || c == '\n');
+}
+
+struct line_field {
+	size_t start = 0;
+	size_t end = 0;
+};
+
+std::vector<line_field> split_line(const input_line& line, std::string_view ifs) {
+	std::vector<line_field> fields;
+	const size_t n = line.text.size();
+	size_t at = 0;
+	while (at < n && is_ifs_space_at(line, ifs, at))
+		++at;  // leading IFS white space is not a delimiter
+	while (at < n) {
+		const size_t start = at;
+		while (at < n && !is_ifs_at(line, ifs, at))
+			++at;
+		fields.push_back({start, at});
+		// ONE delimiter is IFS white space, then at most one non-white-space IFS
+		// character, then more IFS white space. A delimiter that runs to the end of
+		// the line yields NO trailing empty field: `IFS=' -' read a b c` on
+		// `A-B-C - ` gives exactly three fields, which is read-p.tst's "exact number
+		// of fields with non-whitespace IFS". A non-white-space IFS character at the
+		// START does yield an empty field, which is why only one of the two ends is
+		// special-cased.
+		while (at < n && is_ifs_space_at(line, ifs, at))
+			++at;
+		if (at < n && is_ifs_at(line, ifs, at)) {
+			++at;
+			while (at < n && is_ifs_space_at(line, ifs, at))
+				++at;
+		}
+	}
+	return fields;
+}
+
 builtin_result builtin_read(shell_state& state, char** argv) {
 	// POSIX: reads ONE line, splits it on IFS, and assigns to the named variables
 	// with the LAST one receiving everything that remains - which is what makes
 	// `read first rest` work.
 	bool raw = false;
+	// `-d` is POSIX Issue 8 and the reason read-p.tst scores 32 rather than 31 on a
+	// shell that has it: dash predates the addition and fails that one case. The
+	// divergence is deliberate and recorded, per ADR-0001.
+	char delimiter = '\n';
 	size_t first = 1;
-	if (argv[1] != nullptr && std::strcmp(argv[1], "-r") == 0) {
-		raw = true;
-		first = 2;
+	for (; argv[first] != nullptr && argv[first][0] == '-' && argv[first][1] != '\0';
+	     ++first) {
+		if (std::strcmp(argv[first], "--") == 0) {
+			++first;
+			break;
+		}
+		const char* opt = argv[first] + 1;
+		while (*opt != '\0') {
+			if (*opt == 'r') {
+				raw = true;
+				++opt;
+				continue;
+			}
+			if (*opt != 'd') {
+				std::fprintf(stderr, "lesh: read: illegal option -%c\n", *opt);
+				return {2};
+			}
+			// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`).
+			// An empty one means NUL, as it does in bash.
+			++opt;
+			if (*opt == '\0') {
+				if (argv[first + 1] == nullptr) {
+					std::fprintf(stderr, "lesh: read: -d: missing delimiter\n");
+					return {2};
+				}
+				++first;
+				opt = argv[first];
+			}
+			delimiter = *opt;
+			break;
+		}
 	}
 
-	std::string line;
-	for (;;) {
-		const int c = std::fgetc(stdin);
-		if (c == EOF)
-			return {line.empty() ? 1 : 0, control_flow::normal};  // EOF with no data
-		if (c == '\n')
-			break;
-		if (!raw && c == '\\') {
-			// Without -r a backslash escapes the next character, and a
-			// backslash-newline continues the line.
-			const int next = std::fgetc(stdin);
-			if (next == EOF)
-				break;
-			if (next == '\n')
-				continue;
-			line += static_cast<char>(next);
-			continue;
-		}
-		line += static_cast<char>(c);
-	}
+	const input_line line = read_input_line(delimiter, raw);
 
 	// A readonly target makes `read` FAIL rather than discard the line quietly.
 	// dash reports `read: v: is read only` and returns 2 and, being a regular
@@ -991,33 +1121,53 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 		return false;
 	};
 
+	// EOF reached before the delimiter fails, but the variables are still assigned:
+	// `read a </dev/null` leaves `a` set to the empty string with status 1, and
+	// `printf 'foo bar' | read a b` assigns both. dash agrees, and read-p.tst
+	// asserts both ("EOF fails read", "variables are assigned even if EOF is
+	// reached without newline"). Returning early on EOF is what left every variable
+	// UNSET.
+	const int status = line.at_eof ? 1 : 0;
+
+	// No operands: bash, ksh and zsh assign REPLY; dash makes it an error. Kept
+	// because no conformance assertion covers it and `while read; do` is common.
 	if (argv[first] == nullptr)
-		return {assign("REPLY", line) ? 0 : 2};
+		return {assign("REPLY", line.text) ? status : 2};
 
 	const std::string_view ifs = state.ifs();
-	size_t at = 0;
-	size_t var = first;
-	while (argv[var] != nullptr) {
-		while (at < line.size() && ifs.find(line[at]) != std::string_view::npos)
-			++at;
-		const bool last = argv[var + 1] == nullptr;
-		if (last) {
-			// The final variable takes the remainder, with trailing separators
-			// stripped.
-			std::string_view rest{line};
-			rest.remove_prefix(std::min(at, rest.size()));
-			while (!rest.empty() && ifs.find(rest.back()) != std::string_view::npos)
-				rest.remove_suffix(1);
-			return {assign(argv[var], rest) ? 0 : 2};
+	const std::vector<line_field> fields = split_line(line, ifs);
+	const size_t names = argc_of(argv) - first;
+
+	for (size_t v = 0; v < names; ++v) {
+		std::string_view value;
+		if (v + 1 == names && fields.size() > names) {
+			// The last variable takes the raw REMAINDER of the line, delimiters and
+			// all, with trailing IFS white space removed - which is why a joined value
+			// keeps a trailing `-` but not a trailing space. Trailing white space that
+			// was escaped stays: it was quoted, so it is not a delimiter.
+			size_t end = line.text.size();
+			while (end > fields[v].start && is_ifs_space_at(line, ifs, end - 1))
+				--end;
+			value = std::string_view{line.text}.substr(fields[v].start, end - fields[v].start);
+		} else if (v < fields.size()) {
+			value = std::string_view{line.text}.substr(fields[v].start,
+			                                           fields[v].end - fields[v].start);
 		}
-		const size_t start = at;
-		while (at < line.size() && ifs.find(line[at]) == std::string_view::npos)
-			++at;
-		if (!assign(argv[var], std::string_view{line}.substr(start, at - start)))
+		// A name the shell could never assign is refused rather than stored under a
+		// key no expansion can reach. Checked HERE rather than before the read,
+		// because dash consumes the line first and then fails on the operand:
+		// `printf 'A\nB\n' | { read 1bad; read x; }` leaves x as B, and the earlier
+		// names are assigned before the bad one stops it.
+		if (!is_name(argv[first + v])) {
+			std::fprintf(stderr, "lesh: read: %s: bad variable name\n", argv[first + v]);
 			return {2};
-		++var;
+		}
+		// Fewer fields than variables: the surplus variables are assigned the empty
+		// string rather than left alone.
+		if (!assign(argv[first + v], value))
+			return {2};
 	}
-	return {0};
+	return {status};
 }
 
 builtin_result builtin_command(shell_state& state, char** argv) {

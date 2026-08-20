@@ -1702,7 +1702,44 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		std::clearerr(stdout);
 		const bool ok = apply_redirections(t, n, &saved);
 		builtin_result result{};
+		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before a
+		// regular one they apply only for its duration. Not cosmetic - it is why
+		// `x=1 export y` leaves x set and `x=1 cd /tmp` does not.
+		const bool persist = classify_builtin(argv[0]) == builtin_kind::special;
+		// POSIX 2.9.1 performs the assignments AFTER the redirections and BEFORE the
+		// command, so the builtin can READ them. They used to be applied after the
+		// call, and only in the persisting case, under a note saying no builtin read a
+		// variable set that way. `read` does: every field-splitting case in
+		// read-p.tst is `IFS=' -' read a b c`, and with the prefix invisible twelve of
+		// them split on the default IFS and joined the whole line into one variable.
+		std::vector<saved_variable> restore_vars;
+		// A refused prefix assignment must not skip the restores below, so it is a
+		// flag rather than an early return. The readonly pre-check above makes it
+		// unreachable; leaving the path correct is cheaper than relying on that.
+		bool refused = false;
 		if (ok) {
+			if (!persist)
+				restore_vars.reserve(assignments.size());
+			for (const auto& a : assignments) {
+				const size_t eq = a.find('=');
+				if (eq == std::string_view::npos)
+					continue;
+				if (!persist) {
+					saved_variable sv;
+					sv.name.assign(a.substr(0, eq));
+					std::string_view previous;
+					sv.was_set = _state.lookup(sv.name, previous);
+					if (sv.was_set)
+						sv.value.assign(previous);
+					restore_vars.push_back(std::move(sv));
+				}
+				if (!apply_assignment(a)) {
+					refused = true;
+					break;
+				}
+			}
+		}
+		if (ok && !refused) {
 			// `unset -f` removes a FUNCTION, and the function table lives here rather
 			// than in shell state. Only this FORM is intercepted - the variable form
 			// is builtins.cpp's - and it is done inside this block so the
@@ -1720,7 +1757,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 				std::fprintf(stderr, "lesh: %s: not implemented\n", argv[0]);
 				result.status = 127;
 			}
-		} else {
+		} else if (!ok) {
 			result.status = kRedirectionError;
 			// POSIX 2.8.1: a redirection error on a SPECIAL builtin exits a
 			// non-interactive shell; on a regular one it does not. Verified against
@@ -1735,19 +1772,17 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		if (ok && drop_unwritable_output(argv[0]))
 			result.status = 1;
 		restore_fds(saved);
-		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before
-		// a regular one they apply only for its duration. Not cosmetic - it is why
-		// `x=1 export y` leaves x set and `x=1 cd /tmp` does not.
-		const bool persist =
-			classify_builtin(argv[0]) == builtin_kind::special;
-		if (persist) {
-			for (const auto& a : assignments)
-				if (!apply_assignment(a))
-					result.status = assignment_error();
+		for (const auto& sv : restore_vars) {
+			// A name the builtin itself made readonly cannot be put back, and POSIX
+			// says a readonly variable stays readonly - so the refusal is the correct
+			// outcome here rather than an error to report twice.
+			if (sv.was_set)
+				std::ignore = _state.set(sv.name, sv.value);
+			else
+				std::ignore = _state.unset(sv.name);
 		}
-		// A regular builtin's temporary assignments are not implemented yet: they
-		// need save-and-restore around the call, and no builtin here reads a
-		// variable set that way. Recorded rather than pretended.
+		if (refused)
+			result.status = assignment_error();
 
 		if (result.flow == control_flow::exit_shell) {
 			_exit_requested = true;
