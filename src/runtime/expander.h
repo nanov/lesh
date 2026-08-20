@@ -34,6 +34,16 @@ public:
 	[[nodiscard]] virtual std::string_view home_directory() const = 0;
 	// Field separators. POSIX defaults to space, tab, newline when IFS is unset.
 	[[nodiscard]] virtual std::string_view ifs() const = 0;
+
+	// Special and positional parameters. Separate from lookup() because they are
+	// not variables: they have no names in the variable table, `shift` renumbers
+	// them, and a function replaces them for the duration of a call.
+	[[nodiscard]] virtual int last_status_value() const = 0;
+	[[nodiscard]] virtual int process_id_value() const = 0;
+	[[nodiscard]] virtual size_t positional_count() const = 0;
+	// 1-based, matching $1. Returns false past the end.
+	[[nodiscard]] virtual bool positional_at(size_t index, std::string_view& out) const = 0;
+	[[nodiscard]] virtual std::string_view script_name_value() const = 0;
 };
 
 // The port that breaks the cycle.
@@ -52,10 +62,19 @@ public:
 	                                           arena_array<char>& out) = 0;
 };
 
+// Assigning to a parameter from ${x=default}. Separate from arithmetic's port
+// because it writes strings rather than integers.
+class parameter_assigner {
+public:
+	virtual ~parameter_assigner() = default;
+	virtual void assign_parameter(std::string_view name, std::string_view value) = 0;
+};
+
 enum class expansion_status {
 	ok,
 	command_substitution_unavailable,  // no runner supplied - completion's mode
-	unsupported_construct,             // arithmetic and globbing are not here yet
+	unsupported_construct,             // a construct that is not implemented
+	parameter_unset,                   // ${x?message} fired
 };
 
 class expander {
@@ -66,9 +85,10 @@ public:
 	// state as a side effect of drawing a suggestion.
 	expander(buffer_pool& pool, const parameter_source& params,
 	         command_runner* runner = nullptr, bool glob_enabled = true,
-	         arithmetic_variables* vars = nullptr) noexcept
+	         arithmetic_variables* vars = nullptr,
+	         parameter_assigner* assign = nullptr) noexcept
 		: _pool(pool), _params(params), _runner(runner), _glob_enabled(glob_enabled),
-		  _vars(vars) {}
+		  _vars(vars), _assign(assign) {}
 
 	// Expands one word node, appending its fields to `out`.
 	//
@@ -97,6 +117,10 @@ private:
 	// `set -f` disables pathname expansion entirely.
 	bool _glob_enabled = true;
 	arithmetic_variables* _vars = nullptr;
+	parameter_assigner* _assign = nullptr;
+
+	bool lookup_parameter(std::string_view name, std::string_view& out) noexcept;
+	std::string_view int_to_scratch(int value) noexcept;
 
 	// Accumulates the field under construction. Completed fields are copied into
 	// exact-size arena blocks, because this buffer relocates as it grows and a

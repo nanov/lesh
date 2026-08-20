@@ -158,6 +158,25 @@ token lexer::lex_word(lex_mode mode) noexcept {
 		// this the '(' terminates the word and `echo $(x)` lexes as `$`, `(`, `x`,
 		// `)` - which is how the expander first came to receive a bare `$`.
 		// Parens are counted so nesting works: $(a $(b) c).
+		// `${...}` is part of the word even when it contains blanks, which
+		// `${x:?some message}` and `${x:-a default}` both do. Without this the word
+		// split at the space and the closing brace leaked into the next word.
+		if (c == '$' && peek(1) == '{') {
+			literal = false;
+			_position += 2;
+			int depth = 1;
+			while (!at_end() && depth > 0) {
+				if (peek() == '{') ++depth;
+				else if (peek() == '}') --depth;
+				++_position;
+			}
+			if (depth > 0) {
+				_incomplete = true;
+				return finish();
+			}
+			continue;
+		}
+
 		if (c == '$' && peek(1) == '(') {
 			literal = false;
 			_position += 2;
@@ -324,8 +343,22 @@ token lexer::lex_word_segment() noexcept {
 				++_position;
 			return finish(token_kind::seg_parameter);
 		}
-		// A lone '$' is an ordinary character, as are $? $# $@ for now - the
-		// special parameters land with shell state in #12.
+		// The special parameters. Each is exactly one character and none is a valid
+		// variable name, which is why they need their own case rather than a
+		// widened name predicate - `$?x` is `$?` followed by a literal `x`.
+		if (next == '?' || next == '#' || next == '$' || next == '!' ||
+		    next == '@' || next == '*' || next == '-') {
+			_position += 2;
+			return finish(token_kind::seg_parameter);
+		}
+		// A positional parameter: $0 through $9. Multi-digit needs braces
+		// (`${10}`), which POSIX requires and which the ${...} path already
+		// handles.
+		if (next >= '0' && next <= '9') {
+			_position += 2;
+			return finish(token_kind::seg_parameter);
+		}
+		// A lone '$' is an ordinary character.
 		++_position;
 		return finish(token_kind::seg_literal);
 	}

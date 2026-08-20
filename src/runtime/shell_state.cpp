@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <unistd.h>
 
 extern char** environ;
 
@@ -33,6 +34,7 @@ builtin_kind classify_builtin(std::string_view name) noexcept {
 }
 
 shell_state::shell_state() {
+	_pid = static_cast<int>(getpid());
 	// Seed from the process environment. Copying rather than borrowing is the
 	// ADR-0007 decision: these strings are owned here and released in the
 	// destructor, so the leak gate expects zero rather than "zero except envp".
@@ -47,6 +49,20 @@ shell_state::shell_state() {
 }
 
 shell_state::~shell_state() = default;
+
+bool shell_state::positional_at(size_t index, std::string_view& out) const {
+	if (index == 0 || index > _positional.size())
+		return false;
+	out = _positional[index - 1];
+	return true;
+}
+
+bool shell_state::shift_positional(size_t n) {
+	if (n > _positional.size())
+		return false;
+	_positional.erase(_positional.begin(), _positional.begin() + static_cast<long>(n));
+	return true;
+}
 
 bool shell_state::lookup(std::string_view name, std::string_view& value) const {
 	const auto it = _vars.find(name);

@@ -42,22 +42,22 @@ case abc in a*) echo matched;; *) echo no;; esac
 --- brace group [xfail(legacy): legacy has no compound commands]
 { echo grouped; }
 
---- default value expansion [xfail: #22 - the ${...} family]
+--- default value expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
 echo ${undefined_var:-fallback}
 
---- length expansion [xfail: #22]
+--- length expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
 x=hello; echo ${#x}
 
---- suffix trimming [xfail: #22]
+--- suffix trimming [xfail(legacy): legacy has no parameter expansion beyond $name]
 x=file.txt; echo ${x%.txt}
 
---- prefix trimming [xfail: #22]
+--- prefix trimming [xfail(legacy): legacy has no parameter expansion beyond $name]
 x=/a/b/c; echo ${x##*/}
 
---- exit status parameter [xfail: #22 - special parameters]
+--- exit status parameter [xfail(legacy): legacy has no parameter expansion beyond $name]
 false; echo $?
 
---- positional parameters [xfail: #22]
+--- positional parameters [xfail(legacy): legacy has no parameter expansion beyond $name]
 set -- one two; echo $1 $2
 
 --- glob expansion [xfail(legacy): legacy has no pathname expansion]
@@ -194,3 +194,36 @@ echo $((no_such_var + 1))
 
 --- arithmetic bases follow C [xfail(legacy): legacy has no arithmetic expansion]
 echo $((0x1f)) $((010))
+
+--- the colon distinguishes unset from empty [xfail(legacy): legacy has no parameter expansion beyond $name]
+x=; echo "[${x:-colon}] [${x-nocolon}]"
+
+--- assign-default writes the value back [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo ${undef_assign:=written}; echo $undef_assign
+
+--- use-alternate substitutes only when set [xfail(legacy): legacy has no parameter expansion beyond $name]
+x=yes; echo "[${x:+alt}] [${unset_alt:+alt}]"
+
+--- all four trimming forms [xfail(legacy): legacy has no parameter expansion beyond $name]
+p=/a/b/c.txt; echo "${p#*/} ${p##*/} ${p%.*} ${p%%.*}"
+
+--- a default value may contain blanks [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo "${undef_blanks:-a default with spaces}"
+
+--- the positional count [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo $#
+
+--- unquoted star and at behave alike [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -- one two; echo $* ; echo $@
+
+--- quoted at produces one field per parameter [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -- a b; for x in "$@"; do echo "[$x]"; done
+
+--- quoted star joins with the first IFS character [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -- a b; echo "[$*]"
+
+--- shift renumbers the positional parameters [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -- a b c; shift; echo "$1 $2"; echo $#
+
+--- set -f disables pathname expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -f; echo /usr/bin/tru*

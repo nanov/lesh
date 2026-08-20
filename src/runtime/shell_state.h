@@ -30,7 +30,9 @@ enum class builtin_kind {
 
 [[nodiscard]] builtin_kind classify_builtin(std::string_view name) noexcept;
 
-class shell_state final : public parameter_source, public arithmetic_variables {
+class shell_state final : public parameter_source,
+                          public arithmetic_variables,
+                          public parameter_assigner {
 public:
 	shell_state();
 	~shell_state() override;
@@ -43,6 +45,11 @@ public:
 	[[nodiscard]] bool lookup(std::string_view name, std::string_view& value) const override;
 	[[nodiscard]] std::string_view home_directory() const override;
 	[[nodiscard]] std::string_view ifs() const override;
+	[[nodiscard]] int last_status_value() const override { return _last_status; }
+	[[nodiscard]] int process_id_value() const override { return _pid; }
+	[[nodiscard]] size_t positional_count() const override { return _positional.size(); }
+	[[nodiscard]] bool positional_at(size_t index, std::string_view& out) const override;
+	[[nodiscard]] std::string_view script_name_value() const override { return _script_name; }
 
 	// --- arithmetic_variables -------------------------------------------------
 
@@ -55,6 +62,9 @@ public:
 	// zero-leak gate reachable - the alternative is what legacy does.
 	void set(std::string_view name, std::string_view value);
 	void set_exported(std::string_view name, std::string_view value);
+	void assign_parameter(std::string_view name, std::string_view value) override {
+		set(name, value);
+	}
 	void unset(std::string_view name);
 	[[nodiscard]] bool is_exported(std::string_view name) const;
 
@@ -62,10 +72,26 @@ public:
 	// by this object and stay valid until the next call.
 	[[nodiscard]] char** environment_block();
 
-	// --- special parameters ---------------------------------------------------
+	// --- special and positional parameters ------------------------------------
 
 	[[nodiscard]] int last_status() const noexcept { return _last_status; }
 	void set_last_status(int status) noexcept { _last_status = status; }
+
+	// $0 is the shell or script name; $1.. are the positional parameters. Held
+	// separately from variables because they are not variables: they have no
+	// names, `shift` renumbers them, and a function replaces them for the
+	// duration of a call (#25).
+	void set_positional(std::vector<std::string> args) { _positional = std::move(args); }
+	[[nodiscard]] const std::vector<std::string>& positional() const noexcept {
+		return _positional;
+	}
+	void set_script_name(std::string name) { _script_name = std::move(name); }
+	[[nodiscard]] std::string_view script_name() const noexcept { return _script_name; }
+
+	// POSIX: `shift n` discards the first n, and is an error if n exceeds $#.
+	[[nodiscard]] bool shift_positional(size_t n);
+
+	[[nodiscard]] int process_id() const noexcept { return _pid; }
 
 	// --- options --------------------------------------------------------------
 
@@ -75,6 +101,7 @@ public:
 		bool exit_on_error = false;
 		bool error_on_unset = false;
 		bool trace = false;
+		bool no_glob = false;  // set -f
 	};
 	[[nodiscard]] options& opts() noexcept { return _options; }
 	[[nodiscard]] const options& opts() const noexcept { return _options; }
@@ -90,6 +117,9 @@ private:
 
 	std::unordered_map<std::string, variable, lesh::transparent_string_hash, std::equal_to<>> _vars;
 	std::string _ifs_default = " \t\n";
+	std::vector<std::string> _positional;
+	std::string _script_name = "lesh";
+	int _pid = 0;
 	int _last_status = 0;
 	options _options;
 	bool _interactive = false;

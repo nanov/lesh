@@ -104,7 +104,7 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	// splitting must not apply - POSIX makes a redirection target expanding to
 	// more than one field an error, and treating it as one word is the behaviour
 	// dash has.
-	expander ex{_pool, _state, &_runner, true, &_state};
+	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
 	arena_array<std::string_view> fields{_pool, 2};
 	{
 		// Reparse the target as a standalone word so the expander sees it whole.
@@ -221,7 +221,7 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 	// - the body is one blob of text, not a word list.
 	std::string expanded;
 	if (body.expand) {
-		expander ex{_pool, _state, &_runner, false, &_state};
+		expander ex{_pool, _state, &_runner, false, &_state, &_state};
 		const std::string_view result = ex.expand_assignment_value(text);
 		expanded.assign(result);
 		text = expanded;
@@ -454,7 +454,7 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 
 	// Every child but the last is a word to iterate; the last is the body.
 	const uint32_t word_count = self.children_count - 1;
-	expander ex{_pool, _state, &_runner, true, &_state};
+	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
 	arena_array<std::string_view> items{_pool, 8};
 	for (uint32_t i = 0; i < word_count; ++i)
 		ex.expand_word(t, t.child_of(self, i), items);
@@ -488,7 +488,7 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 	// to field splitting or pathname expansion - otherwise `*)` expands to the
 	// files in the current directory and matches nothing, which is exactly what
 	// happened before this flag was passed.
-	expander ex{_pool, _state, &_runner, false, &_state};
+	expander ex{_pool, _state, &_runner, false, &_state, &_state};
 	arena_array<std::string_view> subject{_pool, 2};
 	ex.expand_word(t, t.child_of(self, 0), subject);
 	const std::string_view text = subject.empty() ? std::string_view{} : subject[0];
@@ -540,7 +540,7 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 
 	// The runner is passed here, so a command substitution inside a word reaches
 	// this same executor. That is what makes `echo $(echo $(echo x))` work.
-	expander ex{_pool, _state, &_runner, true, &_state};
+	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
 	arena_array<std::string_view> fields{_pool, 8};
 
 	for (uint32_t i = 0; i < self.children_count; ++i) {
@@ -607,7 +607,7 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 		// out of the shell - the parent's state is untouched by construction rather
 		// than by remembering to undo it.
 		if (assignments != nullptr) {
-			expander child_ex{_pool, _state, nullptr};
+			expander child_ex{_pool, _state, nullptr, true, &_state, &_state};
 			for (const auto& a : *assignments) {
 				const size_t eq = a.find('=');
 				if (eq != std::string_view::npos)
@@ -634,7 +634,7 @@ void tree_walking_executor::apply_assignment(std::string_view text) {
 	// The value is expanded, not stored raw: `x="a b"` assigns `a b` without the
 	// quotes, and `x=$y` assigns y's value. Storing the source text meant a later
 	// `echo $x` printed the quotes.
-	expander ex{_pool, _state, &_runner, true, &_state};
+	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
 	_state.set(text.substr(0, eq), ex.expand_assignment_value(text.substr(eq + 1)));
 }
 

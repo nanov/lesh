@@ -8,6 +8,7 @@
 #include <tuple>
 #include <string_view>
 #include <vector>
+#include <vector>
 #include <unistd.h>
 
 namespace lesh::runtime {
@@ -182,21 +183,48 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 }
 
 builtin_result builtin_set(shell_state& state, char** argv) {
-	// Options only for now. `set --` replacing the positional parameters needs
-	// them to exist first (#22).
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
+	size_t i = 1;
+	for (; argv[i] != nullptr; ++i) {
 		const std::string_view arg{argv[i]};
+
+		// `--` ends the options and replaces the positional parameters with
+		// whatever follows - including nothing, which clears them.
+		if (arg == "--") {
+			++i;
+			break;
+		}
 		if (arg.size() < 2 || (arg[0] != '-' && arg[0] != '+'))
-			continue;
+			break;  // a plain operand also ends the options and sets $1..
+
 		const bool enable = arg[0] == '-';
 		for (const char c : arg.substr(1)) {
 			switch (c) {
 				case 'e': state.opts().exit_on_error = enable; break;
 				case 'u': state.opts().error_on_unset = enable; break;
 				case 'x': state.opts().trace = enable; break;
+				case 'f': state.opts().no_glob = enable; break;
 				default: break;
 			}
 		}
+	}
+
+	// Only replace the positional parameters when operands were actually given -
+	// bare `set -e` must not clear them, which is why this is conditional rather
+	// than unconditional.
+	if (argv[i] != nullptr || (i > 1 && std::string_view{argv[i - 1]} == "--")) {
+		std::vector<std::string> positional;
+		for (; argv[i] != nullptr; ++i)
+			positional.emplace_back(argv[i]);
+		state.set_positional(std::move(positional));
+	}
+	return {0};
+}
+
+builtin_result builtin_shift(shell_state& state, char** argv) {
+	const size_t n = argv[1] != nullptr ? static_cast<size_t>(std::atoi(argv[1])) : 1;
+	if (!state.shift_positional(n)) {
+		std::fprintf(stderr, "lesh: shift: can't shift that many\n");
+		return {1};
 	}
 	return {0};
 }
@@ -227,7 +255,7 @@ constexpr entry kBuiltins[] = {
 	{"pwd", builtin_pwd},     {"cd", builtin_cd},       {":", builtin_colon},
 	{"exit", builtin_exit},   {"export", builtin_export}, {"unset", builtin_unset},
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
-	{"return", builtin_return},
+	{"return", builtin_return}, {"shift", builtin_shift},
 };
 
 } // namespace

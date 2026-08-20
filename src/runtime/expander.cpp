@@ -23,15 +23,100 @@ bool is_ifs(char c, std::string_view ifs) noexcept {
 	return ifs.find(c) != std::string_view::npos;
 }
 
-// The name inside a parameter segment: `$name` or `${name}`.
-std::string_view parameter_name(std::string_view segment) noexcept {
+// The body of a parameter segment: what sits between `${` and `}`, or after `$`.
+std::string_view parameter_body(std::string_view segment) noexcept {
 	if (segment.size() >= 2 && segment[1] == '{') {
-		const size_t close = segment.find('}');
-		if (close == std::string_view::npos)
+		const size_t close = segment.rfind('}');
+		if (close == std::string_view::npos || close < 2)
 			return segment.substr(2);
 		return segment.substr(2, close - 2);
 	}
 	return segment.substr(1);
+}
+
+// How a ${...} form modifies the value. POSIX's set, with the colon variants
+// distinguishing "unset" from "unset or empty" - a real difference: `${x:-d}`
+// substitutes for an empty x while `${x-d}` does not.
+enum class param_op {
+	none,
+	length,        // ${#x}
+	use_default,   // ${x-d}  ${x:-d}
+	assign_default,// ${x=d}  ${x:=d}
+	error_if_unset,// ${x?m}  ${x:?m}
+	use_alternate, // ${x+d}  ${x:+d}
+	trim_prefix_short,  // ${x#pat}
+	trim_prefix_long,   // ${x##pat}
+	trim_suffix_short,  // ${x%pat}
+	trim_suffix_long,   // ${x%%pat}
+};
+
+struct parsed_parameter {
+	std::string_view name;
+	param_op op = param_op::none;
+	std::string_view argument;
+	bool colon = false;  // the colon variants also treat empty as unset
+};
+
+parsed_parameter parse_parameter(std::string_view body) noexcept {
+	parsed_parameter out;
+	if (body.empty())
+		return out;
+
+	// A body that is exactly one special parameter is a NAME, not an operator.
+	// `$?` is the exit status; `${x?msg}` is the error-if-unset form. Without this
+	// the operator scan reads `?` as the operator and leaves an empty name, which
+	// turned `echo $?` into "parameter null or not set".
+	if (body.size() == 1) {
+		switch (body[0]) {
+			case '?': case '#': case '$': case '!': case '@': case '*': case '-':
+				out.name = body;
+				return out;
+			default:
+				break;
+		}
+		if (body[0] >= '0' && body[0] <= '9') {
+			out.name = body;
+			return out;
+		}
+	}
+
+	if (body[0] == '#' && body.size() > 1) {
+		// ${#x} is length - but `$#` alone is the positional count, which reaches
+		// here as a bare name rather than through this branch.
+		out.op = param_op::length;
+		out.name = body.substr(1);
+		return out;
+	}
+
+	// Scan for the operator, which starts after the name.
+	size_t at = 0;
+	while (at < body.size() && body[at] != ':' && body[at] != '-' && body[at] != '=' &&
+	       body[at] != '?' && body[at] != '+' && body[at] != '#' && body[at] != '%')
+		++at;
+
+	out.name = body.substr(0, at);
+	if (at >= body.size())
+		return out;
+
+	if (body[at] == ':' && at + 1 < body.size()) {
+		out.colon = true;
+		++at;
+	}
+
+	const char op = body[at];
+	const bool doubled = at + 1 < body.size() && body[at + 1] == op;
+	switch (op) {
+		case '-': out.op = param_op::use_default; break;
+		case '=': out.op = param_op::assign_default; break;
+		case '?': out.op = param_op::error_if_unset; break;
+		case '+': out.op = param_op::use_alternate; break;
+		case '#': out.op = doubled ? param_op::trim_prefix_long : param_op::trim_prefix_short; break;
+		case '%': out.op = doubled ? param_op::trim_suffix_long : param_op::trim_suffix_short; break;
+		default: return out;
+	}
+	at += doubled ? 2 : 1;
+	out.argument = at <= body.size() ? body.substr(at) : std::string_view{};
+	return out;
 }
 
 // The code inside `$(...)` or backticks.
@@ -81,6 +166,51 @@ void expander::finish_field(arena_array<std::string_view>& out) noexcept {
 	out.push(std::string_view(block, n));
 	_current->truncate(0);
 	_field_started = false;
+}
+
+// Resolves a parameter name, including the special ones. `$?`, `$#`, `$$` and
+// `$1` are not variables and are not in the variable table.
+bool expander::lookup_parameter(std::string_view name, std::string_view& out) noexcept {
+	if (name.empty())
+		return false;
+
+	if (name == "?") {
+		out = int_to_scratch(_params.last_status_value());
+		return true;
+	}
+	if (name == "#") {
+		out = int_to_scratch(static_cast<int>(_params.positional_count()));
+		return true;
+	}
+	if (name == "$") {
+		out = int_to_scratch(_params.process_id_value());
+		return true;
+	}
+	if (name == "0") {
+		out = _params.script_name_value();
+		return true;
+	}
+	if (name[0] >= '1' && name[0] <= '9') {
+		size_t index = 0;
+		for (const char c : name) {
+			if (c < '0' || c > '9')
+				return _params.lookup(name, out);
+			index = index * 10 + static_cast<size_t>(c - '0');
+		}
+		return _params.positional_at(index, out);
+	}
+	return _params.lookup(name, out);
+}
+
+// Formats an integer into arena storage so the returned view outlives the call.
+std::string_view expander::int_to_scratch(int value) noexcept {
+	char digits[24];
+	const int n = std::snprintf(digits, sizeof(digits), "%d", value);
+	const size_t len = n > 0 ? static_cast<size_t>(n) : 0;
+	char* block = nullptr;
+	_pool.allocate(len == 0 ? 1 : len, block, 1);
+	std::memcpy(block, digits, len);
+	return {block, len};
 }
 
 expansion_status expander::expand_text(std::string_view text, bool quoted,
@@ -140,19 +270,151 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 			} break;
 
 			case token_kind::seg_parameter: {
-				std::string_view value;
-				if (_params.lookup(parameter_name(body), value)) {
-					if (quoted) {
-						append(value);
+				const std::string_view pbody = parameter_body(body);
+				const parsed_parameter p = parse_parameter(pbody);
+
+				// $@ and $* are the only expansions whose FIELD COUNT depends on
+				// quoting: "$@" produces one field per positional parameter, while
+				// "$*" produces exactly one, joined by the first character of IFS.
+				// Getting this wrong breaks every argument-forwarding script ever
+				// written, which is why it is handled before anything else.
+				if (p.op == param_op::none && (p.name == "@" || p.name == "*")) {
+					const size_t count = _params.positional_count();
+					if (quoted && p.name == "@") {
+						for (size_t i = 1; i <= count; ++i) {
+							std::string_view arg;
+							if (!_params.positional_at(i, arg))
+								continue;
+							if (i > 1)
+								finish_field(out);   // one field each
+							append(arg);
+						}
+					} else if (quoted) {  // "$*"
+						const std::string_view sep = _params.ifs();
+						const char joiner = sep.empty() ? '\0' : sep[0];
+						for (size_t i = 1; i <= count; ++i) {
+							std::string_view arg;
+							if (!_params.positional_at(i, arg))
+								continue;
+							if (i > 1 && joiner != '\0')
+								append(std::string_view(&joiner, 1));
+							append(arg);
+						}
+						_field_started = true;
 					} else {
-						// POSIX: the RESULT of an unquoted expansion is subject to
-						// pathname expansion, so `x='*.txt'; echo $x` globs.
-						if (has_pattern_characters(value))
-							_field_globbable = true;
-						append_split(value, out);
+						// Unquoted, both behave alike: split like any other expansion.
+						for (size_t i = 1; i <= count; ++i) {
+							std::string_view arg;
+							if (!_params.positional_at(i, arg))
+								continue;
+							if (i > 1)
+								finish_field(out);
+							append_split(arg, out);
+						}
 					}
+					break;
 				}
-				// Unset expands to nothing. Unquoted, that means no field at all.
+
+				std::string_view value;
+				bool found = lookup_parameter(p.name, value);
+
+				if (p.op == param_op::length) {
+					// ${#x} is the length in bytes; ${#@} and ${#*} the count.
+					size_t n = 0;
+					if (p.name == "@" || p.name == "*")
+						n = _params.positional_count();
+					else if (found)
+						n = value.size();
+					char digits[24];
+					const int written = std::snprintf(digits, sizeof(digits), "%zu", n);
+					append(std::string_view(digits, written > 0 ? static_cast<size_t>(written) : 0));
+					break;
+				}
+
+				// The colon variants treat an EMPTY value as unset. Without the
+				// colon only a genuinely unset parameter qualifies - a real
+				// difference that `${x:-d}` versus `${x-d}` turns on.
+				const bool absent = !found || (p.colon && value.empty());
+
+				switch (p.op) {
+					case param_op::use_default:
+						if (absent) {
+							const std::string_view d = expand_assignment_value(p.argument);
+							if (quoted) append(d); else append_split(d, out);
+							break;
+						}
+						goto substitute_value;
+
+					case param_op::assign_default:
+						if (absent) {
+							const std::string_view d = expand_assignment_value(p.argument);
+							if (_assign != nullptr)
+								_assign->assign_parameter(p.name, d);
+							if (quoted) append(d); else append_split(d, out);
+							break;
+						}
+						goto substitute_value;
+
+					case param_op::use_alternate:
+						if (!absent) {
+							const std::string_view d = expand_assignment_value(p.argument);
+							if (quoted) append(d); else append_split(d, out);
+						}
+						break;
+
+					case param_op::error_if_unset:
+						if (absent) {
+							const std::string_view message =
+								p.argument.empty() ? std::string_view{"parameter null or not set"}
+								                   : expand_assignment_value(p.argument);
+							std::fprintf(stderr, "lesh: %.*s: %.*s\n",
+							             static_cast<int>(p.name.size()), p.name.data(),
+							             static_cast<int>(message.size()), message.data());
+							status = expansion_status::parameter_unset;
+							break;
+						}
+						goto substitute_value;
+
+					case param_op::trim_prefix_short:
+					case param_op::trim_prefix_long:
+					case param_op::trim_suffix_short:
+					case param_op::trim_suffix_long: {
+						if (!found)
+							break;
+						// The pattern is expanded but NOT globbed - it is a pattern,
+						// not a filename. The matcher is #23's, shared with `case`.
+						const std::string_view pat = expand_assignment_value(p.argument);
+						std::string_view result = value;
+						const bool prefix = p.op == param_op::trim_prefix_short ||
+						                    p.op == param_op::trim_prefix_long;
+						const bool longest = p.op == param_op::trim_prefix_long ||
+						                     p.op == param_op::trim_suffix_long;
+						const size_t n = prefix ? match_prefix(pat, value, longest)
+						                        : match_suffix(pat, value, longest);
+						if (n != no_match && n > 0) {
+							result = prefix ? value.substr(n)
+							                : value.substr(0, value.size() - n);
+						}
+						if (quoted) append(result); else append_split(result, out);
+						break;
+					}
+
+					case param_op::none:
+					substitute_value:
+						if (found) {
+							if (quoted) {
+								append(value);
+							} else {
+								if (has_pattern_characters(value))
+									_field_globbable = true;
+								append_split(value, out);
+							}
+						}
+						break;
+
+					default:
+						break;
+				}
 			} break;
 
 			case token_kind::seg_tilde: {

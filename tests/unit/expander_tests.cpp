@@ -31,6 +31,30 @@ public:
 	}
 	std::string_view home_directory() const override { return home; }
 	std::string_view ifs() const override { return separators; }
+
+	// Special and positional parameters.
+	std::vector<std::string> args;
+	int status = 0;
+
+	int last_status_value() const override { return status; }
+	int process_id_value() const override { return 4242; }
+	size_t positional_count() const override { return args.size(); }
+	bool positional_at(size_t index, std::string_view& out) const override {
+		if (index == 0 || index > args.size())
+			return false;
+		out = args[index - 1];
+		return true;
+	}
+	std::string_view script_name_value() const override { return "lesh"; }
+};
+
+// Records ${x=default} assignments so tests can assert they happened.
+class FakeAssigner final : public parameter_assigner {
+public:
+	std::map<std::string, std::string> assigned;
+	void assign_parameter(std::string_view name, std::string_view value) override {
+		assigned[std::string(name)] = std::string(value);
+	}
 };
 
 // A runner that records what it was asked to execute, so tests can assert the
