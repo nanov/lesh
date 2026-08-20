@@ -1,0 +1,15 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+b=b
+bracket ${a-x$(echo -)x}
+bracket ${b+x$(echo -)x}
+bracket ${c=x$(echo -)x}
+(: ${a?x$(echo -)x}) 2>&1 | grep -Fq "x-x"; echo $?

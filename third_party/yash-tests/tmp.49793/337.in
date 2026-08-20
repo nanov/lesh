@@ -1,0 +1,20 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+w='ab\bc' a='*' b='\'
+bracket ${w#${a}b}  "${w#${a}b}"  ${w#"${a}b"}
+bracket ${w##${a}b} "${w##${a}b}" ${w##"${a}b"}
+bracket ${w%b${a}}  "${w%b${a}}"  ${w%"b${a}"}
+bracket ${w%%b${a}} "${w%%b${a}}" ${w%%"b${a}"}
+# XCU 2.9.4 implies unquoted backslashes are special in the pattern.
+bracket ${w#*${b}b}  "${w#*${b}b}"  ${w#"*${b}b"}
+bracket ${w##*${b}b} "${w##*${b}b}" ${w##"*${b}b"}
+bracket ${w%${b}b*}  "${w%${b}b*}"  ${w%"${b}b*"}
+bracket ${w%%${b}b*} "${w%%${b}b*}" ${w%%"${b}b*"}

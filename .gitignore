@@ -62,3 +62,6 @@ compile_commands.json
 
 # Serena tool state
 .serena/
+
+# yash suite results, regenerated on every run
+third_party/yash-tests/*.trs
