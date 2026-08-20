@@ -72,7 +72,7 @@ x=value; echo $x
 --- function definition and call [xfail: #25 - functions]
 greet() { echo hello; }; greet
 
---- here-document [xfail: #21 - here-documents]
+--- here-document [xfail(legacy): legacy has no here-documents]
 cat <<EOT
 body
 EOT
@@ -142,3 +142,31 @@ d=$(mktemp -d); echo one > $d/a > $d/b; cat $d/b
 
 --- a builtin's redirection does not leak into the shell [xfail(legacy): legacy ignores redirect nodes entirely]
 d=$(mktemp -d); pwd > $d/p; cat $d/p > /dev/null; echo still-here
+
+--- here-document body is expanded when the delimiter is unquoted [xfail(legacy): legacy has no here-documents]
+x=world; cat <<EOT
+hello $x
+EOT
+
+--- a quoted delimiter suppresses expansion [xfail(legacy): legacy has no here-documents]
+cat <<'EOT'
+hello $x
+EOT
+
+--- two here-documents on one line, in order [xfail(legacy): legacy has no here-documents]
+cat <<A; cat <<B
+first
+A
+second
+B
+
+--- a here-document feeds a pipeline [xfail(legacy): legacy has no here-documents]
+cat <<EOT | wc -l
+a
+b
+c
+EOT
+
+--- an empty here-document body [xfail(legacy): legacy has no here-documents]
+cat <<EOT
+EOT

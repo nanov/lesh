@@ -69,6 +69,8 @@ private:
 	bool consume_loop_flow(bool& should_break);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
+	bool apply_here_doc(const syntax::tree& t, syntax::node_index n,
+	                    arena_array<saved_fd>* restore);
 	bool apply_redirections(const syntax::tree& t, syntax::node_index command,
 	                        arena_array<saved_fd>* restore);
 	void restore_fds(arena_array<saved_fd>& saved);

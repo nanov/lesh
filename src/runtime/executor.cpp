@@ -170,7 +170,7 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 			return true;
 		}
 		default:
-			return true;  // here-documents are #21
+			return true;
 	}
 
 	if (opened == -1) {
@@ -191,11 +191,97 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 
 // Applies every redirection on a command, LEFT TO RIGHT. The order is
 // observable: `>a >b` leaves the fd pointing at b while creating both files.
+// Feeds a here-document body to stdin.
+//
+// Written into a pipe rather than a temporary file: no filesystem, no cleanup,
+// and no window where a signal leaves a stray file behind. The cost is the pipe
+// buffer - a body larger than it would block, so this forks a writer for exactly
+// that case rather than assuming bodies are small.
+bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
+                                           arena_array<saved_fd>* restore) {
+	const syntax::here_doc_body& body = t.here_doc_at(t[n].aux);
+	std::string_view text = t.here_doc_text(t[n].aux);
+
+	// `<<-` strips leading tabs from every line of the body.
+	std::string stripped;
+	if (body.strip_tabs) {
+		stripped.reserve(text.size());
+		bool at_line_start = true;
+		for (const char c : text) {
+			if (at_line_start && c == '\t')
+				continue;
+			stripped += c;
+			at_line_start = c == '\n';
+		}
+		text = stripped;
+	}
+
+	// An unquoted delimiter means the body is expanded: parameters, command
+	// substitution and arithmetic, but NOT field splitting or pathname expansion
+	// - the body is one blob of text, not a word list.
+	std::string expanded;
+	if (body.expand) {
+		expander ex{_pool, _state, &_runner, /*glob_enabled=*/false};
+		const std::string_view result = ex.expand_assignment_value(text);
+		expanded.assign(result);
+		text = expanded;
+	}
+
+	int pipe_fds[2];
+	if (pipe(pipe_fds) == -1) {
+		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		return false;
+	}
+
+	if (restore != nullptr) {
+		const int saved = dup(STDIN_FILENO);
+		if (saved != -1)
+			restore->push({STDIN_FILENO, saved});
+	}
+
+	// A body that fits the pipe buffer is written directly; a larger one needs a
+	// writer process, or the write blocks before the reader has been started.
+	long buffer_capacity = fpathconf(pipe_fds[1], _PC_PIPE_BUF);
+	if (buffer_capacity <= 0)
+		buffer_capacity = 512;
+	if (text.size() <= static_cast<size_t>(buffer_capacity)) {
+		if (!text.empty())
+			(void)!write(pipe_fds[1], text.data(), text.size());
+		close(pipe_fds[1]);
+	} else {
+		std::fflush(nullptr);
+		const pid_t writer = fork();
+		if (writer == 0) {
+			setpgid(0, 0);
+			close(pipe_fds[0]);
+			size_t written = 0;
+			while (written < text.size()) {
+				const ssize_t n = write(pipe_fds[1], text.data() + written, text.size() - written);
+				if (n <= 0)
+					break;
+				written += static_cast<size_t>(n);
+			}
+			close(pipe_fds[1]);
+			_exit(0);
+		}
+		close(pipe_fds[1]);
+	}
+
+	dup2(pipe_fds[0], STDIN_FILENO);
+	close(pipe_fds[0]);
+	return true;
+}
+
 bool tree_walking_executor::apply_redirections(const tree& t, node_index command,
                                                arena_array<saved_fd>* restore) {
 	const node& self = t[command];
 	for (uint32_t i = 0; i < self.children_count; ++i) {
 		const node_index child = t.child_of(self, i);
+		if (t[child].kind == node_kind::here_doc) {
+			if (!apply_here_doc(t, child, restore))
+				return false;
+			continue;
+		}
 		if (t[child].kind != node_kind::redirect)
 			continue;
 		if (!apply_redirection(t, child, restore))

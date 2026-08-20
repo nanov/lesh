@@ -54,6 +54,10 @@ enum class node_kind : uint16_t {
 	case_item,       // children: [pattern, pattern, ..., body]; `aux` = pattern count
 	subshell,        // children: [compound_list] - runs in its own environment
 	brace_group,     // children: [compound_list] - runs in this one
+	// A here-document. `aux` packs the body's source range, recorded separately
+	// from the node's token range because the body is not made of tokens - the
+	// lexer never sees it. See here_doc_body below.
+	here_doc,
 };
 
 enum class parse_error : uint16_t {
@@ -83,6 +87,21 @@ struct node {
 
 static_assert(sizeof(node) == 24, "nodes are the bulk of the tree; the size is a cache property");
 
+// Where a here-document's body lives in the source, and how to treat it.
+//
+// The lexer emits only the operator and the delimiter; the BODY is collected by
+// the parser and recorded as a plain source range. That is what keeps the lexer
+// pure: zsh's lexer performs I/O to read here-doc bodies and mksh's runs the
+// expander on the delimiter, while Oils keeps bodies as re-parseable lines behind
+// a reader. This is the Oils shape, minus the reader, because the parser already
+// has the whole buffer.
+struct here_doc_body {
+	uint32_t offset = 0;
+	uint32_t length = 0;
+	bool expand = true;   // false when the delimiter was quoted: <<'EOF'
+	bool strip_tabs = false;  // <<- strips leading tabs from every line
+};
+
 // Byte range in the source. Derived from the token range rather than stored, so
 // there is exactly one representation and it cannot drift.
 struct span {
@@ -97,11 +116,23 @@ struct span {
 class tree {
 public:
 	tree(buffer_pool& pool, std::string_view source) noexcept
-		: _source(source), _nodes(pool, 32), _children(pool, 64), _tokens(pool, 32) {}
+		: _source(source), _nodes(pool, 32), _children(pool, 64), _tokens(pool, 32),
+		  _here_docs(pool, 4) {}
 
 	// --- construction ---------------------------------------------------------
 
 	uint32_t add_token(const token& t) noexcept { return _tokens.push(t); }
+
+	// Here-doc bodies are stored separately and referenced by index from a
+	// here_doc node's `aux`, because a body is a source range rather than tokens.
+	uint32_t add_here_doc(const here_doc_body& b) noexcept { return _here_docs.push(b); }
+	[[nodiscard]] const here_doc_body& here_doc_at(uint32_t i) const noexcept {
+		return _here_docs[i];
+	}
+	[[nodiscard]] std::string_view here_doc_text(uint32_t i) const noexcept {
+		const here_doc_body& b = _here_docs[i];
+		return _source.substr(b.offset, b.length);
+	}
 
 	node_index add_node(node n) noexcept { return _nodes.push(n); }
 
@@ -196,6 +227,7 @@ private:
 	arena_array<node> _nodes;
 	arena_array<uint32_t> _children;
 	arena_array<token> _tokens;
+	arena_array<here_doc_body> _here_docs;
 	node_index _root = no_node;
 	bool _incomplete = false;
 };

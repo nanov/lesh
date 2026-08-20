@@ -3,6 +3,7 @@
 #include "substrate/char_utils.h"
 
 #include <utility>
+#include <vector>
 
 namespace lesh::syntax {
 
@@ -394,6 +395,16 @@ private:
 		_index = _tree.add_token(_lexer.next(lex_mode::command));
 		if (_lexer.incomplete())
 			_tree.set_incomplete(true);
+
+		// A here-doc body begins after the newline that ends the command line.
+		// Collect the pending ones and resume past them, so the body is never
+		// lexed as commands.
+		if (!_pending_here_docs.empty() &&
+		    _tree.token_at(_index).kind == token_kind::newline) {
+			const uint32_t resume = collect_here_doc_bodies(
+				_tree.token_at(_index).end_offset());
+			_lexer.seek(resume);
+		}
 	}
 	[[nodiscard]] const token& peek() const noexcept { return _tree.token_at(_index); }
 	uint32_t advance() noexcept {
@@ -498,6 +509,91 @@ private:
 		return _tree.add_node(n);
 	}
 
+	// A here-document whose delimiter has been seen but whose body has not been
+	// collected yet. POSIX puts the body after the NEXT newline, not after the
+	// operator, so `cat <<A <<B` collects both bodies in order once the line ends.
+	struct pending_here_doc {
+		node_index node;
+		uint32_t delimiter_token;
+	};
+
+	// Collects every pending here-doc body, starting at `from`. Returns where the
+	// last body ended so lexing can resume past it.
+	//
+	// The parser does this, not the lexer. The lexer never reads and never seeks
+	// on its own - it is handed a buffer and a position, which is exactly what
+	// makes it safe to run on every keystroke over an editor's buffer.
+	uint32_t collect_here_doc_bodies(uint32_t from) noexcept {
+		const std::string_view src = _tree.source();
+		uint32_t at = from;
+
+		for (const auto& pending : _pending_here_docs) {
+			const std::string_view raw = text_of_token(pending.delimiter_token);
+
+			// A quoted delimiter suppresses expansion in the body: <<'EOF' is
+			// literal, <<EOF is expanded. The lexer already recorded whether the
+			// word was literal, so this needs no re-scanning.
+			const bool quoted = (_tree.token_at(pending.delimiter_token).flags &
+			                     syntax::flag_literal) == 0;
+			std::string_view delimiter = raw;
+			if (!delimiter.empty() && (delimiter.front() == '\'' || delimiter.front() == '"') &&
+			    delimiter.size() >= 2 && delimiter.back() == delimiter.front())
+				delimiter = delimiter.substr(1, delimiter.size() - 2);
+
+			node& n = const_cast<node&>(_tree[pending.node]);
+			const bool strip = n.error == parse_error::none && _strip_tabs_for.size() > 0
+			                   ? false : false;
+			(void)strip;
+
+			const uint32_t body_start = at;
+			uint32_t body_end = at;
+			bool terminated = false;
+
+			while (at <= src.size()) {
+				const size_t nl = src.find('\n', at);
+				const std::string_view line = src.substr(
+					at, nl == std::string_view::npos ? std::string_view::npos : nl - at);
+
+				// <<- strips leading tabs from the body AND from the delimiter line.
+				std::string_view compared = line;
+				if (n.aux != 0xFFFFFFFFu && _tree.here_doc_at(n.aux).strip_tabs)
+					while (!compared.empty() && compared.front() == '\t')
+						compared.remove_prefix(1);
+
+				if (compared == delimiter) {
+					terminated = true;
+					at = nl == std::string_view::npos ? static_cast<uint32_t>(src.size())
+					                                  : static_cast<uint32_t>(nl + 1);
+					break;
+				}
+				if (nl == std::string_view::npos) {
+					body_end = static_cast<uint32_t>(src.size());
+					at = body_end;
+					break;
+				}
+				body_end = static_cast<uint32_t>(nl + 1);
+				at = body_end;
+			}
+
+			if (!terminated) {
+				// An unterminated here-doc is INCOMPLETE, not malformed: an
+				// interactive shell answers it with a continuation prompt.
+				_tree.set_incomplete(true);
+			}
+
+			syntax::here_doc_body body{};
+			body.offset = body_start;
+			body.length = body_end > body_start ? body_end - body_start : 0;
+			body.expand = !quoted;
+			body.strip_tabs = n.aux != 0xFFFFFFFFu && _tree.here_doc_at(n.aux).strip_tabs;
+			// Overwrite the placeholder recorded when the operator was seen.
+			const_cast<syntax::here_doc_body&>(_tree.here_doc_at(n.aux)) = body;
+		}
+
+		_pending_here_docs.clear();
+		return at;
+	}
+
 	node_index parse_redirect() noexcept {
 		const uint32_t first = _index;
 		uint32_t fd = 0xFFFFFFFFu;  // unspecified: the operator's default applies
@@ -513,7 +609,38 @@ private:
 		if (!is_redirect_operator(peek().kind))
 			return error_node(advance(), parse_error::unexpected_operator);
 
+		const token_kind op = peek().kind;
 		advance();  // the operator
+
+		if (op == token_kind::dless || op == token_kind::dless_dash) {
+			if (peek().kind != token_kind::word) {
+				node n;
+				n.kind = node_kind::error;
+				n.error = parse_error::missing_operand;
+				n.first_token = first;
+				n.last_token = _index > first ? _index - 1 : first;
+				return _tree.add_node(n);
+			}
+			// The pending record MUST be pushed before advancing past the
+			// delimiter. advance() lexes the next token, and if that token is the
+			// newline, fill() collects bodies right then - so pushing afterwards
+			// means fill() sees an empty list and the body gets lexed as commands.
+			const uint32_t delimiter = _index;
+
+			syntax::here_doc_body placeholder{};
+			placeholder.strip_tabs = op == token_kind::dless_dash;
+			node n;
+			n.kind = node_kind::here_doc;
+			n.first_token = first;
+			n.last_token = delimiter;
+			n.aux = _tree.add_here_doc(placeholder);
+			const node_index node = _tree.add_node(n);
+			// The body starts after the next newline, so it cannot be collected
+			// here - the rest of this line may hold more redirections.
+			_pending_here_docs.push_back({node, delimiter});
+			advance();
+			return node;
+		}
 
 		if (peek().kind != token_kind::word) {
 			// `echo >` - an operator with nothing to redirect to.
@@ -565,6 +692,8 @@ private:
 	lexer _lexer;
 	tree _tree;
 	arena_array<node_index> _scratch;
+	std::vector<pending_here_doc> _pending_here_docs;
+	std::vector<uint32_t> _strip_tabs_for;
 	uint32_t _index = 0;
 };
 

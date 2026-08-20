@@ -49,6 +49,13 @@ public:
 	[[nodiscard]] constexpr bool incomplete() const noexcept { return _incomplete; }
 
 	[[nodiscard]] constexpr uint32_t position() const noexcept { return _position; }
+
+	// Resumes lexing at a different offset. The parser uses this to skip a
+	// here-document body it has already collected: the lexer never reads input
+	// itself, so somebody has to tell it where the body ended. That the lexer is
+	// restartable at ANY offset (#9) is what makes this a one-liner rather than a
+	// second input path.
+	constexpr void seek(uint32_t position) noexcept { _position = position; }
 	[[nodiscard]] constexpr std::string_view source() const noexcept { return _source; }
 
 	// The bytes a token spans. Borrowed from the source, never copied.
