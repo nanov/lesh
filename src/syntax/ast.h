@@ -36,6 +36,24 @@ enum class node_kind : uint16_t {
 	word,            // one word of a command
 	assignment,      // NAME=value preceding a command
 	redirect,        // an operator with its target
+
+	// --- compound commands (#19) ---------------------------------------------
+	// A sequence of and_or lists. The body of every construct below, and what
+	// `program` itself is - so the same walker handles all of them.
+	compound_list,
+	// children: [cond, body, cond, body, ..., else_body?]
+	// `aux` holds the number of (cond, body) pairs, so the optional trailing else
+	// is whatever remains. That beats a distinct node kind per elif depth.
+	if_clause,
+	while_loop,      // children: [cond, body]
+	until_loop,      // children: [cond, body]
+	// children: [word, word, ..., body]. `aux` is the token index of the loop
+	// variable's name; the body is always the last child.
+	for_loop,
+	case_clause,     // children: [subject, case_item, case_item, ...]
+	case_item,       // children: [pattern, pattern, ..., body]; `aux` = pattern count
+	subshell,        // children: [compound_list] - runs in its own environment
+	brace_group,     // children: [compound_list] - runs in this one
 };
 
 enum class parse_error : uint16_t {

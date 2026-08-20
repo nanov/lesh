@@ -26,6 +26,35 @@ bool looks_like_assignment(std::string_view text) noexcept {
 	return false;
 }
 
+// Reserved words are recognised by POSITION, not lexically. `if` is a keyword in
+// command position and an ordinary argument elsewhere - `echo if` prints `if`.
+// The lexer deliberately has no reserved-word token kind (#9); this is where the
+// decision lives, and it is the caller the mode channel was designed for.
+enum class reserved {
+	none, kw_if, kw_then, kw_elif, kw_else, kw_fi,
+	kw_while, kw_until, kw_do, kw_done,
+	kw_for, kw_in, kw_case, kw_esac, kw_lbrace, kw_rbrace,
+};
+
+reserved reserved_of(std::string_view text) noexcept {
+	if (text == "if") return reserved::kw_if;
+	if (text == "then") return reserved::kw_then;
+	if (text == "elif") return reserved::kw_elif;
+	if (text == "else") return reserved::kw_else;
+	if (text == "fi") return reserved::kw_fi;
+	if (text == "while") return reserved::kw_while;
+	if (text == "until") return reserved::kw_until;
+	if (text == "do") return reserved::kw_do;
+	if (text == "done") return reserved::kw_done;
+	if (text == "for") return reserved::kw_for;
+	if (text == "in") return reserved::kw_in;
+	if (text == "case") return reserved::kw_case;
+	if (text == "esac") return reserved::kw_esac;
+	if (text == "{") return reserved::kw_lbrace;
+	if (text == "}") return reserved::kw_rbrace;
+	return reserved::none;
+}
+
 constexpr bool is_redirect_operator(token_kind k) noexcept {
 	switch (k) {
 		case token_kind::less: case token_kind::great: case token_kind::dless:
@@ -94,6 +123,270 @@ private:
 		return k == token_kind::newline || k == token_kind::semi || k == token_kind::amp;
 	}
 
+	[[nodiscard]] reserved peek_reserved() const noexcept {
+		const token& t = peek();
+		if (t.kind != token_kind::word || t.is_error())
+			return reserved::none;
+		// A quoted or expanded word is never a keyword: `"if"` and `$x` are
+		// arguments however they spell out. flag_literal is exactly that test, and
+		// the lexer already computed it.
+		if ((t.flags & syntax::flag_literal) == 0)
+			return reserved::none;
+		return reserved_of(text_of_token(_index));
+	}
+
+	// True for words that close or continue a construct, so a command list stops
+	// rather than swallowing them as arguments.
+	[[nodiscard]] bool at_list_terminator() const noexcept {
+		switch (peek_reserved()) {
+			case reserved::kw_then: case reserved::kw_elif: case reserved::kw_else:
+			case reserved::kw_fi:   case reserved::kw_do:   case reserved::kw_done:
+			case reserved::kw_esac: case reserved::kw_rbrace:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	// Consumes a reserved word if it is next. Recovery depends on this returning
+	// false rather than throwing: `if x; then y` with no `fi` must still parse.
+	bool accept(reserved want) noexcept {
+		if (peek_reserved() != want)
+			return false;
+		advance();
+		return true;
+	}
+
+	// A sequence of and_or lists, ending at a terminator or end of input. The body
+	// of every compound command, and what `program` is - so one walker handles all.
+	node_index parse_compound_list() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+
+		// `)` closes a subshell or a case pattern, and `;;` ends a case item. Both
+		// end a compound list without being reserved words, and without them the
+		// list loops making no progress and error-nodes the closer.
+		while (peek().kind != token_kind::end &&
+		       peek().kind != token_kind::rparen &&
+		       peek().kind != token_kind::dsemi &&
+		       !at_list_terminator()) {
+			if (is_separator(peek().kind)) {
+				advance();
+				continue;
+			}
+			const uint32_t before = _index;
+			_scratch.push(parse_and_or());
+			if (_index == before)  // progress guarantee, as in parse_program
+				_scratch.push(error_node(advance(), parse_error::unexpected_operator));
+		}
+
+		node n;
+		n.kind = node_kind::compound_list;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_if() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `if`
+		uint32_t pairs = 0;
+
+		for (;;) {
+			_scratch.push(parse_compound_list());   // condition
+			if (!accept(reserved::kw_then))
+				break;
+			_scratch.push(parse_compound_list());   // body
+			++pairs;
+			if (!accept(reserved::kw_elif))
+				break;
+		}
+		if (accept(reserved::kw_else))
+			_scratch.push(parse_compound_list());
+		accept(reserved::kw_fi);
+
+		node n;
+		n.kind = node_kind::if_clause;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		n.aux = pairs;  // how many (condition, body) pairs; anything after is else
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_while_or_until(bool is_until) noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `while` / `until`
+
+		_scratch.push(parse_compound_list());  // condition
+		if (accept(reserved::kw_do))
+			_scratch.push(parse_compound_list());  // body
+		accept(reserved::kw_done);
+
+		node n;
+		n.kind = is_until ? node_kind::until_loop : node_kind::while_loop;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_for() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `for`
+
+		uint32_t name_token = _index;
+		if (peek().kind == token_kind::word)
+			name_token = advance();
+
+		// `for x; do ...` iterates the positional parameters; `for x in a b; do`
+		// iterates the listed words.
+		if (accept(reserved::kw_in)) {
+			while (peek().kind == token_kind::word && peek_reserved() == reserved::none) {
+				const uint32_t at = advance();
+				node w;
+				w.kind = node_kind::word;
+				w.first_token = at;
+				w.last_token = at;
+				_scratch.push(_tree.add_node(w));
+			}
+		}
+		while (is_separator(peek().kind))
+			advance();
+
+		if (accept(reserved::kw_do))
+			_scratch.push(parse_compound_list());
+		accept(reserved::kw_done);
+
+		node n;
+		n.kind = node_kind::for_loop;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		n.aux = name_token;  // the loop variable's name token
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_case() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `case`
+
+		if (peek().kind == token_kind::word) {   // the subject
+			const uint32_t at = advance();
+			node w;
+			w.kind = node_kind::word;
+			w.first_token = at;
+			w.last_token = at;
+			_scratch.push(_tree.add_node(w));
+		}
+		accept(reserved::kw_in);
+		while (is_separator(peek().kind))
+			advance();
+
+		while (peek().kind != token_kind::end && peek_reserved() != reserved::kw_esac) {
+			const uint32_t item_first = _index;
+			const uint32_t item_mark = mark_scratch();
+			uint32_t patterns = 0;
+
+			// An optional leading '(' is allowed before the first pattern.
+			if (peek().kind == token_kind::lparen)
+				advance();
+
+			while (peek().kind == token_kind::word) {
+				const uint32_t at = advance();
+				node w;
+				w.kind = node_kind::word;
+				w.first_token = at;
+				w.last_token = at;
+				_scratch.push(_tree.add_node(w));
+				++patterns;
+				if (peek().kind != token_kind::pipe)
+					break;
+				advance();  // `|` separates alternative patterns
+			}
+			if (peek().kind == token_kind::rparen)
+				advance();
+
+			_scratch.push(parse_compound_list());
+
+			node item;
+			item.kind = node_kind::case_item;
+			item.first_token = item_first;
+			item.last_token = _index > item_first ? _index - 1 : item_first;
+			item.aux = patterns;
+			commit_children(item, item_mark);
+			_scratch.push(_tree.add_node(item));
+
+			if (peek().kind == token_kind::dsemi)
+				advance();
+			while (is_separator(peek().kind))
+				advance();
+			if (_index == item_first)  // progress guarantee
+				break;
+		}
+		accept(reserved::kw_esac);
+
+		node n;
+		n.kind = node_kind::case_clause;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_brace_group() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `{`
+		_scratch.push(parse_compound_list());
+		accept(reserved::kw_rbrace);
+
+		node n;
+		n.kind = node_kind::brace_group;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	node_index parse_subshell() noexcept {
+		const uint32_t first = _index;
+		const uint32_t mark = mark_scratch();
+		advance();  // `(`
+		_scratch.push(parse_compound_list());
+		if (peek().kind == token_kind::rparen)
+			advance();
+
+		node n;
+		n.kind = node_kind::subshell;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
+	// Dispatches on what a command starts with. A reserved word here is a keyword;
+	// the same word after a command name is an argument, which is what makes
+	// `echo if` print `if`.
+	[[nodiscard]] node_index parse_command_or_compound() noexcept {
+		if (peek().kind == token_kind::lparen)
+			return parse_subshell();
+		switch (peek_reserved()) {
+			case reserved::kw_if:     return parse_if();
+			case reserved::kw_while:  return parse_while_or_until(false);
+			case reserved::kw_until:  return parse_while_or_until(true);
+			case reserved::kw_for:    return parse_for();
+			case reserved::kw_case:   return parse_case();
+			case reserved::kw_lbrace: return parse_brace_group();
+			default:                  return parse_command();
+		}
+	}
+
 	// One token of lookahead, lexed on demand so the parser keeps control of the
 	// lexer's mode. Lexing everything up front would surrender that, and the mode
 	// channel is the whole reason the lexer takes one.
@@ -133,10 +426,10 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 
-		_scratch.push(parse_command());
+		_scratch.push(parse_command_or_compound());
 		while (peek().kind == token_kind::pipe) {
 			advance();
-			_scratch.push(parse_command());
+			_scratch.push(parse_command_or_compound());
 		}
 
 		if (_scratch.size() - mark == 1) {
@@ -161,6 +454,13 @@ private:
 		bool seen_command_name = false;
 
 		while (!ends_command(peek().kind)) {
+			// A reserved word is only a keyword in COMMAND position. `echo done`
+			// prints `done`, while `echo yes; done` ends the loop - the `;` is what
+			// puts `done` back in command position. Checking every position made
+			// `echo done` a syntax error.
+			if (_scratch.size() == mark && at_list_terminator())
+				break;
+
 			const token& t = peek();
 
 			if (is_redirect_operator(t.kind) || t.kind == token_kind::io_number) {

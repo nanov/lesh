@@ -21,25 +21,25 @@ echo a > /tmp/lesh_spec_app && echo b >> /tmp/lesh_spec_app && cat /tmp/lesh_spe
 --- stderr redirection [xfail: #20]
 ls /nonexistent 2>/dev/null; echo done
 
---- if statement [xfail: #19 - compound commands]
+--- if statement [xfail(legacy): legacy has no compound commands]
 if true; then echo yes; fi
 
---- if else [xfail: #19]
+--- if else [xfail(legacy): legacy has no compound commands]
 if false; then echo yes; else echo no; fi
 
---- while loop [xfail: #19]
-i=0; while [ $i -lt 2 ]; do echo $i; i=$((i+1)); done
+--- while loop [xfail(legacy): legacy has no compound commands]
+i=0; while [ $i -lt 2 ]; do echo $i; i=$(expr $i + 1); done
 
---- for loop [xfail: #19]
+--- for loop [xfail(legacy): legacy has no compound commands]
 for x in a b c; do echo $x; done
 
---- case statement [xfail: #19]
+--- case statement [xfail(legacy): legacy has no compound commands]
 case abc in a*) echo matched;; *) echo no;; esac
 
---- subshell [xfail: #19]
+--- subshell [xfail(legacy): legacy has no compound commands]
 (echo inside)
 
---- brace group [xfail: #19]
+--- brace group [xfail(legacy): legacy has no compound commands]
 { echo grouped; }
 
 --- default value expansion [xfail: #22 - the ${...} family]
@@ -106,3 +106,24 @@ echo /tmp/definitely_no_match_here_zzz_*
 
 --- assignment values are expanded, not stored raw [xfail(legacy): legacy stores assignment values as raw source text]
 y=world; x="hello $y"; echo "[$x]"
+
+--- break leaves the loop [xfail(legacy): legacy has no compound commands]
+for x in a b c; do if [ $x = b ]; then break; fi; echo $x; done
+
+--- continue skips an iteration [xfail(legacy): legacy has no compound commands]
+for x in a b c; do if [ $x = b ]; then continue; fi; echo $x; done
+
+--- case patterns are not pathname-expanded [xfail(legacy): legacy has no compound commands]
+case xyz in a*) echo matched;; *) echo fallback;; esac
+
+--- alternative case patterns [xfail(legacy): legacy has no compound commands]
+case b in a|b|c) echo alt;; esac
+
+--- a subshell does not leak its changes [xfail(legacy): legacy has no compound commands]
+x=1; (x=2); echo $x
+
+--- a reserved word after a command name is an argument
+echo done fi esac
+
+--- until loops until true [xfail(legacy): legacy has no compound commands]
+until true; do echo never; done; echo after

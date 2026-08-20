@@ -1,6 +1,7 @@
 #include "runtime/executor.h"
 
 #include "runtime/builtins.h"
+#include "runtime/pattern.h"
 #include "substrate/assert.h"
 #include "syntax/parser.h"
 
@@ -92,6 +93,14 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 		case node_kind::simple_command: return run_simple_command(t, n);
 		case node_kind::pipeline:       return run_pipeline(t, n);
 		case node_kind::and_or:         return run_and_or(t, n);
+		case node_kind::compound_list: return run_compound_list(t, n);
+		case node_kind::if_clause:     return run_if(t, n);
+		case node_kind::while_loop:    return run_loop(t, n, /*until=*/false);
+		case node_kind::until_loop:    return run_loop(t, n, /*until=*/true);
+		case node_kind::for_loop:      return run_for(t, n);
+		case node_kind::case_clause:   return run_case(t, n);
+		case node_kind::brace_group:   return run_compound_list(t, t.child_of(t[n], 0));
+		case node_kind::subshell:      return run_subshell(t, n);
 		case node_kind::error:
 			std::fprintf(stderr, "lesh: syntax error near '%.*s'\n",
 			             static_cast<int>(t.text_of(t[n]).size()), t.text_of(t[n]).data());
@@ -113,6 +122,188 @@ int tree_walking_executor::run_and_or(const tree& t, node_index n) {
 		return left;  // short-circuit
 
 	return run_node(t, t.child_of(self, 1));
+}
+
+int tree_walking_executor::run_compound_list(const tree& t, node_index n) {
+	const node& self = t[n];
+	int status = 0;
+	for (uint32_t i = 0; i < self.children_count; ++i) {
+		status = run_node(t, t.child_of(self, i));
+		_state.set_last_status(status);
+		// A break, continue or return unwinds through here rather than being
+		// swallowed: the enclosing loop or function is what decides to stop.
+		if (_flow != control_flow::normal || _exit_requested)
+			break;
+		if (status != 0 && _state.opts().exit_on_error)
+			break;
+	}
+	return status;
+}
+
+int tree_walking_executor::run_if(const tree& t, node_index n) {
+	const node& self = t[n];
+	const uint32_t pairs = self.aux;
+
+	for (uint32_t i = 0; i < pairs; ++i) {
+		const int cond = run_node(t, t.child_of(self, i * 2));
+		if (_flow != control_flow::normal || _exit_requested)
+			return cond;
+		// POSIX: a condition's status is TESTED, so `set -e` must not fire on it.
+		// That is why conditions run through run_node directly rather than through
+		// the exit_on_error path in run_compound_list's caller.
+		if (cond == 0)
+			return run_node(t, t.child_of(self, i * 2 + 1));
+	}
+
+	// Whatever follows the (condition, body) pairs is the else branch.
+	if (self.children_count > pairs * 2)
+		return run_node(t, t.child_of(self, pairs * 2));
+	// POSIX: an if with no matching branch has status zero, not the condition's.
+	return 0;
+}
+
+// True when a break or continue should stop this loop, decrementing the level so
+// `break 2` passes through the inner loop and stops the outer one.
+bool tree_walking_executor::consume_loop_flow(bool& should_break) {
+	if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop) {
+		should_break = _flow == control_flow::break_loop;
+		if (--_flow_level <= 0) {
+			_flow = control_flow::normal;
+			return true;  // handled here
+		}
+		return true;  // still unwinding, but this loop stops either way
+	}
+	return false;
+}
+
+int tree_walking_executor::run_loop(const tree& t, node_index n, bool until) {
+	const node& self = t[n];
+	if (self.children_count < 2)
+		return 0;
+
+	int status = 0;
+	// A guard against a runaway loop taking the machine down, which is exactly
+	// what an unbounded `while true` in a test harness would do.
+	for (uint64_t iteration = 0; iteration < kMaxLoopIterations; ++iteration) {
+		const int cond = run_node(t, t.child_of(self, 0));
+		if (_exit_requested)
+			return status;
+		if (_flow != control_flow::normal) {
+			bool should_break = false;
+			if (consume_loop_flow(should_break))
+				return status;
+		}
+		const bool keep_going = until ? (cond != 0) : (cond == 0);
+		if (!keep_going)
+			break;
+
+		status = run_node(t, t.child_of(self, 1));
+		if (_exit_requested)
+			return status;
+		if (_flow != control_flow::normal) {
+			bool should_break = false;
+			if (consume_loop_flow(should_break)) {
+				if (should_break || _flow != control_flow::normal)
+					return status;
+				continue;  // `continue`: next iteration
+			}
+			return status;  // `return` unwinds past the loop
+		}
+	}
+	return status;
+}
+
+int tree_walking_executor::run_for(const tree& t, node_index n) {
+	const node& self = t[n];
+	if (self.children_count == 0)
+		return 0;
+
+	const std::string_view name = t.text_of(t[t.child_of(self, 0)]).empty()
+	                              ? std::string_view{}
+	                              : std::string_view{};
+	(void)name;
+	const std::string_view var = t.source().substr(t.token_at(self.aux).offset,
+	                                               t.token_at(self.aux).length);
+
+	// Every child but the last is a word to iterate; the last is the body.
+	const uint32_t word_count = self.children_count - 1;
+	expander ex{_pool, _state, &_runner};
+	arena_array<std::string_view> items{_pool, 8};
+	for (uint32_t i = 0; i < word_count; ++i)
+		ex.expand_word(t, t.child_of(self, i), items);
+
+	int status = 0;
+	for (const auto& item : items) {
+		_state.set(var, item);
+		status = run_node(t, t.child_of(self, word_count));
+		if (_exit_requested)
+			return status;
+		if (_flow != control_flow::normal) {
+			bool should_break = false;
+			if (consume_loop_flow(should_break)) {
+				if (should_break || _flow != control_flow::normal)
+					return status;
+				continue;
+			}
+			return status;
+		}
+	}
+	return status;
+}
+
+int tree_walking_executor::run_case(const tree& t, node_index n) {
+	const node& self = t[n];
+	if (self.children_count == 0)
+		return 0;
+
+	// Patterns are expanded with PATHNAME EXPANSION DISABLED. POSIX subjects a
+	// case pattern to tilde, parameter, command and arithmetic expansion but NOT
+	// to field splitting or pathname expansion - otherwise `*)` expands to the
+	// files in the current directory and matches nothing, which is exactly what
+	// happened before this flag was passed.
+	expander ex{_pool, _state, &_runner, /*glob_enabled=*/false};
+	arena_array<std::string_view> subject{_pool, 2};
+	ex.expand_word(t, t.child_of(self, 0), subject);
+	const std::string_view text = subject.empty() ? std::string_view{} : subject[0];
+
+	for (uint32_t i = 1; i < self.children_count; ++i) {
+		const node& item = t[t.child_of(self, i)];
+		for (uint32_t p = 0; p < item.aux; ++p) {
+			arena_array<std::string_view> pattern{_pool, 2};
+			ex.expand_word(t, t.child_of(item, p), pattern);
+			if (pattern.empty())
+				continue;
+			// The shared matcher from #23. period_is_special is false here: the
+			// filename rule does not apply to `case`.
+			if (pattern_match(pattern[0], text, /*period_is_special=*/false)) {
+				if (item.children_count > item.aux)
+					return run_node(t, t.child_of(item, item.aux));
+				return 0;
+			}
+		}
+	}
+	return 0;  // POSIX: no matching pattern is status zero
+}
+
+int tree_walking_executor::run_subshell(const tree& t, node_index n) {
+	// A separate execution environment whose changes do not escape. Forking gives
+	// that for free: the child mutates its own copy of shell state.
+	std::fflush(nullptr);
+	const pid_t pid = fork();
+	if (pid == -1)
+		return 1;
+	if (pid == 0) {
+		setpgid(0, 0);
+		const int status = t[n].children_count > 0
+		                   ? run_node(t, t.child_of(t[n], 0))
+		                   : 0;
+		std::fflush(nullptr);
+		_exit(status);
+	}
+	setpgid(pid, pid);
+	int wait_status = 0;
+	waitpid(pid, &wait_status, 0);
+	return status_from_wait(wait_status);
 }
 
 bool tree_walking_executor::build_argv(const tree& t, node_index n,
@@ -243,8 +434,13 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// need save-and-restore around the call, and no builtin here reads a
 		// variable set that way. Recorded rather than pretended.
 
-		if (result.flow == control_flow::exit_shell)
+		if (result.flow == control_flow::exit_shell) {
 			_exit_requested = true;
+		} else if (result.flow != control_flow::normal) {
+			// break, continue and return unwind through the enclosing construct.
+			_flow = result.flow;
+			_flow_level = result.level;
+		}
 		return result.status;
 	}
 

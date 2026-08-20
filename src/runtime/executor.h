@@ -54,6 +54,13 @@ private:
 	int run_simple_command(const syntax::tree& t, syntax::node_index n);
 	int run_pipeline(const syntax::tree& t, syntax::node_index n);
 	int run_and_or(const syntax::tree& t, syntax::node_index n);
+	int run_compound_list(const syntax::tree& t, syntax::node_index n);
+	int run_if(const syntax::tree& t, syntax::node_index n);
+	int run_loop(const syntax::tree& t, syntax::node_index n, bool until);
+	int run_for(const syntax::tree& t, syntax::node_index n);
+	int run_case(const syntax::tree& t, syntax::node_index n);
+	int run_subshell(const syntax::tree& t, syntax::node_index n);
+	bool consume_loop_flow(bool& should_break);
 
 	// Expands a command's words into a NUL-terminated argv the arena owns.
 	// Returns false when the command expanded to nothing at all, which is not an
@@ -88,6 +95,14 @@ private:
 	runner_adapter _runner;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
+	// Set by break, continue and return; consumed by the enclosing loop or
+	// function. _flow_level implements `break 2`.
+	control_flow _flow = control_flow::normal;
+	int _flow_level = 0;
+
+	// A runaway `while true` would otherwise take the machine down - which is
+	// precisely how a hung test cost this project a pegged core once already.
+	static constexpr uint64_t kMaxLoopIterations = 10'000'000;
 };
 
 } // namespace lesh::runtime
