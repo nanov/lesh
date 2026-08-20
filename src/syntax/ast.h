@@ -60,6 +60,8 @@ enum class node_kind : uint16_t {
 	here_doc,
 	// `name() compound-command`. children: [body]. `aux` is the name's token.
 	function_definition,
+	// A list terminated by `&`: runs in the background and is not waited for.
+	async_list,
 };
 
 enum class parse_error : uint16_t {

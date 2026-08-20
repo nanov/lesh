@@ -1,0 +1,17 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+echo $#
+set x
+echo $#
+set x 'y  y' z
+echo $#
+set a b c d e f g h i j k
+echo $#

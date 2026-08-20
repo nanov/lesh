@@ -7,6 +7,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <sys/types.h>
 
@@ -69,6 +70,7 @@ private:
 	int run_for(const syntax::tree& t, syntax::node_index n);
 	int run_case(const syntax::tree& t, syntax::node_index n);
 	int run_subshell(const syntax::tree& t, syntax::node_index n);
+	int run_async(const syntax::tree& t, syntax::node_index n);
 	int run_function_definition(const syntax::tree& t, syntax::node_index n);
 	// Returns false when the name is not a function, so the caller execs instead.
 	bool try_run_function(const syntax::tree& t, arena_array<char*>& argv, int& status);
@@ -142,6 +144,8 @@ private:
 	// would otherwise exhaust the stack rather than reporting anything.
 	static constexpr int kMaxFunctionDepth = 256;
 	int _function_depth = 0;
+	// Background jobs, so `wait` can reap them and they do not become zombies.
+	std::vector<pid_t> _background;
 
 	// A runaway `while true` would otherwise take the machine down - which is
 	// precisely how a hung test cost this project a pegged core once already.

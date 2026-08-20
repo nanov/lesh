@@ -1,0 +1,15 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+w='ab\bc'
+bracket ${w#$(echo '*')b}  "${w#$(echo '*')b}"  ${w#"$(echo '*')b"}
+bracket ${w##$(echo '*')b} "${w##$(echo '*')b}" ${w##"$(echo '*')b"}
+bracket ${w%b$(echo '*')}  "${w%b$(echo '*')}"  ${w%"b$(echo '*')"}
+bracket ${w%%b$(echo '*')} "${w%%b$(echo '*')}" ${w%%"b$(echo '*')"}

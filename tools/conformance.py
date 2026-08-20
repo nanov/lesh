@@ -23,7 +23,11 @@ from pathlib import Path
 
 # Signal-related tests hang against a shell without job control or trap. Listed
 # by prefix rather than by name so the exclusion survives suite updates.
-SIGNAL_PREFIXES = ("kill", "trap", "signal", "job", "fg", "bg", "wait", "suspend")
+# "sig" catches sigcont*, sighup*, sigint*, sigquit* and friends. "signal" did
+# not: these are named sigcont3-p.tst, so a prefix check never matched and forty
+# job-control tests were counted as errors rather than skips - which made the
+# score look like it was hiding failures when it was only mislabelling skips.
+SIGNAL_PREFIXES = ("kill", "trap", "sig", "job", "fg", "bg", "wait", "suspend")
 
 
 def is_excluded(name: str) -> bool:

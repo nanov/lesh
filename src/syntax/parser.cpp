@@ -100,7 +100,24 @@ public:
 			}
 
 			const uint32_t before = _index;
-			_scratch.push(parse_and_or());
+			node_index item = parse_and_or();
+
+			// `&` makes the preceding list ASYNCHRONOUS. It was in is_separator and
+			// therefore silently equivalent to `;`, so background commands ran in
+			// the foreground - which deadlocks the moment one waits on the other,
+			// as `cat fifo & echo x > fifo` does.
+			if (peek().kind == token_kind::amp) {
+				advance();
+				node async;
+				async.kind = node_kind::async_list;
+				async.first_token = _tree[item].first_token;
+				async.last_token = _index > 0 ? _index - 1 : 0;
+				const uint32_t child_mark = mark_scratch();
+				_scratch.push(item);
+				commit_children(async, child_mark);
+				item = _tree.add_node(async);
+			}
+			_scratch.push(item);
 
 			// PROGRESS GUARANTEE. Recovery that consumes nothing is not recovery, it
 			// is a hang. `;;` at top level ends a command without being a separator,

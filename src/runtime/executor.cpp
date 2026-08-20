@@ -359,6 +359,7 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 		}
 		case node_kind::subshell:      return run_subshell(t, n);
 		case node_kind::function_definition: return run_function_definition(t, n);
+		case node_kind::async_list:          return run_async(t, n);
 		case node_kind::error:
 			std::fprintf(stderr, "lesh: syntax error near '%.*s'\n",
 			             static_cast<int>(t.text_of(t[n]).size()), t.text_of(t[n]).data());
@@ -646,6 +647,39 @@ bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& ar
 	return true;
 }
 
+// Runs a list in the background. POSIX: the shell does NOT wait, and the status
+// is zero regardless of what the command eventually does.
+int tree_walking_executor::run_async(const tree& t, node_index n) {
+	if (t[n].children_count == 0)
+		return 0;
+
+	std::fflush(nullptr);
+	const pid_t pid = fork();
+	if (pid == -1) {
+		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		return 1;
+	}
+	if (pid == 0) {
+		setpgid(0, 0);
+		// POSIX: an asynchronous command's stdin is /dev/null unless redirected,
+		// so a background job cannot steal the terminal's input.
+		const int devnull = open("/dev/null", O_RDONLY);
+		if (devnull != -1) {
+			dup2(devnull, STDIN_FILENO);
+			close(devnull);
+		}
+		const int status = run_node(t, t.child_of(t[n], 0));
+		std::fflush(nullptr);
+		_exit(status);
+	}
+
+	setpgid(pid, pid);
+	// Remembered so `wait` can reap it, and so it is not left as a zombie.
+	_background.push_back(pid);
+	_state.set("!", std::to_string(pid));
+	return 0;
+}
+
 int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	// A separate execution environment whose changes do not escape. Forking gives
 	// that for free: the child mutates its own copy of shell state.
@@ -837,6 +871,27 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// This is the cycle the ports in #11 were designed to survive: parsing inside
 	// execution, with the parse seeing the same aliases and the execution seeing
 	// the same state.
+	// `wait` needs the executor's record of background jobs, so it lives here
+	// alongside eval and . rather than in builtins.cpp.
+	if (std::string_view{argv[0]} == "wait") {
+		int status = 0;
+		if (argv[1] != nullptr) {
+			const pid_t target = static_cast<pid_t>(std::atoi(argv[1]));
+			int wait_status = 0;
+			if (waitpid(target, &wait_status, 0) > 0)
+				status = status_from_wait(wait_status);
+			std::erase(_background, target);
+		} else {
+			for (const pid_t pid : _background) {
+				int wait_status = 0;
+				if (waitpid(pid, &wait_status, 0) > 0)
+					status = status_from_wait(wait_status);
+			}
+			_background.clear();
+		}
+		return status;
+	}
+
 	if (const std::string_view name{argv[0]}; name == "eval" || name == ".") {
 		arena_array<saved_fd> saved{_pool, 4};
 		std::fflush(nullptr);
