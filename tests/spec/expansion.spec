@@ -43,7 +43,7 @@ echo ${HOME}x${HOME}
 --- parameters and literals alternating [xfail(legacy): both name-scan and accumulation defects]
 echo a$HOME-$HOME-b
 
---- braced parameter as the last word of a pipeline stage [xfail(next): same]
+--- braced parameter as the last word of a pipeline stage
 echo ${HOME} | cat
 
 --- braced parameter alone

@@ -15,13 +15,13 @@ false
 --- command not found is 127
 definitely_not_a_real_command_xyz
 
---- pipeline passes data [xfail(next): pipelines need fd plumbing plus a shared process group]
+--- pipeline passes data
 echo hello | cat
 
---- pipeline status is the last command's [xfail(next): same]
+--- pipeline status is the last command's
 true | false
 
---- pipeline status is the last command's, inverted [xfail(next): same]
+--- pipeline status is the last command's, inverted
 false | true
 
 --- single quotes suppress expansion
@@ -30,20 +30,20 @@ echo 'literal $HOME'
 --- double quotes allow expansion [xfail(legacy): quote handling strips the brackets but never runs expansion on the contents]
 echo "quoted $HOME"
 
---- command substitution [xfail(next): needs the pipeline plumbing]
+--- command substitution
 echo $(echo inner)
 
---- command substitution with a prefix [xfail: partial expansion around $() is unfinished]
+--- command substitution with a prefix [xfail(legacy): partial expansion around $() is unfinished]
 echo pre$(echo inner)
 
---- expansion of an argument inside a pipeline [xfail(next): same]
+--- expansion of an argument inside a pipeline
 echo $HOME | cat
 
---- expansion with a prefix inside a pipeline [xfail(next): same]
+--- expansion with a prefix inside a pipeline
 echo pre$HOME | cat
 
---- pipeline in the new front end [xfail(next): pipelines need fd plumbing plus a shared process group]
+--- pipeline in the new front end
 echo a | cat
 
---- command substitution in the new front end [xfail(next): needs the pipeline plumbing above]
+--- command substitution in the new front end
 echo $(echo inner)
