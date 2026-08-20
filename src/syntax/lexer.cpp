@@ -129,8 +129,24 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			while (!at_end() && peek() != '"') {
 				// Inside double quotes a backslash escapes only a few bytes, but for
 				// delimiting purposes it always consumes the next one.
-				if (peek() == '\\' && _position + 1 < _source.size())
-					++_position;
+				if (peek() == '\\' && _position + 1 < _source.size()) {
+					_position += 2;
+					continue;
+				}
+				// A `$(...)` inside the quotes may contain quotes of its own, at any
+				// depth. The same fix was applied to the word-interior scan; this is
+				// the command-mode one, and missing it here meant two levels of
+				// nesting failed while one worked.
+				if (peek() == '$' && peek(1) == '(') {
+					_position += 2;
+					int depth = 1;
+					while (!at_end() && depth > 0) {
+						if (peek() == '(') ++depth;
+						else if (peek() == ')') --depth;
+						++_position;
+					}
+					continue;
+				}
 				++_position;
 			}
 			if (at_end()) {
@@ -138,6 +154,14 @@ token lexer::lex_word(lex_mode mode) noexcept {
 				return finish(token_error::unterminated_double_quote, quote_at);
 			}
 			++_position;  // closing quote
+			continue;
+		}
+
+		if (c == '\\' && peek(1) == '\n') {
+			// A line continuation, not an escape: both characters are removed
+			// entirely, so `echo one\<newline>two` prints `onetwo`.
+			literal = false;
+			_position += 2;
 			continue;
 		}
 
@@ -261,8 +285,23 @@ token lexer::lex_word_segment() noexcept {
 	if (c == '"') {
 		++_position;
 		while (!at_end() && peek() != '"') {
-			if (peek() == '\\' && _position + 1 < _source.size())
-				++_position;
+			if (peek() == '\\' && _position + 1 < _source.size()) {
+				_position += 2;
+				continue;
+			}
+			// A `$(...)` inside double quotes may itself contain quotes:
+			// `"outer $(echo "inner") end"` is ONE quoted string. Scanning to the
+			// next `"` split it at the inner quote and left a stray `)`.
+			if (peek() == '$' && peek(1) == '(') {
+				_position += 2;
+				int depth = 1;
+				while (!at_end() && depth > 0) {
+					if (peek() == '(') ++depth;
+					else if (peek() == ')') --depth;
+					++_position;
+				}
+				continue;
+			}
 			++_position;
 		}
 		if (at_end()) {
@@ -326,13 +365,17 @@ token lexer::lex_word_segment() noexcept {
 			return finish(token_kind::seg_command_sub);
 		}
 		if (next == '{') {
+			// Braces are COUNTED: `${x:-${y:-z}}` nests, and stopping at the first
+			// `}` left the outer brace as literal text.
 			_position += 2;
-			while (!at_end() && peek() != '}')
+			int depth = 1;
+			while (!at_end() && depth > 0) {
+				if (peek() == '{') ++depth;
+				else if (peek() == '}') --depth;
 				++_position;
-			if (at_end())
+			}
+			if (depth > 0)
 				_incomplete = true;
-			else
-				++_position;
 			return finish(token_kind::seg_parameter);
 		}
 		if (lesh::string_utils::is_valid_var_name_first_char(static_cast<unsigned char>(next))) {
@@ -366,6 +409,10 @@ token lexer::lex_word_segment() noexcept {
 	// A literal run: everything up to the next byte that starts a segment.
 	while (!at_end()) {
 		const char ch = peek();
+		if (ch == '\\' && peek(1) == '\n') {
+			_position += 2;  // line continuation
+			continue;
+		}
 		if (ch == '\\' && _position + 1 < _source.size()) {
 			_position += 2;
 			continue;

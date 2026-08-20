@@ -5,6 +5,9 @@
 #include "runtime/shell_state.h"
 #include "syntax/ast.h"
 
+#include <string>
+#include <unordered_map>
+
 #include <sys/types.h>
 
 namespace lesh::runtime {
@@ -66,6 +69,9 @@ private:
 	int run_for(const syntax::tree& t, syntax::node_index n);
 	int run_case(const syntax::tree& t, syntax::node_index n);
 	int run_subshell(const syntax::tree& t, syntax::node_index n);
+	int run_function_definition(const syntax::tree& t, syntax::node_index n);
+	// Returns false when the name is not a function, so the caller execs instead.
+	bool try_run_function(const syntax::tree& t, arena_array<char*>& argv, int& status);
 	bool consume_loop_flow(bool& should_break);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
@@ -114,6 +120,25 @@ private:
 	// function. _flow_level implements `break 2`.
 	control_flow _flow = control_flow::normal;
 	int _flow_level = 0;
+
+	// Defined functions, by name.
+	//
+	// A body is stored as a node in the tree it was parsed from, so the tree must
+	// outlive the definition. That holds for one invocation - `-c 'f() {...}; f'`
+	// is a single parse - and is the ONLY case that works today. Persisting a
+	// function across invocations, which an interactive shell needs, requires
+	// copying the body into storage the function owns; that is ADR-0007 work and
+	// lands with the line editor. Recorded rather than pretended.
+	struct defined_function {
+		const syntax::tree* tree;
+		syntax::node_index body;
+	};
+	std::unordered_map<std::string, defined_function> _functions;
+
+	// Guards runaway recursion. A shell function that calls itself unconditionally
+	// would otherwise exhaust the stack rather than reporting anything.
+	static constexpr int kMaxFunctionDepth = 256;
+	int _function_depth = 0;
 
 	// A runaway `while true` would otherwise take the machine down - which is
 	// precisely how a hung test cost this project a pegged core once already.

@@ -235,6 +235,13 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				// differently inside double quotes - there it escapes only a few
 				// bytes. Outside, it escapes anything.
 				for (size_t i = 0; i < body.size(); ++i) {
+					if (body[i] == '\\' && i + 1 < body.size() && body[i + 1] == '\n') {
+						// A line continuation: BOTH characters vanish. Removing only
+						// the backslash left the newline in the field, so
+						// `echo one\<newline>two` printed two lines.
+						++i;
+						continue;
+					}
 					if (body[i] == '\\' && i + 1 < body.size()) {
 						const char next = body[i + 1];
 						if (!quoted || next == '"' || next == '\\' || next == '$' || next == '`') {

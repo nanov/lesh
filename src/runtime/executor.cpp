@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -302,6 +303,15 @@ int tree_walking_executor::run(const tree& t) {
 	if (t.root() == syntax::no_node)
 		return _state.last_status();
 
+	// POSIX: a syntax error in a non-interactive shell exits without executing
+	// anything. The parser deliberately recovers and returns a tree - that is what
+	// the line editor needs (#10) - but recovery is for INSPECTION, not execution.
+	// Running the parts that parsed is what made `echo a;; echo b` print both.
+	if (!_state.interactive() && t.has_errors()) {
+		std::fprintf(stderr, "lesh: syntax error\n");
+		return 2;
+	}
+
 	const node& program = t[t.root()];
 	int status = _state.last_status();
 	for (uint32_t i = 0; i < program.children_count; ++i) {
@@ -328,6 +338,7 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 		case node_kind::case_clause:   return run_case(t, n);
 		case node_kind::brace_group:   return run_compound_list(t, t.child_of(t[n], 0));
 		case node_kind::subshell:      return run_subshell(t, n);
+		case node_kind::function_definition: return run_function_definition(t, n);
 		case node_kind::error:
 			std::fprintf(stderr, "lesh: syntax error near '%.*s'\n",
 			             static_cast<int>(t.text_of(t[n]).size()), t.text_of(t[n]).data());
@@ -512,6 +523,51 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 	return 0;  // POSIX: no matching pattern is status zero
 }
 
+int tree_walking_executor::run_function_definition(const tree& t, node_index n) {
+	const node& self = t[n];
+	if (self.children_count == 0)
+		return 0;
+	const token& name_token = t.token_at(self.aux);
+	const std::string name{t.source().substr(name_token.offset, name_token.length)};
+	// A redefinition replaces the previous body, which is what POSIX requires and
+	// what makes reloading an rc file work.
+	_functions[name] = {&t, t.child_of(self, 0)};
+	return 0;
+}
+
+bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& argv,
+                                             int& status) {
+	const auto it = _functions.find(argv[0]);
+	if (it == _functions.end())
+		return false;
+
+	if (_function_depth >= kMaxFunctionDepth) {
+		std::fprintf(stderr, "lesh: %s: recursion too deep\n", argv[0]);
+		status = 1;
+		return true;
+	}
+
+	// POSIX: the positional parameters are REPLACED for the duration of the call
+	// and restored afterwards. $0 is not replaced - it stays the shell's name.
+	std::vector<std::string> saved = _state.positional();
+	std::vector<std::string> arguments;
+	for (size_t i = 1; argv[i] != nullptr; ++i)
+		arguments.emplace_back(argv[i]);
+	_state.set_positional(std::move(arguments));
+
+	++_function_depth;
+	status = run_node(*it->second.tree, it->second.body);
+	--_function_depth;
+
+	// `return` unwinds to here and no further. The control_flow machinery has been
+	// wired since #24 with nothing to unwind; this is what it was waiting for.
+	if (_flow == control_flow::return_from)
+		_flow = control_flow::normal;
+
+	_state.set_positional(std::move(saved));
+	return true;
+}
+
 int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	// A separate execution environment whose changes do not escape. Forking gives
 	// that for free: the child mutates its own copy of shell state.
@@ -651,6 +707,30 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return 0;
 	}
 
+	// A function shadows an external command but NOT a special builtin, per
+	// POSIX's command search order: special builtins, then functions, then regular
+	// builtins, then PATH.
+	if (classify_builtin(argv[0]) != builtin_kind::special) {
+		arena_array<saved_fd> saved{_pool, 4};
+		int status = 0;
+		std::fflush(nullptr);
+		const bool ok = apply_redirections(t, n, &saved);
+		bool ran = false;
+		if (ok)
+			ran = try_run_function(t, argv, status);
+		if (ran) {
+			std::fflush(nullptr);
+			restore_fds(saved);
+			for (const auto& a : assignments)
+				apply_assignment(a);
+			return status;
+		}
+		std::fflush(nullptr);
+		restore_fds(saved);
+		if (!ok)
+			return 1;
+	}
+
 	// A builtin runs in THIS process - `cd` in a forked child would change the
 	// child's directory and exit, achieving nothing. So dispatch happens before
 	// the fork, not after.
@@ -727,6 +807,41 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 		arena_array<char*> argv{_pool, 8};
 		arena_array<std::string_view> assignments{_pool, 4};
 		if (build_argv(t, t.child_of(self, i), argv, &assignments)) {
+			// A function or builtin in a pipeline stage runs in ITS OWN process, so
+			// it forks like anything else and its effects do not reach the shell.
+			// POSIX allows either, and running it in a subshell is what dash does -
+			// which is why `f | cat` cannot set a variable in the parent.
+			const bool in_process = _functions.contains(argv[0]) ||
+			                        classify_builtin(argv[0]) != builtin_kind::none;
+			if (in_process) {
+				std::fflush(nullptr);
+				const pid_t pid = fork();
+				if (pid == 0) {
+					setpgid(0, group);
+					if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
+					if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
+					int status = 0;
+					arena_array<saved_fd> ignored{_pool, 2};
+					(void)apply_redirections(t, t.child_of(self, i), &ignored);
+					if (!try_run_function(t, argv, status)) {
+						builtin_result r{};
+						(void)try_run_builtin(_state, argv.data(), r);
+						status = r.status;
+					}
+					std::fflush(nullptr);
+					_exit(status);
+				}
+				if (pid > 0) {
+					setpgid(pid, group == 0 ? pid : group);
+					pids.push(pid);
+					if (group == 0)
+						group = pid;
+				}
+				if (input_fd != STDIN_FILENO) close(input_fd);
+				if (!is_last) { close(pipe_fds[1]); input_fd = pipe_fds[0]; }
+				continue;
+			}
+
 			// Every stage runs in its own process, so a builtin in a pipeline stage
 			// affects only that process - which is why dispatch here would be wrong
 			// and `echo a | read x` cannot set x in the shell. That is POSIX's

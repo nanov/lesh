@@ -69,7 +69,7 @@ cd /tmp && pwd
 --- variable assignment persists [xfail(legacy): legacy parses assignments and applies them only via setenv in the child]
 x=value; echo $x
 
---- function definition and call [xfail: #25 - functions]
+--- function definition and call [xfail(legacy): legacy has no functions]
 greet() { echo hello; }; greet
 
 --- here-document [xfail(legacy): legacy has no here-documents]
@@ -227,3 +227,24 @@ set -- a b c; shift; echo "$1 $2"; echo $#
 
 --- set -f disables pathname expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
 set -f; echo /usr/bin/tru*
+
+--- a function receives positional parameters [xfail(legacy): legacy has no functions]
+f() { echo "$1-$2"; }; f a b
+
+--- return sets the status and leaves the function [xfail(legacy): legacy has no functions]
+f() { return 3; }; f; echo $?
+
+--- return stops execution mid-function [xfail(legacy): legacy has no functions]
+f() { echo in; return; echo never; }; f
+
+--- positional parameters are restored after a call [xfail(legacy): legacy has no functions]
+set -- outer; f() { echo "$1"; }; f inner; echo "$1"
+
+--- a redefinition replaces the previous body [xfail(legacy): legacy has no functions]
+f() { echo one; }; f() { echo two; }; f
+
+--- a function sees and mutates global variables [xfail(legacy): legacy has no functions]
+x=before; f() { x=after; }; f; echo $x
+
+--- a function can be recursive [xfail(legacy): legacy has no functions]
+countdown() { if [ $1 -gt 0 ]; then echo $1; countdown $(($1 - 1)); fi; }; countdown 3

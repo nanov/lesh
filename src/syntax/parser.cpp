@@ -374,9 +374,50 @@ private:
 	// Dispatches on what a command starts with. A reserved word here is a keyword;
 	// the same word after a command name is an argument, which is what makes
 	// `echo if` print `if`.
+	// `name ( ) compound-command`. There is no keyword, so this is recognised by
+	// SHAPE: a word in command position followed by `(` then `)`. It must be
+	// checked before parse_command consumes the name as a command.
+	[[nodiscard]] bool at_function_definition() noexcept {
+		if (peek().kind != token_kind::word || peek_reserved() != reserved::none)
+			return false;
+		char* ignored = nullptr;
+		(void)ignored;
+		// Look ahead without consuming: lex from the current position on a copy.
+		syntax::lexer probe{_tree.source(), _tree.token_at(_index).end_offset()};
+		const token after_name = probe.next(lex_mode::command);
+		if (after_name.kind != token_kind::lparen)
+			return false;
+		const token after_paren = probe.next(lex_mode::command);
+		return after_paren.kind == token_kind::rparen;
+	}
+
+	node_index parse_function_definition() noexcept {
+		const uint32_t first = _index;
+		const uint32_t name_token = advance();  // the name
+		advance();  // (
+		advance();  // )
+		while (is_separator(peek().kind))
+			advance();
+
+		const uint32_t mark = mark_scratch();
+		// The body is a compound command - in practice a brace group, but POSIX
+		// permits any of them.
+		_scratch.push(parse_command_or_compound());
+
+		node n;
+		n.kind = node_kind::function_definition;
+		n.first_token = first;
+		n.last_token = _index > first ? _index - 1 : first;
+		n.aux = name_token;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
 	[[nodiscard]] node_index parse_command_or_compound() noexcept {
 		if (peek().kind == token_kind::lparen)
 			return parse_subshell();
+		if (at_function_definition())
+			return parse_function_definition();
 		switch (peek_reserved()) {
 			case reserved::kw_if:     return parse_if();
 			case reserved::kw_while:  return parse_while_or_until(false);

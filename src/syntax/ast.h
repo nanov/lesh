@@ -58,6 +58,8 @@ enum class node_kind : uint16_t {
 	// from the node's token range because the body is not made of tokens - the
 	// lexer never sees it. See here_doc_body below.
 	here_doc,
+	// `name() compound-command`. children: [body]. `aux` is the name's token.
+	function_definition,
 };
 
 enum class parse_error : uint16_t {
