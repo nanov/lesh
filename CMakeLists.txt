@@ -183,8 +183,12 @@ target_link_libraries(lesh_syntax PUBLIC lesh_substrate)
 # runtime: expansion, and later shell state and execution. Depends on syntax and
 # the substrate; never on legacy, never on the editor.
 add_library(lesh_runtime STATIC
+	src/runtime/executor.cpp
+	src/runtime/executor.h
 	src/runtime/expander.cpp
-	src/runtime/expander.h)
+	src/runtime/expander.h
+	src/runtime/shell_state.cpp
+	src/runtime/shell_state.h)
 target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 
 add_executable(lesh src/main.cpp)
@@ -195,6 +199,7 @@ add_executable(lesh_tests
 	tests/lesh_state_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/executor_tests.cpp
 	tests/unit/expander_tests.cpp
 	tests/unit/parser_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)

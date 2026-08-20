@@ -1,0 +1,118 @@
+#include "runtime/shell_state.h"
+
+#include <array>
+#include <cstdlib>
+
+extern char** environ;
+
+namespace lesh::runtime {
+
+namespace {
+
+// POSIX XCU 2.14. The list is closed and the membership matters: a failure in one
+// of these exits a non-interactive shell, and assignments preceding one persist.
+constexpr std::array<std::string_view, 15> kSpecialBuiltins = {
+	"break", ":", "continue", ".", "eval", "exec", "exit", "export",
+	"readonly", "return", "set", "shift", "times", "trap", "unset",
+};
+
+constexpr std::array<std::string_view, 6> kRegularBuiltins = {
+	"cd", "echo", "false", "pwd", "true", "test",
+};
+
+} // namespace
+
+builtin_kind classify_builtin(std::string_view name) noexcept {
+	for (const auto& s : kSpecialBuiltins)
+		if (s == name)
+			return builtin_kind::special;
+	for (const auto& r : kRegularBuiltins)
+		if (r == name)
+			return builtin_kind::regular;
+	return builtin_kind::none;
+}
+
+shell_state::shell_state() {
+	// Seed from the process environment. Copying rather than borrowing is the
+	// ADR-0007 decision: these strings are owned here and released in the
+	// destructor, so the leak gate expects zero rather than "zero except envp".
+	for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+		const std::string_view entry{*e};
+		const size_t eq = entry.find('=');
+		if (eq == std::string_view::npos)
+			continue;
+		_vars.emplace(std::string(entry.substr(0, eq)),
+		              variable{std::string(entry.substr(eq + 1)), true});
+	}
+}
+
+shell_state::~shell_state() = default;
+
+bool shell_state::lookup(std::string_view name, std::string_view& value) const {
+	const auto it = _vars.find(name);
+	if (it == _vars.end())
+		return false;
+	value = it->second.value;
+	return true;
+}
+
+std::string_view shell_state::home_directory() const {
+	std::string_view home;
+	if (lookup("HOME", home))
+		return home;
+	return "/";
+}
+
+std::string_view shell_state::ifs() const {
+	std::string_view value;
+	// POSIX: when IFS is unset, splitting behaves as if it were space-tab-newline.
+	// When it is set but empty, no splitting happens at all - which is why this
+	// returns the value rather than falling back on emptiness.
+	if (lookup("IFS", value))
+		return value;
+	return _ifs_default;
+}
+
+void shell_state::set(std::string_view name, std::string_view value) {
+	const auto it = _vars.find(name);
+	if (it != _vars.end()) {
+		it->second.value = value;
+		return;
+	}
+	_vars.emplace(std::string(name), variable{std::string(value), false});
+}
+
+void shell_state::set_exported(std::string_view name, std::string_view value) {
+	set(name, value);
+	_vars.find(name)->second.exported = true;
+}
+
+void shell_state::unset(std::string_view name) {
+	if (const auto it = _vars.find(name); it != _vars.end())
+		_vars.erase(it);
+}
+
+bool shell_state::is_exported(std::string_view name) const {
+	const auto it = _vars.find(name);
+	return it != _vars.end() && it->second.exported;
+}
+
+char** shell_state::environment_block() {
+	_env_strings.clear();
+	_env_pointers.clear();
+	for (const auto& [name, var] : _vars) {
+		if (!var.exported)
+			continue;
+		_env_strings.emplace_back(name + "=" + var.value);
+	}
+	// Pointers are taken only after every string is in place: _env_strings can
+	// reallocate while it is being filled, which would dangle every pointer taken
+	// during the loop. This is the same class of bug as the arena_array leak.
+	_env_pointers.reserve(_env_strings.size() + 1);
+	for (auto& s : _env_strings)
+		_env_pointers.push_back(s.data());
+	_env_pointers.push_back(nullptr);
+	return _env_pointers.data();
+}
+
+} // namespace lesh::runtime
