@@ -30,7 +30,7 @@ enum class builtin_kind {
 
 [[nodiscard]] builtin_kind classify_builtin(std::string_view name) noexcept;
 
-class shell_state final : public parameter_source {
+class shell_state final : public parameter_source, public arithmetic_variables {
 public:
 	shell_state();
 	~shell_state() override;
@@ -43,6 +43,11 @@ public:
 	[[nodiscard]] bool lookup(std::string_view name, std::string_view& value) const override;
 	[[nodiscard]] std::string_view home_directory() const override;
 	[[nodiscard]] std::string_view ifs() const override;
+
+	// --- arithmetic_variables -------------------------------------------------
+
+	[[nodiscard]] int64_t get(std::string_view name) const override;
+	void set(std::string_view name, int64_t value) override;
 
 	// --- variables ------------------------------------------------------------
 

@@ -28,7 +28,7 @@ if true; then echo yes; fi
 if false; then echo yes; else echo no; fi
 
 --- while loop [xfail(legacy): legacy has no compound commands]
-i=0; while [ $i -lt 2 ]; do echo $i; i=$(expr $i + 1); done
+i=0; while [ $i -lt 2 ]; do echo $i; i=$((i+1)); done
 
 --- for loop [xfail(legacy): legacy has no compound commands]
 for x in a b c; do echo $x; done
@@ -171,11 +171,26 @@ EOT
 cat <<EOT
 EOT
 
---- arithmetic expansion [xfail: #30 - $(( )) is not implemented]
+--- arithmetic expansion [xfail(legacy): legacy has no arithmetic expansion]
 echo $((1 + 2))
 
---- arithmetic in an assignment [xfail: #30]
+--- arithmetic in an assignment [xfail(legacy): legacy has no arithmetic expansion]
 i=1; i=$((i + 1)); echo $i
 
---- arithmetic as a loop counter [xfail: #30]
+--- arithmetic as a loop counter [xfail(legacy): legacy has no arithmetic expansion]
 i=0; while [ $i -lt 3 ]; do i=$((i+1)); done; echo $i
+
+--- arithmetic precedence follows C [xfail(legacy): legacy has no arithmetic expansion]
+echo $((2 + 3 * 4)) $(((2 + 3) * 4))
+
+--- arithmetic reads variables without a dollar [xfail(legacy): legacy has no arithmetic expansion]
+i=5; echo $((i * i))
+
+--- arithmetic assignment writes back [xfail(legacy): legacy has no arithmetic expansion]
+i=5; echo $((i += 3)); echo $i
+
+--- an unset variable is zero in arithmetic [xfail(legacy): legacy has no arithmetic expansion]
+echo $((no_such_var + 1))
+
+--- arithmetic bases follow C [xfail(legacy): legacy has no arithmetic expansion]
+echo $((0x1f)) $((010))

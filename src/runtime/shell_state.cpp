@@ -73,6 +73,31 @@ std::string_view shell_state::ifs() const {
 	return _ifs_default;
 }
 
+int64_t shell_state::get(std::string_view name) const {
+	std::string_view text;
+	if (!lookup(name, text))
+		return 0;  // unset is zero, not an error
+	int64_t value = 0;
+	bool negative = false;
+	size_t at = 0;
+	if (at < text.size() && (text[at] == '-' || text[at] == '+')) {
+		negative = text[at] == '-';
+		++at;
+	}
+	// A non-numeric value is zero too: POSIX leaves it unspecified, and dash
+	// treats it as zero rather than failing.
+	for (; at < text.size(); ++at) {
+		if (text[at] < '0' || text[at] > '9')
+			return 0;
+		value = value * 10 + (text[at] - '0');
+	}
+	return negative ? -value : value;
+}
+
+void shell_state::set(std::string_view name, int64_t value) {
+	set(name, std::to_string(value));
+}
+
 void shell_state::set(std::string_view name, std::string_view value) {
 	const auto it = _vars.find(name);
 	if (it != _vars.end()) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/arithmetic.h"
+
 #include "substrate/arena.h"
 #include "substrate/arena_array.h"
 #include "syntax/ast.h"
@@ -58,9 +60,15 @@ enum class expansion_status {
 
 class expander {
 public:
+	// `vars` is optional and separate from `params`, because arithmetic ASSIGNS
+	// (`$((i += 1))`) while parameter expansion only reads. Completion supplies
+	// none, and arithmetic then evaluates against zeroes rather than mutating
+	// state as a side effect of drawing a suggestion.
 	expander(buffer_pool& pool, const parameter_source& params,
-	         command_runner* runner = nullptr, bool glob_enabled = true) noexcept
-		: _pool(pool), _params(params), _runner(runner), _glob_enabled(glob_enabled) {}
+	         command_runner* runner = nullptr, bool glob_enabled = true,
+	         arithmetic_variables* vars = nullptr) noexcept
+		: _pool(pool), _params(params), _runner(runner), _glob_enabled(glob_enabled),
+		  _vars(vars) {}
 
 	// Expands one word node, appending its fields to `out`.
 	//
@@ -88,6 +96,7 @@ private:
 	command_runner* _runner;
 	// `set -f` disables pathname expansion entirely.
 	bool _glob_enabled = true;
+	arithmetic_variables* _vars = nullptr;
 
 	// Accumulates the field under construction. Completed fields are copied into
 	// exact-size arena blocks, because this buffer relocates as it grows and a

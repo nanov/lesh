@@ -1,10 +1,12 @@
 #include "runtime/expander.h"
 
+#include "runtime/arithmetic.h"
 #include "runtime/glob.h"
 #include "runtime/pattern.h"
 
 #include "syntax/lexer.h"
 
+#include <cstdio>
 #include <cstring>
 #include <tuple>
 
@@ -181,9 +183,33 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				}
 			} break;
 
-			case token_kind::seg_arithmetic:
-				status = expansion_status::unsupported_construct;
-				break;
+			case token_kind::seg_arithmetic: {
+				// The lexer spans `$((...))`; strip the delimiters and evaluate.
+				std::string_view inner = body;
+				if (inner.size() >= 5)
+					inner = inner.substr(3, inner.size() - 5);
+
+				// The inner text is expanded first: `$((x + $y))` is legal, and the
+				// evaluator sees only arithmetic.
+				const std::string_view resolved = expand_assignment_value(inner);
+
+				if (_vars == nullptr) {
+					// No mutable state - completion's mode. Evaluating would still be
+					// safe for reads, but an assignment would mutate the shell as a
+					// side effect of drawing a suggestion.
+					status = expansion_status::unsupported_construct;
+					break;
+				}
+				const arithmetic_result r = evaluate(resolved, *_vars);
+				if (!r.ok) {
+					status = expansion_status::unsupported_construct;
+					break;
+				}
+				char digits[24];
+				const int n = std::snprintf(digits, sizeof(digits), "%lld",
+				                            static_cast<long long>(r.value));
+				append(std::string_view(digits, n > 0 ? static_cast<size_t>(n) : 0));
+			} break;
 
 			default:
 				append(body);
@@ -194,6 +220,14 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 }
 
 std::string_view expander::expand_assignment_value(std::string_view text) noexcept {
+	// RE-ENTRANT. Arithmetic expansion calls this from inside expand_text to
+	// resolve its own inner text, so the caller's accumulator must survive.
+	// Nulling _current on exit unconditionally clobbered it - UBSan caught the
+	// null dereference on the very first `$((1 + 2))`.
+	arena_array<char>* const outer_current = _current;
+	const bool outer_started = _field_started;
+	const bool outer_globbable = _field_globbable;
+
 	arena_array<char> accumulator{_pool, 64};
 	arena_array<std::string_view> discard{_pool, 4};
 	_current = &accumulator;
@@ -209,7 +243,10 @@ std::string_view expander::expand_assignment_value(std::string_view text) noexce
 	_pool.allocate(n == 0 ? 1 : n, block, 1);
 	if (n > 0)
 		std::memcpy(block, accumulator.data(), n);
-	_current = nullptr;
+
+	_current = outer_current;
+	_field_started = outer_started;
+	_field_globbable = outer_globbable;
 	return {block, n};
 }
 
