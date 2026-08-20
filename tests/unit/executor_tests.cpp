@@ -210,3 +210,15 @@ TEST_F(ExecutorTest, ErrexitStillFiresWhereTheStatusIsActedOn) {
 	for (const char* src : exits)
 		EXPECT_EQ(run(src), 1) << src;
 }
+
+// POSIX: `wait` with no operands waits for every known child and its status is
+// ZERO - not the last child's. Reporting the last one made `false & wait` fail,
+// and under `set -e` that would have exited the shell.
+TEST_F(ExecutorTest, WaitWithNoOperandsIsAlwaysZero) {
+	EXPECT_EQ(run("false & wait"), 0);
+}
+
+TEST_F(ExecutorTest, WaitOnANonChildReportsTheStatusPosixDefines) {
+	// 127, and no diagnostic: this is a specified result, not a failure.
+	EXPECT_EQ(run("wait 99999"), 127);
+}

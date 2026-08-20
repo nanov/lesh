@@ -253,7 +253,7 @@ token lexer::lex_word(lex_mode mode) noexcept {
 // its contents. Interpretation belongs to the expander, and the contents of a
 // command substitution belong to a fresh parse. Keeping the split here means the
 // lexer never needs to know what an expansion *does*.
-token lexer::lex_word_segment() noexcept {
+token lexer::lex_word_segment(lex_mode mode) noexcept {
 	const uint32_t start = _position;
 
 	token t;
@@ -269,8 +269,11 @@ token lexer::lex_word_segment() noexcept {
 	};
 
 	const char c = peek();
+	// Inside double quotes a single quote is just a byte, and a leading tilde is
+	// not eligible for tilde expansion. Everything else - $, `, \ - still is.
+	const bool in_double_quotes = mode == lex_mode::double_quote_interior;
 
-	if (c == '\'') {
+	if (c == '\'' && !in_double_quotes) {
 		++_position;
 		while (!at_end() && peek() != '\'')
 			++_position;
@@ -312,7 +315,7 @@ token lexer::lex_word_segment() noexcept {
 		return finish(token_kind::seg_double_quoted);
 	}
 
-	if (c == '~' && start == 0) {
+	if (c == '~' && start == 0 && !in_double_quotes) {
 		// Only a leading tilde is eligible. POSIX confines tilde expansion to the
 		// start of a word (and after ':' in assignments, which is #12's problem).
 		++_position;
@@ -417,7 +420,7 @@ token lexer::lex_word_segment() noexcept {
 			_position += 2;
 			continue;
 		}
-		if (ch == '\'' || ch == '"' || ch == '$' || ch == '`')
+		if ((ch == '\'' && !in_double_quotes) || ch == '"' || ch == '$' || ch == '`')
 			break;
 		++_position;
 	}
@@ -427,14 +430,14 @@ token lexer::lex_word_segment() noexcept {
 token lexer::next(lex_mode mode) noexcept {
 	_incomplete = false;
 
-	if (mode == lex_mode::word_interior) {
+	if (mode == lex_mode::word_interior || mode == lex_mode::double_quote_interior) {
 		if (at_end()) {
 			token t;
 			t.kind = token_kind::end;
 			t.offset = _position;
 			return t;
 		}
-		return lex_word_segment();
+		return lex_word_segment(mode);
 	}
 
 	const bool skipped = skip_blanks_and_comments();

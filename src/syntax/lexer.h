@@ -20,6 +20,11 @@ namespace lesh::syntax {
 enum class lex_mode : uint8_t {
 	command,             // operators are operators, words are words
 	word_interior,       // inside a word: quoting and expansion boundaries
+	// Inside DOUBLE quotes. A single quote is an ordinary character there, and a
+	// leading tilde is not special. Lexing the interior in word_interior mode
+	// instead made `echo "it's"` print `it`, because `'s"` was taken for the start
+	// of a single-quoted segment and its quotes were removed.
+	double_quote_interior,
 	here_doc_delimiter,  // the word after << : quoting matters, expansion does not
 };
 
@@ -77,7 +82,7 @@ private:
 	bool skip_blanks_and_comments() noexcept;  // returns whether anything was skipped
 	token lex_operator() noexcept;
 	token lex_word(lex_mode mode) noexcept;
-	token lex_word_segment() noexcept;
+	token lex_word_segment(lex_mode mode) noexcept;
 };
 
 // True for bytes that end an unquoted word in command position.

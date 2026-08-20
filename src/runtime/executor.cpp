@@ -43,9 +43,33 @@ int status_from_wait(int wait_status) noexcept {
 // explicit. Explicit, because the child's environment is built from shell state,
 // and assigning to environ to smuggle it into execvp is the hidden coupling this
 // design avoids.
-[[noreturn]] void exec_or_die(char** argv, char** env, std::string_view path_value) {
+// POSIX 2.9.1.1: when execve rejects a file with ENOEXEC - no shebang, no magic
+// number - the shell runs it as a SHELL SCRIPT rather than reporting a format
+// error. `self` is this shell's own executable, resolved at startup, because
+// argv[0] is not a usable path when the shell was itself found on PATH.
+//
+// Returns only if the re-exec fails too.
+void exec_as_script(std::string_view self, const char* file, char** argv, char** env) {
+	if (self.empty())
+		return;
+	// argv becomes: <self> <file> <the original arguments after argv[0]>.
+	std::vector<char*> rewritten;
+	std::string self_owned{self};
+	std::string file_owned{file};
+	rewritten.push_back(self_owned.data());
+	rewritten.push_back(file_owned.data());
+	for (size_t i = 1; argv[i] != nullptr; ++i)
+		rewritten.push_back(argv[i]);
+	rewritten.push_back(nullptr);
+	execve(self_owned.c_str(), rewritten.data(), env);
+}
+
+[[noreturn]] void exec_or_die(char** argv, char** env, std::string_view path_value,
+                              std::string_view self_path) {
 	if (std::strchr(argv[0], '/') != nullptr) {
 		execve(argv[0], argv, env);
+		if (errno == ENOEXEC)
+			exec_as_script(self_path, argv[0], argv, env);
 	} else {
 		std::string candidate;
 		size_t at = 0;
@@ -58,6 +82,11 @@ int status_from_wait(int wait_status) noexcept {
 			candidate += '/';
 			candidate += argv[0];
 			execve(candidate.c_str(), argv, env);
+			if (errno == ENOEXEC) {
+				// Found it, and it is a script without a shebang. This is the one
+				// "failure" that is not a failure.
+				exec_as_script(self_path, candidate.c_str(), argv, env);
+			}
 			// Only ENOENT means "keep looking"; anything else is the real answer.
 			if (errno != ENOENT)
 				last_errno = errno;
@@ -897,7 +926,8 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 		std::string_view path_value;
 		if (!_state.lookup("PATH", path_value))
 			path_value = "/usr/bin:/bin";
-		exec_or_die(argv.data(), _state.environment_block(), path_value);
+		exec_or_die(argv.data(), _state.environment_block(), path_value,
+		            _state.own_path());
 	}
 
 	setpgid(pid, ctx.group == 0 ? pid : ctx.group);
@@ -1001,20 +1031,32 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// `wait` needs the executor's record of background jobs, so it lives here
 	// alongside eval and . rather than in builtins.cpp.
 	if (std::string_view{argv[0]} == "wait") {
-		int status = 0;
-		if (argv[1] != nullptr) {
-			const pid_t target = static_cast<pid_t>(std::atoi(argv[1]));
-			int wait_status = 0;
-			if (waitpid(target, &wait_status, 0) > 0)
-				status = status_from_wait(wait_status);
-			std::erase(_background, target);
-		} else {
+		if (argv[1] == nullptr) {
+			// POSIX: with no operands, `wait` waits for ALL known children and its
+			// status is ZERO - not the last child's. Reporting the last one made
+			// `false & wait` fail, and under `set -e` that would exit the shell.
 			for (const pid_t pid : _background) {
 				int wait_status = 0;
-				if (waitpid(pid, &wait_status, 0) > 0)
-					status = status_from_wait(wait_status);
+				(void)waitpid(pid, &wait_status, 0);
 			}
 			_background.clear();
+			return 0;
+		}
+		// With operands the status is the LAST operand's, and a child killed by a
+		// signal reports 128 + the signal number.
+		int status = 0;
+		for (size_t i = 1; argv[i] != nullptr; ++i) {
+			const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
+			int wait_status = 0;
+			if (waitpid(target, &wait_status, 0) > 0) {
+				status = status_from_wait(wait_status);
+			} else {
+				// POSIX DEFINES the answer for a pid that is not a child: status 127.
+				// No diagnostic, because this is a specified result rather than a
+				// failure - dash is silent here too.
+				status = 127;
+			}
+			std::erase(_background, target);
 		}
 		return status;
 	}

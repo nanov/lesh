@@ -96,6 +96,14 @@ public:
 
 	[[nodiscard]] int process_id() const noexcept { return _pid; }
 
+	// The path to this shell's own executable, resolved once at startup.
+	//
+	// POSIX requires the ENOEXEC fallback: when a file is found and readable but
+	// execve rejects it - no shebang, no magic number - the shell runs it as a
+	// SHELL SCRIPT rather than reporting a format error. Doing that needs a path to
+	// re-exec, and argv[0] is not one when the shell was found on PATH.
+	[[nodiscard]] std::string_view own_path() const noexcept { return _own_path; }
+
 	// --- options --------------------------------------------------------------
 
 	// set -e: exit on a command failing. set -u: unset parameter is an error.
@@ -167,6 +175,7 @@ private:
 	std::vector<std::string> _positional;
 	std::string _script_name = "lesh";
 	int _pid = 0;
+	std::string _own_path;
 	signal_state _signals;
 	int _last_status = 0;
 	options _options;

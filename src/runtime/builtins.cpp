@@ -225,52 +225,129 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 	return {0};
 }
 
+// Writes `text` so the shell reads it back as exactly these bytes: wrapped in
+// single quotes, with each embedded single quote spelled `'\''`.
+//
+// POSIX requires `trap` with no operands to print the traps in a form that can be
+// RE-INPUT, and a trap command containing a quote is the case that decides whether
+// it really can be. Printing the text raw produced a line that changed meaning
+// when it was sourced back.
+void print_single_quoted(std::string_view text) {
+	std::fputc('\'', stdout);
+	for (const char c : text) {
+		if (c == '\'')
+			std::fputs("'\\''", stdout);
+		else
+			std::fputc(c, stdout);
+	}
+	std::fputc('\'', stdout);
+}
+
+// One `trap -- ACTION CONDITION` line.
+//
+// `include_default` is what `-p` adds. Without it a condition at its default
+// disposition prints nothing, because there is nothing to restore; with it the
+// line reads `trap -- - NAME`, which is how a caller saves and restores a trap it
+// has not set.
+void print_trap(const signal_state& sigs, int signo, bool include_default) {
+	const std::string_view name = signal_state::signal_name(signo);
+	if (name.empty())
+		return;
+	switch (sigs.disposition_of(signo)) {
+		case disposition::ignore:
+			std::fputs("trap -- ", stdout);
+			print_single_quoted("");
+			break;
+		case disposition::handler:
+			std::fputs("trap -- ", stdout);
+			print_single_quoted(sigs.trap_command(signo));
+			break;
+		case disposition::default_action:
+			if (!include_default)
+				return;
+			std::fputs("trap -- -", stdout);
+			break;
+	}
+	std::printf(" %.*s\n", static_cast<int>(name.size()), name.data());
+}
+
+// True for an unsigned decimal integer. POSIX: when `trap`'s first operand is one,
+// EVERY operand is a condition and each is reset to its default - so `trap 2 QUIT`
+// resets both rather than running the command `2` on QUIT.
+bool is_unsigned_integer(std::string_view text) {
+	if (text.empty())
+		return false;
+	for (const char c : text)
+		if (c < '0' || c > '9')
+			return false;
+	return true;
+}
+
 builtin_result builtin_trap(shell_state& state, char** argv) {
 	signal_state& sigs = state.signals();
 
-	// `trap` with no operands lists the current traps in a form that can be fed
-	// back in, which is what POSIX requires - not a human-readable summary.
-	if (argv[1] == nullptr) {
-		for (int i = 0; i < kMaxSignal; ++i) {
-			const std::string_view name = signal_state::signal_name(i);
-			if (name.empty())
-				continue;
-			switch (sigs.disposition_of(i)) {
-				case disposition::ignore:
-					std::printf("trap -- \'\' %.*s\n", static_cast<int>(name.size()), name.data());
-					break;
-				case disposition::handler: {
-					const std::string_view cmd = sigs.trap_command(i);
-					std::printf("trap -- \'%.*s\' %.*s\n",
-					            static_cast<int>(cmd.size()), cmd.data(),
-					            static_cast<int>(name.size()), name.data());
-					break;
-				}
-				case disposition::default_action:
-					break;
-			}
+	// Options first. `-p` prints defaults too; `--` ends the options, which is what
+	// lets `trap -- '- trapped' USR1` set a command that starts with a hyphen.
+	size_t i = 1;
+	bool include_default = false;
+	for (; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (arg == "--") {
+			++i;
+			break;
 		}
-		return {0};
+		if (arg == "-p") {
+			include_default = true;
+			continue;
+		}
+		break;
+	}
+
+	// `trap`, `trap -p` and `trap -p SIG...` all PRINT rather than set. Only the
+	// presence of an action operand makes this a setting call, and after `-p` there
+	// is no action - the operands are conditions to report.
+	if (argv[i] == nullptr || include_default) {
+		if (argv[i] == nullptr) {
+			for (int signo = 0; signo < kMaxSignal; ++signo)
+				print_trap(sigs, signo, include_default);
+			return {0};
+		}
+		int status = 0;
+		for (; argv[i] != nullptr; ++i) {
+			const int signo = signal_state::signal_number(argv[i]);
+			if (signo < 0) {
+				std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[i]);
+				status = 1;
+				continue;
+			}
+			print_trap(sigs, signo, include_default);
+		}
+		return {status};
 	}
 
 	// `trap - SIG...` resets; `trap '' SIG...` ignores; `trap 'cmd' SIG...` sets.
-	// A first operand that names a signal means reset, which is how `trap INT`
-	// (no action) behaves.
-	size_t first_signal = 2;
-	const std::string_view action{argv[1]};
+	const std::string_view action{argv[i]};
+	size_t first_signal = i + 1;
 	bool reset_only = false;
 	if (action == "-") {
 		reset_only = true;
-	} else if (signal_state::signal_number(action) >= 0 && argv[2] == nullptr) {
+	} else if (is_unsigned_integer(action)) {
+		// The POSIX rule: a numeric first operand makes every operand a condition.
 		reset_only = true;
-		first_signal = 1;
+		first_signal = i;
+	} else if (signal_state::signal_number(action) >= 0 && argv[i + 1] == nullptr) {
+		// `trap INT` with nothing after it. POSIX specifies only the numeric form,
+		// so this stays conditional on there being no further operands - otherwise
+		// `trap INT USR1` would stop meaning "run the command INT on USR1".
+		reset_only = true;
+		first_signal = i;
 	}
 
 	int status = 0;
-	for (size_t i = first_signal; argv[i] != nullptr; ++i) {
-		const int signo = signal_state::signal_number(argv[i]);
+	for (size_t s = first_signal; argv[s] != nullptr; ++s) {
+		const int signo = signal_state::signal_number(argv[s]);
 		if (signo < 0) {
-			std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[i]);
+			std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[s]);
 			status = 1;
 			continue;
 		}

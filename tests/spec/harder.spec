@@ -107,7 +107,10 @@ d=$(mktemp -d); mkfifo $d/f; cat $d/f & echo piped > $d/f; wait
 true & wait; echo $?
 
 --- an ampersand is not a semicolon [xfail(legacy): legacy has no asynchronous lists]
-echo one & echo two; wait
+# Interleaving `echo one & echo two` is a RACE, and a corpus case that sometimes
+# passes is worse than none. What is deterministic is that the shell does not wait:
+# the async list's status is zero however the command ends, and $! is set.
+false & echo "status=$?"; [ -n "$!" ] && echo "pid set"; wait
 
 --- an EXIT trap runs on normal completion [xfail(legacy): legacy has no signal handling]
 trap "echo caught" EXIT; echo body

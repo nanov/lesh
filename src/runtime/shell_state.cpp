@@ -1,9 +1,14 @@
 #include "runtime/shell_state.h"
 
 #include <array>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 extern char** environ;
 
@@ -35,8 +40,35 @@ builtin_kind classify_builtin(std::string_view name) noexcept {
 	return builtin_kind::none;
 }
 
+namespace {
+
+// This process's own executable path. There is no portable call for it: macOS has
+// _NSGetExecutablePath, Linux has /proc/self/exe. Both are one line, and the
+// alternative - trusting argv[0] - is wrong the moment the shell is found on PATH.
+std::string resolve_own_path() {
+#if defined(__APPLE__)
+	uint32_t size = 0;
+	_NSGetExecutablePath(nullptr, &size);  // asks for the required length
+	std::string buffer(size, '\0');
+	if (size == 0 || _NSGetExecutablePath(buffer.data(), &size) != 0)
+		return {};
+	buffer.resize(std::strlen(buffer.c_str()));
+	return buffer;
+#else
+	std::string buffer(4096, '\0');
+	const ssize_t got = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+	if (got <= 0)
+		return {};
+	buffer.resize(static_cast<size_t>(got));
+	return buffer;
+#endif
+}
+
+} // namespace
+
 shell_state::shell_state() {
 	_pid = static_cast<int>(getpid());
+	_own_path = resolve_own_path();
 	// Seed from the process environment. Copying rather than borrowing is the
 	// ADR-0007 decision: these strings are owned here and released in the
 	// destructor, so the leak gate expects zero rather than "zero except envp".

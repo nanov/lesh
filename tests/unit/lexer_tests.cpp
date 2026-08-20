@@ -205,3 +205,40 @@ TEST(Lexer, TokenStaysSmall) {
 	// One token per input byte run; the size is a latency property, not a detail.
 	EXPECT_EQ(sizeof(token), 16u);
 }
+
+// Inside double quotes a single quote is an ordinary byte, and a leading tilde is
+// not eligible for tilde expansion. Lexing the interior in word_interior mode
+// instead made `echo "it's"` print `it` - the trailing `'s"` was taken for the
+// start of a single-quoted segment and its quotes were removed.
+TEST(LexerDoubleQuoteInterior, SingleQuoteIsOrdinary) {
+	lexer lx{"it's"};
+	const token t = lx.next(lex_mode::double_quote_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_literal);
+	EXPECT_EQ(t.length, 4u) << "the whole run is literal, quotes and all";
+}
+
+TEST(LexerDoubleQuoteInterior, SingleQuoteStartsASegmentInAPlainWord) {
+	// The contrast that makes the mode necessary: outside double quotes the same
+	// bytes DO begin a quoted segment.
+	lexer lx{"'s'"};
+	const token t = lx.next(lex_mode::word_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_single_quoted);
+}
+
+TEST(LexerDoubleQuoteInterior, TildeIsNotSpecial) {
+	lexer lx{"~/x"};
+	const token t = lx.next(lex_mode::double_quote_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_literal);
+
+	lexer plain{"~/x"};
+	EXPECT_EQ(plain.next(lex_mode::word_interior).kind, token_kind::seg_tilde)
+		<< "outside double quotes a leading tilde is still eligible";
+}
+
+TEST(LexerDoubleQuoteInterior, ExpansionsAreStillRecognised) {
+	// Only quoting changes. `$`, backtick and backslash keep their meaning.
+	lexer lx{"$HOME"};
+	EXPECT_EQ(lx.next(lex_mode::double_quote_interior).kind, token_kind::seg_parameter);
+	lexer sub{"$(echo hi)"};
+	EXPECT_EQ(sub.next(lex_mode::double_quote_interior).kind, token_kind::seg_command_sub);
+}

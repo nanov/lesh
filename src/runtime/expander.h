@@ -5,6 +5,7 @@
 #include "substrate/arena.h"
 #include "substrate/arena_array.h"
 #include "syntax/ast.h"
+#include "syntax/lexer.h"
 
 #include <string_view>
 
@@ -105,8 +106,13 @@ public:
 	[[nodiscard]] std::string_view expand_assignment_value(std::string_view text) noexcept;
 
 private:
+	// `mode` is how the TEXT is lexed; `quoted` is whether field splitting and
+	// pathname expansion apply. They are separate because an assignment value is
+	// expanded with quoted=true while its single quotes still mean single quotes.
 	expansion_status expand_text(std::string_view text, bool quoted,
-	                             arena_array<std::string_view>& out) noexcept;
+	                             arena_array<std::string_view>& out,
+	                             syntax::lex_mode mode
+	                                 = syntax::lex_mode::word_interior) noexcept;
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
 	void finish_field(arena_array<std::string_view>& out) noexcept;

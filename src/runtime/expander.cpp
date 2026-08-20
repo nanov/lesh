@@ -214,12 +214,13 @@ std::string_view expander::int_to_scratch(int value) noexcept {
 }
 
 expansion_status expander::expand_text(std::string_view text, bool quoted,
-                                       arena_array<std::string_view>& out) noexcept {
+                                       arena_array<std::string_view>& out,
+                                       lex_mode mode) noexcept {
 	expansion_status status = expansion_status::ok;
 	lexer lx{text};
 
 	for (;;) {
-		const token seg = lx.next(lex_mode::word_interior);
+		const token seg = lx.next(mode);
 		if (seg.kind == token_kind::end)
 			break;
 		const std::string_view body = text.substr(seg.offset, seg.length);
@@ -269,8 +270,11 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				// quoted=true is what encodes that.
 				_field_started = true;
 				if (body.size() >= 2) {
+					// The interior is lexed as the inside of double quotes: a single
+					// quote there is an ordinary byte, not the start of a quoted run.
 					const expansion_status inner =
-						expand_text(body.substr(1, body.size() - 2), true, out);
+						expand_text(body.substr(1, body.size() - 2), true, out,
+						            lex_mode::double_quote_interior);
 					if (inner != expansion_status::ok)
 						status = inner;
 				}

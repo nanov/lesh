@@ -350,3 +350,48 @@ set -e; case x in x) false;; esac; echo after
 
 --- set -e reads the pipeline's status, not the first stage's [xfail(legacy): legacy does not honour set -e]
 set -e; false | true; echo after
+
+--- a single quote inside double quotes is an ordinary character [xfail(legacy): legacy strips single quotes inside double quotes]
+echo "it's"; echo "'b'"; echo "a'b'c"
+
+--- single and double quoted runs concatenate without losing quotes
+echo 'x'"'y'"'z'
+
+--- a tilde inside double quotes is not expanded [xfail(legacy): legacy strips single quotes inside double quotes]
+echo "~"; echo "~/x"; echo "a~b"
+
+--- a single quote survives an expansion in the same word [xfail(legacy): legacy strips single quotes inside double quotes]
+x="it's"; echo "[$x]"; echo $x
+
+--- a single quote inside double quotes around a command substitution [xfail(legacy): legacy strips single quotes inside double quotes]
+echo "a$(echo "b'c")d"
+
+--- a file without a shebang is run as a shell script [xfail(legacy): legacy has no ENOEXEC fallback]
+D=/tmp/lesh_spec_noexec; rm -r $D 2>/dev/null; mkdir -p $D; printf 'echo "ran: $1"\n' > $D/s; chmod +x $D/s; $D/s hello; rm -r $D
+
+--- ENOEXEC fallback also applies to a command found on PATH [xfail(legacy): legacy has no ENOEXEC fallback]
+D=/tmp/lesh_spec_noexec2; rm -r $D 2>/dev/null; mkdir -p $D; printf 'echo "ran: $1"\n' > $D/prog; chmod +x $D/prog; PATH=$D:$PATH prog hello; rm -r $D
+
+--- a trap listing can be read back in [xfail(legacy): legacy has no trap builtin]
+# Written to a FILE rather than captured with $( ), deliberately. Whether `trap`
+# inside a command substitution reports the parent's traps is a point where dash
+# and POSIX.1-2024 disagree, and this case is about re-inputtable QUOTING.
+F=/tmp/lesh_spec_traplist; trap 'echo "a"'"'b'"'\c' USR1; trap > $F; trap - USR1; . $F; kill -s USR1 $$; rm -f $F
+
+--- trap with a numeric first operand resets every condition [xfail(legacy): legacy has no trap builtin]
+trap 'echo trapped' 2 QUIT; trap 2 QUIT; trap; echo listed-nothing
+
+--- trap -- lets a command start with a hyphen [xfail(legacy): legacy has no trap builtin]
+trap -- '- x' USR1; trap
+
+--- an ignored trap prints as an empty action [xfail(legacy): legacy has no trap builtin]
+trap '' INT TERM; trap
+
+--- wait with no operands reports zero, not the last job's status [xfail(legacy): legacy has no asynchronous lists]
+false & wait; echo "wait=$?"
+
+--- wait with a pid reports that job's status [xfail(legacy): legacy has no asynchronous lists]
+false & wait $!; echo "one=$?"; true & wait $!; echo "two=$?"
+
+--- wait on a pid that is not a child reports 127 [xfail(legacy): legacy has no asynchronous lists]
+wait 99999; echo "wait=$?"
