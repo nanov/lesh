@@ -637,6 +637,57 @@ getopts a: o -a arg; getopts a: o -a arg; sh -c 'echo ${OPTIND-unset} ${OPTARG-u
 --- getopts is a regular builtin, so a usage error does not exit the shell [xfail(legacy): legacy has no getopts]
 getopts 2>/dev/null; echo "st=$?"; getopts ab 1bad -a 2>/dev/null; echo "st=$?"; echo reached
 
+# `test`, `[` and `readonly` - the three builtins of #35. Each was CLASSIFIED and
+# unimplemented, so the command search never reached PATH and the dispatch's false
+# return was discarded: `test 1 = 2` reported 0, and so did `readonly OPTIND`.
+# Statuses are asserted everywhere below because 0, 1 and 2 are the three answers
+# the broken version could not tell apart.
+
+--- test follows the argument-count rules for zero through four arguments [xfail(legacy): legacy does not dispatch builtins and its lexer swallows the `;`]
+test; echo $?; test ''; echo $?; test -n; echo $?; x=-n; test "$x"; echo $?; test ! -n; echo $?; test = = =; echo $?; test ! ! ''; echo $?; test ! 1 = 2; echo $?
+
+--- test compares integers numerically and reports a non-integer [xfail(legacy): legacy does not dispatch builtins and its lexer swallows the `;`]
+test 1 -eq 1; echo $?; test 10 -gt 9; echo $?; test 007 -eq 7; echo $?; test x -eq 1 2>/dev/null; echo $?
+
+--- test file predicates answer about the file rather than succeeding [xfail(legacy): legacy does not dispatch builtins and its lexer swallows the `;`]
+test -d /; echo $?; test -f /; echo $?; test -s /nonexistent; echo $?; test -e /etc/hosts; echo $?; test -h /nonexistent; echo $?
+
+--- test combines expressions with -a, -o and parentheses [xfail(legacy): legacy does not dispatch builtins and its lexer swallows the `;`]
+test 1 = 1 -a 2 = 2; echo $?; test 1 = 2 -o 2 = 2; echo $?; test ! \( 1 = 1 \); echo $?; test -z '' -a -n x -o -n ''; echo $?; test \( 1 = 2 \) -o \( 3 = 3 \); echo $?
+
+--- the bracket form is the same builtin and requires its closing bracket [xfail(legacy): legacy has no `[` builtin and no exit status parameter]
+[ 1 = 1 ]; echo $?; [ 1 = 2 ]; echo $?; [ 1 = 1 2>/dev/null; echo $?; [ ! ]; echo $?
+
+--- readonly with no operands lists in re-inputtable form [xfail(legacy): legacy has no readonly builtin at all]
+readonly r=1; readonly; readonly u; readonly -p
+
+--- readonly takes -- and marks a name without assigning to it [xfail(legacy): legacy has no readonly builtin at all]
+b=B; readonly -- a=A b c=C; echo $a $b $c; readonly
+
+--- assigning to a readonly variable exits a non-interactive shell [xfail(legacy): legacy has no readonly builtin at all]
+readonly a=1; echo $a; a=2; echo not reached
+
+--- unset refuses a readonly variable, and unset is a special builtin [xfail(legacy): legacy has no readonly builtin at all]
+readonly a=1; unset a; echo not reached
+
+--- exporting a readonly variable is allowed and assigning to it is not [xfail(legacy): legacy has no readonly builtin at all]
+readonly a=1; export a; export a=2; echo not reached
+
+--- a refused assignment inside a parameter expansion is fatal too [xfail(legacy): legacy has no readonly builtin at all]
+readonly x; : ${x=1}; echo not reached
+
+--- a refused assignment inside arithmetic is fatal too [xfail(legacy): legacy has no readonly builtin at all]
+readonly x; echo $((x=1)); echo not reached
+
+--- a readonly name with no value is still unset [xfail(legacy): legacy has no readonly builtin at all]
+readonly x; echo ${x-unset}; x=1
+
+--- read reports a readonly target and, being regular, does not exit the shell [xfail(legacy): legacy has no readonly builtin at all]
+readonly v; echo hi | { read v 2>/dev/null; echo "st=$?"; }; echo reached
+
+--- getopts fails rather than ignore a readonly OPTIND [xfail(legacy): legacy has no getopts and no readonly]
+readonly OPTIND; getopts a o -a 2>/dev/null; echo "st=$?"; echo reached
+
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
 # assertion dash itself fails in the yash suite, so the xfail marker here means
@@ -664,6 +715,9 @@ set -o pipefail; exit 1 | exit 2 | exit 0; echo "b $?"; exit 3 | exit 0 | exit 0
 
 --- set -o lists only the options the shell has [xfail: divergence - dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
 set -o
+
+--- an incomplete test expression is an error rather than a crash [xfail: divergence - dash SEGFAULTS on `test x -a` and reports 139; POSIX leaves the two-argument case unspecified, and 2 with a diagnostic is the only answer that is not a crash]
+test x -a 2>/dev/null; echo $?
 
 --- OPTIND names the argument still being parsed rather than the next one [xfail: divergence - dash advances OPTIND on entering a word, so a mid-word `shift $((OPTIND-1))` discards letters nobody examined; bash, ksh and zsh all report it as lesh does]
 set -- -abc; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"

@@ -55,8 +55,9 @@ public:
 class FakeAssigner final : public parameter_assigner {
 public:
 	std::map<std::string, std::string> assigned;
-	void assign_parameter(std::string_view name, std::string_view value) override {
+	bool assign_parameter(std::string_view name, std::string_view value) override {
 		assigned[std::string(name)] = std::string(value);
+		return true;
 	}
 };
 

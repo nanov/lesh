@@ -384,8 +384,12 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					case param_op::assign_default:
 						if (absent) {
 							const std::string_view d = expand_assignment_value(p.argument);
-							if (_assign != nullptr)
-								_assign->assign_parameter(p.name, d);
+							// A REFUSED assignment - `readonly x; : ${x=1}` - is a variable
+							// assignment error, which POSIX makes fatal to a non-interactive
+							// shell. The assigner has already reported it by name; what it
+							// cannot do is stop the command, so the flag is set here.
+							if (_assign != nullptr && !_assign->assign_parameter(p.name, d))
+								_fatal_error = true;
 							if (quoted) append(d); else append_split(d, out);
 							break;
 						}
@@ -518,6 +522,12 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				}
 				const arithmetic_result r = evaluate(resolved, *_vars);
 				if (!r.ok) {
+					// A refused assignment - `readonly x; echo $((x=1))` - is a variable
+					// assignment error rather than a malformed expression, and POSIX makes
+					// it fatal to a non-interactive shell. shell_state has already named
+					// the variable, the way dash does.
+					if (r.assignment_refused)
+						_fatal_error = true;
 					status = expansion_status::unsupported_construct;
 					break;
 				}

@@ -21,7 +21,11 @@ public:
 	// An unset or non-numeric variable evaluates to 0 rather than erroring, which
 	// is what makes `i=$((i+1))` work without initialising i first.
 	[[nodiscard]] virtual int64_t get(std::string_view name) const = 0;
-	virtual void set(std::string_view name, int64_t value) = 0;
+	// False when the write was REFUSED - a readonly variable - having already
+	// reported it. `$((x=1))` on a readonly x is a variable assignment error, and
+	// POSIX makes that fatal to a non-interactive shell, so the evaluator has to
+	// be able to see the refusal rather than compute a value nothing stored.
+	[[nodiscard]] virtual bool set(std::string_view name, int64_t value) = 0;
 	// Whether the variable exists at all. get() cannot say - it answers 0 for
 	// "unset" and for "set to 0" alike - and `set -u` has to tell them apart.
 	[[nodiscard]] virtual bool defined(std::string_view name) const = 0;
@@ -35,6 +39,11 @@ struct arithmetic_result {
 	// POSIX makes it an error under `set -u` and 0 otherwise, and which of those
 	// applies is the caller's policy, not the evaluator's.
 	std::string_view unset_name;
+	// True when the expression tried to ASSIGN to a variable that refused the
+	// write. Separate from `error` because the caller acts on it differently: a
+	// malformed expression is a bad expansion, while a refused assignment is a
+	// variable assignment error POSIX makes fatal to a non-interactive shell.
+	bool assignment_refused = false;
 };
 
 // POSIX specifies signed long arithmetic. Division by zero is an error rather

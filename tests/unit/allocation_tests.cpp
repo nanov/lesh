@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace lesh;
@@ -91,7 +92,7 @@ TEST_F(AllocationTest, LiteralWordsExpandWithoutAllocatingAtAll) {
 
 TEST_F(AllocationTest, ExpansionNeverFallsBackToTheHeap) {
 	runtime::shell_state state;
-	state.set("VAR", "value");
+	std::ignore = state.set("VAR", "value");
 	for (const char* src : {"echo $VAR", "echo pre$VAR-post", "echo \"a $VAR b\"",
 	                        "echo '$VAR'", "echo $VAR$VAR"}) {
 		buffer_pool fresh{BUFFER_POOL_SIZE};

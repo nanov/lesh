@@ -212,6 +212,7 @@ add_executable(lesh_tests
 	tests/lesh_state_tests.cpp
 	tests/unit/allocation_tests.cpp
 	tests/unit/arithmetic_tests.cpp
+	tests/unit/builtin_registry_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
@@ -221,6 +222,8 @@ add_executable(lesh_tests
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
+	tests/unit/readonly_tests.cpp
+	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui gtest gtest_main)

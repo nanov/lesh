@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <tuple>
 
 using namespace lesh::runtime;
 using namespace lesh::syntax;
@@ -87,7 +88,7 @@ TEST(ShellState, InheritsTheProcessEnvironment) {
 
 TEST(ShellState, SetAndLookupRoundTrip) {
 	shell_state state;
-	state.set("MY_VAR", "my value");
+	std::ignore = state.set("MY_VAR", "my value");
 	std::string_view value;
 	ASSERT_TRUE(state.lookup("MY_VAR", value));
 	EXPECT_EQ(value, "my value");
@@ -100,7 +101,7 @@ TEST(ShellState, OwnsItsValuesRatherThanBorrowingThem) {
 	shell_state state;
 	{
 		const std::string temporary = "value that goes away";
-		state.set("OWNED", temporary);
+		std::ignore = state.set("OWNED", temporary);
 	}
 	std::string_view value;
 	ASSERT_TRUE(state.lookup("OWNED", value));
@@ -109,16 +110,16 @@ TEST(ShellState, OwnsItsValuesRatherThanBorrowingThem) {
 
 TEST(ShellState, UnsetRemoves) {
 	shell_state state;
-	state.set("GONE", "here");
-	state.unset("GONE");
+	std::ignore = state.set("GONE", "here");
+	std::ignore = state.unset("GONE");
 	std::string_view value;
 	EXPECT_FALSE(state.lookup("GONE", value));
 }
 
 TEST(ShellState, OnlyExportedVariablesReachTheEnvironmentBlock) {
 	shell_state state;
-	state.set("LOCAL_ONLY", "no");
-	state.set_exported("EXPORTED", "yes");
+	std::ignore = state.set("LOCAL_ONLY", "no");
+	std::ignore = state.set_exported("EXPORTED", "yes");
 
 	bool saw_exported = false, saw_local = false;
 	for (char** e = state.environment_block(); *e != nullptr; ++e) {
@@ -132,7 +133,7 @@ TEST(ShellState, OnlyExportedVariablesReachTheEnvironmentBlock) {
 
 TEST(ShellState, IfsDefaultsToSpaceTabNewlineWhenUnset) {
 	shell_state state;
-	state.unset("IFS");
+	std::ignore = state.unset("IFS");
 	EXPECT_EQ(state.ifs(), " \t\n");
 }
 
@@ -140,7 +141,7 @@ TEST(ShellState, IfsSetToEmptyMeansNoSplitting) {
 	// Distinct from unset. POSIX: IFS="" disables field splitting entirely, which
 	// is why ifs() returns the value rather than falling back on emptiness.
 	shell_state state;
-	state.set("IFS", "");
+	std::ignore = state.set("IFS", "");
 	EXPECT_EQ(state.ifs(), "");
 }
 

@@ -31,6 +31,10 @@ enum class builtin_kind {
 	regular,   // cd echo false pwd true and the rest
 };
 
+// Defined in builtins.cpp, from the ONE registry that also carries the handlers.
+// It used to be defined here, over two name lists of its own, and the two tables
+// disagreed: `test` and `readonly` were classified with no handler anywhere, so
+// the command search never reached PATH and `test 1 = 2` silently succeeded (#35).
 [[nodiscard]] builtin_kind classify_builtin(std::string_view name) noexcept;
 
 class shell_state final : public parameter_source,
@@ -59,7 +63,7 @@ public:
 	// --- arithmetic_variables -------------------------------------------------
 
 	[[nodiscard]] int64_t get(std::string_view name) const override;
-	void set(std::string_view name, int64_t value) override;
+	bool set(std::string_view name, int64_t value) override;
 	[[nodiscard]] bool defined(std::string_view name) const override {
 		std::string_view ignored;
 		return lookup(name, ignored);
@@ -69,13 +73,52 @@ public:
 
 	// Copies the value in. The state owns it from here, which is what makes the
 	// zero-leak gate reachable - the alternative is what legacy does.
-	void set(std::string_view name, std::string_view value);
-	void set_exported(std::string_view name, std::string_view value);
-	void assign_parameter(std::string_view name, std::string_view value) override {
-		set(name, value);
-	}
-	void unset(std::string_view name);
+	//
+	// Returns FALSE when the name is readonly, having written nothing. The result
+	// is [[nodiscard]] because a refused assignment that the caller ignores is the
+	// bug #35 is about: POSIX makes a variable assignment error fatal to a
+	// non-interactive shell, so `readonly a=1; a=2; echo not reached` must print
+	// nothing, and every writer has to decide what its own failure means. The
+	// DIAGNOSTIC is the caller's too, because dash prefixes it with the builtin
+	// that refused: `export: a: is read only` but a bare `a: is read only`.
+	[[nodiscard]] bool set(std::string_view name, std::string_view value);
+	[[nodiscard]] bool set_exported(std::string_view name, std::string_view value);
+	bool assign_parameter(std::string_view name, std::string_view value) override;
+	[[nodiscard]] bool unset(std::string_view name);
 	[[nodiscard]] bool is_exported(std::string_view name) const;
+
+	// Marks a name exported WITHOUT writing a value, which `export name` needs:
+	// exporting a readonly variable is not an assignment and dash allows it, so
+	// routing it through set() would refuse a command POSIX permits.
+	void mark_exported(std::string_view name);
+
+	// --- readonly -------------------------------------------------------------
+	//
+	// POSIX: a readonly variable cannot be assigned to and cannot be unset. The
+	// flag lives on the variable rather than in a separate set, so a name can be
+	// readonly while UNSET - `readonly x` then `x=1` fails, and `${x-unset}`
+	// still says unset, which is what dash does and what readonly-p.tst checks.
+
+	void mark_readonly(std::string_view name);
+	[[nodiscard]] bool is_readonly(std::string_view name) const;
+
+	// The one wording for a refused write. `who` is the builtin that refused, or
+	// empty for a plain assignment; dash prints `export: a: is read only` for the
+	// first and `a: is read only` for the second, and one function means the six
+	// call sites cannot word it six ways.
+	static void report_readonly(std::string_view who, std::string_view name);
+
+	// Every variable, sorted by name, for the listing forms of `export` and
+	// `readonly`. Sorted because the map is unordered and POSIX leaves the order
+	// unspecified: a stable order is what makes `export -p` output diffable.
+	struct variable_row {
+		std::string_view name;
+		std::string_view value;
+		bool assigned = false;   // false for a name that is readonly but unset
+		bool exported = false;
+		bool readonly = false;
+	};
+	[[nodiscard]] std::vector<variable_row> variables() const;
 
 	// Builds the envp array for a child process. The returned pointers are owned
 	// by this object and stay valid until the next call.
@@ -128,7 +171,10 @@ public:
 	// getopts' own write of OPTIND. The one path that does NOT clear the offset,
 	// since getopts is reporting the position it just reached rather than asking to
 	// start over. dash spells this `setvarsafe("OPTIND", s, VNOFUNC)`.
-	void set_optind(size_t index, size_t offset);
+	//
+	// False when OPTIND is readonly, which POSIX XBD 8.1 lets getopts fail over
+	// rather than ignore - and dash does fail, so the offset is left alone too.
+	[[nodiscard]] bool set_optind(size_t index, size_t offset);
 
 	// --- options --------------------------------------------------------------
 
@@ -215,6 +261,12 @@ private:
 	struct variable {
 		std::string value;
 		bool exported = false;
+		bool readonly = false;
+		// `readonly x` on an unset x creates the entry to hold the flag without
+		// creating the variable. lookup() reports it as absent, and the
+		// environment block leaves it out, or `sh -c 'readonly x' ` would export
+		// an empty x to every child.
+		bool assigned = true;
 	};
 
 	std::unordered_map<std::string, variable, lesh::transparent_string_hash, std::equal_to<>> _vars;

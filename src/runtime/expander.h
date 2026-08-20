@@ -72,7 +72,12 @@ public:
 class parameter_assigner {
 public:
 	virtual ~parameter_assigner() = default;
-	virtual void assign_parameter(std::string_view name, std::string_view value) = 0;
+	// False when the assignment was REFUSED - a readonly variable - having already
+	// reported it. POSIX makes that a variable assignment error, which is fatal to
+	// a non-interactive shell, so `readonly x; : ${x=1}; echo not reached` must
+	// print nothing: the expander cannot decide that without a status back.
+	[[nodiscard]] virtual bool assign_parameter(std::string_view name,
+	                                            std::string_view value) = 0;
 };
 
 enum class expansion_status {

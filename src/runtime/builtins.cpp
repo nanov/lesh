@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <vector>
 #include <vector>
 #include <algorithm>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace lesh::runtime {
@@ -24,6 +26,12 @@ size_t argc_of(char** argv) noexcept {
 		++n;
 	return n;
 }
+
+// Both are defined further down, beside the builtin that first needed them: the
+// quoting grew with `trap`'s re-inputtable listing and the name test with
+// `getopts`. `export` and `readonly` need both, and they come first in the file.
+void print_single_quoted(std::string_view text);
+bool is_name(std::string_view text);
 
 // --- regular builtins --------------------------------------------------------
 
@@ -148,10 +156,387 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 		std::printf("%s\n", logical.c_str());  // POSIX: `cd -` prints where it went
 
 	// PWD and OLDPWD are part of cd's contract, not a nicety: scripts read them.
-	if (!current.empty())
-		state.set_exported("OLDPWD", current);
-	state.set_exported("PWD", logical);
-	return {0};
+	// A readonly PWD makes cd FAIL after the directory has already changed, which
+	// is what dash does too - the chdir is not undone, but the shell says that the
+	// variable no longer describes where it is.
+	int status = 0;
+	if (!current.empty() && !state.set_exported("OLDPWD", current)) {
+		shell_state::report_readonly("cd", "OLDPWD");
+		status = 2;
+	}
+	if (!state.set_exported("PWD", logical)) {
+		shell_state::report_readonly("cd", "PWD");
+		status = 2;
+	}
+	return {status};
+}
+
+// --- test and [ --------------------------------------------------------------
+//
+// POSIX gives `test` a table of primaries AND, before it, explicit rules for
+// argument counts of 0 through 4. The COUNT RULES COME FIRST, and that ordering is
+// the whole difficulty of this utility: `test "$x"` with x set to `-n` is a
+// one-argument test of a non-empty string, not a `-n` missing its operand, and an
+// implementation that matches operators before counting arguments gets it wrong.
+// Everything below is written in that order for that reason.
+
+// What went wrong, so the diagnostic can name the operand. dash's wording, since
+// dash is the differential reference for the floor.
+struct test_failure {
+	const char* message = nullptr;   // nullptr while nothing has failed
+	std::string_view token;          // the operand to name, when there is one
+};
+
+bool is_test_unary(std::string_view op) {
+	// POSIX's unary primaries, plus `-G`, `-O` and `-k`, which dash also accepts.
+	// `-N` is deliberately absent: dash rejects it, and accepting it here would
+	// make `test -N f` differ from the reference for no standard's sake.
+	static constexpr std::string_view ops[] = {
+		"-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-n",
+		"-O", "-G", "-p", "-r", "-S", "-s", "-t", "-u", "-w", "-x", "-z",
+	};
+	for (const auto& candidate : ops)
+		if (candidate == op)
+			return true;
+	return false;
+}
+
+bool is_test_binary(std::string_view op) {
+	// `<` and `>` are not POSIX primaries; dash has them, and a shell script that
+	// reaches the builtin with them would otherwise get "unexpected operator" where
+	// the reference answers.
+	static constexpr std::string_view ops[] = {
+		"=", "!=", "<", ">", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+		"-nt", "-ot", "-ef",
+	};
+	for (const auto& candidate : ops)
+		if (candidate == op)
+			return true;
+	return false;
+}
+
+// dash's `getn`: optional sign, decimal digits, blanks either side, and nothing
+// else. Overflow is an error rather than a wrap, because `test 99999999999999999999
+// -eq 1` must report `Illegal number` rather than compare a truncated value.
+bool test_integer(std::string_view text, int64_t& out) {
+	size_t at = 0;
+	while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n'))
+		++at;
+	bool negative = false;
+	if (at < text.size() && (text[at] == '-' || text[at] == '+'))
+		negative = text[at++] == '-';
+	size_t digits = 0;
+	uint64_t magnitude = 0;
+	for (; at < text.size() && text[at] >= '0' && text[at] <= '9'; ++at, ++digits) {
+		if (magnitude > (UINT64_MAX - 9) / 10)
+			return false;
+		magnitude = magnitude * 10 + static_cast<uint64_t>(text[at] - '0');
+	}
+	if (digits == 0)
+		return false;
+	while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n'))
+		++at;
+	if (at != text.size())
+		return false;
+	const uint64_t limit = negative ? uint64_t{1} << 63
+	                                : static_cast<uint64_t>(INT64_MAX);
+	if (magnitude > limit)
+		return false;
+	out = negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
+	return true;
+}
+
+bool test_unary(std::string_view op, const char* operand, test_failure& fail) {
+	const std::string_view text{operand};
+	if (op == "-n")
+		return !text.empty();
+	if (op == "-z")
+		return text.empty();
+	if (op == "-t") {
+		int64_t fd = 0;
+		if (!test_integer(text, fd)) {
+			fail = {"Illegal number", text};
+			return false;
+		}
+		return isatty(static_cast<int>(fd)) == 1;
+	}
+	// -h and -L ask about the LINK, so they must not follow it; everything else
+	// follows, which is why there are two stat calls rather than one.
+	struct stat info {};
+	if (op == "-h" || op == "-L")
+		return lstat(operand, &info) == 0 && S_ISLNK(info.st_mode);
+	if (op == "-r")
+		return access(operand, R_OK) == 0;
+	if (op == "-w")
+		return access(operand, W_OK) == 0;
+	if (op == "-x")
+		return access(operand, X_OK) == 0;
+	if (stat(operand, &info) != 0)
+		return false;
+	if (op == "-e")
+		return true;
+	if (op == "-b")
+		return S_ISBLK(info.st_mode);
+	if (op == "-c")
+		return S_ISCHR(info.st_mode);
+	if (op == "-d")
+		return S_ISDIR(info.st_mode);
+	if (op == "-f")
+		return S_ISREG(info.st_mode);
+	if (op == "-p")
+		return S_ISFIFO(info.st_mode);
+	if (op == "-S")
+		return S_ISSOCK(info.st_mode);
+	if (op == "-s")
+		return info.st_size > 0;
+	if (op == "-g")
+		return (info.st_mode & S_ISGID) != 0;
+	if (op == "-u")
+		return (info.st_mode & S_ISUID) != 0;
+	if (op == "-k")
+		return (info.st_mode & S_ISVTX) != 0;
+	if (op == "-O")
+		return info.st_uid == geteuid();
+	if (op == "-G")
+		return info.st_gid == getegid();
+	fail = {"unexpected operator", op};
+	return false;
+}
+
+bool test_binary(const char* left, std::string_view op, const char* right,
+                 test_failure& fail) {
+	const std::string_view a{left};
+	const std::string_view b{right};
+	if (op == "=")
+		return a == b;
+	if (op == "!=")
+		return a != b;
+	if (op == "<")
+		return a < b;
+	if (op == ">")
+		return a > b;
+	if (op == "-nt" || op == "-ot" || op == "-ef") {
+		struct stat first {};
+		struct stat second {};
+		if (stat(left, &first) != 0 || stat(right, &second) != 0)
+			return false;
+		if (op == "-ef")
+			return first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+		if (op == "-nt")
+			return first.st_mtime > second.st_mtime;
+		return first.st_mtime < second.st_mtime;
+	}
+	int64_t x = 0;
+	int64_t y = 0;
+	if (!test_integer(a, x)) {
+		fail = {"Illegal number", a};
+		return false;
+	}
+	if (!test_integer(b, y)) {
+		fail = {"Illegal number", b};
+		return false;
+	}
+	if (op == "-eq") return x == y;
+	if (op == "-ne") return x != y;
+	if (op == "-lt") return x < y;
+	if (op == "-le") return x <= y;
+	if (op == "-gt") return x > y;
+	return x >= y;  // -ge, the only one left
+}
+
+// The POSIX count rules for one and two arguments, used by the three- and
+// four-argument rules too - which is why they are functions rather than inline
+// branches: `test ! ! ""` is the two-argument rule applied inside the three.
+bool test_one(const char* arg) { return std::string_view{arg}.size() != 0; }
+
+bool test_two(char** args, test_failure& fail) {
+	const std::string_view op{args[0]};
+	if (op == "!")
+		return !test_one(args[1]);
+	if (is_test_unary(op))
+		return test_unary(op, args[1], fail);
+	fail = {"unexpected operator", op};
+	return false;
+}
+
+// The expression grammar, for more than four arguments and for the counts POSIX
+// leaves unspecified. Only reached after the count rules have had their say.
+//
+//   expression := and ( -o and )*
+//   and        := negation ( -a negation )*
+//   negation   := `!` negation | primary
+//   primary    := `(` expression `)` | unary operand | operand binary operand
+//                | operand
+struct test_parser {
+	char** args = nullptr;
+	size_t count = 0;
+	size_t at = 0;
+	test_failure fail;
+
+	[[nodiscard]] std::string_view peek() const {
+		return at < count ? std::string_view{args[at]} : std::string_view{};
+	}
+	[[nodiscard]] bool done() const { return at >= count; }
+
+	bool parse_expression() {
+		bool value = parse_and();
+		while (!fail.message && peek() == "-o") {
+			++at;
+			// Not short-circuited: `test x -o BADOP y` must still report the operator,
+			// and POSIX gives `test` no lazy evaluation to hide an error behind.
+			const bool right = parse_and();
+			value = value || right;
+		}
+		return value;
+	}
+
+	bool parse_and() {
+		bool value = parse_negation();
+		while (!fail.message && peek() == "-a") {
+			++at;
+			const bool right = parse_negation();
+			value = value && right;
+		}
+		return value;
+	}
+
+	bool parse_negation() {
+		if (peek() == "!") {
+			++at;
+			return !parse_negation();
+		}
+		return parse_primary();
+	}
+
+	bool parse_primary() {
+		if (done()) {
+			fail = {"argument expected", {}};
+			return false;
+		}
+		if (peek() == "(") {
+			++at;
+			const bool value = parse_expression();
+			if (!fail.message && peek() != ")") {
+				fail = {"closing paren expected", {}};
+				return false;
+			}
+			++at;
+			return value;
+		}
+		// A unary primary only when an operand follows it. Without that test, a
+		// trailing `-n` would read past the end of the arguments.
+		if (is_test_unary(peek()) && at + 1 < count) {
+			const std::string_view op = peek();
+			at += 2;
+			return test_unary(op, args[at - 1], fail);
+		}
+		char* const left = args[at++];
+		if (!done() && is_test_binary(peek()) && at + 1 < count) {
+			const std::string_view op = peek();
+			at += 2;
+			return test_binary(left, op, args[at - 1], fail);
+		}
+		// A bare operand is true when it is not the empty string. An operator here
+		// is a syntax error rather than a string, which is what tells
+		// `test 1 = 1 = 1` from `test = = =`.
+		if (!done() && (is_test_binary(peek()) || is_test_unary(peek()))) {
+			fail = {"unexpected operator", std::string_view{left}};
+			return false;
+		}
+		return test_one(left);
+	}
+};
+
+// The three-argument rule, which the four-argument rule applies inside itself:
+// `test ! a = b` is `!` in front of the three-argument case, so this has to be one
+// function rather than a branch.
+bool test_three(char** args, test_failure& fail) {
+	if (is_test_binary(args[1]))
+		return test_binary(args[0], args[1], args[2], fail);
+	if (std::string_view{args[0]} == "!")
+		return !test_two(args + 1, fail);
+	if (std::string_view{args[0]} == "(" && std::string_view{args[2]} == ")")
+		return test_one(args[1]);
+	// POSIX calls the rest of this case unspecified. The expression grammar is the
+	// answer that agrees with dash on `test -a -a -a` and reports `test x bogus y`
+	// rather than guessing.
+	test_parser parser{args, 3, 0, {}};
+	const bool value = parser.parse_expression();
+	fail = parser.fail;
+	if (!fail.message && !parser.done())
+		fail = {"unexpected operator", parser.peek()};
+	return value;
+}
+
+// `test`, and `[` with its closing bracket already removed.
+//
+// Status is 0 for true, 1 for false, and 2 for an ERROR - which is the difference
+// this builtin exists to make: an unimplemented `test` returned 0, so
+// `test 1 = 2` was indistinguishable from success (#35).
+builtin_result run_test(std::string_view invoked_as, char** args, size_t count) {
+	test_failure fail;
+	bool value = false;
+	switch (count) {
+		// POSIX: with no arguments, `test` is FALSE. Not an error.
+		case 0: value = false; break;
+		case 1: value = test_one(args[0]); break;
+		case 2: value = test_two(args, fail); break;
+		case 3: value = test_three(args, fail); break;
+		case 4:
+			if (std::string_view{args[0]} == "!") {
+				value = !test_three(args + 1, fail);
+			} else if (std::string_view{args[0]} == "(" &&
+			           std::string_view{args[3]} == ")") {
+				value = test_two(args + 1, fail);
+			} else {
+				test_parser parser{args, count, 0, {}};
+				value = parser.parse_expression();
+				fail = parser.fail;
+				if (!fail.message && !parser.done())
+					fail = {"unexpected operator", parser.peek()};
+			}
+			break;
+		default: {
+			test_parser parser{args, count, 0, {}};
+			value = parser.parse_expression();
+			fail = parser.fail;
+			// Arguments left over are an error, not something to ignore: without this
+			// `test 1 = 1 junk` would report the truth of its first three operands.
+			if (!fail.message && !parser.done())
+				fail = {"unexpected operator", parser.peek()};
+			break;
+		}
+	}
+
+	if (fail.message != nullptr) {
+		if (fail.token.empty())
+			std::fprintf(stderr, "lesh: %.*s: %s\n",
+			             static_cast<int>(invoked_as.size()), invoked_as.data(),
+			             fail.message);
+		else
+			std::fprintf(stderr, "lesh: %.*s: %.*s: %s\n",
+			             static_cast<int>(invoked_as.size()), invoked_as.data(),
+			             static_cast<int>(fail.token.size()), fail.token.data(),
+			             fail.message);
+		return {2};
+	}
+	return {value ? 0 : 1};
+}
+
+builtin_result builtin_test(shell_state&, char** argv) {
+	const std::string_view name{argv[0]};
+	size_t count = argc_of(argv) - 1;
+	// `[` is the same utility and must require its closing bracket, which is the
+	// only difference between the two spellings. Anything after the `]` is an error
+	// too, so the check is on the LAST argument rather than a search.
+	if (name == "[") {
+		if (count == 0 || std::string_view{argv[count]} != "]") {
+			std::fprintf(stderr, "lesh: [: missing ]\n");
+			return {2};
+		}
+		--count;
+	}
+	return run_test(name, argv + 1, count);
 }
 
 // --- special builtins --------------------------------------------------------
@@ -164,25 +549,130 @@ builtin_result builtin_exit(shell_state& state, char** argv) {
 	return {status, control_flow::exit_shell};
 }
 
-builtin_result builtin_export(shell_state& state, char** argv) {
-	if (argv[1] == nullptr)
-		return {0};  // listing exported names: not implemented, not an error
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
+// One `export NAME='VALUE'` or `readonly NAME='VALUE'` line, quoted so the shell
+// reads it back as exactly these bytes.
+//
+// POSIX requires the no-operand form of both builtins to print in a form that can
+// be RE-INPUT, which is what export-p.tst's `e="$(export -p)"; eval "$e"` round
+// trip checks. A name that is readonly but UNSET prints bare - `readonly x` - and
+// printing `x=''` for it would create the variable on re-input.
+void print_declaration(std::string_view keyword, const shell_state::variable_row& row) {
+	std::printf("%.*s %.*s", static_cast<int>(keyword.size()), keyword.data(),
+	            static_cast<int>(row.name.size()), row.name.data());
+	if (row.assigned) {
+		std::fputc('=', stdout);
+		print_single_quoted(row.value);
+	}
+	std::fputc('\n', stdout);
+}
+
+// `export` and `readonly` differ in one flag and one predicate, so they share a
+// body: writing them twice is how the two would come to disagree about `--`, about
+// a bad name, or about what a refused assignment costs.
+builtin_result run_declaration(shell_state& state, char** argv, bool make_readonly) {
+	const std::string_view keyword{argv[0]};
+	size_t i = 1;
+	bool print_only = false;
+	for (; argv[i] != nullptr; ++i) {
 		const std::string_view arg{argv[i]};
-		if (const size_t eq = arg.find('='); eq != std::string_view::npos)
-			state.set_exported(arg.substr(0, eq), arg.substr(eq + 1));
-		else if (std::string_view existing; state.lookup(arg, existing))
-			state.set_exported(arg, existing);
-		else
-			state.set_exported(arg, "");
+		// `--` ends the options: readonly-p.tst's 'separator preceding operand' is
+		// `readonly -- a=foo`, which without this assigned to a name of `--`.
+		if (arg == "--") {
+			++i;
+			break;
+		}
+		if (arg == "-p") {
+			print_only = true;
+			continue;
+		}
+		if (arg.size() >= 2 && arg[0] == '-') {
+			std::fprintf(stderr, "lesh: %.*s: Illegal option %.*s\n",
+			             static_cast<int>(keyword.size()), keyword.data(),
+			             static_cast<int>(arg.size()), arg.data());
+			return {2};
+		}
+		break;
+	}
+
+	// `-p` PRINTS and ignores any operands, which is dash's behaviour: `readonly -p
+	// x` there neither lists x nor makes it readonly.
+	if (print_only || argv[i] == nullptr) {
+		for (const auto& row : state.variables())
+			if (make_readonly ? row.readonly : row.exported)
+				print_declaration(keyword, row);
+		return {0};
+	}
+
+	for (; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		const size_t eq = arg.find('=');
+		const std::string_view name = arg.substr(0, eq);
+		if (!is_name(name)) {
+			std::fprintf(stderr, "lesh: %.*s: %.*s: bad variable name\n",
+			             static_cast<int>(keyword.size()), keyword.data(),
+			             static_cast<int>(name.size()), name.data());
+			return {2};
+		}
+		if (eq != std::string_view::npos) {
+			const bool ok = make_readonly ? state.set(name, arg.substr(eq + 1))
+			                              : state.set_exported(name, arg.substr(eq + 1));
+			if (!ok) {
+				// Both are SPECIAL builtins, so this status exits a non-interactive
+				// shell - the dispatch applies that, not this. readonly-p.tst and
+				// export-p.tst each have a case that requires exactly it.
+				shell_state::report_readonly(keyword, name);
+				return {2};
+			}
+		} else if (!make_readonly) {
+			// `export name` is not an assignment, so it is allowed on a readonly
+			// variable and must not create a value for an unset one.
+			state.mark_exported(name);
+		}
+		if (make_readonly)
+			state.mark_readonly(name);
 	}
 	return {0};
 }
 
+builtin_result builtin_export(shell_state& state, char** argv) {
+	return run_declaration(state, argv, /*make_readonly=*/false);
+}
+
+builtin_result builtin_readonly(shell_state& state, char** argv) {
+	return run_declaration(state, argv, /*make_readonly=*/true);
+}
+
 builtin_result builtin_unset(shell_state& state, char** argv) {
-	for (size_t i = 1; argv[i] != nullptr; ++i)
-		state.unset(argv[i]);
-	return {0};
+	size_t i = 1;
+	for (; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (arg == "--") {
+			++i;
+			break;
+		}
+		// `-v` is the default and selects variables. `-f` never reaches here: the
+		// executor intercepts that form, because removing a function means reaching
+		// the function table, which lives there.
+		if (arg == "-v")
+			continue;
+		if (arg.size() >= 2 && arg[0] == '-') {
+			std::fprintf(stderr, "lesh: unset: Illegal option %.*s\n",
+			             static_cast<int>(arg.size()), arg.data());
+			return {2};
+		}
+		break;
+	}
+	int status = 0;
+	for (; argv[i] != nullptr; ++i) {
+		// POSIX: unsetting a readonly variable is an error, and `unset` is a special
+		// builtin, so it takes a non-interactive shell down with it. Two cases in
+		// unset-p.tst check that, and both were passing silently.
+		if (!state.unset(argv[i])) {
+			shell_state::report_readonly("unset", argv[i]);
+			status = 2;
+		}
+	}
+	return {status};
 }
 
 // `set -o` with no name: the current settings, one per line.
@@ -491,10 +981,18 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 		line += static_cast<char>(c);
 	}
 
-	if (argv[first] == nullptr) {
-		state.set("REPLY", line);
-		return {0};
-	}
+	// A readonly target makes `read` FAIL rather than discard the line quietly.
+	// dash reports `read: v: is read only` and returns 2 and, being a regular
+	// builtin, carries on.
+	const auto assign = [&state](std::string_view name, std::string_view value) {
+		if (state.set(name, value))
+			return true;
+		shell_state::report_readonly("read", name);
+		return false;
+	};
+
+	if (argv[first] == nullptr)
+		return {assign("REPLY", line) ? 0 : 2};
 
 	const std::string_view ifs = state.ifs();
 	size_t at = 0;
@@ -510,13 +1008,13 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 			rest.remove_prefix(std::min(at, rest.size()));
 			while (!rest.empty() && ifs.find(rest.back()) != std::string_view::npos)
 				rest.remove_suffix(1);
-			state.set(argv[var], rest);
-			return {0};
+			return {assign(argv[var], rest) ? 0 : 2};
 		}
 		const size_t start = at;
 		while (at < line.size() && ifs.find(line[at]) == std::string_view::npos)
 			++at;
-		state.set(argv[var], std::string_view{line}.substr(start, at - start));
+		if (!assign(argv[var], std::string_view{line}.substr(start, at - start)))
+			return {2};
 		++var;
 	}
 	return {0};
@@ -601,16 +1099,40 @@ std::vector<std::string_view> getopts_arguments(const shell_state& state, char**
 // report it that way; dash advances OPTIND as soon as it enters the word, which
 // makes `shift $((OPTIND-1))` after a mid-word `?` discard letters nobody looked
 // at. Recorded as a divergence in tests/spec/posix_gaps.spec.
-builtin_result builtin_getopts(shell_state& state, char** argv) {
+// `refused` is set when a write was rejected because the variable is readonly.
+// getopts writes THREE variables - OPTIND, OPTARG and the name operand - and POSIX
+// XBD 8.1 lets the builtin fail rather than ignore the readonlyness. dash fails,
+// and getopts-p.tst's 'readonly OPTIND' and 'readonly OPTARG' each require a
+// diagnostic and a non-zero status from one of the two builtins involved.
+int getopts_step(shell_state& state, char** argv, bool& refused) {
+	const auto write = [&state, &refused](std::string_view name, std::string_view value) {
+		if (!state.set(name, value)) {
+			shell_state::report_readonly("getopts", name);
+			refused = true;
+		}
+	};
+	const auto write_optind = [&state, &refused](size_t index, size_t offset) {
+		if (!state.set_optind(index, offset)) {
+			shell_state::report_readonly("getopts", "OPTIND");
+			refused = true;
+		}
+	};
+	const auto erase = [&state, &refused](std::string_view name) {
+		if (!state.unset(name)) {
+			shell_state::report_readonly("getopts", name);
+			refused = true;
+		}
+	};
+
 	if (argv[1] == nullptr || argv[2] == nullptr) {
 		std::fprintf(stderr, "lesh: getopts: usage: getopts optstring name [arg...]\n");
-		return {2};
+		return 2;
 	}
 	const std::string_view name{argv[2]};
 	if (!is_name(name)) {
 		std::fprintf(stderr, "lesh: getopts: %.*s: bad variable name\n",
 		             static_cast<int>(name.size()), name.data());
-		return {2};
+		return 2;
 	}
 
 	// A leading colon in optstring hands the diagnostics to the CALLER: nothing is
@@ -675,10 +1197,10 @@ builtin_result builtin_getopts(shell_state& state, char** argv) {
 		if (!is_option || word == "--") {
 			if (word == "--")
 				++index;  // POSIX: OPTIND points PAST the `--`
-			state.set_optind(index, 0);
-			state.set(name, "?");
-			state.unset("OPTARG");
-			return {1};
+			write_optind(index, 0);
+			write(name, "?");
+			erase("OPTARG");
+			return 1;
 		}
 		offset = 1;  // past the `-`
 	}
@@ -697,54 +1219,63 @@ builtin_result builtin_getopts(shell_state& state, char** argv) {
 	// appears in the optstring. Without this test, `getopts a:b v -:` would parse a
 	// colon as a valid option.
 	if (option == ':' || at == std::string_view::npos) {
-		state.set_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
-		state.set(name, "?");
+		write_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
+		write(name, "?");
 		if (quiet) {
-			state.set("OPTARG", std::string_view{&option, 1});
+			write("OPTARG", std::string_view{&option, 1});
 		} else {
-			state.unset("OPTARG");
+			erase("OPTARG");
 			std::fprintf(stderr, "lesh: getopts: illegal option -%c\n", option);
 		}
 		// Zero, not one: POSIX gives status >0 to the END of the options, and an
 		// unknown option was still an option FOUND. `while getopts ...` has to keep
 		// looping so the script's own `?)` case can run.
-		return {0};
+		return 0;
 	}
 
 	if (at + 1 < letters.size() && letters[at + 1] == ':') {
 		if (!word_done) {
 			// Adjoined: `-afoo` puts the rest of the word in OPTARG and finishes it.
-			state.set("OPTARG", word.substr(offset));
-			state.set_optind(index + 1, 0);
+			write("OPTARG", word.substr(offset));
+			write_optind(index + 1, 0);
 		} else if (index + 1 <= args.size()) {
-			state.set("OPTARG", args[index]);
-			state.set_optind(index + 2, 0);
+			write("OPTARG", args[index]);
+			write_optind(index + 2, 0);
 		} else {
 			// Missing argument. The option word is consumed either way, so OPTIND
 			// still advances past it.
-			state.set_optind(index + 1, 0);
+			write_optind(index + 1, 0);
 			if (quiet) {
-				state.set(name, ":");
-				state.set("OPTARG", std::string_view{&option, 1});
+				write(name, ":");
+				write("OPTARG", std::string_view{&option, 1});
 			} else {
-				state.set(name, "?");
-				state.unset("OPTARG");
+				write(name, "?");
+				erase("OPTARG");
 				std::fprintf(stderr, "lesh: getopts: option requires an argument -%c\n",
 				             option);
 			}
-			return {0};
+			return 0;
 		}
 	} else {
 		// POSIX: OPTARG is UNSET when the option takes no argument, which is what
 		// makes `${OPTARG-unset}` tell an argument-less option from an empty one.
 		// dash and zsh leave the empty string here and both fail getopts-p.tst's
 		// 'OPTARG is unset when option without argument is parsed'.
-		state.unset("OPTARG");
-		state.set_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
+		erase("OPTARG");
+		write_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
 	}
 
-	state.set(name, std::string_view{&option, 1});
-	return {0};
+	write(name, std::string_view{&option, 1});
+	return 0;
+}
+
+builtin_result builtin_getopts(shell_state& state, char** argv) {
+	bool refused = false;
+	const int status = getopts_step(state, argv, refused);
+	// A refused write is getopts' OWN failure: reporting an option it could not
+	// record would leave `while getopts ...` looping on a variable that never
+	// changes.
+	return {refused ? 2 : status};
 }
 
 builtin_result builtin_times(shell_state&, char**) {
@@ -801,15 +1332,14 @@ builtin_result builtin_return(shell_state& state, char** argv) {
 	        control_flow::return_from};
 }
 
+// The handler table. Names, kinds and the executor's share of the work all live
+// in kBuiltinRegistry (runtime/builtins.h); this table carries only the functions,
+// and the static_assert below is what keeps the two from drifting.
 struct entry {
 	std::string_view name;
 	builtin_result (*fn)(shell_state&, char**);
 };
 
-// Only what is implemented. `eval`, `.`, `exec` and `wait` are absent because they
-// live in the executor - they need the front end, the process itself, or the record
-// of background jobs. `readonly` is absent because it is not written yet, and a
-// stub that silently succeeds is worse than a command that reports "not found".
 constexpr entry kBuiltins[] = {
 	{"true", builtin_true},   {"false", builtin_false}, {"echo", builtin_echo},
 	{"pwd", builtin_pwd},     {"cd", builtin_cd},       {":", builtin_colon},
@@ -819,9 +1349,85 @@ constexpr entry kBuiltins[] = {
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
 	{"read", builtin_read}, {"command", builtin_command}, {"times", builtin_times},
 	{"trap", builtin_trap}, {"kill", builtin_kill}, {"getopts", builtin_getopts},
+	{"readonly", builtin_readonly},
+	{"test", builtin_test}, {"[", builtin_test},
 };
 
+constexpr bool has_handler(std::string_view name) {
+	for (const auto& b : kBuiltins)
+		if (b.name == name)
+			return true;
+	return false;
+}
+
+constexpr bool in_registry(std::string_view name) {
+	for (const auto& d : kBuiltinRegistry)
+		if (d.name == name)
+			return true;
+	return false;
+}
+
+// THE GUARD, and the deliverable of #35.
+//
+// Before this, classification lived in shell_state.cpp over two name lists and the
+// handlers lived here, with nothing relating them. `test` and `readonly` were in
+// the first and not the second, so the command search stopped at "this is a
+// builtin" and never reached PATH, the dispatch returned false, and the executor
+// discarded it: `test 1 = 2; echo $?` printed 0 and `readonly OPTIND` did nothing
+// at all. A unit test diffing the tables would have caught it the day `test` was
+// classified; a static_assert cannot even be skipped by not running the tests.
+//
+// The check is both directions, because each direction is a different bug: a
+// registry name with no handler is a command that silently succeeds, and a handler
+// with no registry entry is a builtin the search order never reaches.
+constexpr bool registry_agrees_with_handlers() {
+	for (const auto& d : kBuiltinRegistry)
+		if ((d.home == builtin_home::table) != has_handler(d.name))
+			return false;
+	for (const auto& b : kBuiltins)
+		if (!in_registry(b.name))
+			return false;
+	return true;
+}
+
+static_assert(registry_agrees_with_handlers(),
+              "kBuiltinRegistry and kBuiltins disagree: every registry entry with "
+              "builtin_home::table needs a handler here, every handler needs a "
+              "registry entry, and a name the executor implements must be marked "
+              "builtin_home::executor. See issue #35.");
+
 } // namespace
+
+builtin_kind classify_builtin(std::string_view name) noexcept {
+	for (const auto& d : kBuiltinRegistry)
+		if (d.name == name)
+			return d.kind;
+	return builtin_kind::none;
+}
+
+bool builtin_has_handler(std::string_view name) noexcept {
+	return has_handler(name);
+}
+
+builtin_home builtin_home_of(std::string_view name) noexcept {
+	for (const auto& d : kBuiltinRegistry)
+		if (d.name == name)
+			return d.home;
+	return builtin_home::table;
+}
+
+bool unset_selects_functions(char** argv) noexcept {
+	if (argv == nullptr || argv[0] == nullptr)
+		return false;
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (arg == "--" || arg.size() < 2 || arg[0] != '-')
+			return false;
+		if (arg.find('f') != std::string_view::npos)
+			return true;
+	}
+	return false;
+}
 
 bool try_run_builtin(shell_state& state, char** argv, builtin_result& out) {
 	if (argv == nullptr || argv[0] == nullptr)
@@ -841,7 +1447,6 @@ bool try_run_builtin(shell_state& state, char** argv, builtin_result& out) {
 			out.flow = control_flow::exit_shell;
 		return true;
 	}
-	(void)argc_of;
 	return false;
 }
 

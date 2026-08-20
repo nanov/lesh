@@ -45,6 +45,12 @@ _Avoid_: using "parameter" for an argument of a command. The current code does t
 A parameter denoted by a name. Scalars are variables too, not only maps and arrays.
 _Avoid_: env, which names only the exported subset.
 
+**Readonly variable** _[floor]_:
+A variable that assignment and `unset` both refuse. The flag belongs to the
+variable rather than to a separate list, so a name can be readonly while **unset**:
+`readonly x` then `x=1` fails, and `${x-unset}` still says unset.
+_Avoid_: constant, immutable, frozen.
+
 **Subscript** _[curated]_:
 What sits between the brackets in `$var[key]` — the selector into a map or an array.
 _Avoid_: key, index. The code currently uses both, for opposite halves of the same
@@ -144,6 +150,12 @@ A redirection whose input is taken from the lines following the command.
 **Substrate** _[lesh]_:
 The allocation and container layer everything else is built on: the arena and the
 stack-first hybrid containers. Depends on nothing.
+
+**Builtin registry** _[lesh]_:
+The one table naming every builtin, its kind, and where its implementation lives.
+Classification and dispatch both read it, so a name cannot be classified without
+being implemented — the disagreement that had `test 1 = 2` reporting success.
+_Avoid_: builtin table, which named either of the two tables that disagreed.
 
 **Arena** _[lesh]_:
 A pool that hands out memory and reclaims it in one shot, rather than per object.

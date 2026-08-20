@@ -19,10 +19,10 @@ public:
 		const int64_t value = parse_comma();
 		skip_blanks();
 		if (_failed)
-			return {0, false, _error, {}};
+			return {0, false, _error, {}, _refused};
 		if (_at < _text.size())
-			return {0, false, "unexpected character", {}};
-		return {value, true, nullptr, _unset_name};
+			return {0, false, "unexpected character", {}, false};
+		return {value, true, nullptr, _unset_name, false};
 	}
 
 private:
@@ -30,6 +30,7 @@ private:
 	arithmetic_variables& _vars;
 	size_t _at = 0;
 	bool _failed = false;
+	bool _refused = false;
 	const char* _error = nullptr;
 	// The first name read that the caller had never set. Only the first, because
 	// that is the one `set -u` reports and the evaluation stops mattering after it.
@@ -112,7 +113,13 @@ private:
 					const int64_t rhs = parse_assignment();
 					const int64_t lhs = read_variable(name);
 					const int64_t result = apply_compound(op, lhs, rhs);
-					_vars.set(name, result);
+					// A readonly variable refuses the write. Failing the whole expression
+					// is the only honest answer: `$((x+=1))` that reports a value it did
+					// not store would be a lie the caller cannot see through.
+					if (!_vars.set(name, result)) {
+						_refused = true;
+						fail("readonly variable");
+					}
 					return result;
 				}
 			}
@@ -120,7 +127,10 @@ private:
 			    (after + 1 >= _text.size() || _text[after + 1] != '=')) {
 				_at = after + 1;
 				const int64_t rhs = parse_assignment();
-				_vars.set(name, rhs);
+				if (!_vars.set(name, rhs)) {
+					_refused = true;
+					fail("readonly variable");
+				}
 				return rhs;
 			}
 		}

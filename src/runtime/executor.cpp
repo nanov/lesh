@@ -840,7 +840,13 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 
 	int status = 0;
 	for (const auto& item : items) {
-		_state.set(var, item);
+		// A readonly loop variable stops the loop: dash exits the shell over
+		// `readonly i; for i in 1 2; do echo $i; done`, because assigning the
+		// variable is how the loop advances and POSIX makes the failure fatal.
+		if (!_state.set(var, item)) {
+			shell_state::report_readonly({}, var);
+			return assignment_error();
+		}
 		status = run_node(t, t.child_of(self, word_count));
 		if (_exit_requested)
 			return status;
@@ -1021,7 +1027,9 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 	setpgid(pid, pid);
 	// Remembered so `wait` can reap it, and so it is not left as a zombie.
 	_background.push_back(pid);
-	_state.set("!", std::to_string(pid));
+	// `!` is not a NAME, so nothing can have made it readonly and the refusal path
+	// is unreachable here.
+	std::ignore = _state.set("!", std::to_string(pid));
 	return 0;
 }
 
@@ -1141,9 +1149,12 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 			expander child_ex{_pool, _state, nullptr, true, &_state, &_state};
 			for (const auto& a : *assignments) {
 				const size_t eq = a.find('=');
+				// A readonly name was refused before the fork - see run_simple_command -
+				// so the refusal cannot happen here, and a child could not exit the
+				// shell over it anyway.
 				if (eq != std::string_view::npos)
-					_state.set_exported(a.substr(0, eq),
-					                    child_ex.expand_assignment_value(a.substr(eq + 1)));
+					std::ignore = _state.set_exported(
+						a.substr(0, eq), child_ex.expand_assignment_value(a.substr(eq + 1)));
 			}
 		}
 
@@ -1180,16 +1191,34 @@ std::string_view tree_walking_executor::expand_assignment(std::string_view text)
 	return {joined, name.size() + 1 + value.size()};
 }
 
-void tree_walking_executor::apply_expanded_assignment(std::string_view expanded) {
+// False when the assignment was REFUSED because the name is readonly, having
+// reported it. POSIX 2.8.1 calls that a variable assignment error and makes it
+// fatal to a non-interactive shell, which is why the result travels rather than
+// being dropped here: `readonly a=1; a=2; echo not reached` must print nothing.
+bool tree_walking_executor::apply_expanded_assignment(std::string_view expanded) {
 	const size_t eq = expanded.find('=');
 	if (eq == std::string_view::npos)
-		return;
-	_state.set(expanded.substr(0, eq), expanded.substr(eq + 1));
+		return true;
+	const std::string_view name = expanded.substr(0, eq);
+	if (_state.set(name, expanded.substr(eq + 1)))
+		return true;
+	shell_state::report_readonly({}, name);
+	return false;
 }
 
 // Splits NAME=value, expands the value, and applies it.
-void tree_walking_executor::apply_assignment(std::string_view text) {
-	apply_expanded_assignment(expand_assignment(text));
+bool tree_walking_executor::apply_assignment(std::string_view text) {
+	return apply_expanded_assignment(expand_assignment(text));
+}
+
+// A variable assignment error, applied where POSIX 2.8.1 puts it: the shell exits
+// when it is not interactive, and reports and carries on when it is. One function
+// because every assignment site - a bare `x=1`, a command prefix, a `for` variable,
+// `exec`'s prefix, a function call's prefix - must not decide it separately.
+int tree_walking_executor::assignment_error() {
+	if (!_state.interactive())
+		_exit_requested = true;
+	return kExpansionError;
 }
 
 // One `set -x` trace line.
@@ -1285,7 +1314,8 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 		// because exec is a special builtin, and they persist UNEXPORTED - dash
 		// leaves `FOO=bar exec` visible to the shell but absent from `env`.
 		for (const auto& a : assignments)
-			apply_assignment(a);
+			if (!apply_assignment(a))
+				return assignment_error();
 		return 0;
 	}
 
@@ -1304,8 +1334,11 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 			const size_t eq = a.find('=');
 			if (eq == std::string_view::npos)
 				continue;
-			_state.set_exported(a.substr(0, eq),
-			                    ex.expand_assignment_value(a.substr(eq + 1)));
+			const std::string_view name = a.substr(0, eq);
+			if (!_state.set_exported(name, ex.expand_assignment_value(a.substr(eq + 1)))) {
+				shell_state::report_readonly({}, name);
+				return assignment_error();
+			}
 		}
 	}
 
@@ -1336,6 +1369,132 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 	if (fatal)
 		_exit_requested = true;
 	return status;
+}
+
+// `unset -f name...` removes functions. It lives here rather than in builtins.cpp
+// for the same reason `eval` does: the function table is the executor's, and
+// try_run_builtin is handed nothing but shell state.
+//
+// POSIX: unsetting a name that is not a function is NOT an error, which is why
+// there is no diagnostic and no status but zero.
+builtin_result tree_walking_executor::run_unset_functions(char** argv) {
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (arg == "--") {
+			++i;
+			for (; argv[i] != nullptr; ++i)
+				_functions.erase(std::string{argv[i]});
+			break;
+		}
+		if (arg.size() >= 2 && arg[0] == '-')
+			continue;  // an option word; unset_selects_functions has read them
+		_functions.erase(std::string{arg});
+	}
+	return {0};
+}
+
+// The builtins the EXECUTOR implements instead of builtins.cpp, which is what
+// `builtin_home::executor` marks in the registry.
+//
+// One function rather than three blocks inside run_simple_command, because a
+// PIPELINE STAGE needs the same four: `echo hi | eval cat` went to
+// try_run_builtin, which has no entry for `eval`, and the false return was
+// discarded - the stage printed nothing and reported success, which is the same
+// defect as the unimplemented `test` in #35. Returns false when the name is none
+// of them.
+bool tree_walking_executor::try_run_executor_builtin(
+		const tree& t, node_index n, arena_array<char*>& argv,
+		const arena_array<std::string_view>& assignments, bool bypass_functions,
+		int& status) {
+	const std::string_view name{argv[0]};
+
+	// `exec` replaces this process, so no table of functions could hold it. Until it
+	// landed it was classified with no handler anywhere, so try_run_builtin found
+	// nothing and returned success: `exec echo hi; echo notreached` printed only
+	// `notreached`. A stub that silently succeeds is worse than an absent builtin -
+	// the same mistake `command` made earlier on #31, which cost 19 of 49
+	// assertions in command-p.tst.
+	if (name == "exec") {
+		status = run_exec(t, n, argv, assignments, bypass_functions);
+		return true;
+	}
+
+	// `wait` needs the executor's record of background jobs, so it lives here
+	// alongside eval and . rather than in builtins.cpp.
+	if (name == "wait") {
+		if (argv[1] == nullptr) {
+			// POSIX: with no operands, `wait` waits for ALL known children and its
+			// status is ZERO - not the last child's. Reporting the last one made
+			// `false & wait` fail, and under `set -e` that would exit the shell.
+			for (const pid_t pid : _background) {
+				int wait_status = 0;
+				(void)waitpid(pid, &wait_status, 0);
+			}
+			_background.clear();
+			status = 0;
+			return true;
+		}
+		// With operands the status is the LAST operand's, and a child killed by a
+		// signal reports 128 + the signal number.
+		status = 0;
+		for (size_t i = 1; argv[i] != nullptr; ++i) {
+			const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
+			int wait_status = 0;
+			if (waitpid(target, &wait_status, 0) > 0) {
+				status = status_from_wait(wait_status);
+			} else {
+				// POSIX DEFINES the answer for a pid that is not a child: status 127.
+				// No diagnostic, because this is a specified result rather than a
+				// failure - dash is silent here too.
+				status = 127;
+			}
+			std::erase(_background, target);
+		}
+		return true;
+	}
+
+	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
+	// here too - giving every builtin a back-reference to the executor to serve
+	// two of them would be the wrong trade. This is the cycle the ports in #11
+	// were designed to survive: parsing inside execution, with the parse seeing
+	// the same aliases and the execution seeing the same state.
+	if (name == "eval" || name == ".") {
+		arena_array<saved_fd> saved{_pool, 4};
+		std::fflush(nullptr);
+		const bool ok = apply_redirections(t, n, &saved);
+		if (!ok) {
+			// `eval` and `.` are SPECIAL builtins, and POSIX 2.8.1 makes a
+			// redirection error on a special builtin fatal to a non-interactive
+			// shell. dash agrees: `dash -c 'eval : </missing; echo reached'` exits 2
+			// without printing `reached`, while a regular builtin in the same
+			// position reports 2 and carries on. `command eval ...` demotes it, which
+			// is what bypass_functions records.
+			status = kRedirectionError;
+			if (!bypass_functions && !_state.interactive())
+				_exit_requested = true;
+		} else if (name == "eval") {
+			// POSIX: the arguments are joined with spaces and read as shell input.
+			std::string joined;
+			for (size_t i = 1; argv[i] != nullptr; ++i) {
+				if (i > 1)
+					joined += ' ';
+				joined += argv[i];
+			}
+			status = joined.empty() ? 0 : run_source(joined);
+		} else {
+			if (argv[1] == nullptr) {
+				std::fprintf(stderr, "lesh: .: filename argument required\n");
+				status = 2;
+			} else {
+				status = run_file(argv[1]);
+			}
+		}
+		std::fflush(nullptr);
+		restore_fds(saved);
+		return true;
+	}
+
+	return false;
 }
 
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
@@ -1385,7 +1544,8 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			// managed to expand.
 			if (_expansion_error)
 				return kExpansionError;
-			apply_expanded_assignment(expanded);
+			if (!apply_expanded_assignment(expanded))
+				return assignment_error();
 			traced.push(expanded);
 		}
 		if (_state.opts().trace)
@@ -1412,6 +1572,20 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			argv.truncate(argv.size() - 1);
 		if (argv.empty() || argv[0] == nullptr)
 			return 0;
+	}
+
+	// A readonly name in an assignment PREFIX is a variable assignment error, and
+	// POSIX makes it fatal BEFORE the command runs: `readonly a=1; a=2 echo prefix`
+	// prints nothing at all in dash. Asked here, ahead of every dispatch path,
+	// because each applies the prefix somewhere else - a builtin's is applied in
+	// this process, an external command's in the CHILD, where a refusal could no
+	// longer exit the shell, and a regular builtin's not at all yet.
+	for (const auto& a : assignments) {
+		const size_t eq = a.find('=');
+		if (eq != std::string_view::npos && _state.is_readonly(a.substr(0, eq))) {
+			shell_state::report_readonly({}, a.substr(0, eq));
+			return assignment_error();
+		}
 	}
 
 	// `set -x` traces the command once, HERE - before the search order decides
@@ -1453,6 +1627,11 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// after. Applying them AFTER the call - which is what this did - both hid
 		// them from the function and made them permanent.
 		std::vector<saved_variable> restore_vars;
+		// A refused prefix assignment must not skip the restores below - an early
+		// return here would leave the redirections applied to the shell's own fds.
+		// The pre-check above makes this unreachable; leaving the path correct is
+		// cheaper than relying on that.
+		bool refused = false;
 		if (ok) {
 			restore_vars.reserve(assignments.size());
 			for (const auto& a : assignments) {
@@ -1466,111 +1645,40 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 				if (sv.was_set)
 					sv.value.assign(previous);
 				restore_vars.push_back(std::move(sv));
-				apply_assignment(a);
+				if (!apply_assignment(a)) {
+					refused = true;
+					break;
+				}
 			}
 		}
 		bool ran = false;
-		if (ok)
+		if (ok && !refused)
 			ran = try_run_function(t, argv, status);
 		for (const auto& sv : restore_vars) {
+			// A name the function made readonly cannot be put back, and POSIX says a
+			// readonly variable stays readonly - so the refusal is the correct
+			// outcome here rather than an error to report twice.
 			if (sv.was_set)
-				_state.set(sv.name, sv.value);
+				std::ignore = _state.set(sv.name, sv.value);
 			else
-				_state.unset(sv.name);
+				std::ignore = _state.unset(sv.name);
 		}
 		std::fflush(nullptr);
 		restore_fds(saved);
 		if (!ok)
 			return kRedirectionError;
+		if (refused)
+			return assignment_error();
 		if (ran)
 			return status;
 	}
 
-	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
-	// here rather than in builtins.cpp - giving every builtin a back-reference to
-	// the executor to serve two of them would be the wrong trade.
-	//
-	// This is the cycle the ports in #11 were designed to survive: parsing inside
-	// execution, with the parse seeing the same aliases and the execution seeing
-	// the same state.
-
-	// `exec` replaces this process, so it lives here too. Until this landed it was
-	// in kSpecialBuiltins with no handler anywhere, so try_run_builtin found
-	// nothing and returned success: `exec echo hi; echo notreached` printed only
-	// `notreached`. A stub that silently succeeds is worse than an absent builtin -
-	// the same mistake `command` made earlier on #31, which cost 19 of 49
-	// assertions in command-p.tst.
-	if (std::string_view{argv[0]} == "exec")
-		return run_exec(t, n, argv, assignments, bypass_functions);
-
-	// `wait` needs the executor's record of background jobs, so it lives here
-	// alongside eval and . rather than in builtins.cpp.
-	if (std::string_view{argv[0]} == "wait") {
-		if (argv[1] == nullptr) {
-			// POSIX: with no operands, `wait` waits for ALL known children and its
-			// status is ZERO - not the last child's. Reporting the last one made
-			// `false & wait` fail, and under `set -e` that would exit the shell.
-			for (const pid_t pid : _background) {
-				int wait_status = 0;
-				(void)waitpid(pid, &wait_status, 0);
-			}
-			_background.clear();
-			return 0;
-		}
-		// With operands the status is the LAST operand's, and a child killed by a
-		// signal reports 128 + the signal number.
+	// `eval`, `.`, `exec` and `wait` live in the executor rather than in
+	// builtins.cpp; see try_run_executor_builtin.
+	{
 		int status = 0;
-		for (size_t i = 1; argv[i] != nullptr; ++i) {
-			const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
-			int wait_status = 0;
-			if (waitpid(target, &wait_status, 0) > 0) {
-				status = status_from_wait(wait_status);
-			} else {
-				// POSIX DEFINES the answer for a pid that is not a child: status 127.
-				// No diagnostic, because this is a specified result rather than a
-				// failure - dash is silent here too.
-				status = 127;
-			}
-			std::erase(_background, target);
-		}
-		return status;
-	}
-
-	if (const std::string_view name{argv[0]}; name == "eval" || name == ".") {
-		arena_array<saved_fd> saved{_pool, 4};
-		std::fflush(nullptr);
-		const bool ok = apply_redirections(t, n, &saved);
-		int status = 0;
-		if (!ok) {
-			// `eval` and `.` are SPECIAL builtins, and POSIX 2.8.1 makes a
-			// redirection error on a special builtin fatal to a non-interactive
-			// shell. dash agrees: `dash -c 'eval : </missing; echo reached'` exits 2
-			// without printing `reached`, while a regular builtin in the same
-			// position reports 2 and carries on. `command eval ...` demotes it, which
-			// is what bypass_functions records.
-			status = kRedirectionError;
-			if (!bypass_functions && !_state.interactive())
-				_exit_requested = true;
-		} else if (name == "eval") {
-			// POSIX: the arguments are joined with spaces and read as shell input.
-			std::string joined;
-			for (size_t i = 1; argv[i] != nullptr; ++i) {
-				if (i > 1)
-					joined += ' ';
-				joined += argv[i];
-			}
-			status = joined.empty() ? 0 : run_source(joined);
-		} else {
-			if (argv[1] == nullptr) {
-				std::fprintf(stderr, "lesh: .: filename argument required\n");
-				status = 2;
-			} else {
-				status = run_file(argv[1]);
-			}
-		}
-		std::fflush(nullptr);
-		restore_fds(saved);
-		return status;
+		if (try_run_executor_builtin(t, n, argv, assignments, bypass_functions, status))
+			return status;
 	}
 
 	// A builtin runs in THIS process - `cd` in a forked child would change the
@@ -1595,7 +1703,23 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		const bool ok = apply_redirections(t, n, &saved);
 		builtin_result result{};
 		if (ok) {
-			(void)try_run_builtin(_state, argv.data(), result);
+			// `unset -f` removes a FUNCTION, and the function table lives here rather
+			// than in shell state. Only this FORM is intercepted - the variable form
+			// is builtins.cpp's - and it is done inside this block so the
+			// redirections around it are still applied and restored.
+			if (std::string_view{argv[0]} == "unset" &&
+			    unset_selects_functions(argv.data())) {
+				result = run_unset_functions(argv.data());
+			} else if (!try_run_builtin(_state, argv.data(), result)) {
+				// A CLASSIFIED name with no implementation. The registry guard in
+				// builtins.cpp makes this a compile error, and this branch is what
+				// happens if the guard is ever removed: 127 and a diagnostic rather
+				// than the silent success that made `test 1 = 2` report 0 (#35). The
+				// return value used to be discarded with a `(void)`, which is what let
+				// that through.
+				std::fprintf(stderr, "lesh: %s: not implemented\n", argv[0]);
+				result.status = 127;
+			}
 		} else {
 			result.status = kRedirectionError;
 			// POSIX 2.8.1: a redirection error on a SPECIAL builtin exits a
@@ -1618,7 +1742,8 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			classify_builtin(argv[0]) == builtin_kind::special;
 		if (persist) {
 			for (const auto& a : assignments)
-				apply_assignment(a);
+				if (!apply_assignment(a))
+					result.status = assignment_error();
 		}
 		// A regular builtin's temporary assignments are not implemented yet: they
 		// need save-and-restore around the call, and no builtin here reads a
@@ -1704,17 +1829,16 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 					setpgid(0, group);
 					if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
 					if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
-					// `exec` in a pipeline stage replaces only THAT stage's process, so it
-					// is dispatched here rather than through try_run_builtin, which has no
-					// entry for it and would have made `exec echo foo | cat` print
-					// nothing. run_exec applies the stage's redirections itself, so it must
-					// come before the apply_redirections below rather than after it.
-					if (std::string_view{argv[0]} == "exec") {
-						const int exec_status = run_exec(t, stage, argv, assignments, false);
-						std::fflush(nullptr);
-						_exit(exec_status);
-					}
+					// The executor's own builtins are dispatched here rather than through
+					// try_run_builtin, which has no entry for any of them: `exec echo foo |
+					// cat` printed nothing, and so did `echo hi | eval cat`. They come
+					// before the apply_redirections below because each applies the stage's
+					// redirections itself where it needs them.
 					int status = 0;
+					if (try_run_executor_builtin(t, stage, argv, assignments, false, status)) {
+						std::fflush(nullptr);
+						_exit(status);
+					}
 					// nullptr for `restore`: this process exists only for this stage, so
 					// there is nothing to put the fds back for. Its status matters
 					// though - a failed redirection has to make the STAGE fail, and

@@ -16,8 +16,9 @@ public:
 		const auto it = values.find(std::string(name));
 		return it == values.end() ? 0 : it->second;
 	}
-	void set(std::string_view name, int64_t value) override {
+	bool set(std::string_view name, int64_t value) override {
 		values[std::string(name)] = value;
+		return true;
 	}
 	bool defined(std::string_view name) const override {
 		return values.find(std::string(name)) != values.end();

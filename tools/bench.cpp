@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <tuple>
 #include <string_view>
 #include <vector>
 
@@ -105,7 +106,7 @@ int main() {
 	report_header("expansion (per word, no execution)");
 	{
 		runtime::shell_state state;
-		state.set("HOME", "/home/tester");
+		std::ignore = state.set("HOME", "/home/tester");
 		for (const auto& c : kCases) {
 			buffer_pool pool{BUFFER_POOL_SIZE};
 			const syntax::tree t = syntax::parse(pool, c.source);

@@ -1,5 +1,6 @@
 #include "runtime/shell_state.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -13,35 +14,6 @@
 extern char** environ;
 
 namespace lesh::runtime {
-
-namespace {
-
-// POSIX XCU 2.14. The list is closed and the membership matters: a failure in one
-// of these exits a non-interactive shell, and assignments preceding one persist.
-constexpr std::array<std::string_view, 15> kSpecialBuiltins = {
-	"break", ":", "continue", ".", "eval", "exec", "exit", "export",
-	"readonly", "return", "set", "shift", "times", "trap", "unset",
-};
-
-// `getopts` belongs HERE and not above: POSIX 2.14 lists it nowhere in the special
-// set, so its failure must not exit a non-interactive shell - `getopts` with too
-// few operands has to report and carry on, the way dash does.
-constexpr std::array<std::string_view, 12> kRegularBuiltins = {
-	"cd", "echo", "false", "pwd", "true", "test", "alias", "unalias",
-	"read", "command", "kill", "getopts",
-};
-
-} // namespace
-
-builtin_kind classify_builtin(std::string_view name) noexcept {
-	for (const auto& s : kSpecialBuiltins)
-		if (s == name)
-			return builtin_kind::special;
-	for (const auto& r : kRegularBuiltins)
-		if (r == name)
-			return builtin_kind::regular;
-	return builtin_kind::none;
-}
 
 namespace {
 
@@ -141,7 +113,10 @@ bool shell_state::shift_positional(size_t n) {
 
 bool shell_state::lookup(std::string_view name, std::string_view& value) const {
 	const auto it = _vars.find(name);
-	if (it == _vars.end())
+	// An entry that holds nothing but a readonly flag - `readonly x` on an unset x -
+	// is ABSENT to every reader: `${x-unset}` says unset in dash too, and reporting
+	// it as an empty string would make `set -u` accept it.
+	if (it == _vars.end() || !it->second.assigned)
 		return false;
 	value = it->second.value;
 	return true;
@@ -185,19 +160,28 @@ int64_t shell_state::get(std::string_view name) const {
 	return negative ? -value : value;
 }
 
-void shell_state::set(std::string_view name, int64_t value) {
-	set(name, std::to_string(value));
+bool shell_state::set(std::string_view name, int64_t value) {
+	// Arithmetic's port, so the diagnostic is the unprefixed one: dash reports
+	// `x: is read only` for `$((x=1))` exactly as it does for `x=1`.
+	if (!set(name, std::to_string(value))) {
+		report_readonly({}, name);
+		return false;
+	}
+	return true;
 }
 
-void shell_state::set(std::string_view name, std::string_view value) {
-	// Assigning OPTIND restarts getopts: the within-word position it kept beside
-	// the index is discarded, so `OPTIND=1; getopts abc o` re-reads `-abc` from its
-	// first letter instead of resuming at the letter it had reached. Every
-	// assignment funnels through here, so the hook cannot be bypassed by `export
-	// OPTIND=1`, `${OPTIND=1}`, or a `read OPTIND`.
-	if (name == "OPTIND")
-		_getopts_offset = 0;
+bool shell_state::assign_parameter(std::string_view name, std::string_view value) {
+	// `${x=default}`. Reported here rather than in the expander, because the
+	// expander must not know what a variable table is - and dash words this one
+	// like a plain assignment too.
+	if (!set(name, value)) {
+		report_readonly({}, name);
+		return false;
+	}
+	return true;
+}
 
+bool shell_state::set(std::string_view name, std::string_view value) {
 	// `set -a`: every variable CREATED OR MODIFIED by an assignment is marked for
 	// export. Applied here rather than at each assignment site so `x=1`, a `for`
 	// loop's variable, `read`, and `${x=default}` all obey it - which is what dash
@@ -205,30 +189,110 @@ void shell_state::set(std::string_view name, std::string_view value) {
 	const bool exported = _options.all_export;
 	const auto it = _vars.find(name);
 	if (it != _vars.end()) {
+		// POSIX: a readonly variable cannot be assigned to. Refused here, in the
+		// ONE place every assignment funnels through, so `x=1`, a `for` variable,
+		// `read`, `getopts`, `${x=1}` and `$((x=1))` cannot each forget it.
+		if (it->second.readonly)
+			return false;
+		// Assigning OPTIND restarts getopts: the within-word position it kept beside
+		// the index is discarded, so `OPTIND=1; getopts abc o` re-reads `-abc` from
+		// its first letter instead of resuming at the letter it had reached. Every
+		// assignment funnels through here, so the hook cannot be bypassed by `export
+		// OPTIND=1`, `${OPTIND=1}`, or a `read OPTIND` - and it comes after the
+		// readonly test, because an assignment that was REFUSED must not restart the
+		// parse as a side effect of failing.
+		if (name == "OPTIND")
+			_getopts_offset = 0;
 		it->second.value = value;
 		it->second.exported = it->second.exported || exported;
+		it->second.assigned = true;
+		return true;
+	}
+	if (name == "OPTIND")
+		_getopts_offset = 0;
+	_vars.emplace(std::string(name), variable{std::string(value), exported, false, true});
+	return true;
+}
+
+bool shell_state::set_exported(std::string_view name, std::string_view value) {
+	if (!set(name, value))
+		return false;
+	_vars.find(name)->second.exported = true;
+	return true;
+}
+
+void shell_state::mark_exported(std::string_view name) {
+	const auto it = _vars.find(name);
+	if (it != _vars.end()) {
+		it->second.exported = true;
 		return;
 	}
-	_vars.emplace(std::string(name), variable{std::string(value), exported});
+	// `export x` on an unset x exports the NAME: dash's `export -p` lists it and
+	// a child sees x set to the empty string.
+	_vars.emplace(std::string(name), variable{std::string{}, true, false, true});
 }
 
-void shell_state::set_exported(std::string_view name, std::string_view value) {
-	set(name, value);
-	_vars.find(name)->second.exported = true;
+void shell_state::mark_readonly(std::string_view name) {
+	const auto it = _vars.find(name);
+	if (it != _vars.end()) {
+		it->second.readonly = true;
+		return;
+	}
+	// Readonly and UNSET: the entry exists only to hold the flag, so lookup() and
+	// the environment block both skip it until something assigns.
+	_vars.emplace(std::string(name), variable{std::string{}, false, true, false});
 }
 
-void shell_state::unset(std::string_view name) {
-	if (name == "OPTIND")
-		_getopts_offset = 0;  // same restart as an assignment; see set()
-	if (const auto it = _vars.find(name); it != _vars.end())
+bool shell_state::is_readonly(std::string_view name) const {
+	const auto it = _vars.find(name);
+	return it != _vars.end() && it->second.readonly;
+}
+
+void shell_state::report_readonly(std::string_view who, std::string_view name) {
+	if (who.empty()) {
+		std::fprintf(stderr, "lesh: %.*s: is read only\n",
+		             static_cast<int>(name.size()), name.data());
+		return;
+	}
+	std::fprintf(stderr, "lesh: %.*s: %.*s: is read only\n",
+	             static_cast<int>(who.size()), who.data(),
+	             static_cast<int>(name.size()), name.data());
+}
+
+std::vector<shell_state::variable_row> shell_state::variables() const {
+	std::vector<variable_row> rows;
+	rows.reserve(_vars.size());
+	for (const auto& [name, var] : _vars)
+		rows.push_back({name, var.value, var.assigned, var.exported, var.readonly});
+	std::sort(rows.begin(), rows.end(),
+	          [](const variable_row& a, const variable_row& b) { return a.name < b.name; });
+	return rows;
+}
+
+bool shell_state::unset(std::string_view name) {
+	// POSIX: unsetting a readonly variable is an error. Checked before the OPTIND
+	// hook, so a refused `unset OPTIND` does not restart getopts as a side effect
+	// of failing.
+	if (const auto it = _vars.find(name); it != _vars.end()) {
+		if (it->second.readonly)
+			return false;
+		if (name == "OPTIND")
+			_getopts_offset = 0;  // same restart as an assignment; see set()
 		_vars.erase(it);
+		return true;
+	}
+	if (name == "OPTIND")
+		_getopts_offset = 0;
+	return true;
 }
 
-void shell_state::set_optind(size_t index, size_t offset) {
+bool shell_state::set_optind(size_t index, size_t offset) {
 	// set() clears the offset unconditionally, so the offset getopts wants to keep
 	// is written back AFTER the index. Ordering, not redundancy.
-	set("OPTIND", std::to_string(index));
+	if (!set("OPTIND", std::to_string(index)))
+		return false;
 	_getopts_offset = offset;
+	return true;
 }
 
 bool shell_state::is_exported(std::string_view name) const {
@@ -310,7 +374,7 @@ char** shell_state::environment_block() {
 	_env_strings.clear();
 	_env_pointers.clear();
 	for (const auto& [name, var] : _vars) {
-		if (!var.exported)
+		if (!var.exported || !var.assigned)
 			continue;
 		_env_strings.emplace_back(name + "=" + var.value);
 	}

@@ -92,6 +92,15 @@ private:
 	int run_exec(const syntax::tree& t, syntax::node_index n,
 	             arena_array<char*>& argv,
 	             const arena_array<std::string_view>& assignments, bool demoted);
+	// The builtins the executor owns - `exec`, `wait`, `eval` and `.`. False when
+	// the name is none of them. See the definition, and builtin_home::executor in
+	// runtime/builtins.h.
+	[[nodiscard]] bool try_run_executor_builtin(
+		const syntax::tree& t, syntax::node_index n, arena_array<char*>& argv,
+		const arena_array<std::string_view>& assignments, bool bypass_functions,
+		int& status);
+	// `unset -f`: the function form, which needs the function table.
+	builtin_result run_unset_functions(char** argv);
 	int run_negation(const syntax::tree& t, syntax::node_index n);
 
 	// Builds an expander wired to this executor AND to this shell's options.
@@ -120,7 +129,11 @@ private:
 	// `set -x` has to print the value the assignment takes, and expanding a second
 	// time to print it would run a command substitution in the value twice.
 	std::string_view expand_assignment(std::string_view text);
-	void apply_expanded_assignment(std::string_view expanded);
+	// False when the name is READONLY, having reported it. See the definition.
+	[[nodiscard]] bool apply_expanded_assignment(std::string_view expanded);
+	// POSIX 2.8.1's variable assignment error: arranges for a non-interactive
+	// shell to exit and returns the status to report.
+	int assignment_error();
 	// One `set -x` trace line: the expanded PS4, then the command as it will run.
 	void trace_command(const arena_array<std::string_view>& prefix,
 	                   char* const* argv);
@@ -175,7 +188,7 @@ private:
 	bool build_argv(const syntax::tree& t, syntax::node_index n,
 	                arena_array<char*>& argv,
 	                arena_array<std::string_view>* assignments = nullptr);
-	void apply_assignment(std::string_view text);
+	[[nodiscard]] bool apply_assignment(std::string_view text);
 
 	// forks, execs, and returns the child's pid. Never returns in the child.
 	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx,
