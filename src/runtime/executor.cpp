@@ -1,5 +1,6 @@
 #include "runtime/executor.h"
 
+#include "runtime/builtins.h"
 #include "substrate/assert.h"
 #include "syntax/parser.h"
 
@@ -78,6 +79,8 @@ int tree_walking_executor::run(const tree& t) {
 	for (uint32_t i = 0; i < program.children_count; ++i) {
 		status = run_node(t, t.child_of(program, i));
 		_state.set_last_status(status);
+		if (_exit_requested)
+			break;
 		if (status != 0 && _state.opts().exit_on_error)
 			break;
 	}
@@ -113,7 +116,8 @@ int tree_walking_executor::run_and_or(const tree& t, node_index n) {
 }
 
 bool tree_walking_executor::build_argv(const tree& t, node_index n,
-                                       arena_array<char*>& argv) {
+                                       arena_array<char*>& argv,
+                                       arena_array<std::string_view>* assignments) {
 	const node& self = t[n];
 
 	// The runner is passed here, so a command substitution inside a word reaches
@@ -123,6 +127,11 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 
 	for (uint32_t i = 0; i < self.children_count; ++i) {
 		const node_index child = t.child_of(self, i);
+		if (t[child].kind == node_kind::assignment) {
+			if (assignments != nullptr)
+				assignments->push(t.text_of(t[child]));
+			continue;
+		}
 		if (t[child].kind != node_kind::word)
 			continue;
 		ex.expand_word(t, child, fields);
@@ -142,7 +151,8 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 	return true;
 }
 
-pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context& ctx) {
+pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context& ctx,
+                                   const arena_array<std::string_view>* assignments) {
 	// Built-ins run in this process, so their output sits in our stdout buffer.
 	// Flush before forking or the child inherits a copy and prints it again.
 	std::fflush(nullptr);
@@ -168,6 +178,17 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 			close(ctx.output_fd);
 		}
 
+		// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
+		// out of the shell - the parent's state is untouched by construction rather
+		// than by remembering to undo it.
+		if (assignments != nullptr) {
+			for (const auto& a : *assignments) {
+				const size_t eq = a.find('=');
+				if (eq != std::string_view::npos)
+					_state.set_exported(a.substr(0, eq), a.substr(eq + 1));
+			}
+		}
+
 		std::string_view path_value;
 		if (!_state.lookup("PATH", path_value))
 			path_value = "/usr/bin:/bin";
@@ -178,12 +199,50 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 	return pid;
 }
 
+// Splits NAME=value and applies it. Returns the name so the caller can restore.
+void tree_walking_executor::apply_assignment(std::string_view text) {
+	const size_t eq = text.find('=');
+	if (eq == std::string_view::npos)
+		return;
+	_state.set(text.substr(0, eq), text.substr(eq + 1));
+}
+
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	arena_array<char*> argv{_pool, 8};
-	if (!build_argv(t, n, argv))
-		return _state.last_status();  // expanded to nothing: a no-op, not an error
+	arena_array<std::string_view> assignments{_pool, 4};
+	const bool has_command = build_argv(t, n, argv, &assignments);
 
-	const pid_t pid = spawn(argv, {});
+	if (!has_command) {
+		// Assignments with no command persist in the shell: `x=1` is how a variable
+		// gets set. Previously these were parsed and silently dropped.
+		for (const auto& a : assignments)
+			apply_assignment(a);
+		return 0;
+	}
+
+	// A builtin runs in THIS process - `cd` in a forked child would change the
+	// child's directory and exit, achieving nothing. So dispatch happens before
+	// the fork, not after.
+	if (builtin_result result; try_run_builtin(_state, argv.data(), result)) {
+		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before
+		// a regular one they apply only for its duration. Not cosmetic - it is why
+		// `x=1 export y` leaves x set and `x=1 cd /tmp` does not.
+		const bool persist =
+			classify_builtin(argv[0]) == builtin_kind::special;
+		if (persist) {
+			for (const auto& a : assignments)
+				apply_assignment(a);
+		}
+		// A regular builtin's temporary assignments are not implemented yet: they
+		// need save-and-restore around the call, and no builtin here reads a
+		// variable set that way. Recorded rather than pretended.
+
+		if (result.flow == control_flow::exit_shell)
+			_exit_requested = true;
+		return result.status;
+	}
+
+	const pid_t pid = spawn(argv, {}, &assignments);
 	if (pid == -1)
 		return 1;
 
@@ -210,8 +269,14 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 		}
 
 		arena_array<char*> argv{_pool, 8};
-		if (build_argv(t, t.child_of(self, i), argv)) {
-			const pid_t pid = spawn(argv, {input_fd, is_last ? STDOUT_FILENO : pipe_fds[1], group});
+		arena_array<std::string_view> assignments{_pool, 4};
+		if (build_argv(t, t.child_of(self, i), argv, &assignments)) {
+			// Every stage runs in its own process, so a builtin in a pipeline stage
+			// affects only that process - which is why dispatch here would be wrong
+			// and `echo a | read x` cannot set x in the shell. That is POSIX's
+			// behaviour, not a limitation.
+			const pid_t pid = spawn(argv, {input_fd, is_last ? STDOUT_FILENO : pipe_fds[1], group},
+			                        &assignments);
 			if (pid > 0) {
 				pids.push(pid);
 				if (group == 0)

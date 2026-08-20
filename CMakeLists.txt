@@ -182,6 +182,8 @@ target_link_libraries(lesh_syntax PUBLIC lesh_substrate)
 # runtime: expansion, and later shell state and execution. Depends on syntax and
 # the substrate; never on legacy, never on the editor.
 add_library(lesh_runtime STATIC
+	src/runtime/builtins.cpp
+	src/runtime/builtins.h
 	src/runtime/executor.cpp
 	src/runtime/executor.h
 	src/runtime/expander.cpp

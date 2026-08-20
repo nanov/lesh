@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/builtins.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
 #include "syntax/ast.h"
@@ -58,10 +59,13 @@ private:
 	// Returns false when the command expanded to nothing at all, which is not an
 	// error - `$empty` as an entire command is a no-op.
 	bool build_argv(const syntax::tree& t, syntax::node_index n,
-	                arena_array<char*>& argv);
+	                arena_array<char*>& argv,
+	                arena_array<std::string_view>* assignments = nullptr);
+	void apply_assignment(std::string_view text);
 
 	// forks, execs, and returns the child's pid. Never returns in the child.
-	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx);
+	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx,
+	                          const arena_array<std::string_view>* assignments = nullptr);
 
 	// Runs a whole tree with stdout captured. Used by command substitution.
 	[[nodiscard]] bool capture(std::string_view code, arena_array<char>& out);
@@ -82,6 +86,8 @@ private:
 	buffer_pool& _pool;
 	shell_state& _state;
 	runner_adapter _runner;
+	// Set by `exit`, so the program loop stops rather than running the next command.
+	bool _exit_requested = false;
 };
 
 } // namespace lesh::runtime

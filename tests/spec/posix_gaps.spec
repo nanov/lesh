@@ -54,10 +54,10 @@ set -- one two; echo $1 $2
 --- glob expansion [xfail: #23 - pathname expansion]
 cd /tmp && echo /tmp/*
 
---- cd builtin [xfail: #24 - builtins run in this process]
+--- cd builtin [xfail(legacy): legacy forks builtins, so cd changes the child and exits]
 cd /tmp && pwd
 
---- variable assignment persists [xfail: #24 - assignments are parsed, never applied]
+--- variable assignment persists [xfail(legacy): legacy parses assignments and applies them only via setenv in the child]
 x=value; echo $x
 
 --- function definition and call [xfail: #25 - functions]
@@ -67,3 +67,21 @@ greet() { echo hello; }; greet
 cat <<EOT
 body
 EOT
+
+--- cd keeps a logical PWD through a symlink [xfail(legacy): legacy resolves the physical path]
+cd /tmp && pwd
+
+--- cd .. is lexical, not physical [xfail(legacy): legacy resolves the physical path]
+cd /tmp && cd .. && pwd
+
+--- export makes a variable visible to a child [xfail(legacy): legacy's export path is incomplete]
+export EXPORTED_VAR=visible; /usr/bin/env | /usr/bin/grep '^EXPORTED_VAR='
+
+--- an unexported variable is not visible to a child [xfail(legacy): legacy leaks assignments into the environment]
+LOCAL_VAR=hidden; /usr/bin/env | /usr/bin/grep -c '^LOCAL_VAR=' || true
+
+--- assignment prefixed to a command does not persist [xfail(legacy): legacy applies prefixed assignments with setenv, so they persist]
+x=outer; x=inner /usr/bin/true; echo $x
+
+--- exit sets the status [xfail(legacy): legacy matches `exit` as a string in the REPL rather than as a builtin]
+exit 3
