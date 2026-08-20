@@ -47,22 +47,28 @@ def is_excluded(name: str) -> bool:
     return any(name.startswith(p) for p in JOB_CONTROL_PREFIXES)
 
 
-def parse_results(trs: Path) -> tuple[int, int]:
-    """Counts (passed, total) from a .trs result file.
+def parse_results(trs: Path) -> tuple[int, int, int]:
+    """Counts (passed, total, skipped) from a .trs result file.
 
     run-test.sh ALWAYS exits 0 and writes its verdicts to this file, so the exit
     status carries no information - reading it reported every case as a failure.
     """
     if not trs.exists():
-        return 0, 0
+        return 0, 0, 0
     text = trs.read_text(errors="replace")
-    # The markers are literally these two strings. Guessing at "NG[FAILED]"
+    # The markers are literally these three strings. Guessing at "NG[FAILED]"
     # counted zero failures, so every file reported 100% and a file whose
     # assertions ALL failed reported "no assertions ran" - a scoreboard that
     # flattered the shell it was measuring.
+    #
+    # SKIPPED is counted because the suite skips a case itself when a prerequisite
+    # is missing - `checkfg`, a helper binary the suite builds and we do not vendor,
+    # gates every -m file. Twenty-four files were reported as ERRORED for that,
+    # which reads as "lesh broke" when it means "not measured here".
     passed = text.count("%%% OK[PASSED]")
     failed = text.count("%%% ERROR[FAILED]")
-    return passed, passed + failed
+    skipped = text.count("%%% SKIPPED:")
+    return passed, passed + failed, skipped
 
 
 def run_case(runner: Path, shell: str, case: Path, timeout: float) -> tuple[str, str]:
@@ -94,8 +100,13 @@ def run_case(runner: Path, shell: str, case: Path, timeout: float) -> tuple[str,
         proc.communicate()
         return "timeout", ""
 
-    passed, total = parse_results(case.with_suffix(".trs"))
+    passed, total, skipped = parse_results(case.with_suffix(".trs"))
     if total == 0:
+        # The suite declined to run its own cases - a missing prerequisite, not a
+        # failure of the shell. Distinguishing this from a runner malfunction is
+        # the difference between "not measured" and "broken".
+        if skipped > 0:
+            return "suite-skipped", f"{skipped} cases skipped by the suite"
         return "error", "no assertions ran"
     return "counted", f"{passed}/{total}"
 
@@ -133,7 +144,8 @@ def main() -> int:
 
     assertions_passed = 0
     assertions_total = 0
-    files = {"counted": 0, "timeout": 0, "error": 0, "skipped": 0}
+    files = {"counted": 0, "timeout": 0, "error": 0, "skipped": 0,
+             "suite-skipped": 0}
 
     for case in cases:
         if not args.include_signal_tests and is_excluded(case.name):
@@ -145,7 +157,7 @@ def main() -> int:
             p, t_ = detail.split("/")
             assertions_passed += int(p)
             assertions_total += int(t_)
-        if args.verbose or outcome in ("timeout", "error"):
+        if args.verbose or outcome in ("timeout", "error", "suite-skipped"):
             print(f"  {outcome:8} {case.name} {detail}")
 
     pct = (100.0 * assertions_passed / assertions_total) if assertions_total else 0.0
@@ -153,7 +165,8 @@ def main() -> int:
           f"{assertions_passed}/{assertions_total} assertions pass ({pct:.1f}%) "
           f"across {files['counted']} files; "
           f"{files['timeout']} timed out, {files['error']} errored, "
-          f"{files['skipped']} skipped (job control)")
+          f"{files['suite-skipped']} skipped by the suite, "
+          f"{files['skipped']} excluded (job control)")
 
     # A SCOREBOARD, not a gate. It reports and always succeeds; the number is
     # what moves. Only a runner malfunction is an error.

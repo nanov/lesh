@@ -100,7 +100,7 @@ f() { for i do echo $i; done; }; f a b
 --- for with an empty in list iterates nothing [xfail(legacy): not implemented in legacy]
 set -- a; for i in; do echo never; done; echo after
 
---- a background command does not block the shell [xfail: a FIFO reader started in the background does not rendezvous with the writer; regular files and pipes work]
+--- a background command does not block the shell [xfail(legacy): legacy runs `&` in the foreground]
 d=$(mktemp -d); mkfifo $d/f; cat $d/f & echo piped > $d/f; wait
 
 --- wait reports the background command's status [xfail(legacy): legacy has no asynchronous lists]

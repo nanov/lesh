@@ -170,24 +170,7 @@ public:
 			}
 
 			const uint32_t before = _index;
-			node_index item = parse_and_or();
-
-			// `&` makes the preceding list ASYNCHRONOUS. It was in is_separator and
-			// therefore silently equivalent to `;`, so background commands ran in
-			// the foreground - which deadlocks the moment one waits on the other,
-			// as `cat fifo & echo x > fifo` does.
-			if (peek().kind == token_kind::amp) {
-				advance();
-				node async;
-				async.kind = node_kind::async_list;
-				async.first_token = _tree[item].first_token;
-				async.last_token = _index > 0 ? _index - 1 : 0;
-				const uint32_t child_mark = mark_scratch();
-				_scratch.push(item);
-				commit_children(async, child_mark);
-				item = _tree.add_node(async);
-			}
-			_scratch.push(item);
+			_scratch.push(parse_list_item());
 
 			// PROGRESS GUARANTEE. Recovery that consumes nothing is not recovery, it
 			// is a hang. `;;` at top level ends a command without being a separator,
@@ -210,6 +193,30 @@ public:
 private:
 	static constexpr bool is_separator(token_kind k) noexcept {
 		return k == token_kind::newline || k == token_kind::semi || k == token_kind::amp;
+	}
+
+	// One and-or list plus the `&` that may follow it, which makes it ASYNCHRONOUS.
+	//
+	// Shared by parse_program and parse_compound_list because it was fixed in only
+	// one of them once already. `&` is in is_separator, so a list that is not
+	// wrapped here has its `&` silently consumed as a `;` and runs in the
+	// foreground - and that deadlocks the moment the background command waits on
+	// something the foreground has yet to do, which is exactly what
+	// `( echo x >fifo & ); cat fifo` does. It ran in the program body and hung in
+	// every compound command.
+	node_index parse_list_item() noexcept {
+		node_index item = parse_and_or();
+		if (peek().kind != token_kind::amp)
+			return item;
+		advance();
+		node async;
+		async.kind = node_kind::async_list;
+		async.first_token = _tree[item].first_token;
+		async.last_token = _index > 0 ? _index - 1 : 0;
+		const uint32_t child_mark = mark_scratch();
+		_scratch.push(item);
+		commit_children(async, child_mark);
+		return _tree.add_node(async);
 	}
 
 	[[nodiscard]] reserved peek_reserved() const noexcept {
@@ -264,7 +271,7 @@ private:
 				continue;
 			}
 			const uint32_t before = _index;
-			_scratch.push(parse_and_or());
+			_scratch.push(parse_list_item());
 			if (_index == before)  // progress guarantee, as in parse_program
 				_scratch.push(error_node(advance(), parse_error::unexpected_operator));
 		}

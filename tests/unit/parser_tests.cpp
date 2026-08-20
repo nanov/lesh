@@ -254,3 +254,32 @@ TEST_F(ParserTest, HereDocDelimiterDoesNotMatchAPrefixOrSuffix) {
 	ASSERT_TRUE(body.has_value());
 	EXPECT_EQ(*body, "EOTX\nXEOT\n");
 }
+
+// `&` inside a compound command. It is in is_separator, so a list that is not
+// explicitly wrapped in an async_list has its `&` silently consumed as a `;` -
+// which was fixed for the program body and left broken in every compound command.
+// Running `&` in the foreground deadlocks the moment something waits on it.
+TEST_F(ParserTest, AmpersandMakesAListAsynchronousInsideCompoundCommands) {
+	struct wrapper {
+		const char* source;
+		const char* what;
+	};
+	const wrapper wrappers[] = {
+		{"echo a &", "the program body"},
+		{"{ echo a & }", "a brace group"},
+		{"( echo a & )", "a subshell"},
+		{"if true; then echo a & fi", "an if body"},
+		{"while false; do echo a & done", "a while body"},
+		{"for i in 1; do echo a & done", "a for body"},
+		{"case x in x) echo a & ;; esac", "a case item"},
+		{"f() { echo a & }", "a function body"},
+	};
+	for (const auto& w : wrappers) {
+		const tree t = parse_it(w.source);
+		bool found = false;
+		for (node_index n = 0; n < t.node_count(); ++n)
+			if (t[n].kind == node_kind::async_list)
+				found = true;
+		EXPECT_TRUE(found) << "no async_list in " << w.what << ": " << w.source;
+	}
+}

@@ -707,6 +707,13 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 	if (pid == 0) {
 		setpgid(0, 0);
 		_state.signals().reset_for_subshell();
+		// POSIX XCU 2.11: with job control disabled, an asynchronous command has
+		// SIGINT and SIGQUIT ignored. lesh has no job control (ADR-0001 puts it in
+		// the User Portability option), so this is the ordinary case rather than the
+		// exception - and SIG_IGN survives exec, which is what carries the rule into
+		// a background job that replaces itself.
+		if (!_state.opts().monitor)
+			_state.signals().ignore_interrupts_for_async();
 		// POSIX: an asynchronous command's stdin is /dev/null unless redirected,
 		// so a background job cannot steal the terminal's input.
 		const int devnull = open("/dev/null", O_RDONLY);
@@ -855,6 +862,13 @@ void tree_walking_executor::apply_assignment(std::string_view text) {
 }
 
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
+	// POSIX 2.9.1: a command with no command name completes with the status of the
+	// LAST command substitution it performed, and only zero when it performed none.
+	// So `x=$(exit 3); echo $?` prints 3. Counting substitutions is how "performed
+	// none" is told apart from "performed one that happened to succeed" - reading
+	// $? alone cannot distinguish them.
+	const uint64_t substitutions_before = _substitutions;
+
 	arena_array<char*> argv{_pool, 8};
 	arena_array<std::string_view> assignments{_pool, 4};
 	const bool has_command = build_argv(t, n, argv, &assignments);
@@ -862,9 +876,12 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	if (!has_command) {
 		// Assignments with no command persist in the shell: `x=1` is how a variable
 		// gets set. Previously these were parsed and silently dropped.
+		//
+		// The values are expanded HERE, not in build_argv, so a substitution inside
+		// one is counted by the check below.
 		for (const auto& a : assignments)
 			apply_assignment(a);
-		return 0;
+		return _substitutions != substitutions_before ? _state.last_status() : 0;
 	}
 
 	// `command name args...` runs a command bypassing FUNCTION lookup. Stripping
@@ -891,7 +908,16 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// A function shadows an external command but NOT a special builtin, per
 	// POSIX's command search order: special builtins, then functions, then regular
 	// builtins, then PATH.
-	if (!bypass_functions && classify_builtin(argv[0]) != builtin_kind::special) {
+	//
+	// The function must be looked up BEFORE the redirections are applied. Applying
+	// them to find out whether one exists, then undoing them, is not free: opening
+	// a file creates it and truncates it, and opening a FIFO BLOCKS until the other
+	// end appears and then hands that reader an immediate EOF when the speculative
+	// fd is closed. The re-open on the real path then waits for a reader that has
+	// already gone, so `echo foo >fifo & cat fifo` lost its output and
+	// `cat fifo & echo foo >fifo` hung outright - a deadlock built out of a lookup.
+	if (!bypass_functions && classify_builtin(argv[0]) != builtin_kind::special &&
+	    _functions.find(argv[0]) != _functions.end()) {
 		arena_array<saved_fd> saved{_pool, 4};
 		int status = 0;
 		std::fflush(nullptr);
@@ -899,17 +925,15 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		bool ran = false;
 		if (ok)
 			ran = try_run_function(t, argv, status);
-		if (ran) {
-			std::fflush(nullptr);
-			restore_fds(saved);
-			for (const auto& a : assignments)
-				apply_assignment(a);
-			return status;
-		}
 		std::fflush(nullptr);
 		restore_fds(saved);
 		if (!ok)
 			return 1;
+		if (ran) {
+			for (const auto& a : assignments)
+				apply_assignment(a);
+			return status;
+		}
 	}
 
 	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
@@ -1192,6 +1216,7 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 	int wait_status = 0;
 	waitpid(pid, &wait_status, 0);
 	_state.set_last_status(status_from_wait(wait_status));
+	++_substitutions;
 	return true;
 }
 

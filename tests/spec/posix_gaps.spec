@@ -290,3 +290,15 @@ PPID=42; echo "$PPID"
 
 --- PPID does not change in a subshell [xfail(legacy): legacy does not set PPID]
 outer=$PPID; inner=$( echo "$PPID" ); [ "$outer" = "$inner" ] && echo same
+
+--- an async command inside a brace group runs in the background [xfail(legacy): legacy has no compound commands]
+F=/tmp/lesh_spec_fifo_brace; rm -f $F; mkfifo $F; { echo foo >$F & }; cat $F; rm -f $F
+
+--- an async command inside a subshell runs in the background [xfail(legacy): legacy has no compound commands]
+F=/tmp/lesh_spec_fifo_sub; rm -f $F; mkfifo $F; (echo foo >$F &); cat $F; rm -f $F
+
+--- an async command inside a loop body runs in the background [xfail(legacy): legacy has no compound commands]
+F=/tmp/lesh_spec_fifo_loop; rm -f $F; mkfifo $F; for i in 1; do echo foo >$F & done; cat $F; rm -f $F
+
+--- a redirection to a FIFO is opened once, not speculatively [xfail(legacy): legacy ignores redirect nodes entirely]
+F=/tmp/lesh_spec_fifo_once; rm -f $F; mkfifo $F; cat $F & echo foo >$F; wait; rm -f $F

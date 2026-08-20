@@ -151,4 +151,9 @@ void signal_state::reset_for_subshell() {
 		g_pending[i] = 0;
 }
 
+void signal_state::ignore_interrupts_for_async() {
+	set_ignore(SIGINT);
+	set_ignore(SIGQUIT);
+}
+
 } // namespace lesh::runtime

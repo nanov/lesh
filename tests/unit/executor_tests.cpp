@@ -152,3 +152,17 @@ TEST(ShellState, SpecialBuiltinsAreDistinguishedFromRegularOnes) {
 	EXPECT_EQ(classify_builtin("echo"), builtin_kind::regular);
 	EXPECT_EQ(classify_builtin("ls"), builtin_kind::none);
 }
+
+// POSIX 2.9.1: a command with no command name completes with the exit status of
+// the LAST command substitution it performed, and zero only when it performed
+// none. `x=$(exit 3); echo $?` prints 3 - it does not print 0.
+TEST_F(ExecutorTest, AssignmentOnlyCommandTakesTheLastSubstitutionStatus) {
+	EXPECT_EQ(run("x=$(exit 3)"), 3);
+	EXPECT_EQ(run("x=$(exit 3) y=$(exit 4)"), 4);
+	EXPECT_EQ(run("x=$(true)"), 0);
+}
+
+TEST_F(ExecutorTest, AssignmentWithNoSubstitutionIsAlwaysZero) {
+	state.set_last_status(9);
+	EXPECT_EQ(run("x=1"), 0) << "a plain assignment must not inherit the old status";
+}

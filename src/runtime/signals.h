@@ -54,6 +54,15 @@ public:
 	// conformance cases test.
 	void reset_for_subshell();
 
+	// POSIX XCU 2.11: when job control is DISABLED, a command started
+	// asynchronously has SIGINT and SIGQUIT set to ignore. Without job control
+	// there is no other way to keep a keyboard interrupt aimed at the foreground
+	// job from also killing everything running in the background.
+	//
+	// It applies at subshell entry, so a `trap` inside the async list still wins -
+	// which is the order the conformance suite checks.
+	void ignore_interrupts_for_async();
+
 	// Name to number, accepting `INT`, `SIGINT`, `2`, and `EXIT`. Returns -1 when
 	// the name is not recognised.
 	[[nodiscard]] static int signal_number(std::string_view name);

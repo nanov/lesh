@@ -121,6 +121,10 @@ private:
 	buffer_pool& _pool;
 	shell_state& _state;
 	runner_adapter _runner;
+	// How many command substitutions this executor has completed. Only the DELTA
+	// is ever read: it tells a command with no command name whether it performed a
+	// substitution whose status it must adopt (POSIX 2.9.1).
+	uint64_t _substitutions = 0;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
 	bool _exit_trap_ran = false;
