@@ -90,3 +90,12 @@ d=$(mktemp -d); if true; then echo yes; fi > $d/f; cat $d/f
 
 --- a compound command with a bad redirection spares the shell [xfail(legacy): not implemented in legacy]
 if echo x; then echo y; fi <_no_such_dir_/foo 2>/dev/null; printf 'reached\n'
+
+--- a for loop without in iterates the positional parameters [xfail(legacy): not implemented in legacy]
+set -- x y; for i do echo $i; done
+
+--- a for loop without in inside a function [xfail(legacy): not implemented in legacy]
+f() { for i do echo $i; done; }; f a b
+
+--- for with an empty in list iterates nothing [xfail(legacy): not implemented in legacy]
+set -- a; for i in; do echo never; done; echo after

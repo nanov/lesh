@@ -245,9 +245,13 @@ private:
 		if (peek().kind == token_kind::word)
 			name_token = advance();
 
-		// `for x; do ...` iterates the positional parameters; `for x in a b; do`
-		// iterates the listed words.
+		// `for x do ...` and `for x; do ...` iterate the POSITIONAL PARAMETERS;
+		// `for x in a b; do` iterates the listed words. The distinction matters and
+		// is not the same as an empty list: `for x in; do` iterates nothing.
+		// Recorded in the node so the executor can tell them apart.
+		bool has_in = false;
 		if (accept(reserved::kw_in)) {
+			has_in = true;
 			while (peek().kind == token_kind::word && peek_reserved() == reserved::none) {
 				const uint32_t at = advance();
 				node w;
@@ -268,7 +272,9 @@ private:
 		n.kind = node_kind::for_loop;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
-		n.aux = name_token;  // the loop variable's name token
+		// aux packs the name token and the has_in flag: the top bit says whether
+		// an `in` clause was written.
+		n.aux = name_token | (has_in ? 0x80000000u : 0u);
 		commit_children(n, mark);
 		return _tree.add_node(n);
 	}

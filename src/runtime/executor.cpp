@@ -480,15 +480,30 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 	                              ? std::string_view{}
 	                              : std::string_view{};
 	(void)name;
-	const std::string_view var = t.source().substr(t.token_at(self.aux).offset,
-	                                               t.token_at(self.aux).length);
+	const bool has_in = (self.aux & 0x80000000u) != 0;
+	const uint32_t name_token = self.aux & 0x7FFFFFFFu;
+	const std::string_view var = t.source().substr(t.token_at(name_token).offset,
+	                                               t.token_at(name_token).length);
 
 	// Every child but the last is a word to iterate; the last is the body.
 	const uint32_t word_count = self.children_count - 1;
 	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
 	arena_array<std::string_view> items{_pool, 8};
-	for (uint32_t i = 0; i < word_count; ++i)
-		ex.expand_word(t, t.child_of(self, i), items);
+
+	if (!has_in) {
+		// `for x do ...` iterates the POSITIONAL PARAMETERS. Without this the loop
+		// found no words and its body never ran at all - which is silently doing
+		// nothing, and it is the form yash's own test helpers use throughout, so it
+		// made a third of the conformance suite produce no result.
+		for (size_t i = 1; i <= _state.positional_count(); ++i) {
+			std::string_view arg;
+			if (_state.positional_at(i, arg))
+				items.push(arg);
+		}
+	} else {
+		for (uint32_t i = 0; i < word_count; ++i)
+			ex.expand_word(t, t.child_of(self, i), items);
+	}
 
 	int status = 0;
 	for (const auto& item : items) {
