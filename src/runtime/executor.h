@@ -73,6 +73,9 @@ private:
 	// Returns false when the name is not a function, so the caller execs instead.
 	bool try_run_function(const syntax::tree& t, arena_array<char*>& argv, int& status);
 	bool consume_loop_flow(bool& should_break);
+	// Parses and runs source in this environment. Used by `eval` and `.`.
+	int run_source(std::string_view source);
+	int run_file(std::string_view path);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
 	bool apply_here_doc(const syntax::tree& t, syntax::node_index n,

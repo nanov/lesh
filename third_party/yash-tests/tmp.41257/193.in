@@ -1,0 +1,13 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+a=a n=; unset u
+readonly n
+bracket ${n:=}

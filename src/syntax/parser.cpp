@@ -414,18 +414,41 @@ private:
 		return _tree.add_node(n);
 	}
 
+	// POSIX permits redirections AFTER a compound command: `if ...; fi > file`
+	// redirects the whole construct. They are attached to the compound node so the
+	// executor applies them around it.
+	node_index attach_trailing_redirects(node_index compound) noexcept {
+		if (!is_redirect_operator(peek().kind) && peek().kind != token_kind::io_number)
+			return compound;
+
+		const uint32_t mark = mark_scratch();
+		_scratch.push(compound);
+		while (is_redirect_operator(peek().kind) || peek().kind == token_kind::io_number)
+			_scratch.push(parse_redirect());
+
+		// A brace group wrapping the compound plus its redirections: the executor
+		// already applies a command's redirect children, so reusing that shape
+		// avoids a second mechanism.
+		node n;
+		n.kind = node_kind::brace_group;
+		n.first_token = _tree[compound].first_token;
+		n.last_token = _index > n.first_token ? _index - 1 : n.first_token;
+		commit_children(n, mark);
+		return _tree.add_node(n);
+	}
+
 	[[nodiscard]] node_index parse_command_or_compound() noexcept {
 		if (peek().kind == token_kind::lparen)
-			return parse_subshell();
+			return attach_trailing_redirects(parse_subshell());
 		if (at_function_definition())
 			return parse_function_definition();
 		switch (peek_reserved()) {
-			case reserved::kw_if:     return parse_if();
-			case reserved::kw_while:  return parse_while_or_until(false);
-			case reserved::kw_until:  return parse_while_or_until(true);
-			case reserved::kw_for:    return parse_for();
-			case reserved::kw_case:   return parse_case();
-			case reserved::kw_lbrace: return parse_brace_group();
+			case reserved::kw_if:     return attach_trailing_redirects(parse_if());
+			case reserved::kw_while:  return attach_trailing_redirects(parse_while_or_until(false));
+			case reserved::kw_until:  return attach_trailing_redirects(parse_while_or_until(true));
+			case reserved::kw_for:    return attach_trailing_redirects(parse_for());
+			case reserved::kw_case:   return attach_trailing_redirects(parse_case());
+			case reserved::kw_lbrace: return attach_trailing_redirects(parse_brace_group());
 			default:                  return parse_command();
 		}
 	}

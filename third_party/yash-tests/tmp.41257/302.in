@@ -1,0 +1,14 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+a=1-2-3-4 s='***' p='%%%'
+bracket "${a%4}" "${a%*4}" "${a%4*}" "${a%-*4}"
+bracket "${a%*-}" "${a%*}" "${a%-*}" "${a%*-*}"
+bracket "${a%3}" "${s%'*'}" "${p%'%'}"

@@ -336,7 +336,27 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 		case node_kind::until_loop:    return run_loop(t, n, /*until=*/true);
 		case node_kind::for_loop:      return run_for(t, n);
 		case node_kind::case_clause:   return run_case(t, n);
-		case node_kind::brace_group:   return run_compound_list(t, t.child_of(t[n], 0));
+		case node_kind::brace_group: {
+			// A brace group may carry redirections when it was produced by
+			// attach_trailing_redirects for `if ...; fi > file`. Applying them here
+			// covers both the written `{ ...; } > file` and the synthesised case.
+			arena_array<saved_fd> saved{_pool, 4};
+			std::fflush(nullptr);
+			if (!apply_redirections(t, n, &saved)) {
+				restore_fds(saved);
+				// POSIX: a redirection error on a COMPOUND command does not exit a
+				// non-interactive shell, unlike one on a special builtin.
+				return 1;
+			}
+			// run_node, not run_compound_list: a written brace group's child IS a
+			// compound_list, but a synthesised one wraps whatever construct carried
+			// the redirection. Calling run_compound_list directly iterated a for
+			// loop's WORDS as if they were commands.
+			const int status = run_node(t, t.child_of(t[n], 0));
+			std::fflush(nullptr);
+			restore_fds(saved);
+			return status;
+		}
 		case node_kind::subshell:      return run_subshell(t, n);
 		case node_kind::function_definition: return run_function_definition(t, n);
 		case node_kind::error:
@@ -523,6 +543,49 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 	return 0;  // POSIX: no matching pattern is status zero
 }
 
+// Parses and runs source in THIS environment. `eval` and `.` both need it, and
+// both must see the shell's own state rather than a copy - which is what makes
+// `. ./config` able to set variables the caller then reads.
+int tree_walking_executor::run_source(std::string_view source) {
+	// A nested pool: the tree lives only as long as this call. Functions defined
+	// here would not outlive it, which is the same limitation #25 recorded.
+	buffer_pool nested{BUFFER_POOL_SIZE};
+	const tree parsed = syntax::parse(nested, source, &_state);
+	if (parsed.has_errors() && !_state.interactive()) {
+		// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
+		// exactly as one at the top level does. Returning a status and carrying on
+		// let `eval fi; echo not reached` reach the echo.
+		std::fprintf(stderr, "lesh: syntax error\n");
+		_exit_requested = true;
+		return 2;
+	}
+	const node& program = parsed[parsed.root()];
+	int status = _state.last_status();
+	for (uint32_t i = 0; i < program.children_count; ++i) {
+		status = run_node(parsed, parsed.child_of(program, i));
+		_state.set_last_status(status);
+		if (_flow != control_flow::normal || _exit_requested)
+			break;
+	}
+	return status;
+}
+
+int tree_walking_executor::run_file(std::string_view path) {
+	std::string name{path};
+	std::FILE* f = std::fopen(name.c_str(), "rb");
+	if (f == nullptr) {
+		std::fprintf(stderr, "lesh: %s: %s\n", name.c_str(), std::strerror(errno));
+		return 127;
+	}
+	std::string source;
+	char buffer[4096];
+	size_t got;
+	while ((got = std::fread(buffer, 1, sizeof(buffer), f)) > 0)
+		source.append(buffer, got);
+	std::fclose(f);
+	return run_source(source);
+}
+
 int tree_walking_executor::run_function_definition(const tree& t, node_index n) {
 	const node& self = t[n];
 	if (self.children_count == 0)
@@ -707,10 +770,31 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return 0;
 	}
 
+	// `command name args...` runs a command bypassing FUNCTION lookup. Stripping
+	// the prefix here and setting a flag is simpler than threading a mode through
+	// the search, and it is the executor that owns the search order anyway.
+	//
+	// The `-v` reporting form stays in builtins.cpp. Implementing only that form
+	// and letting every other use silently succeed made `command echo hi` do
+	// nothing - a stub that succeeds is worse than an absent builtin, which is
+	// the mistake #24 explicitly warned about and I made anyway.
+	bool bypass_functions = false;
+	while (argv.size() > 1 && std::string_view{argv[0]} == "command" &&
+	       argv[1] != nullptr && std::string_view{argv[1]} != "-v") {
+		bypass_functions = true;
+		// Drop argv[0] by shifting the rest down; the arena owns the strings.
+		for (size_t i = 0; i + 1 < argv.size(); ++i)
+			argv[i] = argv[i + 1];
+		if (argv.size() > 0)
+			argv.truncate(argv.size() - 1);
+		if (argv.empty() || argv[0] == nullptr)
+			return 0;
+	}
+
 	// A function shadows an external command but NOT a special builtin, per
 	// POSIX's command search order: special builtins, then functions, then regular
 	// builtins, then PATH.
-	if (classify_builtin(argv[0]) != builtin_kind::special) {
+	if (!bypass_functions && classify_builtin(argv[0]) != builtin_kind::special) {
 		arena_array<saved_fd> saved{_pool, 4};
 		int status = 0;
 		std::fflush(nullptr);
@@ -729,6 +813,42 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		restore_fds(saved);
 		if (!ok)
 			return 1;
+	}
+
+	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
+	// here rather than in builtins.cpp - giving every builtin a back-reference to
+	// the executor to serve two of them would be the wrong trade.
+	//
+	// This is the cycle the ports in #11 were designed to survive: parsing inside
+	// execution, with the parse seeing the same aliases and the execution seeing
+	// the same state.
+	if (const std::string_view name{argv[0]}; name == "eval" || name == ".") {
+		arena_array<saved_fd> saved{_pool, 4};
+		std::fflush(nullptr);
+		const bool ok = apply_redirections(t, n, &saved);
+		int status = 0;
+		if (!ok) {
+			status = 1;
+		} else if (name == "eval") {
+			// POSIX: the arguments are joined with spaces and read as shell input.
+			std::string joined;
+			for (size_t i = 1; argv[i] != nullptr; ++i) {
+				if (i > 1)
+					joined += ' ';
+				joined += argv[i];
+			}
+			status = joined.empty() ? 0 : run_source(joined);
+		} else {
+			if (argv[1] == nullptr) {
+				std::fprintf(stderr, "lesh: .: filename argument required\n");
+				status = 2;
+			} else {
+				status = run_file(argv[1]);
+			}
+		}
+		std::fflush(nullptr);
+		restore_fds(saved);
+		return status;
 	}
 
 	// A builtin runs in THIS process - `cd` in a forked child would change the
@@ -804,9 +924,37 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 			break;
 		}
 
+		const node_index stage = t.child_of(self, i);
+
+		// A stage may be a COMPOUND command - `echo x | { read v; ... }` and
+		// `... | while read l; do ...; done` are both ordinary shell. build_argv
+		// only understands simple commands, so a compound stage found no words and
+		// was silently skipped, producing no output at all.
+		if (t[stage].kind != node_kind::simple_command) {
+			std::fflush(nullptr);
+			const pid_t pid = fork();
+			if (pid == 0) {
+				setpgid(0, group);
+				if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
+				if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
+				const int status = run_node(t, stage);
+				std::fflush(nullptr);
+				_exit(status);
+			}
+			if (pid > 0) {
+				setpgid(pid, group == 0 ? pid : group);
+				pids.push(pid);
+				if (group == 0)
+					group = pid;
+			}
+			if (input_fd != STDIN_FILENO) close(input_fd);
+			if (!is_last) { close(pipe_fds[1]); input_fd = pipe_fds[0]; }
+			continue;
+		}
+
 		arena_array<char*> argv{_pool, 8};
 		arena_array<std::string_view> assignments{_pool, 4};
-		if (build_argv(t, t.child_of(self, i), argv, &assignments)) {
+		if (build_argv(t, stage, argv, &assignments)) {
 			// A function or builtin in a pipeline stage runs in ITS OWN process, so
 			// it forks like anything else and its effects do not reach the shell.
 			// POSIX allows either, and running it in a subshell is what dash does -
@@ -822,7 +970,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 					if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
 					int status = 0;
 					arena_array<saved_fd> ignored{_pool, 2};
-					(void)apply_redirections(t, t.child_of(self, i), &ignored);
+					(void)apply_redirections(t, stage, &ignored);
 					if (!try_run_function(t, argv, status)) {
 						builtin_result r{};
 						(void)try_run_builtin(_state, argv.data(), r);
@@ -847,7 +995,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 			// and `echo a | read x` cannot set x in the shell. That is POSIX's
 			// behaviour, not a limitation.
 			const pid_t pid = spawn(argv, {input_fd, is_last ? STDOUT_FILENO : pipe_fds[1], group},
-			                        &assignments, &t, t.child_of(self, i));
+			                        &assignments, &t, stage);
 			if (pid > 0) {
 				pids.push(pid);
 				if (group == 0)

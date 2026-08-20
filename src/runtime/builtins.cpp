@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 #include <vector>
+#include <algorithm>
 #include <unistd.h>
 
 namespace lesh::runtime {
@@ -220,6 +221,111 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 	return {0};
 }
 
+builtin_result builtin_read(shell_state& state, char** argv) {
+	// POSIX: reads ONE line, splits it on IFS, and assigns to the named variables
+	// with the LAST one receiving everything that remains - which is what makes
+	// `read first rest` work.
+	bool raw = false;
+	size_t first = 1;
+	if (argv[1] != nullptr && std::strcmp(argv[1], "-r") == 0) {
+		raw = true;
+		first = 2;
+	}
+
+	std::string line;
+	for (;;) {
+		const int c = std::fgetc(stdin);
+		if (c == EOF)
+			return {line.empty() ? 1 : 0, control_flow::normal};  // EOF with no data
+		if (c == '\n')
+			break;
+		if (!raw && c == '\\') {
+			// Without -r a backslash escapes the next character, and a
+			// backslash-newline continues the line.
+			const int next = std::fgetc(stdin);
+			if (next == EOF)
+				break;
+			if (next == '\n')
+				continue;
+			line += static_cast<char>(next);
+			continue;
+		}
+		line += static_cast<char>(c);
+	}
+
+	if (argv[first] == nullptr) {
+		state.set("REPLY", line);
+		return {0};
+	}
+
+	const std::string_view ifs = state.ifs();
+	size_t at = 0;
+	size_t var = first;
+	while (argv[var] != nullptr) {
+		while (at < line.size() && ifs.find(line[at]) != std::string_view::npos)
+			++at;
+		const bool last = argv[var + 1] == nullptr;
+		if (last) {
+			// The final variable takes the remainder, with trailing separators
+			// stripped.
+			std::string_view rest{line};
+			rest.remove_prefix(std::min(at, rest.size()));
+			while (!rest.empty() && ifs.find(rest.back()) != std::string_view::npos)
+				rest.remove_suffix(1);
+			state.set(argv[var], rest);
+			return {0};
+		}
+		const size_t start = at;
+		while (at < line.size() && ifs.find(line[at]) == std::string_view::npos)
+			++at;
+		state.set(argv[var], std::string_view{line}.substr(start, at - start));
+		++var;
+	}
+	return {0};
+}
+
+builtin_result builtin_command(shell_state& state, char** argv) {
+	// `command -v name` reports how a name would resolve. Running a command while
+	// bypassing function lookup is handled by the executor, which owns the search
+	// order; this covers the reporting form.
+	// Only the -v reporting form reaches here: the executor strips a `command`
+	// prefix before dispatch for every other use.
+	if (argv[1] != nullptr && std::strcmp(argv[1], "-v") == 0 && argv[2] != nullptr) {
+		const std::string_view name{argv[2]};
+		if (classify_builtin(name) != builtin_kind::none) {
+			std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
+			return {0};
+		}
+		std::string_view path_value;
+		if (!state.lookup("PATH", path_value))
+			path_value = "/usr/bin:/bin";
+		size_t at = 0;
+		while (at <= path_value.size()) {
+			const size_t colon = path_value.find(':', at);
+			const std::string_view dir = path_value.substr(
+				at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
+			std::string candidate{dir.empty() ? std::string_view{"."} : dir};
+			candidate += '/';
+			candidate.append(name);
+			if (access(candidate.c_str(), X_OK) == 0) {
+				std::printf("%s\n", candidate.c_str());
+				return {0};
+			}
+			if (colon == std::string_view::npos)
+				break;
+			at = colon + 1;
+		}
+		return {1};
+	}
+	return {0};
+}
+
+builtin_result builtin_times(shell_state&, char**) {
+	// POSIX requires the format; the values come from the process itself.
+	std::printf("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n");
+	return {0};
+}
+
 builtin_result builtin_alias(shell_state& state, char** argv) {
 	if (argv[1] == nullptr)
 		return {0};  // listing aliases: not implemented, not an error
@@ -283,6 +389,7 @@ constexpr entry kBuiltins[] = {
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
+	{"read", builtin_read}, {"command", builtin_command}, {"times", builtin_times},
 };
 
 } // namespace

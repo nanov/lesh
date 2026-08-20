@@ -60,3 +60,33 @@ unalias nothing 2>/dev/null; echo ok
 
 --- a quoted command name bypasses alias substitution [xfail(legacy): legacy's alias model differs]
 alias ls=echo; \ls -d /tmp 2>/dev/null | head -1
+
+--- eval runs its arguments as shell input [xfail(legacy): not implemented in legacy]
+eval "echo from-eval"
+
+--- eval sets state in the current environment [xfail(legacy): not implemented in legacy]
+eval "x=set-by-eval"; echo $x
+
+--- read splits a line on IFS [xfail(legacy): not implemented in legacy]
+echo "a b c" | { read x y z; echo "$z-$y-$x"; }
+
+--- the last variable of read takes the remainder [xfail(legacy): not implemented in legacy]
+echo "one two three" | { read a b; echo "[$a][$b]"; }
+
+--- a while loop can read a stream [xfail(legacy): not implemented in legacy]
+printf 'a\nb\n' | while read l; do echo "[$l]"; done
+
+--- command runs a command bypassing functions [xfail(legacy): not implemented in legacy]
+f() { echo function; }; command echo not-the-function
+
+--- command -v reports a builtin
+command -v cd
+
+--- a for loop can be redirected [xfail(legacy): not implemented in legacy]
+d=$(mktemp -d); for x in a b; do echo $x; done > $d/f; cat $d/f
+
+--- an if can be redirected [xfail(legacy): not implemented in legacy]
+d=$(mktemp -d); if true; then echo yes; fi > $d/f; cat $d/f
+
+--- a compound command with a bad redirection spares the shell [xfail(legacy): not implemented in legacy]
+if echo x; then echo y; fi <_no_such_dir_/foo 2>/dev/null; printf 'reached\n'

@@ -1,0 +1,13 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+set a b c
+echo ${3:+posix}
+echo ${4-posix}

@@ -1,0 +1,14 @@
+
+_empty= _sp=' ' _tab='  ' _nl='
+'
+echoraw() {
+    printf '%s\n' "$*"
+}
+bracket() {
+    if [ $# -gt 0 ]; then printf '[%s]' "$@"; fi
+    echo
+}
+a=a
+bracket -${a-\}}- -${a-'}'}- -${a-"}"}- -${a}}-
+bracket -${a-${a}}- -${a-$({ :;})}-
+bracket -${a-$(($({ :;})))}- -${a-${a-${a-${a}}}}-
