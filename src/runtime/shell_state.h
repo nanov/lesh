@@ -110,6 +110,26 @@ public:
 	// re-exec, and argv[0] is not one when the shell was found on PATH.
 	[[nodiscard]] std::string_view own_path() const noexcept { return _own_path; }
 
+	// --- getopts ---------------------------------------------------------------
+	//
+	// POSIX puts getopts' argument index in the OPTIND *variable*, so that a caller
+	// can restart the parse with `OPTIND=1`. The position WITHIN a word - the `b` of
+	// `-ab`, parsed by the second of two calls - has no such home, and OPTIND cannot
+	// express it. It lives here.
+	//
+	// ANY assignment to OPTIND clears it, which is what makes the documented reset
+	// work. Comparing OPTIND against a shadow copy would NOT: OPTIND names the word
+	// still being parsed, so it is 1 all the way through `-abc`, and `OPTIND=1`
+	// mid-word writes the value that is already there. dash splits the state the
+	// same way and clears the offset from its own assignment hook (var.c
+	// getoptsreset), for the same reason.
+	[[nodiscard]] size_t getopts_offset() const noexcept { return _getopts_offset; }
+
+	// getopts' own write of OPTIND. The one path that does NOT clear the offset,
+	// since getopts is reporting the position it just reached rather than asking to
+	// start over. dash spells this `setvarsafe("OPTIND", s, VNOFUNC)`.
+	void set_optind(size_t index, size_t offset);
+
 	// --- options --------------------------------------------------------------
 
 	// Held here rather than as globals so a subshell can copy them.
@@ -206,6 +226,7 @@ private:
 	std::string _own_path;
 	signal_state _signals;
 	int _last_status = 0;
+	size_t _getopts_offset = 0;
 	options _options;
 	bool _interactive = false;
 	// Backing store for option_flags(). Rebuilt on demand and mutable because

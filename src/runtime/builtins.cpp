@@ -1,5 +1,6 @@
 #include "runtime/builtins.h"
 
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -557,6 +558,195 @@ builtin_result builtin_command(shell_state& state, char** argv) {
 	return {0};
 }
 
+// True for a POSIX name: `[A-Za-z_][A-Za-z0-9_]*`. `getopts` writes through this
+// operand, so a name the shell could never assign has to be refused rather than
+// stored under a key no expansion can reach.
+bool is_name(std::string_view text) {
+	if (text.empty())
+		return false;
+	if (!(std::isalpha(static_cast<unsigned char>(text[0])) || text[0] == '_'))
+		return false;
+	for (const char c : text.substr(1))
+		if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+			return false;
+	return true;
+}
+
+// The arguments getopts parses: the `arg...` operands when given, and the
+// positional parameters otherwise.
+//
+// Views, not copies: the positional parameters outlive the call and nothing here
+// assigns to them. `state.set()` on OPTIND or OPTARG cannot invalidate them
+// either - they live in a separate vector.
+std::vector<std::string_view> getopts_arguments(const shell_state& state, char** argv) {
+	std::vector<std::string_view> args;
+	if (argv[3] != nullptr) {
+		for (size_t i = 3; argv[i] != nullptr; ++i)
+			args.emplace_back(argv[i]);
+		return args;
+	}
+	for (size_t i = 1; i <= state.positional_count(); ++i)
+		if (std::string_view value; state.positional_at(i, value))
+			args.push_back(value);
+	return args;
+}
+
+// One option per call, with the state split between the OPTIND variable and the
+// within-word offset beside it (shell_state::getopts_offset).
+//
+// The invariant, and the whole design in one line: OPTIND is the index of the
+// argument still to be processed, and the offset is how far into THAT argument the
+// last call got. A word with letters left is still the next word, so OPTIND stays
+// 1 for all of `-abc` and only becomes 2 when `c` is taken. bash, ksh and zsh all
+// report it that way; dash advances OPTIND as soon as it enters the word, which
+// makes `shift $((OPTIND-1))` after a mid-word `?` discard letters nobody looked
+// at. Recorded as a divergence in tests/spec/posix_gaps.spec.
+builtin_result builtin_getopts(shell_state& state, char** argv) {
+	if (argv[1] == nullptr || argv[2] == nullptr) {
+		std::fprintf(stderr, "lesh: getopts: usage: getopts optstring name [arg...]\n");
+		return {2};
+	}
+	const std::string_view name{argv[2]};
+	if (!is_name(name)) {
+		std::fprintf(stderr, "lesh: getopts: %.*s: bad variable name\n",
+		             static_cast<int>(name.size()), name.data());
+		return {2};
+	}
+
+	// A leading colon in optstring hands the diagnostics to the CALLER: nothing is
+	// printed, and OPTARG carries the offending letter so the script can report it
+	// itself. Everything below reads `quiet` rather than re-testing optstring[0],
+	// because the two error paths have to agree - getopts-p.tst checks the printing
+	// and the not-printing of both.
+	const std::string_view optstring{argv[1]};
+	const bool quiet = !optstring.empty() && optstring[0] == ':';
+	const std::string_view letters = quiet ? optstring.substr(1) : optstring;
+
+	const std::vector<std::string_view> args = getopts_arguments(state, argv);
+
+	// OPTIND is read back from the variable on every call. That is the point of
+	// keeping it there: a caller's `OPTIND=1` has to be obeyed, and a hidden
+	// counter would ignore it.
+	size_t index = 1;
+	if (std::string_view text; state.lookup("OPTIND", text) && is_unsigned_integer(text)) {
+		index = 0;
+		for (const char c : text) {
+			// Clamped rather than wrapped: `OPTIND=99999999999999999999` is a value
+			// the parse below only ever compares against $#, and an overflowed size_t
+			// would compare as small.
+			if (index > args.size() + 1)
+				break;
+			index = index * 10 + static_cast<size_t>(c - '0');
+		}
+	}
+	// A missing, empty, zero or non-numeric OPTIND - `-1` included, since a sign
+	// makes it non-numeric here - restarts the parse. POSIX specifies only the
+	// value 1, and dash makes this case FATAL: `unset OPTIND` there aborts the
+	// shell with "Illegal number:" from inside its assignment hook. Restarting is
+	// the more useful of two unspecified answers.
+	if (index < 1)
+		index = 1;
+	size_t offset = state.getopts_offset();
+	// An OPTIND past the end means the options are exhausted, however it got there.
+	// POSIX calls a modified OPTIND unspecified and the shells disagree: bash
+	// clamps to $#+1 and reports the end, dash silently restarts from 1, ksh and
+	// zsh report the end and leave the value. bash's is the one that cannot lose
+	// arguments, so it is what this does.
+	if (index > args.size() + 1) {
+		index = args.size() + 1;
+		offset = 0;
+	}
+	// The arguments changed between calls, or shrank under a saved offset - also
+	// unspecified. Starting the word over is the only answer that cannot read off
+	// the end of it.
+	if (offset > 0 && (index > args.size() || offset >= args[index - 1].size()))
+		offset = 0;
+
+	// End of options: no word left, a word that is not an option, or `--`. POSIX
+	// requires status >0, `name` set to `?`, and OPTARG unset - the last of which
+	// dash gets wrong, leaving OPTARG set to the empty string, and fails
+	// getopts-p.tst's 'OPTARG is unset after parsing all options' for it.
+	if (offset == 0) {
+		const std::string_view word = index <= args.size() ? args[index - 1]
+		                                                   : std::string_view{};
+		// A lone `-` is an operand, not an option: it is a word of length 1, which
+		// is why the size test comes before the letter is looked at.
+		const bool is_option = word.size() >= 2 && word[0] == '-';
+		if (!is_option || word == "--") {
+			if (word == "--")
+				++index;  // POSIX: OPTIND points PAST the `--`
+			state.set_optind(index, 0);
+			state.set(name, "?");
+			state.unset("OPTARG");
+			return {1};
+		}
+		offset = 1;  // past the `-`
+	}
+
+	const std::string_view word = args[index - 1];
+	const char option = word[offset];
+	++offset;
+	// The word is finished the moment its last letter is taken, and the index moves
+	// on then rather than at the start of the next call. Anything else would report
+	// an OPTIND that points at a word with nothing left in it.
+	const bool word_done = offset >= word.size();
+
+	const size_t at = letters.find(option);
+	// `:` is never an option letter, only the marker that the letter before it
+	// takes an argument - so `-:` is an unknown option even though the character
+	// appears in the optstring. Without this test, `getopts a:b v -:` would parse a
+	// colon as a valid option.
+	if (option == ':' || at == std::string_view::npos) {
+		state.set_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
+		state.set(name, "?");
+		if (quiet) {
+			state.set("OPTARG", std::string_view{&option, 1});
+		} else {
+			state.unset("OPTARG");
+			std::fprintf(stderr, "lesh: getopts: illegal option -%c\n", option);
+		}
+		// Zero, not one: POSIX gives status >0 to the END of the options, and an
+		// unknown option was still an option FOUND. `while getopts ...` has to keep
+		// looping so the script's own `?)` case can run.
+		return {0};
+	}
+
+	if (at + 1 < letters.size() && letters[at + 1] == ':') {
+		if (!word_done) {
+			// Adjoined: `-afoo` puts the rest of the word in OPTARG and finishes it.
+			state.set("OPTARG", word.substr(offset));
+			state.set_optind(index + 1, 0);
+		} else if (index + 1 <= args.size()) {
+			state.set("OPTARG", args[index]);
+			state.set_optind(index + 2, 0);
+		} else {
+			// Missing argument. The option word is consumed either way, so OPTIND
+			// still advances past it.
+			state.set_optind(index + 1, 0);
+			if (quiet) {
+				state.set(name, ":");
+				state.set("OPTARG", std::string_view{&option, 1});
+			} else {
+				state.set(name, "?");
+				state.unset("OPTARG");
+				std::fprintf(stderr, "lesh: getopts: option requires an argument -%c\n",
+				             option);
+			}
+			return {0};
+		}
+	} else {
+		// POSIX: OPTARG is UNSET when the option takes no argument, which is what
+		// makes `${OPTARG-unset}` tell an argument-less option from an empty one.
+		// dash and zsh leave the empty string here and both fail getopts-p.tst's
+		// 'OPTARG is unset when option without argument is parsed'.
+		state.unset("OPTARG");
+		state.set_optind(word_done ? index + 1 : index, word_done ? 0 : offset);
+	}
+
+	state.set(name, std::string_view{&option, 1});
+	return {0};
+}
+
 builtin_result builtin_times(shell_state&, char**) {
 	// POSIX requires the format; the values come from the process itself.
 	std::printf("0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n");
@@ -616,9 +806,10 @@ struct entry {
 	builtin_result (*fn)(shell_state&, char**);
 };
 
-// Only what is implemented. `eval`, `.`, `exec`, `trap`, `times` and `readonly`
-// are deliberately absent: each needs machinery from another ticket, and a stub
-// that silently succeeds is worse than a command that reports "not found".
+// Only what is implemented. `eval`, `.`, `exec` and `wait` are absent because they
+// live in the executor - they need the front end, the process itself, or the record
+// of background jobs. `readonly` is absent because it is not written yet, and a
+// stub that silently succeeds is worse than a command that reports "not found".
 constexpr entry kBuiltins[] = {
 	{"true", builtin_true},   {"false", builtin_false}, {"echo", builtin_echo},
 	{"pwd", builtin_pwd},     {"cd", builtin_cd},       {":", builtin_colon},
@@ -627,7 +818,7 @@ constexpr entry kBuiltins[] = {
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
 	{"read", builtin_read}, {"command", builtin_command}, {"times", builtin_times},
-	{"trap", builtin_trap}, {"kill", builtin_kill},
+	{"trap", builtin_trap}, {"kill", builtin_kill}, {"getopts", builtin_getopts},
 };
 
 } // namespace

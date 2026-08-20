@@ -589,6 +589,54 @@ set -x; foo=bar; echo $foo
 --- xtrace expands PS4 [xfail(legacy): legacy has no shell options]
 foo=XY; PS4='${foo#X} '; set -x; echo traced
 
+--- getopts parses one option per call [xfail(legacy): legacy has no getopts]
+getopts ab:c o -a -b arg -c; echo "1[$o]"; getopts ab:c o -a -b arg -c; echo "2[$o][$OPTARG]"; getopts ab:c o -a -b arg -c; echo "3[$o]"
+
+--- getopts parses grouped letters one at a time [xfail(legacy): legacy has no getopts]
+for i in 1 2 3 4; do getopts abc o -abc; echo "$i[$o] st=$?"; done
+
+--- getopts takes an option argument adjoined or separate [xfail(legacy): legacy has no getopts]
+getopts a:b o -a'  foo' -b; echo "[$OPTARG][$OPTIND]"; OPTIND=1; getopts a:b o -a '-x  foo' -b; echo "[$OPTARG][$OPTIND]"; OPTIND=1; getopts a:b o -a '' -b; echo "[$OPTARG][$OPTIND]"
+
+--- getopts reports the end of the options with a question mark [xfail(legacy): legacy has no getopts]
+getopts a x -a; getopts a x -a; echo "st=$? [$x]"
+
+--- a lone hyphen is an operand and a double hyphen ends the options [xfail(legacy): legacy has no getopts]
+getopts '' x -; echo "hyphen st=$? [$OPTIND]"; OPTIND=1; getopts ab x -a -- -b; echo "1[$x]"; getopts ab x -a -- -b; echo "2 st=$? [$OPTIND]"
+
+--- getopts leaves OPTIND at the first operand [xfail(legacy): legacy has no getopts]
+getopts '' x; echo "$OPTIND"; OPTIND=1; getopts '' x operand; echo "$OPTIND"; OPTIND=1; getopts '' x --; echo "$OPTIND"; OPTIND=1; getopts '' x -- operand; echo "$OPTIND"
+
+--- getopts parses the positional parameters when given no operands [xfail(legacy): legacy has no getopts]
+set -- -a -b arg -c; getopts ab:c o; echo "1[$o]"; getopts ab:c o; echo "2[$o][$OPTARG]"; getopts ab:c o; echo "3[$o]"; echo "$OPTIND"
+
+--- resetting OPTIND to 1 starts a new parse [xfail(legacy): legacy has no getopts]
+getopts ab p -a -b; getopts ab p -a -b; getopts ab p -a -b; OPTIND=1; getopts xy q -x -y; echo "1[$q]"; getopts xy q -x -y; echo "2[$q]"; getopts xy q -x -y; echo "3[$OPTIND]"
+
+--- an unknown option is a question mark that keeps the loop going [xfail(legacy): legacy has no getopts]
+getopts ab v -z 2>/tmp/lesh_spec_getopts_err; echo "st=$? [$v] [${OPTARG-unset}]"; [ -s /tmp/lesh_spec_getopts_err ] && echo diagnosed; rm -f /tmp/lesh_spec_getopts_err
+
+--- a leading colon puts the offending letter in OPTARG and prints nothing [xfail(legacy): legacy has no getopts]
+getopts :ab v -z 2>/tmp/lesh_spec_getopts_quiet; echo "st=$? [$v] [$OPTARG]"; [ -s /tmp/lesh_spec_getopts_quiet ] || echo silent; rm -f /tmp/lesh_spec_getopts_quiet
+
+--- a missing option argument is a colon under the colon form [xfail(legacy): legacy has no getopts]
+getopts :a: v -a 2>/tmp/lesh_spec_getopts_quiet; echo "st=$? [$v] [$OPTARG] [$OPTIND]"; [ -s /tmp/lesh_spec_getopts_quiet ] || echo silent; rm -f /tmp/lesh_spec_getopts_quiet
+
+--- a missing option argument is a question mark otherwise [xfail(legacy): legacy has no getopts]
+getopts a: v -a 2>/tmp/lesh_spec_getopts_err; echo "st=$? [$v] [${OPTARG-unset}] [$OPTIND]"; [ -s /tmp/lesh_spec_getopts_err ] && echo diagnosed; rm -f /tmp/lesh_spec_getopts_err
+
+--- the colon in an optstring marks an argument and is never an option letter [xfail(legacy): legacy has no getopts]
+getopts a:b v -: 2>/dev/null; echo "st=$? [$v]"
+
+--- option letters may be digits [xfail(legacy): legacy has no getopts]
+getopts ab:01: o -a -b arg -1 -2 -0; getopts ab:01: o -a -b arg -1 -2 -0; getopts ab:01: o -a -b arg -1 -2 -0; echo "[$o][$OPTARG]"; getopts ab:01: o -a -b arg -1 -2 -0; echo "[$o]"
+
+--- OPTIND and OPTARG are not exported [xfail(legacy): legacy has no getopts]
+getopts a: o -a arg; getopts a: o -a arg; sh -c 'echo ${OPTIND-unset} ${OPTARG-unset}'
+
+--- getopts is a regular builtin, so a usage error does not exit the shell [xfail(legacy): legacy has no getopts]
+getopts 2>/dev/null; echo "st=$?"; getopts ab 1bad -a 2>/dev/null; echo "st=$?"; echo reached
+
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
 # assertion dash itself fails in the yash suite, so the xfail marker here means
@@ -616,3 +664,18 @@ set -o pipefail; exit 1 | exit 2 | exit 0; echo "b $?"; exit 3 | exit 0 | exit 0
 
 --- set -o lists only the options the shell has [xfail: divergence - dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
 set -o
+
+--- OPTIND names the argument still being parsed rather than the next one [xfail: divergence - dash advances OPTIND on entering a word, so a mid-word `shift $((OPTIND-1))` discards letters nobody examined; bash, ksh and zsh all report it as lesh does]
+set -- -abc; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"
+
+--- OPTARG is unset when the option takes no argument [xfail: divergence - dash leaves the previous OPTARG as an empty string and fails both of getopts-p.tst's assertions about it; POSIX requires unset]
+getopts a:b o -a foo -b; getopts a:b o -a foo -b; echo "${OPTARG-unset}"; OPTIND=1; getopts a x -a; getopts a x -a; echo "${OPTARG-unset}"
+
+--- getopts state is per-shell, so a function continues the shell's parse [xfail: divergence - dash resets its internal index on function entry while leaving the OPTIND variable alone, so the two disagree inside a function; bash and ksh share it as lesh does]
+f() { getopts ab o; echo "f[$o]"; }; set -- -a -b; getopts ab o; echo "main[$o]"; f -a -b; echo "$OPTIND"
+
+--- an OPTIND past the last argument is the end of the options [xfail: divergence - dash silently restarts the parse from word 1, re-reporting options the script has already acted on; POSIX calls a modified OPTIND unspecified and bash clamps as lesh does]
+set -- -a -b; OPTIND=99; getopts ab o; echo "st=$? [$o] [$OPTIND]"
+
+--- a non-numeric or unset OPTIND restarts the parse [xfail: divergence - dash routes the value through its numeric parser inside the assignment hook and aborts the shell with "Illegal number"; POSIX specifies only the value 1]
+set -- -abc; getopts abc o; unset OPTIND; getopts abc o; echo "[$o]"; OPTIND=junk; getopts abc o; echo "[$o]"

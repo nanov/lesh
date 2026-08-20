@@ -23,9 +23,12 @@ constexpr std::array<std::string_view, 15> kSpecialBuiltins = {
 	"readonly", "return", "set", "shift", "times", "trap", "unset",
 };
 
-constexpr std::array<std::string_view, 11> kRegularBuiltins = {
+// `getopts` belongs HERE and not above: POSIX 2.14 lists it nowhere in the special
+// set, so its failure must not exit a non-interactive shell - `getopts` with too
+// few operands has to report and carry on, the way dash does.
+constexpr std::array<std::string_view, 12> kRegularBuiltins = {
 	"cd", "echo", "false", "pwd", "true", "test", "alias", "unalias",
-	"read", "command", "kill",
+	"read", "command", "kill", "getopts",
 };
 
 } // namespace
@@ -89,6 +92,14 @@ shell_state::shell_state() {
 	// shell for every case whose sender is another process: ninety of the 180 cases
 	// per file could not send the signal at all.
 	_vars.insert_or_assign("PPID", variable{std::to_string(getppid()), false});
+
+	// POSIX: OPTIND is initialised to 1 when the shell is invoked - which is why
+	// this OVERRIDES an inherited value rather than importing it, and why it is
+	// unexported: `OPTIND=7 sh -c 'echo $OPTIND'` prints 1 in dash too, and
+	// getopts-p.tst asserts that a child shell sees its own 1 rather than the
+	// parent's index. OPTARG is deliberately NOT initialised; POSIX says nothing
+	// about it, and dash passes an inherited one through.
+	_vars.insert_or_assign("OPTIND", variable{"1", false});
 }
 
 shell_state::~shell_state() = default;
@@ -179,6 +190,14 @@ void shell_state::set(std::string_view name, int64_t value) {
 }
 
 void shell_state::set(std::string_view name, std::string_view value) {
+	// Assigning OPTIND restarts getopts: the within-word position it kept beside
+	// the index is discarded, so `OPTIND=1; getopts abc o` re-reads `-abc` from its
+	// first letter instead of resuming at the letter it had reached. Every
+	// assignment funnels through here, so the hook cannot be bypassed by `export
+	// OPTIND=1`, `${OPTIND=1}`, or a `read OPTIND`.
+	if (name == "OPTIND")
+		_getopts_offset = 0;
+
 	// `set -a`: every variable CREATED OR MODIFIED by an assignment is marked for
 	// export. Applied here rather than at each assignment site so `x=1`, a `for`
 	// loop's variable, `read`, and `${x=default}` all obey it - which is what dash
@@ -199,8 +218,17 @@ void shell_state::set_exported(std::string_view name, std::string_view value) {
 }
 
 void shell_state::unset(std::string_view name) {
+	if (name == "OPTIND")
+		_getopts_offset = 0;  // same restart as an assignment; see set()
 	if (const auto it = _vars.find(name); it != _vars.end())
 		_vars.erase(it);
+}
+
+void shell_state::set_optind(size_t index, size_t offset) {
+	// set() clears the offset unconditionally, so the offset getopts wants to keep
+	// is written back AFTER the index. Ordering, not redundancy.
+	set("OPTIND", std::to_string(index));
+	_getopts_offset = offset;
 }
 
 bool shell_state::is_exported(std::string_view name) const {
