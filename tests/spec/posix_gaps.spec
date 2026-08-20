@@ -1,5 +1,14 @@
 # Constructs the new front end does not implement yet, one ticket per group.
 #
+# NOTE ON REFERENCE SHELLS. Two cases here legitimately differ under zsh, and
+# lesh matching dash is CORRECT (ADR-0001: dash is authoritative for the POSIX
+# floor, zsh only for the curated layer, dash wins on conflict):
+#
+#   - zsh does not glob the result of an unquoted expansion without `globsubst`
+#   - zsh errors on a pattern that matches nothing rather than passing it through
+#
+# Do not "fix" lesh toward zsh here. ctest gates on dash for exactly this reason.
+#
 # These exist so the scoreboard keeps measuring. A corpus everything passes has
 # stopped being a compass, and the markers name which ticket closes each gap.
 
@@ -51,8 +60,8 @@ false; echo $?
 --- positional parameters [xfail: #22]
 set -- one two; echo $1 $2
 
---- glob expansion [xfail: #23 - pathname expansion]
-cd /tmp && echo /tmp/*
+--- glob expansion [xfail(legacy): legacy has no pathname expansion]
+echo /usr/bin/tru*
 
 --- cd builtin [xfail(legacy): legacy forks builtins, so cd changes the child and exits]
 cd /tmp && pwd
@@ -85,3 +94,15 @@ x=outer; x=inner /usr/bin/true; echo $x
 
 --- exit sets the status [xfail(legacy): legacy matches `exit` as a string in the REPL rather than as a builtin]
 exit 3
+
+--- quoting suppresses pathname expansion
+echo "*.md"
+
+--- an unquoted expansion result is globbed [xfail(legacy): legacy has no pathname expansion]
+p='/usr/bin/tru*'; echo $p
+
+--- a pattern that matches nothing expands to itself
+echo /tmp/definitely_no_match_here_zzz_*
+
+--- assignment values are expanded, not stored raw [xfail(legacy): legacy stores assignment values as raw source text]
+y=world; x="hello $y"; echo "[$x]"

@@ -59,8 +59,8 @@ enum class expansion_status {
 class expander {
 public:
 	expander(buffer_pool& pool, const parameter_source& params,
-	         command_runner* runner = nullptr) noexcept
-		: _pool(pool), _params(params), _runner(runner) {}
+	         command_runner* runner = nullptr, bool glob_enabled = true) noexcept
+		: _pool(pool), _params(params), _runner(runner), _glob_enabled(glob_enabled) {}
 
 	// Expands one word node, appending its fields to `out`.
 	//
@@ -69,6 +69,12 @@ public:
 	// one empty one.
 	expansion_status expand_word(const syntax::tree& t, syntax::node_index word,
 	                             arena_array<std::string_view>& out) noexcept;
+
+	// Expands raw text as a single word with NO field splitting and NO pathname
+	// expansion, which is what an assignment's value requires: `x=a b` assigns
+	// "a" and runs `b`, but `x="a b"` assigns "a b" as one value, and neither is
+	// globbed. Used for assignment right-hand sides.
+	[[nodiscard]] std::string_view expand_assignment_value(std::string_view text) noexcept;
 
 private:
 	expansion_status expand_text(std::string_view text, bool quoted,
@@ -80,12 +86,17 @@ private:
 	buffer_pool& _pool;
 	const parameter_source& _params;
 	command_runner* _runner;
+	// `set -f` disables pathname expansion entirely.
+	bool _glob_enabled = true;
 
 	// Accumulates the field under construction. Completed fields are copied into
 	// exact-size arena blocks, because this buffer relocates as it grows and a
 	// string_view into it would dangle.
 	arena_array<char>* _current = nullptr;
 	bool _field_started = false;
+	// Set when a glob metacharacter arrived from unquoted text. Quoted ones are
+	// literal, so `echo "*.txt"` must not touch the filesystem.
+	bool _field_globbable = false;
 };
 
 } // namespace lesh::runtime

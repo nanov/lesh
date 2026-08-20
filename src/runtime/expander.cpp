@@ -1,8 +1,12 @@
 #include "runtime/expander.h"
 
+#include "runtime/glob.h"
+#include "runtime/pattern.h"
+
 #include "syntax/lexer.h"
 
 #include <cstring>
+#include <tuple>
 
 namespace lesh::runtime {
 
@@ -90,6 +94,11 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 
 		switch (seg.kind) {
 			case token_kind::seg_literal: {
+				// Quoting suppresses pathname expansion: `echo "*.txt"` must print
+				// *.txt, not a filename. So a field is only glob-eligible when a
+				// metacharacter arrived from unquoted text.
+				if (!quoted && has_pattern_characters(body))
+					_field_globbable = true;
 				// Backslash removal is part of quote removal, and it behaves
 				// differently inside double quotes - there it escapes only a few
 				// bytes. Outside, it escapes anything.
@@ -131,10 +140,15 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 			case token_kind::seg_parameter: {
 				std::string_view value;
 				if (_params.lookup(parameter_name(body), value)) {
-					if (quoted)
+					if (quoted) {
 						append(value);
-					else
+					} else {
+						// POSIX: the RESULT of an unquoted expansion is subject to
+						// pathname expansion, so `x='*.txt'; echo $x` globs.
+						if (has_pattern_characters(value))
+							_field_globbable = true;
 						append_split(value, out);
+					}
 				}
 				// Unset expands to nothing. Unquoted, that means no field at all.
 			} break;
@@ -179,6 +193,26 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 	return status;
 }
 
+std::string_view expander::expand_assignment_value(std::string_view text) noexcept {
+	arena_array<char> accumulator{_pool, 64};
+	arena_array<std::string_view> discard{_pool, 4};
+	_current = &accumulator;
+	_field_started = false;
+	_field_globbable = false;
+
+	// quoted=true suppresses field splitting, which is the assignment rule: the
+	// value is one word however many blanks the expansion produced.
+	std::ignore = expand_text(text, true, discard);
+
+	const size_t n = accumulator.size();
+	char* block = nullptr;
+	_pool.allocate(n == 0 ? 1 : n, block, 1);
+	if (n > 0)
+		std::memcpy(block, accumulator.data(), n);
+	_current = nullptr;
+	return {block, n};
+}
+
 expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index word,
                                        arena_array<std::string_view>& out) noexcept {
 	const syntax::node& n = t[word];
@@ -189,6 +223,10 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	// no expansion and no glob characters expands to itself - so the field is a
 	// view into the original source and costs no allocation and no copy at all.
 	// Most words in most command lines take this path.
+	// The fast path flag_literal exists for: no quoting, no expansion, no glob
+	// characters, so the field is a view into the source at no cost. The lexer
+	// already excludes glob characters from flag_literal, so this cannot skip
+	// pathname expansion.
 	if ((tok.flags & syntax::flag_literal) != 0) {
 		out.push(text);
 		return expansion_status::ok;
@@ -198,8 +236,29 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	_current = &accumulator;
 	_field_started = false;
 
+	// Pathname expansion runs AFTER field splitting, on each resulting field, and
+	// only on unquoted text - which is why it happens here rather than inside
+	// expand_text, where quoting context is still being tracked.
+	const size_t before_fields = out.size();
+	_field_globbable = false;
 	const expansion_status status = expand_text(text, false, out);
 	finish_field(out);
+
+	if (_glob_enabled && _field_globbable) {
+		arena_array<std::string_view> globbed{_pool, out.size() - before_fields + 4};
+		bool any = false;
+		for (size_t i = before_fields; i < out.size(); ++i) {
+			if (expand_pathnames(_pool, out[i], globbed))
+				any = true;
+			else
+				globbed.push(out[i]);
+		}
+		if (any) {
+			out.truncate(before_fields);
+			for (const auto& g : globbed)
+				out.push(g);
+		}
+	}
 
 	_current = nullptr;
 	return status;

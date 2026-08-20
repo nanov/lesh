@@ -182,10 +182,12 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 		// out of the shell - the parent's state is untouched by construction rather
 		// than by remembering to undo it.
 		if (assignments != nullptr) {
+			expander child_ex{_pool, _state, nullptr};
 			for (const auto& a : *assignments) {
 				const size_t eq = a.find('=');
 				if (eq != std::string_view::npos)
-					_state.set_exported(a.substr(0, eq), a.substr(eq + 1));
+					_state.set_exported(a.substr(0, eq),
+					                    child_ex.expand_assignment_value(a.substr(eq + 1)));
 			}
 		}
 
@@ -204,7 +206,11 @@ void tree_walking_executor::apply_assignment(std::string_view text) {
 	const size_t eq = text.find('=');
 	if (eq == std::string_view::npos)
 		return;
-	_state.set(text.substr(0, eq), text.substr(eq + 1));
+	// The value is expanded, not stored raw: `x="a b"` assigns `a b` without the
+	// quotes, and `x=$y` assigns y's value. Storing the source text meant a later
+	// `echo $x` printed the quotes.
+	expander ex{_pool, _state, &_runner};
+	_state.set(text.substr(0, eq), ex.expand_assignment_value(text.substr(eq + 1)));
 }
 
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
