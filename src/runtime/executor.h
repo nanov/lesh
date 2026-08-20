@@ -94,6 +94,37 @@ private:
 	             const arena_array<std::string_view>& assignments, bool demoted);
 	int run_negation(const syntax::tree& t, syntax::node_index n);
 
+	// Builds an expander wired to this executor AND to this shell's options.
+	//
+	// One place, so an option cannot be honoured by three of the four expansion
+	// sites and forgotten by the fourth. `set -u` was recorded and inert for
+	// exactly that kind of reason: nothing ever read the flag.
+	[[nodiscard]] expander make_expander() noexcept {
+		return expander{_pool, _state, &_runner, !_state.opts().no_glob, &_state,
+		                &_state, _state.opts().error_on_unset};
+	}
+	// True when `ex` reported an expansion error POSIX makes fatal, having arranged
+	// for a non-interactive shell to stop. `${x?}` and `set -u` on an unset
+	// parameter are the two cases; an interactive shell reports and carries on.
+	bool expansion_failed(const expander& ex) noexcept {
+		if (!ex.fatal_error())
+			return false;
+		_expansion_error = true;
+		if (!_state.interactive())
+			_exit_requested = true;
+		return true;
+	}
+
+	// Expands an assignment's value and returns `NAME=value` with the value
+	// expanded, WITHOUT applying it. Split out from apply_assignment because
+	// `set -x` has to print the value the assignment takes, and expanding a second
+	// time to print it would run a command substitution in the value twice.
+	std::string_view expand_assignment(std::string_view text);
+	void apply_expanded_assignment(std::string_view expanded);
+	// One `set -x` trace line: the expanded PS4, then the command as it will run.
+	void trace_command(const arena_array<std::string_view>& prefix,
+	                   char* const* argv);
+
 	// True when a failing command must exit the shell rather than merely end a list.
 	[[nodiscard]] bool errexit_fires(int status) const noexcept {
 		return status != 0 && _state.opts().exit_on_error &&
@@ -190,6 +221,10 @@ private:
 	// but NOT across a subshell or a function call, which are commands of their own
 	// and do exit. Verified against both dash and bash.
 	bool _status_tested = false;
+	// Set when the expansion of the command being run failed fatally. Cleared at
+	// the start of every simple command, so it answers about THIS command and not
+	// about one three constructs ago.
+	bool _expansion_error = false;
 	bool _exit_trap_ran = false;
 	// Guards against a trap body triggering its own trap recursively.
 	bool _in_trap = false;

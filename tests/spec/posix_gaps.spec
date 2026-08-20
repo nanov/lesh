@@ -525,10 +525,79 @@ C
 five
 D
 
-# Three DELIBERATE divergences from dash, recorded rather than chosen quietly
-# (handoff.md: where dash is behind the standard, say so in writing). All three
-# are assertions dash itself fails in yash's redir-p.tst, so the xfail marker here
-# means "lesh is ahead", and an XPASS would mean dash had changed.
+# Shell options (#31). `$-`, `set -o`/`+o`, and the letters that were parsed,
+# recorded, and then read by nothing at all.
+#
+# The `$-` cases match on the CONTENT of the string rather than printing it: POSIX
+# leaves the order unspecified and dash's is its own internal table order, so
+# comparing the text would be comparing an unspecified detail.
+
+--- dollar-dash reports the letters that are on [xfail(legacy): legacy has no shell options and no $-]
+set -ae; case $- in *a*) echo has-a;; *) echo no-a;; esac; case $- in *e*) echo has-e;; *) echo no-e;; esac
+
+--- dollar-dash drops a letter turned back off [xfail(legacy): legacy has no shell options and no $-]
+set -ae; set +a; case $- in *a*) echo has-a;; *) echo no-a;; esac
+
+--- set -o name and set -e reach the same option [xfail(legacy): legacy has no shell options and no $-]
+set -o errexit; case $- in *e*) echo has-e;; *) echo no-e;; esac; set +o errexit; case $- in *e*) echo has-e;; *) echo no-e;; esac
+
+--- set +o output restores the options it was printed from [xfail(legacy): legacy has no shell options]
+set -aeu; saved=$(set +o); set +aeu -f; eval "$saved"; for l in a e u f; do case $- in *$l*) echo "on $l";; *) echo "off $l";; esac; done
+
+--- an unknown option letter is an error that exits the shell [xfail(legacy): legacy accepts anything after a dash]
+set -Z; echo after
+
+--- an unknown -o name is an error that exits the shell [xfail(legacy): legacy accepts anything after a dash]
+set -o bogus; echo after
+
+--- noexec reads without running [xfail(legacy): legacy has no shell options]
+set -n; echo executed
+
+--- noclobber refuses to truncate an existing file [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_noclobber; echo first > /tmp/lesh_spec_noclobber; set -C; echo second > /tmp/lesh_spec_noclobber; echo "status=$?"; cat /tmp/lesh_spec_noclobber; rm -f /tmp/lesh_spec_noclobber
+
+--- noclobber is overridden by the pipe form [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_clobber; echo first > /tmp/lesh_spec_clobber; set -C; echo second >| /tmp/lesh_spec_clobber; echo "status=$?"; cat /tmp/lesh_spec_clobber; rm -f /tmp/lesh_spec_clobber
+
+--- noclobber still allows an existing file that is not regular [xfail(legacy): legacy ignores redirect nodes entirely]
+set -C; echo hidden > /dev/null; echo "status=$?"
+
+--- allexport marks an assignment for export [xfail(legacy): legacy has no shell options]
+set -a; exported=yes; sh -c 'echo "${exported-unset}"'
+
+--- allexport off leaves an assignment unexported [xfail(legacy): legacy has no shell options]
+set +a; plain=yes; sh -c 'echo "${plain-unset}"'
+
+--- nounset makes an unset parameter fatal [xfail(legacy): legacy has no shell options]
+set -u; echo "[${x}]"; echo after
+
+--- nounset covers the length and trim expansions [xfail(legacy): legacy has no shell options]
+set -u; echo "[${x#y}]"; echo after
+
+--- nounset leaves the defaulting expansions alone [xfail(legacy): legacy has no parameter expansion beyond $name]
+set -u; echo "[${x-d}][${x+s}][${x=v}][${x}]"
+
+--- the question mark expansion is fatal on its own [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo "[${x?}]"; echo after
+
+--- without pipefail a pipeline reports its last stage [xfail(legacy): legacy has no pipelines that report a status]
+exit 1 | exit 2 | exit 0; echo "b $?"; exit 0 | exit 0 | exit 4; echo "d $?"
+
+--- xtrace writes the expanded command to standard error [xfail(legacy): legacy has no shell options]
+set -x; foo=bar; echo $foo
+
+--- xtrace expands PS4 [xfail(legacy): legacy has no shell options]
+foo=XY; PS4='${foo#X} '; set -x; echo traced
+
+# DELIBERATE divergences from dash, recorded rather than chosen quietly
+# (handoff.md: where dash is behind the standard, say so in writing). Each is an
+# assertion dash itself fails in the yash suite, so the xfail marker here means
+# "lesh is ahead", and an XPASS would mean dash had changed.
+#
+# The `set -o` listing is the one entry that is not a standards question: POSIX
+# leaves the format unspecified, dash lists four options of its own that lesh does
+# not have, and printing a name for a switch that does not exist would be the lie
+# `set -o` is meant to expose.
 
 --- redirection operands with no command name are expanded in a subshell [xfail: divergence - dash expands them in the current environment; POSIX 2.9.1 requires a subshell]
 unset x; < ${x=no/such/file}; ${x+echo leaked}; echo done
@@ -538,3 +607,12 @@ unset x; < ${x=no/such/file}; ${x+echo leaked}; echo done
 
 --- duplicating a write-only descriptor onto an input fd is an error [xfail: divergence - dash does not check the access mode; POSIX 2.7.5 requires it]
 cat 3>/dev/null <&3; echo "status=$?"
+
+--- nounset applies inside arithmetic [xfail: divergence - dash expands $((x)) on an unset x to zero; POSIX requires the error, and dash fails option-p.tst for it]
+set -u; echo "[$((x))]"; echo after
+
+--- pipefail makes a pipeline report its rightmost failing stage [xfail: divergence - dash has no pipefail and fails both of pipeline-p.tst's cases for it; POSIX Issue 8 defines it]
+set -o pipefail; exit 1 | exit 2 | exit 0; echo "b $?"; exit 3 | exit 0 | exit 0; echo "c $?"
+
+--- set -o lists only the options the shell has [xfail: divergence - dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
+set -o

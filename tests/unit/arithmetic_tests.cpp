@@ -19,6 +19,9 @@ public:
 	void set(std::string_view name, int64_t value) override {
 		values[std::string(name)] = value;
 	}
+	bool defined(std::string_view name) const override {
+		return values.find(std::string(name)) != values.end();
+	}
 };
 
 class ArithmeticTest : public ::testing::Test {

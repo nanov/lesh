@@ -19,10 +19,10 @@ public:
 		const int64_t value = parse_comma();
 		skip_blanks();
 		if (_failed)
-			return {0, false, _error};
+			return {0, false, _error, {}};
 		if (_at < _text.size())
-			return {0, false, "unexpected character"};
-		return {value, true, nullptr};
+			return {0, false, "unexpected character", {}};
+		return {value, true, nullptr, _unset_name};
 	}
 
 private:
@@ -31,6 +31,15 @@ private:
 	size_t _at = 0;
 	bool _failed = false;
 	const char* _error = nullptr;
+	// The first name read that the caller had never set. Only the first, because
+	// that is the one `set -u` reports and the evaluation stops mattering after it.
+	std::string_view _unset_name;
+
+	[[nodiscard]] int64_t read_variable(std::string_view name) noexcept {
+		if (_unset_name.empty() && !_vars.defined(name))
+			_unset_name = name;
+		return _vars.get(name);
+	}
 
 	void fail(const char* why) noexcept {
 		if (!_failed) {
@@ -101,7 +110,7 @@ private:
 				if (_text.compare(after, op.size(), op) == 0) {
 					_at = after + op.size();
 					const int64_t rhs = parse_assignment();
-					const int64_t lhs = _vars.get(name);
+					const int64_t lhs = read_variable(name);
 					const int64_t result = apply_compound(op, lhs, rhs);
 					_vars.set(name, result);
 					return result;
@@ -266,7 +275,7 @@ private:
 			// Variables are read WITHOUT `$` inside arithmetic, and an unset or
 			// non-numeric one is 0 rather than an error - which is what lets
 			// `i=$((i+1))` work without initialising i.
-			return _vars.get(_text.substr(start, _at - start));
+			return read_variable(_text.substr(start, _at - start));
 		}
 
 		fail("unexpected character");

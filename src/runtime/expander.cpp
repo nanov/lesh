@@ -190,6 +190,10 @@ bool expander::lookup_parameter(std::string_view name, std::string_view& out) no
 		out = _params.script_name_value();
 		return true;
 	}
+	if (name == "-") {
+		out = _params.option_flags();
+		return true;
+	}
 	if (name[0] >= '1' && name[0] <= '9') {
 		size_t index = 0;
 		for (const char c : name) {
@@ -200,6 +204,20 @@ bool expander::lookup_parameter(std::string_view name, std::string_view& out) no
 		return _params.positional_at(index, out);
 	}
 	return _params.lookup(name, out);
+}
+
+// `set -u` met an unset parameter. Returns true when that is an error, so the
+// caller can stop rather than substitute nothing.
+//
+// The message matches dash's `x: parameter not set` because dash is the reference
+// for the POSIX floor, minus its line number, which lesh does not track.
+bool expander::report_unset(std::string_view name) noexcept {
+	if (!_unset_is_error)
+		return false;
+	std::fprintf(stderr, "lesh: %.*s: parameter not set\n",
+	             static_cast<int>(name.size()), name.data());
+	_fatal_error = true;
+	return true;
 }
 
 // Formats an integer into arena storage so the returned view outlives the call.
@@ -332,10 +350,17 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				if (p.op == param_op::length) {
 					// ${#x} is the length in bytes; ${#@} and ${#*} the count.
 					size_t n = 0;
-					if (p.name == "@" || p.name == "*")
+					if (p.name == "@" || p.name == "*") {
 						n = _params.positional_count();
-					else if (found)
+					} else if (found) {
 						n = value.size();
+					} else if (report_unset(p.name)) {
+						// `set -u` covers ${#x} as much as $x: dash exits 2 for
+						// `dash -u -c 'echo "${#x}"'`, and option-p.tst's
+						// 'nounset on: unset variable ${#foo}' requires it.
+						status = expansion_status::parameter_unset;
+						break;
+					}
 					char digits[24];
 					const int written = std::snprintf(digits, sizeof(digits), "%zu", n);
 					append(std::string_view(digits, written > 0 ? static_cast<size_t>(written) : 0));
@@ -375,13 +400,24 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 
 					case param_op::error_if_unset:
 						if (absent) {
+							// The default message is dash's, word for word: `${x?}` says
+							// "parameter not set" and `${x:?}` distinguishes the null case.
+							const std::string_view fallback =
+								p.colon ? std::string_view{"parameter not set or null"}
+								        : std::string_view{"parameter not set"};
 							const std::string_view message =
-								p.argument.empty() ? std::string_view{"parameter null or not set"}
+								p.argument.empty() ? fallback
 								                   : expand_assignment_value(p.argument);
 							std::fprintf(stderr, "lesh: %.*s: %.*s\n",
 							             static_cast<int>(p.name.size()), p.name.data(),
 							             static_cast<int>(message.size()), message.data());
+							// Fatal to a non-interactive shell, whatever `set -u` says:
+							// `${x?}` is the caller ASKING for the shell to stop. Until
+							// this was recorded the message was printed and the command
+							// ran anyway, so `echo "${x?}"` printed a blank line and
+							// reported success.
 							status = expansion_status::parameter_unset;
+							_fatal_error = true;
 							break;
 						}
 						goto substitute_value;
@@ -390,8 +426,11 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					case param_op::trim_prefix_long:
 					case param_op::trim_suffix_short:
 					case param_op::trim_suffix_long: {
-						if (!found)
+						if (!found) {
+							if (report_unset(p.name))
+								status = expansion_status::parameter_unset;
 							break;
+						}
 						// The pattern is expanded but NOT globbed - it is a pattern,
 						// not a filename. The matcher is #23's, shared with `case`.
 						const std::string_view pat = expand_assignment_value(p.argument);
@@ -412,6 +451,10 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 
 					case param_op::none:
 					substitute_value:
+						if (!found && report_unset(p.name)) {
+							status = expansion_status::parameter_unset;
+							break;
+						}
 						if (found) {
 							if (quoted) {
 								append(value);
@@ -476,6 +519,14 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				const arithmetic_result r = evaluate(resolved, *_vars);
 				if (!r.ok) {
 					status = expansion_status::unsupported_construct;
+					break;
+				}
+				// POSIX applies `set -u` inside arithmetic too, so `$((x))` on an
+				// unset x is an error rather than zero. dash does NOT do this and
+				// fails option-p.tst's 'nounset on: unset variable $((foo))';
+				// divergence in lesh's favour, recorded rather than copied.
+				if (!r.unset_name.empty() && report_unset(r.unset_name)) {
+					status = expansion_status::parameter_unset;
 					break;
 				}
 				char digits[24];

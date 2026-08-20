@@ -37,7 +37,11 @@ invocation parse_invocation(int argc, char** argv) {
 						return inv;
 					}
 					inv.command_string = argv[i];
-					group_ended = true;  // the rest of the word, if any, was its argument
+					// The command string is the NEXT WORD, so the rest of THIS word is
+					// still option letters. Ending the group here dropped them silently:
+					// `sh -cn 'for i in $(>f); do :; done'` ran the substitution and
+					// created the file, which is option-p.tst's 'noexec on: for command
+					// is not executed'. dash reads `-cn` the same way.
 					break;
 				case 'i':
 					inv.interactive = enable;

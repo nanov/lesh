@@ -216,6 +216,7 @@ add_executable(lesh_tests
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/invocation_tests.cpp
+	tests/unit/options_tests.cpp
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp

@@ -46,6 +46,9 @@ public:
 		return true;
 	}
 	std::string_view script_name_value() const override { return "lesh"; }
+
+	std::string flags;
+	std::string_view option_flags() const override { return flags; }
 };
 
 // Records ${x=default} assignments so tests can assert they happened.

@@ -5,6 +5,7 @@
 #include "syntax/parser.h"
 #include "substrate/traits.h"
 
+#include <array>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -53,11 +54,16 @@ public:
 	[[nodiscard]] size_t positional_count() const override { return _positional.size(); }
 	[[nodiscard]] bool positional_at(size_t index, std::string_view& out) const override;
 	[[nodiscard]] std::string_view script_name_value() const override { return _script_name; }
+	[[nodiscard]] std::string_view option_flags() const override;
 
 	// --- arithmetic_variables -------------------------------------------------
 
 	[[nodiscard]] int64_t get(std::string_view name) const override;
 	void set(std::string_view name, int64_t value) override;
+	[[nodiscard]] bool defined(std::string_view name) const override {
+		std::string_view ignored;
+		return lookup(name, ignored);
+	}
 
 	// --- variables ------------------------------------------------------------
 
@@ -106,32 +112,54 @@ public:
 
 	// --- options --------------------------------------------------------------
 
-	// set -e: exit on a command failing. set -u: unset parameter is an error.
-	// set -x: trace. Held here rather than as globals so a subshell can copy them.
+	// Held here rather than as globals so a subshell can copy them.
 	//
-	// The POSIX option letters lesh does not yet honour are still RECORDED, because
-	// POSIX requires the shell to accept them on its own command line and in `set`.
-	// Rejecting them is what kept lesh from reading a single byte of the yash signal
-	// suite, which invokes the testee as `sh +i +m`. Recorded-but-inert is marked as
-	// such below so it is a known gap rather than a silent lie; honouring them is
-	// issue #31's business.
+	// HONOURED: -a allexport, -C noclobber, -e errexit, -f noglob, -n noexec,
+	// -u nounset, -v verbose, -x xtrace, -o pipefail.
+	//
+	// RECORDED BUT INERT, still accepted because POSIX requires the shell to take
+	// them on its own command line and in `set` - rejecting them is what kept lesh
+	// from reading a single byte of the yash signal suite, which invokes the testee
+	// as `sh +i +m`:
+	//   -b notify, -m monitor  job control, out of scope per ADR-0001
+	//   -o vi, -o ignoreeof    the line editor's business (Phase 4)
+	//   -h hashondef           command-path hashing; lesh keeps no hash table
+	//   -o nolog               history, which needs the line editor too
+	// Each is listed by `set -o` and reported by `$-` all the same: a shell that
+	// accepts an option must say what it holds, and lying about the value would be
+	// worse than admitting the effect is missing.
 	struct options {
-		bool exit_on_error = false;   // -e
-		bool error_on_unset = false;  // -u
-		bool trace = false;           // -x
-		bool no_glob = false;         // -f
-		// Accepted and recorded, not yet honoured:
 		bool all_export = false;      // -a
-		bool notify = false;          // -b
+		bool notify = false;          // -b, inert
 		bool no_clobber = false;      // -C
-		bool hash_all = false;        // -h
-		bool monitor = false;         // -m, job control: out of scope per ADR-0001
+		bool exit_on_error = false;   // -e
+		bool no_glob = false;         // -f
+		bool hash_all = false;        // -h, inert
+		bool monitor = false;         // -m, inert
 		bool no_exec = false;         // -n
+		bool error_on_unset = false;  // -u
 		bool verbose = false;         // -v
-		bool ignore_eof = false;      // -o ignoreeof
-		bool no_log = false;          // -o nolog
-		bool vi = false;              // -o vi, the line editor's business (Phase 4)
+		bool trace = false;           // -x
+		bool ignore_eof = false;      // -o ignoreeof, inert
+		bool no_log = false;          // -o nolog, inert
+		bool pipefail = false;        // -o pipefail
+		bool vi = false;              // -o vi, inert
 	};
+
+	// One row per POSIX shell option: the letter, the `-o` spelling, and where the
+	// value lives.
+	//
+	// ONE TABLE. `set`, command-line parsing, `set -o` listing and `$-` all read
+	// this, so an option cannot be added to one and forgotten in the others - which
+	// is how `sh -m` and `set -m` would come to disagree about which letters exist.
+	struct option_descriptor {
+		char letter;            // '\0' when POSIX gives the option no letter
+		std::string_view name;  // empty when POSIX gives it no `-o` spelling
+		bool options::*field;
+	};
+	static constexpr size_t kOptionCount = 15;
+	[[nodiscard]] static const std::array<option_descriptor, kOptionCount>&
+		option_table() noexcept;
 
 	// Applies one option letter or `-o` name. Returns false when the option is not
 	// one POSIX names, which is an error rather than something to shrug at.
@@ -180,6 +208,10 @@ private:
 	int _last_status = 0;
 	options _options;
 	bool _interactive = false;
+	// Backing store for option_flags(). Rebuilt on demand and mutable because
+	// parameter_source::option_flags() is const, for the same reason
+	// environment_block() owns its strings: the returned view must outlive the call.
+	mutable std::string _option_flags;
 
 	// Backing store for environment_block(). Rebuilt on demand; owned here so the
 	// strings outlive the char* array handed to execve.

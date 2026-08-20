@@ -184,6 +184,40 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 	return {0};
 }
 
+// `set -o` with no name: the current settings, one per line.
+//
+// POSIX leaves the format unspecified. dash's is the reference for the floor, so
+// the header line and the 16-column name field are copied from it exactly:
+//
+//     Current option settings
+//     errexit         off
+//
+// Which options APPEAR is where lesh diverges: dash lists four of its own
+// (`interactive`, `stdin`, `emacs`, `debug`) that POSIX does not name and lesh
+// does not have, and omits nothing lesh has. Listing lesh's own set is the only
+// honest answer - printing a name for a switch that does not exist would be the
+// lie `set -o` is supposed to expose. Recorded per ADR-0001.
+void print_options_verbose(const shell_state::options& o) {
+	std::fputs("Current option settings\n", stdout);
+	for (const auto& row : shell_state::option_table()) {
+		if (row.name.empty())
+			continue;  // `-h` has a letter and no POSIX `-o` spelling
+		std::printf("%-16.*s%s\n", static_cast<int>(row.name.size()), row.name.data(),
+		            o.*row.field ? "on" : "off");
+	}
+}
+
+// `set +o`: the same settings as commands that RE-INPUT them, which is what POSIX
+// requires of this form and the only property set-p.tst's round-trip depends on.
+void print_options_reinputtable(const shell_state::options& o) {
+	for (const auto& row : shell_state::option_table()) {
+		if (row.name.empty())
+			continue;
+		std::printf("set %co %.*s\n", o.*row.field ? '-' : '+',
+		            static_cast<int>(row.name.size()), row.name.data());
+	}
+}
+
 builtin_result builtin_set(shell_state& state, char** argv) {
 	size_t i = 1;
 	for (; argv[i] != nullptr; ++i) {
@@ -203,13 +237,31 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 		// so `set -m` and `sh -m` cannot disagree about which letters exist.
 		for (const char c : arg.substr(1)) {
 			if (c == 'o') {
-				// `set -o name`. A bare `set -o` lists the options, which is issue #31.
-				if (argv[i + 1] == nullptr)
+				// A bare `set -o` LISTS; `set -o name` sets. dash prints the verbose
+				// form for `-o` and the re-inputtable form for `+o`.
+				if (argv[i + 1] == nullptr) {
+					if (enable)
+						print_options_verbose(state.opts());
+					else
+						print_options_reinputtable(state.opts());
 					break;
-				(void)shell_state::apply_option_name(state.opts(), argv[++i], enable);
+				}
+				if (!shell_state::apply_option_name(state.opts(), argv[++i], enable)) {
+					// An unknown option is an ERROR, not something to shrug at. This
+					// return value was discarded with a `(void)`, so `set -o bogus`
+					// succeeded silently - and `set` is a special builtin, so dash both
+					// reports and exits a non-interactive shell. Status 2 and the
+					// wording are dash's.
+					std::fprintf(stderr, "lesh: set: Illegal option %co %s\n",
+					             arg[0], argv[i]);
+					return {2};
+				}
 				break;
 			}
-			(void)shell_state::apply_option_letter(state.opts(), c, enable);
+			if (!shell_state::apply_option_letter(state.opts(), c, enable)) {
+				std::fprintf(stderr, "lesh: set: Illegal option %c%c\n", arg[0], c);
+				return {2};
+			}
 		}
 	}
 

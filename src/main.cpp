@@ -213,6 +213,24 @@ int run_next_front_end(std::string_view source, lesh::runtime::shell_state& stat
 	return executor.run(t);
 }
 
+// `set -v`: the shell writes its input to standard error as it READS it.
+//
+// lesh reads a script or standard input in one go, so the whole of it is echoed
+// before any of it runs, where dash - which reads a command at a time -
+// interleaves the echo with the output. Only the ORDER differs, and only between
+// two different streams: option-p.tst compares stdout and stderr separately and
+// cannot see it. The same one-unit read is already recorded as the reason an alias
+// defined in a script does not affect its later lines.
+//
+// Not applied to `-c`: POSIX makes verbose a property of reading INPUT, and dash
+// prints nothing for `dash -v -c 'echo hi'`.
+void echo_input_if_verbose(const lesh::runtime::shell_state& state,
+                           std::string_view source) {
+	if (!state.opts().verbose)
+		return;
+	std::fwrite(source.data(), 1, source.size(), stderr);
+}
+
 // Reads a whole stream. Scripts are parsed as ONE unit, which has an observable
 // consequence: an alias defined in a script does not affect later lines of the
 // same script, because POSIX substitutes aliases when a command is READ and the
@@ -283,7 +301,9 @@ int main(int argc, char **argv, char **envp) {
 				std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
 				return 127;
 			}
-			return run_next_front_end(read_all(script), next_state);
+			const std::string source = read_all(script);
+			echo_input_if_verbose(next_state, source);
+			return run_next_front_end(source, next_state);
 		}
 		// `-i` with input that is not a terminal is an ordinary POSIX invocation:
 		// interactive is about SEMANTICS - which signals are fatal, whether an error
@@ -292,8 +312,11 @@ int main(int argc, char **argv, char **envp) {
 		//
 		// Refusing it outright cost 1,800 conformance assertions: ten of the signal
 		// files run the shell under test as `sh -i` with the case piped in.
-		if (!interactive || !isatty(STDIN_FILENO))
-			return run_next_front_end(read_all(std::cin), next_state);
+		if (!interactive || !isatty(STDIN_FILENO)) {
+			const std::string source = read_all(std::cin);
+			echo_input_if_verbose(next_state, source);
+			return run_next_front_end(source, next_state);
+		}
 		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
 		return 2;
 	}

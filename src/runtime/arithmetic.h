@@ -22,12 +22,19 @@ public:
 	// is what makes `i=$((i+1))` work without initialising i first.
 	[[nodiscard]] virtual int64_t get(std::string_view name) const = 0;
 	virtual void set(std::string_view name, int64_t value) = 0;
+	// Whether the variable exists at all. get() cannot say - it answers 0 for
+	// "unset" and for "set to 0" alike - and `set -u` has to tell them apart.
+	[[nodiscard]] virtual bool defined(std::string_view name) const = 0;
 };
 
 struct arithmetic_result {
 	int64_t value = 0;
 	bool ok = true;
 	const char* error = nullptr;  // set when ok is false
+	// The first variable READ that was not set. Reported rather than acted on:
+	// POSIX makes it an error under `set -u` and 0 otherwise, and which of those
+	// applies is the caller's policy, not the evaluator's.
+	std::string_view unset_name;
 };
 
 // POSIX specifies signed long arithmetic. Division by zero is an error rather

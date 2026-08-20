@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 namespace lesh::runtime {
@@ -133,6 +134,8 @@ int search_and_exec(char** argv, char** env, std::string_view path_value,
 // command that RAN and failed reports - and a redirection error means the command
 // never ran at all, so the two deserve different numbers.
 constexpr int kRedirectionError = 2;
+// The status dash reports for `set -u` on an unset parameter and for `${x?}`.
+constexpr int kExpansionError = 2;
 
 // A redirection's default fd when none was written: `>` means 1, `<` means 0.
 int default_fd_for(token_kind op) noexcept {
@@ -195,13 +198,17 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	// splitting must not apply - POSIX makes a redirection target expanding to
 	// more than one field an error, and treating it as one word is the behaviour
 	// dash has.
-	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
+	expander ex = make_expander();
 	arena_array<std::string_view> fields{_pool, 2};
 	{
 		// Reparse the target as a standalone word so the expander sees it whole.
 		const std::string_view expanded = ex.expand_assignment_value(target_text);
 		fields.push(expanded);
 	}
+	// `set -u` in a redirection target is as fatal as anywhere else: dash exits 2
+	// for `dash -u -c '> $x'` rather than creating a file called the empty string.
+	if (expansion_failed(ex))
+		return false;
 	const std::string_view target = fields.empty() ? std::string_view{} : fields[0];
 
 	// NUL-terminate for open(2).
@@ -227,7 +234,26 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 			opened = open(path, O_RDONLY);
 			break;
 		case token_kind::great:
+			// `set -C`: `>` refuses to truncate a file that already exists. O_EXCL is
+			// how that is done without a window between the test and the open.
+			//
+			// An existing file that is NOT REGULAR is still fair game - `>/dev/null`
+			// has to keep working, and redir-p.tst checks exactly that - so EEXIST is
+			// retried without O_EXCL once stat says the path is not a regular file.
+			if (_state.opts().no_clobber) {
+				opened = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+				if (opened == -1 && errno == EEXIST) {
+					struct stat st{};
+					if (stat(path, &st) == 0 && !S_ISREG(st.st_mode))
+						opened = open(path, O_WRONLY);
+					else
+						errno = EEXIST;
+				}
+				break;
+			}
+			[[fallthrough]];
 		case token_kind::clobber:
+			// `>|` overrides noclobber, which is the whole reason the operator exists.
 			opened = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 			break;
 		case token_kind::dgreat:
@@ -521,6 +547,13 @@ int tree_walking_executor::run(const tree& t) {
 	const node& program = t[t.root()];
 	int status = _state.last_status();
 	for (uint32_t i = 0; i < program.children_count; ++i) {
+		// `set -n`: read and parse, execute nothing. POSIX says the option is
+		// ignored by an INTERACTIVE shell, or a typo would end the session.
+		// Checked per command rather than once, so `set -n` partway through a
+		// script stops the rest of it as well as a `sh -n` invocation stopping
+		// everything.
+		if (_state.opts().no_exec && !_state.interactive())
+			break;
 		status = run_node(t, t.child_of(program, i));
 		_state.set_last_status(status);
 		run_pending_traps();
@@ -787,7 +820,7 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 
 	// Every child but the last is a word to iterate; the last is the body.
 	const uint32_t word_count = self.children_count - 1;
-	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
+	expander ex = make_expander();
 	arena_array<std::string_view> items{_pool, 8};
 
 	if (!has_in) {
@@ -1031,7 +1064,7 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 
 	// The runner is passed here, so a command substitution inside a word reaches
 	// this same executor. That is what makes `echo $(echo $(echo x))` work.
-	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
+	expander ex = make_expander();
 	arena_array<std::string_view> fields{_pool, 8};
 
 	for (uint32_t i = 0; i < self.children_count; ++i) {
@@ -1043,8 +1076,15 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 		}
 		if (t[child].kind != node_kind::word)
 			continue;
-		ex.expand_word(t, child, fields);
+		(void)ex.expand_word(t, child, fields);
 	}
+
+	// `set -u` on an unset parameter, or `${x?}`, must stop the command rather
+	// than run it with the parameter expanded to nothing. Until this was checked
+	// the expander printed the message and the command ran anyway, so
+	// `sh -u -c 'echo ${x}'` printed a blank line and reported success.
+	if (expansion_failed(ex))
+		return false;
 
 	if (fields.empty())
 		return false;
@@ -1118,16 +1158,79 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 	return pid;
 }
 
-// Splits NAME=value and applies it. Returns the name so the caller can restore.
-void tree_walking_executor::apply_assignment(std::string_view text) {
+// Expands the value of a NAME=value assignment, returning the whole thing with
+// the value expanded and the name untouched.
+//
+// The value is expanded, not stored raw: `x="a b"` assigns `a b` without the
+// quotes, and `x=$y` assigns y's value. Storing the source text meant a later
+// `echo $x` printed the quotes.
+std::string_view tree_walking_executor::expand_assignment(std::string_view text) {
 	const size_t eq = text.find('=');
 	if (eq == std::string_view::npos)
+		return text;
+	expander ex = make_expander();
+	const std::string_view value = ex.expand_assignment_value(text.substr(eq + 1));
+	(void)expansion_failed(ex);
+	const std::string_view name = text.substr(0, eq);
+	char* joined = nullptr;
+	_pool.allocate(name.size() + 1 + value.size(), joined, 1);
+	std::memcpy(joined, name.data(), name.size());
+	joined[name.size()] = '=';
+	std::memcpy(joined + name.size() + 1, value.data(), value.size());
+	return {joined, name.size() + 1 + value.size()};
+}
+
+void tree_walking_executor::apply_expanded_assignment(std::string_view expanded) {
+	const size_t eq = expanded.find('=');
+	if (eq == std::string_view::npos)
 		return;
-	// The value is expanded, not stored raw: `x="a b"` assigns `a b` without the
-	// quotes, and `x=$y` assigns y's value. Storing the source text meant a later
-	// `echo $x` printed the quotes.
-	expander ex{_pool, _state, &_runner, !_state.opts().no_glob, &_state, &_state};
-	_state.set(text.substr(0, eq), ex.expand_assignment_value(text.substr(eq + 1)));
+	_state.set(expanded.substr(0, eq), expanded.substr(eq + 1));
+}
+
+// Splits NAME=value, expands the value, and applies it.
+void tree_walking_executor::apply_assignment(std::string_view text) {
+	apply_expanded_assignment(expand_assignment(text));
+}
+
+// One `set -x` trace line.
+//
+// PS4 is expanded on every line - option-p.tst's `$PS4` case sets it to
+// `${foo#X} ` and requires the expansion, not the literal - and defaults to
+// `+ `, whose trailing space is part of the default rather than added here.
+//
+// `prefix` holds ALREADY-EXPANDED `NAME=value` assignments; `argv` the expanded
+// words. Tracing is what the expansion is for: `+ echo bar` is the point, not
+// `+ echo $foo`.
+void tree_walking_executor::trace_command(const arena_array<std::string_view>& prefix,
+                                          char* const* argv) {
+	std::string_view ps4 = "+ ";
+	std::string_view raw;
+	std::string expanded_ps4;
+	if (_state.lookup("PS4", raw)) {
+		// A separate expander with NO runner: a command substitution in PS4 would
+		// otherwise recurse into tracing itself.
+		expander ex{_pool, _state, nullptr, false, &_state, &_state};
+		expanded_ps4.assign(ex.expand_assignment_value(raw));
+		ps4 = expanded_ps4;
+	}
+	std::string line{ps4};
+	bool first = true;
+	for (const auto& p : prefix) {
+		if (!first)
+			line += ' ';
+		line.append(p);
+		first = false;
+	}
+	for (size_t i = 0; argv != nullptr && argv[i] != nullptr; ++i) {
+		if (!first)
+			line += ' ';
+		line += argv[i];
+		first = false;
+	}
+	line += '\n';
+	// stderr, per POSIX, and written whole so a trace line cannot be interleaved
+	// with a child's output half-way through.
+	std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
 // `exec [--] [command [argument...]]`.
@@ -1245,7 +1348,14 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 
 	arena_array<char*> argv{_pool, 8};
 	arena_array<std::string_view> assignments{_pool, 4};
+	_expansion_error = false;
 	const bool has_command = build_argv(t, n, argv, &assignments);
+	// An expansion that failed fatally - `set -u` on an unset parameter, or
+	// `${x?}` - must not go on to run anything. build_argv has already arranged
+	// for a non-interactive shell to stop; all that is left is the status, which
+	// dash reports as 2.
+	if (_expansion_error)
+		return kExpansionError;
 
 	if (!has_command) {
 		// The redirections come first, and only their success lets the assignments
@@ -1262,8 +1372,24 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		//
 		// The values are expanded HERE, not in build_argv, so a substitution inside
 		// one is counted by the check below.
-		for (const auto& a : assignments)
-			apply_assignment(a);
+		//
+		// Expanded and applied one at a time, in order, because `a=1 b=$a` must see
+		// a's new value - dash does the same - and the expanded text is kept so
+		// `set -x` can print the values the assignments took without expanding a
+		// second time, which would run a command substitution in one of them twice.
+		arena_array<std::string_view> traced{_pool, 4};
+		for (const auto& a : assignments) {
+			const std::string_view expanded = expand_assignment(a);
+			// Checked BEFORE the assignment lands: dash leaves x unset after
+			// `sh -u -c 'x=${y}'` rather than assigning the empty string it never
+			// managed to expand.
+			if (_expansion_error)
+				return kExpansionError;
+			apply_expanded_assignment(expanded);
+			traced.push(expanded);
+		}
+		if (_state.opts().trace)
+			trace_command(traced, nullptr);
 		return _substitutions != substitutions_before ? _state.last_status() : 0;
 	}
 
@@ -1286,6 +1412,21 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			argv.truncate(argv.size() - 1);
 		if (argv.empty() || argv[0] == nullptr)
 			return 0;
+	}
+
+	// `set -x` traces the command once, HERE - before the search order decides
+	// whether this is a function, a builtin or a PATH lookup, so every one of them
+	// is traced exactly once and none of the paths below has to remember to.
+	//
+	// A `NAME=value` prefix is NOT shown. dash prints it, but printing it here
+	// would mean expanding the value in this process purely to trace it, and the
+	// value is expanded in the CHILD for an external command - so a command
+	// substitution in the prefix would run twice under `-x` and once without it.
+	// A trace that changes what the command does is worse than a trace that omits
+	// a field. Moving that expansion into the parent is its own change.
+	if (_state.opts().trace) {
+		const arena_array<std::string_view> no_prefix{_pool, 1};
+		trace_command(no_prefix, argv.data());
 	}
 
 	// A function shadows an external command but NOT a special builtin, per
@@ -1626,16 +1767,26 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 		}
 	}
 
-	// Every member must be waited on or it becomes a zombie, but POSIX defines the
-	// pipeline's status as its LAST command's.
+	// Every member must be waited on or it becomes a zombie. POSIX defines the
+	// pipeline's status as its LAST command's - unless `set -o pipefail`, which
+	// makes it the status of the RIGHTMOST member that failed, and zero when none
+	// did. `exit 1 | exit 2 | exit 0` is 0 without the option and 2 with it.
 	int last_status = 0;
+	int rightmost_failure = 0;
 	for (size_t i = 0; i < pids.size(); ++i) {
 		int wait_status = 0;
 		waitpid(pids[i], &wait_status, 0);
+		const int status = status_from_wait(wait_status);
+		if (status != 0)
+			rightmost_failure = status;
 		if (i + 1 == pids.size())
-			last_status = status_from_wait(wait_status);
+			last_status = status;
 	}
-	return last_status;
+	// The option is read AFTER the pipeline ran, so a stage that turns it on cannot
+	// change the status of the pipeline it belongs to - pipeline-p.tst's 'pipeline
+	// enabling pipefail does not affect itself'. Every stage forks, so it could not
+	// anyway, but the read order is what says so rather than the process model.
+	return _state.opts().pipefail ? rightmost_failure : last_status;
 }
 
 bool tree_walking_executor::capture(std::string_view code, arena_array<char>& out) {

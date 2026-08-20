@@ -179,12 +179,18 @@ void shell_state::set(std::string_view name, int64_t value) {
 }
 
 void shell_state::set(std::string_view name, std::string_view value) {
+	// `set -a`: every variable CREATED OR MODIFIED by an assignment is marked for
+	// export. Applied here rather than at each assignment site so `x=1`, a `for`
+	// loop's variable, `read`, and `${x=default}` all obey it - which is what dash
+	// does, verified with `dash -a -c 'for i in 1; do sh -c "echo \${i-unset}"; done'`.
+	const bool exported = _options.all_export;
 	const auto it = _vars.find(name);
 	if (it != _vars.end()) {
 		it->second.value = value;
+		it->second.exported = it->second.exported || exported;
 		return;
 	}
-	_vars.emplace(std::string(name), variable{std::string(value), false});
+	_vars.emplace(std::string(name), variable{std::string(value), exported});
 }
 
 void shell_state::set_exported(std::string_view name, std::string_view value) {
@@ -202,43 +208,74 @@ bool shell_state::is_exported(std::string_view name) const {
 	return it != _vars.end() && it->second.exported;
 }
 
-// The one table of POSIX shell options. `set` and the command line both route
-// through here so they cannot disagree about which letters exist.
-bool shell_state::apply_option_letter(options& o, char letter, bool enable) {
-	switch (letter) {
-		case 'a': o.all_export = enable; return true;
-		case 'b': o.notify = enable; return true;
-		case 'C': o.no_clobber = enable; return true;
-		case 'e': o.exit_on_error = enable; return true;
-		case 'f': o.no_glob = enable; return true;
-		case 'h': o.hash_all = enable; return true;
-		case 'm': o.monitor = enable; return true;
-		case 'n': o.no_exec = enable; return true;
-		case 'u': o.error_on_unset = enable; return true;
-		case 'v': o.verbose = enable; return true;
-		case 'x': o.trace = enable; return true;
-		default: return false;
-	}
+// The one table of POSIX shell options.
+//
+// Ordered as POSIX lists them in `set`: the lettered options by letter, then the
+// three that have a `-o` spelling and no letter at all. That order is what `$-`
+// and `set -o` print in, and it has to be STABLE - set-p.tst's round-trip diffs
+// one `set -o` listing against another.
+//
+// `h` is the one lettered option POSIX gives no `-o` name; dash rejects the letter
+// outright and fails both hashondef cases in option-p.tst, so accepting and
+// reporting it is a deliberate divergence in lesh's favour.
+const std::array<shell_state::option_descriptor, shell_state::kOptionCount>&
+shell_state::option_table() noexcept {
+	static constexpr std::array<option_descriptor, kOptionCount> table = {{
+		{'a', "allexport", &options::all_export},
+		{'b', "notify",    &options::notify},
+		{'C', "noclobber", &options::no_clobber},
+		{'e', "errexit",   &options::exit_on_error},
+		{'f', "noglob",    &options::no_glob},
+		{'h', "",          &options::hash_all},
+		{'m', "monitor",   &options::monitor},
+		{'n', "noexec",    &options::no_exec},
+		{'u', "nounset",   &options::error_on_unset},
+		{'v', "verbose",   &options::verbose},
+		{'x', "xtrace",    &options::trace},
+		{'\0', "ignoreeof", &options::ignore_eof},
+		{'\0', "nolog",     &options::no_log},
+		{'\0', "pipefail",  &options::pipefail},
+		{'\0', "vi",        &options::vi},
+	}};
+	return table;
 }
 
-// The `-o name` spellings, which POSIX lists alongside the letters. `ignoreeof`,
-// `nolog` and `vi` have no letter at all, which is why this is a second table
-// rather than a lookup from name to letter.
-bool shell_state::apply_option_name(options& o, std::string_view name, bool enable) {
-	if (name == "allexport") { o.all_export = enable; return true; }
-	if (name == "errexit")   { o.exit_on_error = enable; return true; }
-	if (name == "ignoreeof") { o.ignore_eof = enable; return true; }
-	if (name == "monitor")   { o.monitor = enable; return true; }
-	if (name == "noclobber") { o.no_clobber = enable; return true; }
-	if (name == "noexec")    { o.no_exec = enable; return true; }
-	if (name == "noglob")    { o.no_glob = enable; return true; }
-	if (name == "nolog")     { o.no_log = enable; return true; }
-	if (name == "notify")    { o.notify = enable; return true; }
-	if (name == "nounset")   { o.error_on_unset = enable; return true; }
-	if (name == "verbose")   { o.verbose = enable; return true; }
-	if (name == "vi")        { o.vi = enable; return true; }
-	if (name == "xtrace")    { o.trace = enable; return true; }
+bool shell_state::apply_option_letter(options& o, char letter, bool enable) {
+	for (const auto& row : option_table()) {
+		if (row.letter != '\0' && row.letter == letter) {
+			o.*row.field = enable;
+			return true;
+		}
+	}
 	return false;
+}
+
+bool shell_state::apply_option_name(options& o, std::string_view name, bool enable) {
+	for (const auto& row : option_table()) {
+		if (!row.name.empty() && row.name == name) {
+			o.*row.field = enable;
+			return true;
+		}
+	}
+	return false;
+}
+
+// `$-`: the letters of the options currently on.
+//
+// POSIX leaves the order unspecified, so the table's order is used - stable rather
+// than arbitrary, because option-p.tst and set-p.tst both `grep` this string and a
+// reordering between two calls would be a real bug.
+//
+// `i` is not in the table: interactive is not a `set` option, but POSIX lists it
+// among the flags `$-` reports and dash prints it, so it is appended here.
+std::string_view shell_state::option_flags() const {
+	_option_flags.clear();
+	for (const auto& row : option_table())
+		if (row.letter != '\0' && _options.*row.field)
+			_option_flags.push_back(row.letter);
+	if (_interactive)
+		_option_flags.push_back('i');
+	return _option_flags;
 }
 
 char** shell_state::environment_block() {

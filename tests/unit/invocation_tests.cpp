@@ -87,6 +87,17 @@ TEST(Invocation, DashCLastInAGroupStillTakesItsArgument) {
 	EXPECT_STREQ(inv.command_string, "echo hi");
 }
 
+// The command string is the NEXT WORD, so any letter after `c` in the same word
+// is still an option. lesh ended the group at `c` and dropped them: `sh -cn CMD`
+// executed CMD, which is option-p.tst's 'noexec on: for command is not executed'.
+// dash reads `-cn` the same way.
+TEST(Invocation, LettersAfterDashCAreStillOptions) {
+	const invocation inv = parse({"sh", "-cn", "echo hi"});
+	ASSERT_NE(inv.command_string, nullptr);
+	EXPECT_STREQ(inv.command_string, "echo hi");
+	EXPECT_TRUE(inv.options.no_exec);
+}
+
 // POSIX: `sh -c command_string [command_name [argument...]]`. The operand after
 // the command string is $0, NOT $1 - which lesh had wrong.
 TEST(Invocation, OperandAfterCommandStringIsDollarZero) {

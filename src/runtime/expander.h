@@ -45,6 +45,10 @@ public:
 	// 1-based, matching $1. Returns false past the end.
 	[[nodiscard]] virtual bool positional_at(size_t index, std::string_view& out) const = 0;
 	[[nodiscard]] virtual std::string_view script_name_value() const = 0;
+	// `$-`: the letters of the shell options currently on. A parameter, not a
+	// query about options, which is why it belongs on this port rather than
+	// reaching into shell state - the expander must not know what an option is.
+	[[nodiscard]] virtual std::string_view option_flags() const = 0;
 };
 
 // The port that breaks the cycle.
@@ -87,9 +91,20 @@ public:
 	expander(buffer_pool& pool, const parameter_source& params,
 	         command_runner* runner = nullptr, bool glob_enabled = true,
 	         arithmetic_variables* vars = nullptr,
-	         parameter_assigner* assign = nullptr) noexcept
+	         parameter_assigner* assign = nullptr,
+	         bool unset_is_error = false) noexcept
 		: _pool(pool), _params(params), _runner(runner), _glob_enabled(glob_enabled),
-		  _vars(vars), _assign(assign) {}
+		  _vars(vars), _assign(assign), _unset_is_error(unset_is_error) {}
+
+	// True when an expansion reported an error POSIX makes FATAL to a
+	// non-interactive shell: `${x?message}` fired, or `set -u` met an unset
+	// parameter.
+	//
+	// Sticky, and separate from the returned expansion_status, because
+	// expand_assignment_value() returns a VALUE and has no status to give back -
+	// so a redirection target or an assignment right-hand side would otherwise
+	// swallow the error the caller has to act on.
+	[[nodiscard]] bool fatal_error() const noexcept { return _fatal_error; }
 
 	// Expands one word node, appending its fields to `out`.
 	//
@@ -124,6 +139,16 @@ private:
 	bool _glob_enabled = true;
 	arithmetic_variables* _vars = nullptr;
 	parameter_assigner* _assign = nullptr;
+	// `set -u`: expanding an unset parameter is an error rather than an empty
+	// string. Held as state rather than asked of the parameter_source, because
+	// POSIX makes it the CALLER's policy - completion expands the same words
+	// without wanting the shell to die over an unset variable.
+	bool _unset_is_error = false;
+	bool _fatal_error = false;
+
+	// Reports an unset parameter under `set -u` and records the fatal error.
+	// Returns true when it fired, so a caller can skip substituting nothing.
+	bool report_unset(std::string_view name) noexcept;
 
 	bool lookup_parameter(std::string_view name, std::string_view& out) noexcept;
 	std::string_view int_to_scratch(int value) noexcept;
