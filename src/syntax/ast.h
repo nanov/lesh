@@ -62,6 +62,12 @@ enum class node_kind : uint16_t {
 	function_definition,
 	// A list terminated by `&`: runs in the background and is not waited for.
 	async_list,
+	// `! pipeline`. children: [pipeline]. POSIX makes `!` part of the pipeline
+	// grammar rather than an operator, so it is a reserved WORD recognised by
+	// position - the same rule `if` and `}` follow. Its own node kind rather than a
+	// flag on `pipeline`, because a negated single command is not wrapped in a
+	// pipeline node at all.
+	negation,
 };
 
 enum class parse_error : uint16_t {

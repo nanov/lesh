@@ -104,7 +104,7 @@ bool delimiter_matches(std::string_view raw, std::string_view line) noexcept {
 enum class reserved {
 	none, kw_if, kw_then, kw_elif, kw_else, kw_fi,
 	kw_while, kw_until, kw_do, kw_done,
-	kw_for, kw_in, kw_case, kw_esac, kw_lbrace, kw_rbrace,
+	kw_for, kw_in, kw_case, kw_esac, kw_lbrace, kw_rbrace, kw_bang,
 };
 
 reserved reserved_of(std::string_view text) noexcept {
@@ -123,6 +123,7 @@ reserved reserved_of(std::string_view text) noexcept {
 	if (text == "esac") return reserved::kw_esac;
 	if (text == "{") return reserved::kw_lbrace;
 	if (text == "}") return reserved::kw_rbrace;
+	if (text == "!") return reserved::kw_bang;
 	return reserved::none;
 }
 
@@ -626,8 +627,22 @@ private:
 
 	node_index parse_pipeline() noexcept {
 		const uint32_t first = _index;
-		const uint32_t mark = mark_scratch();
 
+		// `! pipeline` inverts the pipeline's status: zero becomes one and anything
+		// non-zero becomes zero. POSIX puts Bang in the pipeline production, so it
+		// binds to the WHOLE pipeline - `! a | b` negates the pipeline, not `a`.
+		if (accept(reserved::kw_bang)) {
+			const uint32_t child_mark = mark_scratch();
+			_scratch.push(parse_pipeline());
+			node neg;
+			neg.kind = node_kind::negation;
+			neg.first_token = first;
+			neg.last_token = _index > first ? _index - 1 : first;
+			commit_children(neg, child_mark);
+			return _tree.add_node(neg);
+		}
+
+		const uint32_t mark = mark_scratch();
 		_scratch.push(parse_command_or_compound());
 		while (peek().kind == token_kind::pipe) {
 			advance();

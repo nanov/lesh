@@ -166,3 +166,47 @@ TEST_F(ExecutorTest, AssignmentWithNoSubstitutionIsAlwaysZero) {
 	state.set_last_status(9);
 	EXPECT_EQ(run("x=1"), 0) << "a plain assignment must not inherit the old status";
 }
+
+// `! pipeline`. POSIX puts Bang in the pipeline production, so it binds to the
+// whole pipeline and inverts only the sense of the status - one for zero, zero for
+// anything else, never the value itself.
+TEST_F(ExecutorTest, NegationInvertsTheSenseOfTheStatus) {
+	EXPECT_EQ(run("! false"), 0);
+	EXPECT_EQ(run("! true"), 1);
+	// Any non-zero status becomes exactly zero, not the value negated. A subshell
+	// is used to produce 7 because `exit 7` would unwind before `!` could apply.
+	EXPECT_EQ(run("! (exit 7)"), 0);
+}
+
+// `set -e` must EXIT the shell. Ending the enclosing list instead left the loop
+// free to iterate again, so `while true; do false; done` ran forever.
+TEST_F(ExecutorTest, ErrexitExitsRatherThanEndingTheList) {
+	EXPECT_EQ(run("set -e; while true; do false; done; echo unreachable"), 1);
+}
+
+// POSIX suppresses `set -e` where the status is TESTED. Each of these must reach
+// its `exit 42`, which is the only way to tell "did not exit" from "exited zero".
+TEST_F(ExecutorTest, ErrexitIsSuppressedWhereTheStatusIsTested) {
+	const char* survives[] = {
+		"set -e; if false; then :; fi; exit 42",
+		"set -e; while false; do :; done; exit 42",
+		"set -e; until true; do :; done; exit 42",
+		"set -e; false && :; exit 42",
+		"set -e; { false && :; }; exit 42",
+		"set -e; while true; do false && :; break; done; exit 42",
+		"set -e; ! true; exit 42",
+	};
+	for (const char* src : survives)
+		EXPECT_EQ(run(src), 42) << src;
+}
+
+TEST_F(ExecutorTest, ErrexitStillFiresWhereTheStatusIsActedOn) {
+	const char* exits[] = {
+		"set -e; false; exit 42",
+		"set -e; true && false; exit 42",
+		"set -e; false || false; exit 42",
+		"set -e; case x in x) false;; esac; exit 42",
+	};
+	for (const char* src : exits)
+		EXPECT_EQ(run(src), 1) << src;
+}

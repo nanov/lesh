@@ -285,7 +285,14 @@ int main(int argc, char **argv, char **envp) {
 			}
 			return run_next_front_end(read_all(script), next_state);
 		}
-		if (!interactive)
+		// `-i` with input that is not a terminal is an ordinary POSIX invocation:
+		// interactive is about SEMANTICS - which signals are fatal, whether an error
+		// exits - not about line editing. There is nothing to edit when the input is
+		// a file, so only a terminal needs the editor lesh does not have yet.
+		//
+		// Refusing it outright cost 1,800 conformance assertions: ten of the signal
+		// files run the shell under test as `sh -i` with the case piped in.
+		if (!interactive || !isatty(STDIN_FILENO))
 			return run_next_front_end(read_all(std::cin), next_state);
 		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
 		return 2;

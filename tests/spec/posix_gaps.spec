@@ -302,3 +302,51 @@ F=/tmp/lesh_spec_fifo_loop; rm -f $F; mkfifo $F; for i in 1; do echo foo >$F & d
 
 --- a redirection to a FIFO is opened once, not speculatively [xfail(legacy): legacy ignores redirect nodes entirely]
 F=/tmp/lesh_spec_fifo_once; rm -f $F; mkfifo $F; cat $F & echo foo >$F; wait; rm -f $F
+
+--- ! negates a command's status [xfail(legacy): legacy has no `!` negation]
+! false; echo $?; ! true; echo $?
+
+--- ! negates the whole pipeline, not its first command [xfail(legacy): legacy has no `!` negation]
+! echo hi | grep -q x; echo $?
+
+--- ! in an if condition [xfail(legacy): legacy has no `!` negation]
+if ! false; then echo yes; fi
+
+--- set -e exits the shell rather than ending the list [xfail(legacy): legacy does not honour set -e]
+set -e; while true; do echo r1; false; echo nope; break; done; echo nope3
+
+--- set -e is suppressed in an if condition [xfail(legacy): legacy does not honour set -e]
+set -e; if false; then echo a; fi; echo after
+
+--- set -e is suppressed in a while condition [xfail(legacy): legacy does not honour set -e]
+set -e; while false; do :; done; echo after
+
+--- set -e does not fire on a short-circuited and list [xfail(legacy): legacy does not honour set -e]
+set -e; false && echo a; echo after
+
+--- the short-circuit exemption travels out of a brace group [xfail(legacy): legacy does not honour set -e]
+set -e; { false && echo a; }; echo after
+
+--- the short-circuit exemption travels out of a loop body [xfail(legacy): legacy does not honour set -e]
+set -e; while true; do false && echo a; break; done; echo after
+
+--- the short-circuit exemption stops at a subshell [xfail(legacy): legacy does not honour set -e]
+set -e; (false && echo a); echo after
+
+--- the short-circuit exemption stops at a function call [xfail(legacy): legacy does not honour set -e]
+set -e; f(){ false && echo a; }; f; echo after
+
+--- set -e fires on the last command of an and list [xfail(legacy): legacy does not honour set -e]
+set -e; true && false; echo after
+
+--- set -e fires when every operand of an or list fails [xfail(legacy): legacy does not honour set -e]
+set -e; false || false; echo after
+
+--- set -e does not fire on a negated pipeline [xfail(legacy): legacy does not honour set -e]
+set -e; ! true; echo after
+
+--- set -e fires on a case body [xfail(legacy): legacy does not honour set -e]
+set -e; case x in x) false;; esac; echo after
+
+--- set -e reads the pipeline's status, not the first stage's [xfail(legacy): legacy does not honour set -e]
+set -e; false | true; echo after

@@ -77,6 +77,27 @@ private:
 	bool consume_loop_flow(bool& should_break);
 	// Parses and runs source in this environment. Used by `eval` and `.`.
 	int run_source(std::string_view source);
+	int run_negation(const syntax::tree& t, syntax::node_index n);
+
+	// True when a failing command must exit the shell rather than merely end a list.
+	[[nodiscard]] bool errexit_fires(int status) const noexcept {
+		return status != 0 && _state.opts().exit_on_error &&
+		       _errexit_suppressed == 0 && !_status_tested;
+	}
+
+	// Suppresses `set -e` for the duration of a scope. RAII rather than
+	// increment/decrement by hand, so an early return cannot leave the count
+	// raised - which would silently disable errexit for the rest of the run.
+	class errexit_suppression {
+	public:
+		explicit errexit_suppression(tree_walking_executor& owner) noexcept
+			: _owner(owner) { ++_owner._errexit_suppressed; }
+		~errexit_suppression() { --_owner._errexit_suppressed; }
+		errexit_suppression(const errexit_suppression&) = delete;
+		errexit_suppression& operator=(const errexit_suppression&) = delete;
+	private:
+		tree_walking_executor& _owner;
+	};
 	void run_pending_traps();
 	void run_exit_trap();
 	int run_file(std::string_view path);
@@ -127,6 +148,19 @@ private:
 	uint64_t _substitutions = 0;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
+	// POSIX suppresses `set -e` wherever a status is being TESTED rather than acted
+	// on: the condition of if/while/until, every operand of an and-or list but the
+	// last, and a pipeline negated with `!`. A depth counter, not a flag, because
+	// the suppression covers the whole subtree - a command nested three deep inside
+	// an `if` condition must not exit the shell either.
+	uint32_t _errexit_suppressed = 0;
+	// True when the status just returned came from a construct whose LAST command
+	// never ran: a short-circuited and-or list, or a `!` pipeline. POSIX exempts
+	// those from `set -e`, and the exemption travels outward through brace groups,
+	// `if` bodies and loop bodies - `set -e; { false && echo a; }` does not exit -
+	// but NOT across a subshell or a function call, which are commands of their own
+	// and do exit. Verified against both dash and bash.
+	bool _status_tested = false;
 	bool _exit_trap_ran = false;
 	// Guards against a trap body triggering its own trap recursively.
 	bool _in_trap = false;

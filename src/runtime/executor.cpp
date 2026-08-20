@@ -321,8 +321,10 @@ int tree_walking_executor::run(const tree& t) {
 		run_pending_traps();
 		if (_exit_requested)
 			break;
-		if (status != 0 && _state.opts().exit_on_error)
+		if (errexit_fires(status)) {
+			_exit_requested = true;
 			break;
+		}
 	}
 	// The EXIT trap runs on the way out, whether that is the end of input or an
 	// explicit `exit` - which is why it cannot live at the `exit` builtin.
@@ -370,9 +372,13 @@ void tree_walking_executor::run_exit_trap() {
 }
 
 int tree_walking_executor::run_node(const tree& t, node_index n) {
+	// Cleared on the way IN so that whatever runs deepest decides. Only a
+	// short-circuited and-or list and a `!` pipeline set it, on the way out.
+	_status_tested = false;
 	switch (t[n].kind) {
 		case node_kind::simple_command: return run_simple_command(t, n);
 		case node_kind::pipeline:       return run_pipeline(t, n);
+		case node_kind::negation:       return run_negation(t, n);
 		case node_kind::and_or:         return run_and_or(t, n);
 		case node_kind::compound_list: return run_compound_list(t, n);
 		case node_kind::if_clause:     return run_if(t, n);
@@ -413,16 +419,43 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 	}
 }
 
+// `! pipeline`. POSIX: status zero becomes one, anything non-zero becomes zero.
+//
+// `set -e` never fires on the negated pipeline itself - its status is being tested,
+// which is the whole point of writing `!`.
+int tree_walking_executor::run_negation(const tree& t, node_index n) {
+	if (t[n].children_count == 0)
+		return 1;  // `!` with nothing after it inverts the status of nothing
+	int inner = 0;
+	{
+		const errexit_suppression quiet{*this};
+		inner = run_node(t, t.child_of(t[n], 0));
+	}
+	_status_tested = true;  // POSIX exempts a `!` pipeline from `set -e`
+	return inner == 0 ? 1 : 0;
+}
+
 int tree_walking_executor::run_and_or(const tree& t, node_index n) {
 	const node& self = t[n];
 	LESH_ASSERT(self.children_count == 2);
 
-	const int left = run_node(t, t.child_of(self, 0));
+	// The left operand's status is TESTED, so `set -e` must not fire on it. Only
+	// the last command of an and-or list can exit the shell. Nesting is left-deep,
+	// so suppressing the left child covers every operand but the last.
+	int left = 0;
+	{
+		const errexit_suppression quiet{*this};
+		left = run_node(t, t.child_of(self, 0));
+	}
 	_state.set_last_status(left);
 
 	const bool is_and = t.token_at(self.aux).kind == syntax::token_kind::and_if;
-	if (is_and ? (left != 0) : (left == 0))
-		return left;  // short-circuit
+	if (is_and ? (left != 0) : (left == 0)) {
+		// Short-circuit: the list's LAST command never ran, so this status was
+		// tested rather than acted on and `set -e` must not fire on it.
+		_status_tested = true;
+		return left;
+	}
 
 	return run_node(t, t.child_of(self, 1));
 }
@@ -438,8 +471,13 @@ int tree_walking_executor::run_compound_list(const tree& t, node_index n) {
 		// swallowed: the enclosing loop or function is what decides to stop.
 		if (_flow != control_flow::normal || _exit_requested)
 			break;
-		if (status != 0 && _state.opts().exit_on_error)
+		// POSIX: `set -e` EXITS the shell. Merely breaking out of this list left the
+		// enclosing loop free to iterate again, so `set -e; while true; do false;
+		// done` ran forever.
+		if (errexit_fires(status)) {
+			_exit_requested = true;
 			break;
+		}
 	}
 	return status;
 }
@@ -449,12 +487,16 @@ int tree_walking_executor::run_if(const tree& t, node_index n) {
 	const uint32_t pairs = self.aux;
 
 	for (uint32_t i = 0; i < pairs; ++i) {
-		const int cond = run_node(t, t.child_of(self, i * 2));
+		// POSIX: a condition's status is TESTED, so `set -e` must not fire anywhere
+		// inside it - not on the last command of the condition list, and not on any
+		// command nested within it. A depth counter covers the whole subtree.
+		int cond = 0;
+		{
+			const errexit_suppression quiet{*this};
+			cond = run_node(t, t.child_of(self, i * 2));
+		}
 		if (_flow != control_flow::normal || _exit_requested)
 			return cond;
-		// POSIX: a condition's status is TESTED, so `set -e` must not fire on it.
-		// That is why conditions run through run_node directly rather than through
-		// the exit_on_error path in run_compound_list's caller.
 		if (cond == 0)
 			return run_node(t, t.child_of(self, i * 2 + 1));
 	}
@@ -489,7 +531,14 @@ int tree_walking_executor::run_loop(const tree& t, node_index n, bool until) {
 	// A guard against a runaway loop taking the machine down, which is exactly
 	// what an unbounded `while true` in a test harness would do.
 	for (uint64_t iteration = 0; iteration < kMaxLoopIterations; ++iteration) {
-		const int cond = run_node(t, t.child_of(self, 0));
+		// The CONDITION is tested, so `set -e` is suppressed there. The BODY is not:
+		// `set -e; while true; do false; done` must exit the shell, and breaking out
+		// of the body's list without exiting is what made it loop forever.
+		int cond = 0;
+		{
+			const errexit_suppression quiet{*this};
+			cond = run_node(t, t.child_of(self, 0));
+		}
 		if (_exit_requested)
 			return status;
 		if (_flow != control_flow::normal) {
@@ -689,6 +738,9 @@ bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& ar
 		_flow = control_flow::normal;
 
 	_state.set_positional(std::move(saved));
+	// A function CALL is a command in its own right, so `set -e; f` exits when the
+	// body's last list short-circuited. The exemption stops at the call boundary.
+	_status_tested = false;
 	return true;
 }
 
@@ -753,6 +805,9 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	setpgid(pid, pid);
 	int wait_status = 0;
 	waitpid(pid, &wait_status, 0);
+	// A subshell is a command in its own right: `set -e; (false && echo a)` exits
+	// even though the same list would not inside a brace group.
+	_status_tested = false;
 	return status_from_wait(wait_status);
 }
 
