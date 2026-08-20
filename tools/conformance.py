@@ -23,15 +23,28 @@ from pathlib import Path
 
 # Signal-related tests hang against a shell without job control or trap. Listed
 # by prefix rather than by name so the exclusion survives suite updates.
-# "sig" catches sigcont*, sighup*, sigint*, sigquit* and friends. "signal" did
-# not: these are named sigcont3-p.tst, so a prefix check never matched and forty
-# job-control tests were counted as errors rather than skips - which made the
-# score look like it was hiding failures when it was only mislabelling skips.
-SIGNAL_PREFIXES = ("kill", "trap", "sig", "job", "fg", "bg", "wait", "suspend")
+# Only JOB CONTROL is out of scope, per ADR-0001: POSIX puts it in the User
+# Portability option rather than the mandatory core.
+#
+# `trap`, `wait` and `kill` are NOT job control - trap and wait are special
+# builtins and kill is a required utility, all mandatory. Nor is how a
+# non-interactive shell responds to SIGINT, SIGHUP, SIGTERM or SIGQUIT.
+#
+# An earlier version excluded every file starting with "sig" plus trap, wait and
+# kill, which quietly removed mandatory POSIX from the denominator and inflated
+# the score. Excluding work you have not done is not the same as it being out of
+# scope.
+#
+# SIGTSTP, SIGTTIN, SIGTTOU, SIGSTOP and SIGCONT are the terminal stop signals
+# and exist only to serve job control, so they go with it.
+JOB_CONTROL_PREFIXES = (
+    "job", "fg", "bg", "suspend",
+    "sigtstp", "sigttin", "sigttou", "sigstop", "sigcont",
+)
 
 
 def is_excluded(name: str) -> bool:
-    return any(name.startswith(p) for p in SIGNAL_PREFIXES)
+    return any(name.startswith(p) for p in JOB_CONTROL_PREFIXES)
 
 
 def parse_results(trs: Path) -> tuple[int, int]:
@@ -95,7 +108,7 @@ def main() -> int:
     ap.add_argument("--frontend", choices=["legacy", "next"], default="next")
     ap.add_argument("--timeout", type=float, default=10.0)
     ap.add_argument("--include-signal-tests", action="store_true",
-                    help="run the signal tests too; they hang against an incomplete shell")
+                    help="run the job-control tests too; they hang without terminal ownership")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 
@@ -140,7 +153,7 @@ def main() -> int:
           f"{assertions_passed}/{assertions_total} assertions pass ({pct:.1f}%) "
           f"across {files['counted']} files; "
           f"{files['timeout']} timed out, {files['error']} errored, "
-          f"{files['skipped']} skipped (signal tests)")
+          f"{files['skipped']} skipped (job control)")
 
     # A SCOREBOARD, not a gate. It reports and always succeeds; the number is
     # what moves. Only a runner malfunction is an error.
