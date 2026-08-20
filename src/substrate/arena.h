@@ -11,6 +11,52 @@ namespace lesh {
 #define BUFFER_POOL_SIZE (1024*32)
 #define VERBOSE_POOL_DATA
 
+// Allocation counters, compiled in outside Release.
+//
+// Counted rather than timed, deliberately: a count is deterministic, so it can be
+// asserted rather than eyeballed, and it needs no quiet machine. The binding
+// constraint is "near-zero allocation on the command path", and an allocation
+// count is that constraint stated as a number.
+//
+// A heap_allocations increase is the one that matters - it means the arena
+// overflowed and fell back to malloc, which is the failure this design exists to
+// avoid.
+namespace metrics {
+
+struct allocation_counters {
+	size_t pool_allocations = 0;   // served from arena storage
+	size_t heap_allocations = 0;   // fell back to malloc: the number to watch
+	size_t bytes_from_pool = 0;
+	size_t bytes_from_heap = 0;
+
+	void reset() noexcept { *this = {}; }
+};
+
+// One process-wide instance. Not thread-safe by intent - lesh has no threads, and
+// an atomic here would cost more than the counter measures.
+inline allocation_counters& allocations() noexcept {
+	static allocation_counters counters;
+	return counters;
+}
+
+} // namespace metrics
+
+#ifdef LESH_ENABLE_ASSERTS
+#define LESH_COUNT_POOL_ALLOC(bytes)                                           \
+	do {                                                                       \
+		lesh::metrics::allocations().pool_allocations++;                       \
+		lesh::metrics::allocations().bytes_from_pool += (bytes);               \
+	} while (0)
+#define LESH_COUNT_HEAP_ALLOC(bytes)                                           \
+	do {                                                                       \
+		lesh::metrics::allocations().heap_allocations++;                       \
+		lesh::metrics::allocations().bytes_from_heap += (bytes);               \
+	} while (0)
+#else
+#define LESH_COUNT_POOL_ALLOC(bytes) ((void)0)
+#define LESH_COUNT_HEAP_ALLOC(bytes) ((void)0)
+#endif
+
 class buffer_pool {
 	public:
 		explicit buffer_pool(size_t size = 1024) : _data(new char[size]) {
@@ -27,11 +73,13 @@ class buffer_pool {
 #ifdef VERBOSE_POOL_DATA
 				lifetime_pool_bytes_allocated += new_size;
 #endif
+				LESH_COUNT_HEAP_ALLOC(new_size);
 				result = static_cast<char *>(malloc(sizeof(char) * new_size));
 				memcpy(result, at, _current - at);
 				_current = at;
 				return false;
 			}
+			LESH_COUNT_POOL_ALLOC(new_size);
 			_current = at + new_size;
 			result = at;
 #ifdef VERBOSE_POOL_DATA
@@ -60,12 +108,14 @@ class buffer_pool {
 				// free() or grows it with realloc(). Allocating with new[] here made
 				// both of those undefined. reallocate()'s overflow path below already
 				// uses malloc; this keeps one family behind one protocol.
+				LESH_COUNT_HEAP_ALLOC(size);
 				result = static_cast<char *>(malloc(sizeof(char) * size));
 				return false;
 			}
 #ifdef VERBOSE_POOL_DATA
 			lifetime_pool_bytes_used += size;
 #endif
+			LESH_COUNT_POOL_ALLOC(size);
 			result = _current;
 			_current += size;
 			return true;

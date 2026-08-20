@@ -102,7 +102,6 @@ target_compile_definitions(lesh_options INTERFACE
 
 add_subdirectory("include/replxx")
 add_subdirectory("include/sol2")
-add_subdirectory("tools")
 
 # testing
 add_subdirectory("include/googletest")
@@ -191,12 +190,15 @@ add_library(lesh_runtime STATIC
 	src/runtime/shell_state.h)
 target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 
+add_subdirectory("tools")
+
 add_executable(lesh src/main.cpp)
 target_link_libraries(lesh PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui)
 
 add_executable(lesh_tests
 	tests/base_tests.cpp
 	tests/lesh_state_tests.cpp
+	tests/unit/allocation_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
