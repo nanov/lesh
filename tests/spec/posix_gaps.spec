@@ -12,13 +12,13 @@
 # These exist so the scoreboard keeps measuring. A corpus everything passes has
 # stopped being a compass, and the markers name which ticket closes each gap.
 
---- redirection to a file [xfail: #20 - the executor ignores redirect nodes]
+--- redirection to a file [xfail(legacy): legacy ignores redirect nodes entirely]
 echo hi > /tmp/lesh_spec_redirect && cat /tmp/lesh_spec_redirect
 
---- append redirection [xfail: #20]
+--- append redirection [xfail(legacy): legacy ignores redirect nodes entirely]
 echo a > /tmp/lesh_spec_app && echo b >> /tmp/lesh_spec_app && cat /tmp/lesh_spec_app
 
---- stderr redirection [xfail: #20]
+--- stderr redirection [xfail(legacy): legacy ignores redirect nodes entirely]
 ls /nonexistent 2>/dev/null; echo done
 
 --- if statement [xfail(legacy): legacy has no compound commands]
@@ -127,3 +127,18 @@ echo done fi esac
 
 --- until loops until true [xfail(legacy): legacy has no compound commands]
 until true; do echo never; done; echo after
+
+--- input redirection [xfail(legacy): legacy ignores redirect nodes entirely]
+d=$(mktemp -d); echo content > $d/f; cat < $d/f
+
+--- 2>&1 merges stderr into stdout [xfail(legacy): legacy ignores redirect nodes entirely]
+ls /nonexistent_zzz 2>&1 | grep -c .
+
+--- a redirection target is expanded [xfail(legacy): legacy ignores redirect nodes entirely]
+d=$(mktemp -d); f=$d/target; echo written > $f; cat $f
+
+--- redirections apply left to right [xfail(legacy): legacy ignores redirect nodes entirely]
+d=$(mktemp -d); echo one > $d/a > $d/b; cat $d/b
+
+--- a builtin's redirection does not leak into the shell [xfail(legacy): legacy ignores redirect nodes entirely]
+d=$(mktemp -d); pwd > $d/p; cat $d/p > /dev/null; echo still-here

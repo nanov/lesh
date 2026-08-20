@@ -6,6 +6,7 @@
 #include "syntax/parser.h"
 
 #include <cerrno>
+#include <fcntl.h>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,8 @@ namespace lesh::runtime {
 using syntax::node;
 using syntax::node_index;
 using syntax::node_kind;
+using syntax::token;
+using syntax::token_kind;
 using syntax::tree;
 
 namespace {
@@ -69,7 +72,145 @@ int status_from_wait(int wait_status) noexcept {
 	_exit(errno == ENOENT ? 127 : 126);
 }
 
+// A redirection's default fd when none was written: `>` means 1, `<` means 0.
+int default_fd_for(token_kind op) noexcept {
+	switch (op) {
+		case token_kind::less: case token_kind::dless: case token_kind::dless_dash:
+		case token_kind::less_and: case token_kind::less_great:
+			return STDIN_FILENO;
+		default:
+			return STDOUT_FILENO;
+	}
+}
+
 } // namespace
+
+// Applies one redirection. Returns false on failure, having reported why.
+//
+// Called after fork and before exec for external commands, and around the call
+// for builtins - which run in this process and therefore need their fds put back.
+bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
+                                              arena_array<saved_fd>* restore) {
+	const node& self = t[n];
+
+	// The operator sits immediately before the target word. `aux` holds the
+	// explicit fd, or the sentinel when none was written.
+	const token& op_token = t.token_at(self.last_token - 1);
+	const std::string_view target_text =
+		t.source().substr(t.token_at(self.last_token).offset,
+		                  t.token_at(self.last_token).length);
+
+	// The target is a word and gets expanded: `> $out` has to work. Field
+	// splitting must not apply - POSIX makes a redirection target expanding to
+	// more than one field an error, and treating it as one word is the behaviour
+	// dash has.
+	expander ex{_pool, _state, &_runner, /*glob_enabled=*/true};
+	arena_array<std::string_view> fields{_pool, 2};
+	{
+		// Reparse the target as a standalone word so the expander sees it whole.
+		const std::string_view expanded = ex.expand_assignment_value(target_text);
+		fields.push(expanded);
+	}
+	const std::string_view target = fields.empty() ? std::string_view{} : fields[0];
+
+	// NUL-terminate for open(2).
+	char* path = nullptr;
+	_pool.allocate(target.size() + 1, path, 1);
+	std::memcpy(path, target.data(), target.size());
+	path[target.size()] = '\0';
+
+	const int fd = self.aux == 0xFFFFFFFFu ? default_fd_for(op_token.kind)
+	                                       : static_cast<int>(self.aux);
+
+	int opened = -1;
+	switch (op_token.kind) {
+		case token_kind::less:
+			opened = open(path, O_RDONLY);
+			break;
+		case token_kind::great:
+		case token_kind::clobber:
+			opened = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+			break;
+		case token_kind::dgreat:
+			opened = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+			break;
+		case token_kind::less_great:
+			opened = open(path, O_RDWR | O_CREAT, 0666);
+			break;
+		case token_kind::great_and:
+		case token_kind::less_and: {
+			// `2>&1` duplicates a descriptor rather than opening a file, and
+			// `2>&-` closes one.
+			if (target == "-") {
+				if (restore != nullptr) {
+					const int saved = dup(fd);
+					if (saved != -1)
+						restore->push({fd, saved});
+				}
+				close(fd);
+				return true;
+			}
+			int source = 0;
+			for (const char c : target) {
+				if (c < '0' || c > '9') {
+					std::fprintf(stderr, "lesh: %s: bad file descriptor\n", path);
+					return false;
+				}
+				source = source * 10 + (c - '0');
+			}
+			if (restore != nullptr) {
+				const int saved = dup(fd);
+				if (saved != -1)
+					restore->push({fd, saved});
+			}
+			if (dup2(source, fd) == -1) {
+				std::fprintf(stderr, "lesh: %d: %s\n", source, std::strerror(errno));
+				return false;
+			}
+			return true;
+		}
+		default:
+			return true;  // here-documents are #21
+	}
+
+	if (opened == -1) {
+		std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(errno));
+		return false;
+	}
+	if (restore != nullptr) {
+		const int saved = dup(fd);
+		if (saved != -1)
+			restore->push({fd, saved});
+	}
+	if (opened != fd) {
+		dup2(opened, fd);
+		close(opened);
+	}
+	return true;
+}
+
+// Applies every redirection on a command, LEFT TO RIGHT. The order is
+// observable: `>a >b` leaves the fd pointing at b while creating both files.
+bool tree_walking_executor::apply_redirections(const tree& t, node_index command,
+                                               arena_array<saved_fd>* restore) {
+	const node& self = t[command];
+	for (uint32_t i = 0; i < self.children_count; ++i) {
+		const node_index child = t.child_of(self, i);
+		if (t[child].kind != node_kind::redirect)
+			continue;
+		if (!apply_redirection(t, child, restore))
+			return false;
+	}
+	return true;
+}
+
+void tree_walking_executor::restore_fds(arena_array<saved_fd>& saved) {
+	// In reverse, so nested saves of the same fd unwind correctly.
+	for (size_t i = saved.size(); i > 0; --i) {
+		dup2(saved[i - 1].saved, saved[i - 1].original);
+		close(saved[i - 1].saved);
+	}
+}
 
 int tree_walking_executor::run(const tree& t) {
 	if (t.root() == syntax::no_node)
@@ -343,7 +484,8 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 }
 
 pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context& ctx,
-                                   const arena_array<std::string_view>* assignments) {
+                                   const arena_array<std::string_view>* assignments,
+                                   const tree* t, node_index command) {
 	// Built-ins run in this process, so their output sits in our stdout buffer.
 	// Flush before forking or the child inherits a copy and prints it again.
 	std::fflush(nullptr);
@@ -368,6 +510,12 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 			dup2(ctx.output_fd, STDOUT_FILENO);
 			close(ctx.output_fd);
 		}
+
+		// Redirections are applied AFTER the pipeline's fds, so an explicit
+		// `> file` on a pipeline stage overrides the pipe - which is what POSIX
+		// requires and what `a | b > out` means.
+		if (t != nullptr && !apply_redirections(*t, command, nullptr))
+			_exit(1);
 
 		// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
 		// out of the shell - the parent's state is untouched by construction rather
@@ -420,7 +568,27 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// A builtin runs in THIS process - `cd` in a forked child would change the
 	// child's directory and exit, achieving nothing. So dispatch happens before
 	// the fork, not after.
-	if (builtin_result result; try_run_builtin(_state, argv.data(), result)) {
+	if (classify_builtin(argv[0]) != builtin_kind::none) {
+		// A builtin runs in THIS process, so its redirections must be undone
+		// afterwards or they would leak into the shell's own fds. dash does the
+		// same save-and-restore; the alternative is forking, which would defeat
+		// the point of a builtin.
+		arena_array<saved_fd> saved{_pool, 4};
+		// Flush BEFORE redirecting and again before restoring. A builtin writes
+		// through stdio, so its bytes sit in the FILE* buffer: without the first
+		// flush, output queued earlier lands in the redirected file, and without
+		// the second, the builtin's own output is flushed after the fds are put
+		// back and appears on the terminal instead of in the file. The redirection
+		// was correct all along; the buffering was not.
+		std::fflush(nullptr);
+		const bool ok = apply_redirections(t, n, &saved);
+		builtin_result result{};
+		if (ok)
+			(void)try_run_builtin(_state, argv.data(), result);
+		else
+			result.status = 1;
+		std::fflush(nullptr);
+		restore_fds(saved);
 		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before
 		// a regular one they apply only for its duration. Not cosmetic - it is why
 		// `x=1 export y` leaves x set and `x=1 cd /tmp` does not.
@@ -444,7 +612,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return result.status;
 	}
 
-	const pid_t pid = spawn(argv, {}, &assignments);
+	const pid_t pid = spawn(argv, {}, &assignments, &t, n);
 	if (pid == -1)
 		return 1;
 
@@ -478,7 +646,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 			// and `echo a | read x` cannot set x in the shell. That is POSIX's
 			// behaviour, not a limitation.
 			const pid_t pid = spawn(argv, {input_fd, is_last ? STDOUT_FILENO : pipe_fds[1], group},
-			                        &assignments);
+			                        &assignments, &t, t.child_of(self, i));
 			if (pid > 0) {
 				pids.push(pid);
 				if (group == 0)

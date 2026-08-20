@@ -44,6 +44,12 @@ private:
 	// rather than one stage, and it is most of the machinery job control would
 	// need. Job control is out of scope, but reaping is not: #4 established that
 	// lesh must supply its own, whatever conformance corpus it runs.
+	// An fd displaced by a redirection, so a builtin's redirections can be undone.
+	struct saved_fd {
+		int original;
+		int saved;
+	};
+
 	struct spawn_context {
 		int input_fd = 0;
 		int output_fd = 1;
@@ -61,6 +67,11 @@ private:
 	int run_case(const syntax::tree& t, syntax::node_index n);
 	int run_subshell(const syntax::tree& t, syntax::node_index n);
 	bool consume_loop_flow(bool& should_break);
+	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
+	                       arena_array<saved_fd>* restore);
+	bool apply_redirections(const syntax::tree& t, syntax::node_index command,
+	                        arena_array<saved_fd>* restore);
+	void restore_fds(arena_array<saved_fd>& saved);
 
 	// Expands a command's words into a NUL-terminated argv the arena owns.
 	// Returns false when the command expanded to nothing at all, which is not an
@@ -72,7 +83,9 @@ private:
 
 	// forks, execs, and returns the child's pid. Never returns in the child.
 	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx,
-	                          const arena_array<std::string_view>* assignments = nullptr);
+	                          const arena_array<std::string_view>* assignments = nullptr,
+	                          const syntax::tree* t = nullptr,
+	                          syntax::node_index command = 0);
 
 	// Runs a whole tree with stdout captured. Used by command substitution.
 	[[nodiscard]] bool capture(std::string_view code, arena_array<char>& out);
