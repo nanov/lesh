@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/expander.h"
+#include "runtime/signals.h"
 #include "syntax/parser.h"
 #include "substrate/traits.h"
 
@@ -121,6 +122,9 @@ public:
 	[[nodiscard]] bool lookup_alias(std::string_view name, std::string_view& value) const override;
 	[[nodiscard]] bool has_aliases() const noexcept { return !_aliases.empty(); }
 
+	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
+	[[nodiscard]] const signal_state& signals() const noexcept { return _signals; }
+
 	[[nodiscard]] bool interactive() const noexcept { return _interactive; }
 	void set_interactive(bool v) noexcept { _interactive = v; }
 
@@ -136,6 +140,7 @@ private:
 	std::vector<std::string> _positional;
 	std::string _script_name = "lesh";
 	int _pid = 0;
+	signal_state _signals;
 	int _last_status = 0;
 	options _options;
 	bool _interactive = false;

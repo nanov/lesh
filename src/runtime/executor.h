@@ -77,6 +77,8 @@ private:
 	bool consume_loop_flow(bool& should_break);
 	// Parses and runs source in this environment. Used by `eval` and `.`.
 	int run_source(std::string_view source);
+	void run_pending_traps();
+	void run_exit_trap();
 	int run_file(std::string_view path);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
@@ -121,6 +123,9 @@ private:
 	runner_adapter _runner;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
+	bool _exit_trap_ran = false;
+	// Guards against a trap body triggering its own trap recursively.
+	bool _in_trap = false;
 	// Set by break, continue and return; consumed by the enclosing loop or
 	// function. _flow_level implements `break 2`.
 	control_flow _flow = control_flow::normal;

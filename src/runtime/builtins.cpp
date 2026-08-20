@@ -1,6 +1,7 @@
 #include "runtime/builtins.h"
 
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -221,6 +222,100 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 	return {0};
 }
 
+builtin_result builtin_trap(shell_state& state, char** argv) {
+	signal_state& sigs = state.signals();
+
+	// `trap` with no operands lists the current traps in a form that can be fed
+	// back in, which is what POSIX requires - not a human-readable summary.
+	if (argv[1] == nullptr) {
+		for (int i = 0; i < kMaxSignal; ++i) {
+			const std::string_view name = signal_state::signal_name(i);
+			if (name.empty())
+				continue;
+			switch (sigs.disposition_of(i)) {
+				case disposition::ignore:
+					std::printf("trap -- \'\' %.*s\n", static_cast<int>(name.size()), name.data());
+					break;
+				case disposition::handler: {
+					const std::string_view cmd = sigs.trap_command(i);
+					std::printf("trap -- \'%.*s\' %.*s\n",
+					            static_cast<int>(cmd.size()), cmd.data(),
+					            static_cast<int>(name.size()), name.data());
+					break;
+				}
+				case disposition::default_action:
+					break;
+			}
+		}
+		return {0};
+	}
+
+	// `trap - SIG...` resets; `trap '' SIG...` ignores; `trap 'cmd' SIG...` sets.
+	// A first operand that names a signal means reset, which is how `trap INT`
+	// (no action) behaves.
+	size_t first_signal = 2;
+	const std::string_view action{argv[1]};
+	bool reset_only = false;
+	if (action == "-") {
+		reset_only = true;
+	} else if (signal_state::signal_number(action) >= 0 && argv[2] == nullptr) {
+		reset_only = true;
+		first_signal = 1;
+	}
+
+	int status = 0;
+	for (size_t i = first_signal; argv[i] != nullptr; ++i) {
+		const int signo = signal_state::signal_number(argv[i]);
+		if (signo < 0) {
+			std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[i]);
+			status = 1;
+			continue;
+		}
+		if (reset_only)
+			sigs.reset(signo);
+		else if (action.empty())
+			sigs.set_ignore(signo);
+		else
+			sigs.set_trap(signo, std::string(action));
+	}
+	return {status};
+}
+
+builtin_result builtin_kill(shell_state&, char** argv) {
+	int signo = SIGTERM;
+	size_t first = 1;
+
+	if (argv[1] != nullptr && std::strcmp(argv[1], "-l") == 0) {
+		for (int i = 1; i < kMaxSignal; ++i) {
+			const std::string_view name = signal_state::signal_name(i);
+			if (!name.empty())
+				std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
+		}
+		return {0};
+	}
+	if (argv[1] != nullptr && std::strcmp(argv[1], "-s") == 0 && argv[2] != nullptr) {
+		signo = signal_state::signal_number(argv[2]);
+		first = 3;
+	} else if (argv[1] != nullptr && argv[1][0] == '-' && argv[1][1] != '\0') {
+		signo = signal_state::signal_number(argv[1] + 1);
+		first = 2;
+	}
+	if (signo < 0) {
+		std::fprintf(stderr, "lesh: kill: bad signal\n");
+		return {1};
+	}
+
+	int status = 0;
+	for (size_t i = first; argv[i] != nullptr; ++i) {
+		const pid_t pid = static_cast<pid_t>(std::atoi(argv[i]));
+		if (::kill(pid, signo) != 0) {
+			std::fprintf(stderr, "lesh: kill: %s: %s\n", argv[i], std::strerror(errno));
+			status = 1;
+		}
+	}
+	return {status};
+}
+
 builtin_result builtin_read(shell_state& state, char** argv) {
 	// POSIX: reads ONE line, splits it on IFS, and assigns to the named variables
 	// with the LAST one receiving everything that remains - which is what makes
@@ -390,6 +485,7 @@ constexpr entry kBuiltins[] = {
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
 	{"read", builtin_read}, {"command", builtin_command}, {"times", builtin_times},
+	{"trap", builtin_trap}, {"kill", builtin_kill},
 };
 
 } // namespace

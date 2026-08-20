@@ -2,6 +2,7 @@
 
 #include "runtime/builtins.h"
 #include "runtime/pattern.h"
+#include "runtime/signals.h"
 #include "substrate/assert.h"
 #include "syntax/parser.h"
 
@@ -317,12 +318,55 @@ int tree_walking_executor::run(const tree& t) {
 	for (uint32_t i = 0; i < program.children_count; ++i) {
 		status = run_node(t, t.child_of(program, i));
 		_state.set_last_status(status);
+		run_pending_traps();
 		if (_exit_requested)
 			break;
 		if (status != 0 && _state.opts().exit_on_error)
 			break;
 	}
+	// The EXIT trap runs on the way out, whether that is the end of input or an
+	// explicit `exit` - which is why it cannot live at the `exit` builtin.
+	run_exit_trap();
 	return status;
+}
+
+// Runs any traps whose signals have arrived.
+//
+// This is the safe half of signal handling: the installed handler only sets a
+// flag, and the body runs HERE, between commands, where allocating and forking
+// are legal. POSIX requires the same timing, so the safety constraint and the
+// specification agree.
+void tree_walking_executor::run_pending_traps() {
+	if (!_state.signals().any_pending())
+		return;  // the common case, kept cheap
+
+	int signo = 0;
+	while (_state.signals().take_pending(signo)) {
+		if (_state.signals().disposition_of(signo) != disposition::handler)
+			continue;
+		const std::string command{_state.signals().trap_command(signo)};
+		if (command.empty())
+			continue;
+		// The status around a trap is preserved: a trap must not clobber `$?` for
+		// the command that follows it.
+		const int saved = _state.last_status();
+		_in_trap = true;
+		(void)run_source(command);
+		_in_trap = false;
+		_state.set_last_status(saved);
+	}
+}
+
+// Runs the EXIT trap, once, on the way out.
+void tree_walking_executor::run_exit_trap() {
+	if (_exit_trap_ran)
+		return;
+	_exit_trap_ran = true;
+	if (_state.signals().disposition_of(kExitTrap) != disposition::handler)
+		return;
+	const std::string command{_state.signals().trap_command(kExitTrap)};
+	if (!command.empty())
+		(void)run_source(command);
 }
 
 int tree_walking_executor::run_node(const tree& t, node_index n) {
@@ -389,6 +433,7 @@ int tree_walking_executor::run_compound_list(const tree& t, node_index n) {
 	for (uint32_t i = 0; i < self.children_count; ++i) {
 		status = run_node(t, t.child_of(self, i));
 		_state.set_last_status(status);
+		run_pending_traps();
 		// A break, continue or return unwinds through here rather than being
 		// swallowed: the enclosing loop or function is what decides to stop.
 		if (_flow != control_flow::normal || _exit_requested)
@@ -661,6 +706,7 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 	}
 	if (pid == 0) {
 		setpgid(0, 0);
+		_state.signals().reset_for_subshell();
 		// POSIX: an asynchronous command's stdin is /dev/null unless redirected,
 		// so a background job cannot steal the terminal's input.
 		const int devnull = open("/dev/null", O_RDONLY);
@@ -689,6 +735,8 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 		return 1;
 	if (pid == 0) {
 		setpgid(0, 0);
+		// POSIX: a subshell resets traps to default, except those set to ignore.
+		_state.signals().reset_for_subshell();
 		const int status = t[n].children_count > 0
 		                   ? run_node(t, t.child_of(t[n], 0))
 		                   : 0;

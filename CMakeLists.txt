@@ -195,6 +195,8 @@ add_library(lesh_runtime STATIC
 	src/runtime/pattern.h
 	src/runtime/expander.h
 	src/runtime/shell_state.cpp
+	src/runtime/signals.cpp
+	src/runtime/signals.h
 	src/runtime/shell_state.h)
 target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 
@@ -214,6 +216,7 @@ add_executable(lesh_tests
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
+	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
 

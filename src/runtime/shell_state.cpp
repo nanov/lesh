@@ -17,9 +17,9 @@ constexpr std::array<std::string_view, 15> kSpecialBuiltins = {
 	"readonly", "return", "set", "shift", "times", "trap", "unset",
 };
 
-constexpr std::array<std::string_view, 10> kRegularBuiltins = {
+constexpr std::array<std::string_view, 11> kRegularBuiltins = {
 	"cd", "echo", "false", "pwd", "true", "test", "alias", "unalias",
-	"read", "command",
+	"read", "command", "kill",
 };
 
 } // namespace

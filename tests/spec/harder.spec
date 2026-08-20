@@ -108,3 +108,24 @@ true & wait; echo $?
 
 --- an ampersand is not a semicolon [xfail(legacy): legacy has no asynchronous lists]
 echo one & echo two; wait
+
+--- an EXIT trap runs on normal completion [xfail(legacy): legacy has no signal handling]
+trap "echo caught" EXIT; echo body
+
+--- an EXIT trap runs on explicit exit [xfail(legacy): legacy has no signal handling]
+trap "echo bye" EXIT; exit 0
+
+--- trap lists in re-inputtable form [xfail(legacy): legacy has no signal handling]
+trap "echo x" INT; trap
+
+--- trap with an empty action lists as ignore [xfail(legacy): legacy has no signal handling]
+trap "" INT; trap
+
+--- a trap fires when its signal arrives [xfail(legacy): legacy has no signal handling]
+trap "echo got" USR1; kill -USR1 $$; echo after
+
+--- trap - resets to default [xfail(legacy): legacy has no signal handling]
+trap "echo a" USR1; trap - USR1; trap
+
+--- a subshell keeps an ignored trap [xfail(legacy): legacy has no signal handling]
+trap "" USR1; (trap)
