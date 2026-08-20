@@ -110,6 +110,10 @@ struct here_doc_body {
 	uint32_t length = 0;
 	bool expand = true;   // false when the delimiter was quoted: <<'EOF'
 	bool strip_tabs = false;  // <<- strips leading tabs from every line
+	// Which fd the body is fed to. `3<<END` is legal and means fd 3, not stdin;
+	// the fd lives here rather than in the node's `aux` because `aux` already
+	// holds the index of this record.
+	uint32_t fd = 0;
 };
 
 // Byte range in the source. Derived from the token range rather than stored, so

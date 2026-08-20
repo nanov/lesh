@@ -313,3 +313,148 @@ TEST_F(ExecutorTest, ExecInAPipelineStageReplacesOnlyThatStage) {
 	EXPECT_EQ(run("/usr/bin/true | exec /usr/bin/false"), 1);
 	EXPECT_EQ(run("/usr/bin/true | exec /usr/bin/false; exit 42"), 42);
 }
+
+// --- redirection file descriptors (#34) ---------------------------------------
+//
+// apply_redirection remembered a displaced fd with dup(2). A fd that was CLOSED
+// gave it nothing to remember, so nothing was pushed onto the saved_fd array and
+// restore_fds never closed it again - the descriptor a redirection opened outlived
+// the construct that opened it. saved_fd::closed is the sentinel that fixes it,
+// and every case below failed before it existed.
+
+TEST_F(ExecutorTest, ARedirectionOnAGroupingClosesTheFdItOpened) {
+	// The bug in one line: `3>&2` opens fd 3 for the group, the group ends, and
+	// `>&3` afterwards must fail. It printed `foo` and reported success.
+	EXPECT_EQ(run("{ :; } 3>&2; /bin/echo foo >&3"), 2);
+}
+
+TEST_F(ExecutorTest, ARedirectionOnALoopClosesTheFdItOpened) {
+	// Loops reach the same save/restore path through the synthesised brace group,
+	// so they leaked identically.
+	EXPECT_EQ(run("for i in 1; do :; done 3>&2; /bin/echo x >&3"), 2);
+	EXPECT_EQ(run("while false; do :; done 3>&2; /bin/echo x >&3"), 2);
+}
+
+TEST_F(ExecutorTest, ARedirectionOnAFunctionCallClosesTheFdItOpened) {
+	EXPECT_EQ(run("f() { :; }; f 3>&2; /bin/echo x >&3"), 2);
+}
+
+TEST_F(ExecutorTest, ARedirectionOnABuiltinClosesTheFdItOpened) {
+	EXPECT_EQ(run("cd . 3>&2; /bin/echo x >&3"), 2);
+}
+
+TEST_F(ExecutorTest, ADisplacedFdThatWasOpenIsPutBackRatherThanClosed) {
+	// The other half of the sentinel: an fd that WAS open must come back, so
+	// distinguishing the two cases cannot be done by always closing either.
+	const std::string path = ::testing::TempDir() + "lesh_restore_fd.txt";
+	ASSERT_EQ(run("(exec 3>" + path + "; { /bin/echo inner >&3; } 3>&2; "
+	              "/bin/echo outer >&3)"), 0);
+	std::ifstream written{path};
+	std::string first;
+	std::getline(written, first);
+	EXPECT_EQ(first, "outer") << "fd 3 was not restored to the file exec opened";
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, TheSavedCopyIsOutOfReachOfALaterRedirection) {
+	// The copy is taken at fd 10 or above. dup(2) returns the LOWEST free fd,
+	// which `4>&3` in the same command then overwrote - so the restore put back
+	// whatever fd 4 had been aimed at instead of the original fd 3.
+	const std::string path = ::testing::TempDir() + "lesh_saved_copy.txt";
+	ASSERT_EQ(run("(exec 3>" + path + "; { :; } 3>&2 4>&3; "
+	              "/bin/echo outer >&3)"), 0);
+	std::ifstream written{path};
+	std::string first;
+	std::getline(written, first);
+	EXPECT_EQ(first, "outer") << "the saved copy of fd 3 was clobbered by 4>&3";
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ARedirectionFailureReportsTwo) {
+	// dash answers 2 in every position; lesh answered 1, which is also what a
+	// command that ran and failed reports.
+	EXPECT_EQ(run("/bin/echo x < /_lesh_no_such_file_"), 2);
+	EXPECT_EQ(run("cd . < /_lesh_no_such_file_"), 2);
+	EXPECT_EQ(run("{ :; } < /_lesh_no_such_file_"), 2);
+	EXPECT_EQ(run("f() { :; }; f < /_lesh_no_such_file_"), 2);
+	EXPECT_EQ(run("/bin/echo x >&9"), 2);
+}
+
+TEST_F(ExecutorTest, ARedirectionFailureOnASpecialBuiltinExitsANonInteractiveShell) {
+	// POSIX 2.8.1, and dash agrees: `: </missing` exits 2 without reaching the
+	// next command, while the same redirection on a regular builtin does not.
+	EXPECT_EQ(run(": < /_lesh_no_such_file_; exit 42"), 2);
+	EXPECT_EQ(run("eval : < /_lesh_no_such_file_; exit 42"), 2);
+	EXPECT_EQ(run("cd . < /_lesh_no_such_file_; exit 42"), 42);
+}
+
+TEST_F(ExecutorTest, CommandDemotesASpecialBuiltinSoARedirectionFailureIsSurvivable) {
+	EXPECT_EQ(run("command : < /_lesh_no_such_file_; exit 42"), 42);
+}
+
+TEST_F(ExecutorTest, ClosingAnFdThatWasNeverOpenIsNotAnError) {
+	// `5>&-` on a closed fd 5 is a no-op, not a failure - and the sentinel must
+	// not turn it into one by trying to restore something that never existed.
+	EXPECT_EQ(run("/bin/echo a 5>&- 6<&-"), 0);
+}
+
+TEST_F(ExecutorTest, ClosingStdoutMakesABuiltinThatWritesFail) {
+	// dash reports `echo: I/O error` and 1. lesh reported success AND printed the
+	// bytes later, because a failed flush leaves them in the stdio buffer and the
+	// next flush ran after restore_fds had put the shell's own fd 1 back.
+	EXPECT_EQ(run("cd . >&-"), 0) << "a builtin that writes nothing cannot fail";
+	EXPECT_EQ(run("echo x >&-"), 1) << "a builtin that writes must notice it could not";
+	EXPECT_EQ(run("echo after-the-failure"), 0)
+		<< "the shell's own fd 1 was not put back";
+}
+
+TEST_F(ExecutorTest, ACommandThatIsOnlyRedirectionsStillPerformsThem) {
+	// POSIX 2.9.1: no command name does not mean no redirections. lesh dropped
+	// them entirely, so `>file` never created the file and `<missing` never failed.
+	const std::string path = ::testing::TempDir() + "lesh_bare_redirect.txt";
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path), 0);
+	std::ifstream created{path};
+	EXPECT_TRUE(created.good()) << "a bare `>file` did not create the file";
+	std::remove(path.c_str());
+	EXPECT_EQ(run("< /_lesh_no_such_file_"), 2);
+}
+
+TEST_F(ExecutorTest, RedirectionsWithNoCommandNameRunInASubshell) {
+	// POSIX 2.9.1 performs them in a subshell environment, so an assignment made
+	// while expanding the operand is not visible afterwards. dash performs them in
+	// the current environment and fails redir-p.tst for it.
+	run("< ${leaked=no/such/file}");
+	std::string_view value;
+	EXPECT_FALSE(state.lookup("leaked", value))
+		<< "the operand was expanded in the shell rather than in a subshell";
+}
+
+TEST_F(ExecutorTest, AnAssignmentIsSkippedWhenItsRedirectionFails) {
+	// dash leaves the variable unset after `x=1 </missing` and sets it after
+	// `x=1 </dev/null`, so the redirection gates the assignment.
+	run("kept=yes < /dev/null");
+	run("dropped=yes < /_lesh_no_such_file_");
+	std::string_view value;
+	EXPECT_TRUE(state.lookup("kept", value));
+	EXPECT_FALSE(state.lookup("dropped", value));
+}
+
+TEST_F(ExecutorTest, AHereDocumentGoesToTheFdItWasWrittenFor) {
+	// `3<<END` feeds fd 3, not stdin. The fd was hardcoded to STDIN_FILENO, so
+	// `cat 3<<END <&3` read the terminal and several here-documents on one command
+	// all landed on stdin, leaving only the last one readable.
+	EXPECT_EQ(run("/bin/cat 3<<END <&3 >/dev/null\nfoo\nEND\n"), 0);
+	EXPECT_EQ(run("{ /bin/cat <&4; /bin/cat <&3; } <<A 3<<B 4<<C >/dev/null\n"
+	              "zero\nA\nthree\nB\nfour\nC\n"), 0);
+}
+
+TEST_F(ExecutorTest, DuplicatingADescriptorChecksItsAccessMode) {
+	// POSIX 2.7.5/2.7.6: `>&n` requires n open for output and `<&n` for input.
+	// dup2 cannot tell, so `3</dev/null >&3` aimed a read-only fd at stdout and
+	// succeeded - in lesh and in dash, which fails redir-p.tst for it.
+	EXPECT_EQ(run("{ :; } 3</dev/null >&3"), 2);
+	EXPECT_EQ(run("{ :; } 3>/dev/null <&3"), 2);
+	EXPECT_EQ(run("{ :; } 3</dev/null <&3"), 0);
+	EXPECT_EQ(run("{ :; } 3>/dev/null >&3"), 0);
+}

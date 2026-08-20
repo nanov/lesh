@@ -124,6 +124,16 @@ int search_and_exec(char** argv, char** env, std::string_view path_value,
 	_exit(failure == ENOENT ? 127 : 126);
 }
 
+// The status a command reports when one of its redirections failed.
+//
+// POSIX only requires "greater than zero", so this follows dash, which answers 2
+// for every shape and every position: a missing file, a never-opened fd, a fd
+// that `>&-` closed; on a regular builtin, an external command, a compound
+// command, a function and a pipeline stage. lesh answered 1, which is also what a
+// command that RAN and failed reports - and a redirection error means the command
+// never ran at all, so the two deserve different numbers.
+constexpr int kRedirectionError = 2;
+
 // A redirection's default fd when none was written: `>` means 1, `<` means 0.
 int default_fd_for(token_kind op) noexcept {
 	switch (op) {
@@ -136,6 +146,35 @@ int default_fd_for(token_kind op) noexcept {
 }
 
 } // namespace
+
+// Remembers what fd `fd` holds, so restore_fds can put it back.
+//
+// The copy is made at fd 10 or above, not at the lowest free fd. dup(2) hands
+// back the lowest, which a LATER redirection on the same command then targets:
+// with fd 3 open, `{ ...; } 3>&2 4>&3` saved fd 3 into fd 4 and the second
+// redirection overwrote the copy, so the restore put back the wrong file. dash
+// saves from 10 for the same reason.
+//
+// CLOEXEC because the saved copy is the shell's bookkeeping: an external command
+// run inside the construct - `{ ls; } 3>&2` - must not inherit it.
+bool tree_walking_executor::save_fd(int fd, arena_array<saved_fd>* restore) {
+	if (restore == nullptr)
+		return true;
+	const int copy = fcntl(fd, F_DUPFD_CLOEXEC, 10);
+	if (copy == -1) {
+		// EBADF is not a failure: it is the answer. The fd was CLOSED, so putting
+		// it back means closing it, and that is what the sentinel records. Pushing
+		// nothing here is what leaked fds past their construct (#34).
+		if (errno == EBADF) {
+			restore->push({fd, saved_fd::closed});
+			return true;
+		}
+		std::fprintf(stderr, "lesh: %d: %s\n", fd, std::strerror(errno));
+		return false;
+	}
+	restore->push({fd, copy});
+	return true;
+}
 
 // Applies one redirection. Returns false on failure, having reported why.
 //
@@ -174,6 +213,14 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	const int fd = self.aux == 0xFFFFFFFFu ? default_fd_for(op_token.kind)
 	                                       : static_cast<int>(self.aux);
 
+	// Saved BEFORE anything is opened, because open(2) hands back the LOWEST free
+	// descriptor - which is `fd` itself whenever `fd` is closed. Saving afterwards
+	// therefore recorded a copy of the file the redirection had just opened as if
+	// it were the fd's previous contents, and the restore reinstated that instead
+	// of closing: `{ :; } 3>/dev/null` left fd 3 pointing at /dev/null forever.
+	if (!save_fd(fd, restore))
+		return false;
+
 	int opened = -1;
 	switch (op_token.kind) {
 		case token_kind::less:
@@ -194,11 +241,6 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 			// `2>&1` duplicates a descriptor rather than opening a file, and
 			// `2>&-` closes one.
 			if (target == "-") {
-				if (restore != nullptr) {
-					const int saved = dup(fd);
-					if (saved != -1)
-						restore->push({fd, saved});
-				}
 				close(fd);
 				return true;
 			}
@@ -210,10 +252,25 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 				}
 				source = source * 10 + (c - '0');
 			}
-			if (restore != nullptr) {
-				const int saved = dup(fd);
-				if (saved != -1)
-					restore->push({fd, saved});
+			// POSIX 2.7.5/2.7.6: `>&n` is an error unless n is open for OUTPUT and
+			// `<&n` unless n is open for INPUT, so the access mode is checked before
+			// anything is displaced. dup2 alone cannot tell - it happily aims a
+			// read-only fd at stdout, which is why `3</dev/null >&3` succeeded here
+			// and in dash, and why both fail redir-p.tst's 'output duplication,
+			// failure (unreadable file descriptor)'.
+			const int flags = fcntl(source, F_GETFL);
+			if (flags == -1) {
+				std::fprintf(stderr, "lesh: %d: %s\n", source, std::strerror(errno));
+				return false;
+			}
+			const int access = flags & O_ACCMODE;
+			const bool writable = access == O_WRONLY || access == O_RDWR;
+			const bool readable = access == O_RDONLY || access == O_RDWR;
+			if (op_token.kind == token_kind::great_and ? !writable : !readable) {
+				std::fprintf(stderr, "lesh: %d: %s\n", source,
+				             op_token.kind == token_kind::great_and
+				                 ? "not open for output" : "not open for input");
+				return false;
 			}
 			if (dup2(source, fd) == -1) {
 				std::fprintf(stderr, "lesh: %d: %s\n", source, std::strerror(errno));
@@ -228,11 +285,6 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	if (opened == -1) {
 		std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(errno));
 		return false;
-	}
-	if (restore != nullptr) {
-		const int saved = dup(fd);
-		if (saved != -1)
-			restore->push({fd, saved});
 	}
 	if (opened != fd) {
 		dup2(opened, fd);
@@ -279,16 +331,24 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 		text = expanded;
 	}
 
+	// `3<<END` feeds the body to fd 3, not to stdin. Hardcoding STDIN_FILENO here
+	// made `cat 3<<END <&3` read the terminal, and made
+	// `{ cat <&5; ...; } <<A 3<<B 4<<C 5<<D` see only the last body - redir-p.tst's
+	// 'here-document with non-default file descriptor' and 'multiple
+	// here-documents on single command'.
+	const int fd = body.fd == 0 ? STDIN_FILENO : static_cast<int>(body.fd);
+
+	// Saved before the pipe is made, for the same reason apply_redirection saves
+	// before it opens: pipe(2) returns the lowest free descriptors, so with `fd`
+	// closed the pipe lands ON it and a save taken afterwards would record the
+	// pipe as the fd's previous contents.
+	if (!save_fd(fd, restore))
+		return false;
+
 	int pipe_fds[2];
 	if (pipe(pipe_fds) == -1) {
 		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
 		return false;
-	}
-
-	if (restore != nullptr) {
-		const int saved = dup(STDIN_FILENO);
-		if (saved != -1)
-			restore->push({STDIN_FILENO, saved});
 	}
 
 	// A body that fits the pipe buffer is written directly; a larger one needs a
@@ -319,8 +379,13 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 		close(pipe_fds[1]);
 	}
 
-	dup2(pipe_fds[0], STDIN_FILENO);
-	close(pipe_fds[0]);
+	// The read end may already BE `fd` - pipe(2) hands back the lowest free
+	// descriptors and `fd` is free whenever it was closed. Closing it then would
+	// throw away the body.
+	if (pipe_fds[0] != fd) {
+		dup2(pipe_fds[0], fd);
+		close(pipe_fds[0]);
+	}
 	return true;
 }
 
@@ -342,12 +407,102 @@ bool tree_walking_executor::apply_redirections(const tree& t, node_index command
 	return true;
 }
 
+bool tree_walking_executor::has_redirections(const tree& t, node_index command) noexcept {
+	const node& self = t[command];
+	for (uint32_t i = 0; i < self.children_count; ++i) {
+		const node_kind kind = t[t.child_of(self, i)].kind;
+		if (kind == node_kind::redirect || kind == node_kind::here_doc)
+			return true;
+	}
+	return false;
+}
+
+// A command that is nothing but redirections - `>file`, `<&3`, `<<END`.
+//
+// POSIX 2.9.1: with no command name the redirections are still performed, and
+// they are performed in a SUBSHELL environment. That is why this forks rather
+// than applying and restoring in place: the redirection OPERANDS are expanded
+// too, and `< ${x=no/such/file}` must not leave x set in the shell afterwards.
+// dash performs them in the current environment and is the only assertion it
+// fails in redir-p.tst ('redirection without command name runs in subshell'), so
+// the divergence from dash here is deliberate and POSIX is followed instead.
+//
+// Doing nothing at all - which is what lesh did - meant `>file` never created the
+// file, `<missing` never failed, and `1>&- 2>&1` never closed anything.
+int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
+	std::fflush(nullptr);
+	const pid_t pid = fork();
+	if (pid == -1) {
+		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		return kRedirectionError;
+	}
+	if (pid == 0) {
+		setpgid(0, 0);
+		const bool ok = apply_redirections(t, n, nullptr);
+		std::fflush(nullptr);
+		// _exit, not exit: no EXIT trap and no buffers, because this subshell is
+		// implicit and never ran a command of its own.
+		_exit(ok ? 0 : kRedirectionError);
+	}
+	setpgid(pid, pid);
+	int wait_status = 0;
+	waitpid(pid, &wait_status, 0);
+	return status_from_wait(wait_status);
+}
+
+// A builtin runs in this process and writes through stdio, so a fd that a
+// redirection closed is not noticed until the flush - and dash turns that into
+// `echo: I/O error` and status 1, which is redir-p.tst's 'effect of output
+// closing'.
+//
+// Reporting is only half of it. On a failed flush stdio KEEPS the bytes it could
+// not write, so the next flush - by then after restore_fds has put the shell's
+// own fd 1 back - printed them on the terminal: `echo a >&-` printed `a` and
+// reported success. Draining into /dev/null is the portable way to throw the
+// buffer away, since fpurge is BSD-only. fd 1 is put back afterwards so that
+// `{ echo x; echo y; } >&-` fails twice, the way dash does, rather than quietly
+// succeeding once fd 1 has become /dev/null.
+bool tree_walking_executor::drop_unwritable_output(const char* name) {
+	if (std::ferror(stdout) == 0)
+		return false;
+	std::fprintf(stderr, "lesh: %s: I/O error\n", name);
+	std::clearerr(stdout);
+	arena_array<saved_fd> displaced{_pool, 1};
+	if (!save_fd(STDOUT_FILENO, &displaced))
+		return true;
+	const int null_fd = open("/dev/null", O_WRONLY);
+	if (null_fd != -1) {
+		// open(2) hands back the lowest free descriptor, which IS fd 1 when the
+		// redirection closed it - closing the copy would then close the drain and
+		// the buffered bytes would survive to reach the restored fd anyway.
+		if (null_fd != STDOUT_FILENO) {
+			dup2(null_fd, STDOUT_FILENO);
+			close(null_fd);
+		}
+		std::fflush(stdout);
+		std::clearerr(stdout);
+	}
+	restore_fds(displaced);
+	return true;
+}
+
 void tree_walking_executor::restore_fds(arena_array<saved_fd>& saved) {
 	// In reverse, so nested saves of the same fd unwind correctly.
 	for (size_t i = saved.size(); i > 0; --i) {
-		dup2(saved[i - 1].saved, saved[i - 1].original);
-		close(saved[i - 1].saved);
+		const saved_fd& entry = saved[i - 1];
+		if (entry.saved == saved_fd::closed) {
+			// Putting back "not open" means closing. Without this the fd a
+			// redirection opened survived the construct that opened it (#34).
+			close(entry.original);
+			continue;
+		}
+		dup2(entry.saved, entry.original);
+		close(entry.saved);
 	}
+	// Emptied because this is now the only thing that CLOSES fds: a second call on
+	// the same array would close descriptors that have since been handed out to
+	// something else.
+	saved.truncate(0);
 }
 
 int tree_walking_executor::run(const tree& t) {
@@ -446,7 +601,7 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 				restore_fds(saved);
 				// POSIX: a redirection error on a COMPOUND command does not exit a
 				// non-interactive shell, unlike one on a special builtin.
-				return 1;
+				return kRedirectionError;
 			}
 			// run_node, not run_compound_list: a written brace group's child IS a
 			// compound_list, but a synthesised one wraps whatever construct carried
@@ -937,7 +1092,7 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 		// `> file` on a pipeline stage overrides the pipe - which is what POSIX
 		// requires and what `a | b > out` means.
 		if (t != nullptr && !apply_redirections(*t, command, nullptr))
-			_exit(1);
+			_exit(kRedirectionError);
 
 		// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
 		// out of the shell - the parent's state is untouched by construction rather
@@ -1093,6 +1248,15 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	const bool has_command = build_argv(t, n, argv, &assignments);
 
 	if (!has_command) {
+		// The redirections come first, and only their success lets the assignments
+		// through: dash leaves x UNSET after `x=1 </missing` and sets it after
+		// `x=1 </dev/null`. Forking is skipped when there is nothing to redirect,
+		// because a bare `x=1` is the most common command in any script.
+		if (has_redirections(t, n)) {
+			const int status = run_redirections_only(t, n);
+			if (status != 0)
+				return status;
+		}
 		// Assignments with no command persist in the shell: `x=1` is how a variable
 		// gets set. Previously these were parsed and silently dropped.
 		//
@@ -1176,7 +1340,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		std::fflush(nullptr);
 		restore_fds(saved);
 		if (!ok)
-			return 1;
+			return kRedirectionError;
 		if (ran)
 			return status;
 	}
@@ -1237,7 +1401,15 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		const bool ok = apply_redirections(t, n, &saved);
 		int status = 0;
 		if (!ok) {
-			status = 1;
+			// `eval` and `.` are SPECIAL builtins, and POSIX 2.8.1 makes a
+			// redirection error on a special builtin fatal to a non-interactive
+			// shell. dash agrees: `dash -c 'eval : </missing; echo reached'` exits 2
+			// without printing `reached`, while a regular builtin in the same
+			// position reports 2 and carries on. `command eval ...` demotes it, which
+			// is what bypass_functions records.
+			status = kRedirectionError;
+			if (!bypass_functions && !_state.interactive())
+				_exit_requested = true;
 		} else if (name == "eval") {
 			// POSIX: the arguments are joined with spaces and read as shell input.
 			std::string joined;
@@ -1276,13 +1448,27 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// back and appears on the terminal instead of in the file. The redirection
 		// was correct all along; the buffering was not.
 		std::fflush(nullptr);
+		// Cleared so the check after the call reports THIS builtin's write failure
+		// and not one inherited from something earlier.
+		std::clearerr(stdout);
 		const bool ok = apply_redirections(t, n, &saved);
 		builtin_result result{};
-		if (ok)
+		if (ok) {
 			(void)try_run_builtin(_state, argv.data(), result);
-		else
-			result.status = 1;
+		} else {
+			result.status = kRedirectionError;
+			// POSIX 2.8.1: a redirection error on a SPECIAL builtin exits a
+			// non-interactive shell; on a regular one it does not. Verified against
+			// dash, which exits 2 for `: </missing` and reports 2 and continues for
+			// `echo x </missing`. `command : </missing` is demoted to regular and
+			// survives, which is what bypass_functions records.
+			if (!bypass_functions && !_state.interactive() &&
+			    classify_builtin(argv[0]) == builtin_kind::special)
+				_exit_requested = true;
+		}
 		std::fflush(nullptr);
+		if (ok && drop_unwritable_output(argv[0]))
+			result.status = 1;
 		restore_fds(saved);
 		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before
 		// a regular one they apply only for its duration. Not cosmetic - it is why
@@ -1388,8 +1574,15 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 						_exit(exec_status);
 					}
 					int status = 0;
-					arena_array<saved_fd> ignored{_pool, 2};
-					(void)apply_redirections(t, stage, &ignored);
+					// nullptr for `restore`: this process exists only for this stage, so
+					// there is nothing to put the fds back for. Its status matters
+					// though - a failed redirection has to make the STAGE fail, and
+					// discarding the result ran the builtin anyway, on the unredirected
+					// fds.
+					if (!apply_redirections(t, stage, nullptr)) {
+						std::fflush(nullptr);
+						_exit(kRedirectionError);
+					}
 					if (!try_run_function(t, argv, status)) {
 						builtin_result r{};
 						(void)try_run_builtin(_state, argv.data(), r);

@@ -49,7 +49,16 @@ private:
 	// need. Job control is out of scope, but reaping is not: #4 established that
 	// lesh must supply its own, whatever conformance corpus it runs.
 	// An fd displaced by a redirection, so a builtin's redirections can be undone.
+	//
+	// `saved` holds `closed` when the displaced fd was NOT OPEN. Recording that
+	// is the whole point of the field being a sentinel rather than just a copy:
+	// with `{original, saved}` alone, a dup that failed because there was nothing
+	// to dup was indistinguishable from "nothing needed saving", so nothing was
+	// pushed and restore_fds never closed the fd the redirection had just opened.
+	// That is issue #34 - `{ :; } 3>&2; echo foo >&3` printed foo instead of
+	// failing, because fd 3 outlived the brace group that opened it.
 	struct saved_fd {
+		static constexpr int closed = -1;
 		int original;
 		int saved;
 	};
@@ -107,6 +116,10 @@ private:
 	void run_pending_traps();
 	void run_exit_trap();
 	int run_file(std::string_view path);
+	// Records what fd `n` holds before a redirection displaces it. Returns false
+	// only when the copy could not be made for a reason other than "it was not
+	// open", which is recorded rather than treated as an error.
+	bool save_fd(int fd, arena_array<saved_fd>* restore);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
 	bool apply_here_doc(const syntax::tree& t, syntax::node_index n,
@@ -114,6 +127,16 @@ private:
 	bool apply_redirections(const syntax::tree& t, syntax::node_index command,
 	                        arena_array<saved_fd>* restore);
 	void restore_fds(arena_array<saved_fd>& saved);
+	// True when a builtin's output could not be written, having reported it and
+	// thrown away whatever stdio still holds.
+	bool drop_unwritable_output(const char* name);
+	// True when a command carries any redirection at all, so the no-command-name
+	// case can skip forking when there is nothing to perform.
+	[[nodiscard]] static bool has_redirections(const syntax::tree& t,
+	                                           syntax::node_index command) noexcept;
+	// Performs the redirections of a command that has NO command name, in a
+	// subshell, and returns the status POSIX gives that command.
+	int run_redirections_only(const syntax::tree& t, syntax::node_index n);
 
 	// Expands a command's words into a NUL-terminated argv the arena owns.
 	// Returns false when the command expanded to nothing at all, which is not an

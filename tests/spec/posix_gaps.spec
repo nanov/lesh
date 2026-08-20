@@ -440,3 +440,101 @@ trap '' INT; exec sh -c 'kill -INT $$; echo survived'
 
 --- the EXIT trap runs when exec fails [xfail(legacy): legacy has no exec builtin]
 trap 'echo trapped' EXIT; exec ./_lesh_no_such_command_; echo notreached
+
+# --- #34: a redirection's file descriptor must not outlive its construct -------
+#
+# apply_redirection remembered a displaced fd with dup(2), so a fd that was CLOSED
+# left nothing to remember and restore_fds never closed it again: the descriptor
+# the redirection opened survived the construct that opened it. Every case below
+# was wrong because of that one missing sentinel, or because the status a failed
+# redirection reports was 1 where dash answers 2.
+
+--- a redirection on a grouping closes the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+{ :; } 3>&2; echo foo >&3; echo "status=$?"
+
+--- a redirection on a loop closes the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+for i in 1; do :; done 3>&2; echo x >&3; echo "status=$?"
+
+--- a redirection on a function call closes the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+f() { :; }; f 3>&2; echo x >&3; echo "status=$?"
+
+--- a redirection on eval closes the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+eval : 3>&2; echo x >&3; echo "status=$?"
+
+--- a redirection on a builtin closes the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+echo hi 3>&2; echo x >&3; echo "status=$?"
+
+--- a nested grouping closes only the fd it opened [xfail(legacy): legacy ignores redirect nodes entirely]
+{ { :; } 3>&2; echo mid >&3; } 4>&2; echo out >&3; echo "status=$?"
+
+--- a displaced descriptor is put back rather than left closed [xfail(legacy): legacy ignores redirect nodes entirely]
+exec 3>&1; { echo inner >&3; } 3>&- 2>/dev/null; echo outer >&3
+
+--- the saved copy of a descriptor is out of the way of later redirections [xfail(legacy): legacy ignores redirect nodes entirely]
+exec 3>&1; { echo inner >&3; } 3>&2 4>&3 2>/dev/null; echo outer >&3
+
+--- a redirection failure reports two [xfail(legacy): legacy ignores redirect nodes entirely]
+echo x < /_lesh_no_such_file_; echo "status=$?"
+
+--- a redirection failure on a compound command reports two [xfail(legacy): legacy ignores redirect nodes entirely]
+{ :; } < /_lesh_no_such_file_; echo "status=$?"
+
+--- a redirection failure on an external command reports two [xfail(legacy): legacy ignores redirect nodes entirely]
+/bin/echo x < /_lesh_no_such_file_; echo "status=$?"
+
+--- a redirection failure on a special builtin exits a non-interactive shell [xfail(legacy): legacy ignores redirect nodes entirely]
+: < /_lesh_no_such_file_; echo notreached
+
+--- command demotes a special builtin so a redirection failure is survivable [xfail(legacy): legacy ignores redirect nodes entirely]
+command : < /_lesh_no_such_file_; echo "survived=$?"
+
+--- a redirection failure on a pipeline stage reports two [xfail(legacy): legacy ignores redirect nodes entirely]
+true | echo x < /_lesh_no_such_file_; echo "status=$?"
+
+--- closing a descriptor that was never open is not an error [xfail(legacy): legacy ignores redirect nodes entirely]
+echo a 5>&-; echo "out=$?"; echo b 5<&-; echo "in=$?"
+
+--- closing stdout makes a builtin that writes fail [xfail(legacy): legacy ignores redirect nodes entirely]
+echo x >&-; echo "status=$?"
+
+--- a descriptor closed for a command is closed only for that command [xfail(legacy): legacy ignores redirect nodes entirely]
+exec 3>&2; { echo a >&3; } 3>&- 2>/dev/null; echo "inner=$?"; echo b >&3; echo "outer=$?"
+
+--- a command that is only redirections performs them [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_bare; >/tmp/lesh_spec_bare; echo "st=$?"; test -f /tmp/lesh_spec_bare && echo created; rm -f /tmp/lesh_spec_bare
+
+--- a failing redirection with no command name reports two [xfail(legacy): legacy ignores redirect nodes entirely]
+< /_lesh_no_such_file_; echo "status=$?"
+
+--- an assignment is skipped when its redirection fails [xfail(legacy): legacy ignores redirect nodes entirely]
+x=set < /_lesh_no_such_file_; echo "status=$? x=$x"
+
+--- a here-document can be fed to a descriptor other than stdin [xfail(legacy): legacy ignores redirect nodes entirely]
+cat 3<<END <&3
+foo
+END
+
+--- several here-documents on one command each keep their own descriptor [xfail(legacy): legacy ignores redirect nodes entirely]
+{ cat <&5; cat <&4; cat <&3; cat; } <<A 3<<B 4<<C 5<<D
+zero
+A
+three
+B
+four
+C
+five
+D
+
+# Three DELIBERATE divergences from dash, recorded rather than chosen quietly
+# (handoff.md: where dash is behind the standard, say so in writing). All three
+# are assertions dash itself fails in yash's redir-p.tst, so the xfail marker here
+# means "lesh is ahead", and an XPASS would mean dash had changed.
+
+--- redirection operands with no command name are expanded in a subshell [xfail: divergence - dash expands them in the current environment; POSIX 2.9.1 requires a subshell]
+unset x; < ${x=no/such/file}; ${x+echo leaked}; echo done
+
+--- duplicating a read-only descriptor onto an output fd is an error [xfail: divergence - dash does not check the access mode; POSIX 2.7.6 requires it]
+3</dev/null >&3; echo "status=$?"
+
+--- duplicating a write-only descriptor onto an input fd is an error [xfail: divergence - dash does not check the access mode; POSIX 2.7.5 requires it]
+cat 3>/dev/null <&3; echo "status=$?"

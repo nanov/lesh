@@ -796,6 +796,7 @@ private:
 			body.length = body_end > body_start ? body_end - body_start : 0;
 			body.expand = !quoted;
 			body.strip_tabs = n.aux != 0xFFFFFFFFu && _tree.here_doc_at(n.aux).strip_tabs;
+			body.fd = n.aux != 0xFFFFFFFFu ? _tree.here_doc_at(n.aux).fd : 0;
 			// Overwrite the placeholder recorded when the operator was seen.
 			const_cast<syntax::here_doc_body&>(_tree.here_doc_at(n.aux)) = body;
 		}
@@ -875,6 +876,7 @@ private:
 
 			syntax::here_doc_body placeholder{};
 			placeholder.strip_tabs = op == token_kind::dless_dash;
+			placeholder.fd = fd == 0xFFFFFFFFu ? 0 : fd;
 			node n;
 			n.kind = node_kind::here_doc;
 			n.first_token = first;
