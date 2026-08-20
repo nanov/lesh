@@ -17,8 +17,8 @@ constexpr std::array<std::string_view, 15> kSpecialBuiltins = {
 	"readonly", "return", "set", "shift", "times", "trap", "unset",
 };
 
-constexpr std::array<std::string_view, 6> kRegularBuiltins = {
-	"cd", "echo", "false", "pwd", "true", "test",
+constexpr std::array<std::string_view, 8> kRegularBuiltins = {
+	"cd", "echo", "false", "pwd", "true", "test", "alias", "unalias",
 };
 
 } // namespace
@@ -49,6 +49,27 @@ shell_state::shell_state() {
 }
 
 shell_state::~shell_state() = default;
+
+void shell_state::set_alias(std::string_view name, std::string_view value) {
+	if (const auto it = _aliases.find(name); it != _aliases.end()) {
+		it->second = value;
+		return;
+	}
+	_aliases.emplace(std::string(name), std::string(value));
+}
+
+void shell_state::unset_alias(std::string_view name) {
+	if (const auto it = _aliases.find(name); it != _aliases.end())
+		_aliases.erase(it);
+}
+
+bool shell_state::lookup_alias(std::string_view name, std::string_view& value) const {
+	const auto it = _aliases.find(name);
+	if (it == _aliases.end())
+		return false;
+	value = it->second;
+	return true;
+}
 
 bool shell_state::positional_at(size_t index, std::string_view& out) const {
 	if (index == 0 || index > _positional.size())

@@ -902,7 +902,7 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 		// The substitution's contents are a fresh parse. Nesting works because this
 		// is the same code path, reached recursively.
 		buffer_pool inner_pool{BUFFER_POOL_SIZE};
-		const tree inner = syntax::parse(inner_pool, code);
+		const tree inner = syntax::parse(inner_pool, code, &_state);
 		const int status = run(inner);
 		std::fflush(nullptr);
 		_exit(status);

@@ -51,3 +51,12 @@ two
 
 --- an empty command list between separators [xfail(legacy): beyond legacy's single-pass parser]
 echo a;; echo b
+
+--- an alias is not substituted in the same parse unit [xfail(legacy): legacy's alias model differs]
+alias g="echo hi"; g 2>/dev/null; echo after
+
+--- unalias is a builtin [xfail(legacy): legacy's alias model differs]
+unalias nothing 2>/dev/null; echo ok
+
+--- a quoted command name bypasses alias substitution [xfail(legacy): legacy's alias model differs]
+alias ls=echo; \ls -d /tmp 2>/dev/null | head -1

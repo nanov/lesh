@@ -81,8 +81,9 @@ constexpr bool ends_command(token_kind k) noexcept {
 
 class parser_impl {
 public:
-	parser_impl(buffer_pool& pool, std::string_view source) noexcept
-		: _lexer(source), _tree(pool, source), _scratch(pool, 64) {
+	parser_impl(buffer_pool& pool, std::string_view source,
+	            const alias_source* aliases) noexcept
+		: _lexer(source), _tree(pool, source), _scratch(pool, 64), _aliases(aliases) {
 		fill();
 	}
 
@@ -432,7 +433,33 @@ private:
 	// One token of lookahead, lexed on demand so the parser keeps control of the
 	// lexer's mode. Lexing everything up front would surrender that, and the mode
 	// channel is the whole reason the lexer takes one.
+	// Alias substitution replaces a command word with its definition, which is
+	// then re-scanned. A STACK of lexers rather than textual pre-substitution:
+	// pre-substituting would lose the association between a token and the text the
+	// user typed, and the line editor needs that association to survive (#10).
+	//
+	// The cost, recorded rather than hidden: tokens produced from an alias body
+	// carry spans into the ALIAS TEXT, not into the typed line. Highlighting an
+	// aliased command therefore has nothing to underline in the user's buffer.
+	// Solving that needs a span that can name its origin, which is line-editor
+	// work (#14 found zsh has the same problem and solves it no better).
+	struct alias_frame {
+		lexer lex;
+		std::string_view text;
+	};
+
 	void fill() noexcept {
+		// Draw from an alias body while one is active, popping when it runs out.
+		while (!_alias_stack.empty()) {
+			const token t = _alias_stack.back().lex.next(lex_mode::command);
+			if (t.kind != token_kind::end) {
+				_index = _tree.add_token(t);
+				return;
+			}
+			_alias_stack.pop_back();
+			_alias_depth = _alias_stack.size();
+		}
+
 		_index = _tree.add_token(_lexer.next(lex_mode::command));
 		if (_lexer.incomplete())
 			_tree.set_incomplete(true);
@@ -504,6 +531,12 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		bool seen_command_name = false;
+
+		// Alias substitution, at command position only. POSIX substitutes an alias
+		// when the word is a command NAME - `ls foo` substitutes ls, `echo ls` does
+		// not - which is the same rule reserved words follow.
+		if (_aliases != nullptr && _scratch.size() == mark)
+			try_substitute_alias();
 
 		while (!ends_command(peek().kind)) {
 			// A reserved word is only a keyword in COMMAND position. `echo done`
@@ -635,6 +668,42 @@ private:
 		return at;
 	}
 
+	// Replaces a command word with its alias definition, if it has one.
+	void try_substitute_alias() noexcept {
+		for (int guard = 0; guard < kMaxAliasDepth; ++guard) {
+			if (peek().kind != token_kind::word || peek().is_error())
+				return;
+			// A quoted word is never an alias: `\ls` and `'ls'` are how you bypass
+			// one, and flag_literal is exactly that test.
+			if ((peek().flags & syntax::flag_literal) == 0)
+				return;
+
+			const std::string_view name = text_of_token(_index);
+			std::string_view value;
+			if (!_aliases->lookup_alias(name, value))
+				return;
+
+			// Cycle guard: `alias a=b; alias b=a` must terminate. POSIX says an
+			// alias is not re-substituted while its own expansion is being read,
+			// and a depth limit is the simplest form of that which also stops
+			// mutual recursion.
+			for (const auto& frame : _alias_stack)
+				if (frame.text == value)
+					return;
+
+			// Replace the word: drop it and lex the definition in its place.
+			_alias_stack.push_back({lexer{value}, value});
+			_alias_depth = _alias_stack.size();
+			fill();
+
+			// POSIX: a definition ending in a blank makes the NEXT word eligible
+			// too. That is what makes `alias sudo='sudo '` work with an aliased
+			// command after it.
+			if (value.empty() || (value.back() != ' ' && value.back() != '\t'))
+				return;
+		}
+	}
+
 	node_index parse_redirect() noexcept {
 		const uint32_t first = _index;
 		uint32_t fd = 0xFFFFFFFFu;  // unspecified: the operator's default applies
@@ -734,14 +803,19 @@ private:
 	tree _tree;
 	arena_array<node_index> _scratch;
 	std::vector<pending_here_doc> _pending_here_docs;
+	std::vector<alias_frame> _alias_stack;
+	const alias_source* _aliases = nullptr;
+	size_t _alias_depth = 0;
+	static constexpr int kMaxAliasDepth = 16;
 	std::vector<uint32_t> _strip_tabs_for;
 	uint32_t _index = 0;
 };
 
 } // namespace
 
-tree parse(buffer_pool& pool, std::string_view source) noexcept {
-	parser_impl p{pool, source};
+tree parse(buffer_pool& pool, std::string_view source,
+           const alias_source* aliases) noexcept {
+	parser_impl p{pool, source, aliases};
 	p.parse_program();
 	return p.take();
 }

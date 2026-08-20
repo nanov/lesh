@@ -20,6 +20,20 @@ namespace lesh::syntax {
 // notoriously worse: Oils, whose front end is otherwise the most deliberate of
 // any shell surveyed, runs its real parser for completion and catches the
 // exception, then reads a side-channel to find out where it got to.
-tree parse(buffer_pool& pool, std::string_view source) noexcept;
+// Supplies alias definitions to the parser. POSIX alias substitution happens at
+// READ time and is lexical, so it belongs to the parser rather than to any later
+// stage - which is why this is a port rather than a lookup on shell state.
+//
+// Completion may pass nullptr: expanding aliases while drawing a suggestion is
+// safe, but not doing it keeps the tree's spans pointing at what the user typed.
+class alias_source {
+public:
+	virtual ~alias_source() = default;
+	[[nodiscard]] virtual bool lookup_alias(std::string_view name,
+	                                        std::string_view& value) const = 0;
+};
+
+tree parse(buffer_pool& pool, std::string_view source,
+           const alias_source* aliases = nullptr) noexcept;
 
 } // namespace lesh::syntax

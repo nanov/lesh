@@ -220,6 +220,32 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 	return {0};
 }
 
+builtin_result builtin_alias(shell_state& state, char** argv) {
+	if (argv[1] == nullptr)
+		return {0};  // listing aliases: not implemented, not an error
+	int status = 0;
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (const size_t eq = arg.find('='); eq != std::string_view::npos) {
+			state.set_alias(arg.substr(0, eq), arg.substr(eq + 1));
+		} else if (std::string_view value; state.lookup_alias(arg, value)) {
+			std::printf("%.*s=%.*s\n", static_cast<int>(arg.size()), arg.data(),
+			            static_cast<int>(value.size()), value.data());
+		} else {
+			std::fprintf(stderr, "lesh: alias: %.*s: not found\n",
+			             static_cast<int>(arg.size()), arg.data());
+			status = 1;
+		}
+	}
+	return {status};
+}
+
+builtin_result builtin_unalias(shell_state& state, char** argv) {
+	for (size_t i = 1; argv[i] != nullptr; ++i)
+		state.unset_alias(argv[i]);
+	return {0};
+}
+
 builtin_result builtin_shift(shell_state& state, char** argv) {
 	const size_t n = argv[1] != nullptr ? static_cast<size_t>(std::atoi(argv[1])) : 1;
 	if (!state.shift_positional(n)) {
@@ -256,6 +282,7 @@ constexpr entry kBuiltins[] = {
 	{"exit", builtin_exit},   {"export", builtin_export}, {"unset", builtin_unset},
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
 	{"return", builtin_return}, {"shift", builtin_shift},
+	{"alias", builtin_alias}, {"unalias", builtin_unalias},
 };
 
 } // namespace

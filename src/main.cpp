@@ -33,6 +33,7 @@ x .d88"               z`    ^%    .uef^"
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -199,12 +200,26 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 // doing nothing. The differential harness can therefore measure the new front
 // end against dash today, which is the whole point of the strangler seam: parity
 // is tracked continuously rather than discovered at the end.
-int run_next_front_end(std::string_view source) {
+int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state) {
 	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
-	lesh::runtime::shell_state state;
 	lesh::runtime::tree_walking_executor executor{pool, state};
-	const lesh::syntax::tree t = lesh::syntax::parse(pool, source);
+	const lesh::syntax::tree t = lesh::syntax::parse(pool, source, &state);
 	return executor.run(t);
+}
+
+// Reads a whole stream. Scripts are parsed as ONE unit, which has an observable
+// consequence: an alias defined in a script does not affect later lines of the
+// same script, because POSIX substitutes aliases when a command is READ and the
+// whole file is read at once. dash reads a complete command at a time. Closing
+// that gap needs the incremental input source deferred from #15 and #21.
+std::string read_all(std::istream& in) {
+	std::string out;
+	std::string line;
+	while (std::getline(in, line)) {
+		out += line;
+		out += '\n';
+	}
+	return out;
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -246,24 +261,48 @@ int main(int argc, char **argv, char **envp) {
 	std::cout << std::unitbuf;
 	std::cerr << std::unitbuf;
 
+	// The new front end is chosen BEFORE any legacy object is built. Constructing
+	// the legacy parser first ran init_aliases(), whose strdup'd text is
+	// deliberately never freed (see SimpleParsingState) - so a `next` run reported
+	// 14 bytes leaked from a front end it was not even using. ADR-0007 expects
+	// exactly zero.
+	if (use_next) {
+		// The new front end handles every non-interactive form. Interactive is the
+		// line editor's business and stays on legacy until Phase 4.
+		lesh::runtime::shell_state next_state;
+		next_state.set_interactive(interactive);
+		std::vector<std::string> args;
+		for (int a = i; a < argc; ++a)
+			args.emplace_back(argv[a]);
+		next_state.set_positional(std::move(args));
+
+		if (command_string)
+			return run_next_front_end(command_string, next_state);
+		if (script_path) {
+			std::ifstream script{script_path};
+			if (!script) {
+				std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
+				return 127;
+			}
+			next_state.set_script_name(script_path);
+			return run_next_front_end(read_all(script), next_state);
+		}
+		if (!interactive)
+			return run_next_front_end(read_all(std::cin), next_state);
+		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
+		return 2;
+	}
+
 	lesh_state state {std::filesystem::current_path(), envp};
 	auto zsh_parser = ZshParserPlus::Parser(state);
 	zsh_parser.init_aliases();
 
+
 	if (command_string) {
-		if (use_next)
-			return run_next_front_end(command_string);
 		std::string line{command_string};
 		bool should_exit = false;
 		int last_status = 0;
 		return run_line(zsh_parser, line, should_exit, last_status);
-	}
-
-	if (use_next) {
-		// Only -c is wired to the new front end so far. Refuse the rest rather than
-		// falling back to legacy, which would make a harness run look like a pass.
-		std::fprintf(stderr, "lesh: LESH_FRONTEND=next currently supports -c only\n");
-		return 2;
 	}
 
 	if (script_path) {

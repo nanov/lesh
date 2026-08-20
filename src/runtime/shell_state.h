@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/expander.h"
+#include "syntax/parser.h"
 #include "substrate/traits.h"
 
 #include <string>
@@ -32,7 +33,8 @@ enum class builtin_kind {
 
 class shell_state final : public parameter_source,
                           public arithmetic_variables,
-                          public parameter_assigner {
+                          public parameter_assigner,
+                          public syntax::alias_source {
 public:
 	shell_state();
 	~shell_state() override;
@@ -106,6 +108,19 @@ public:
 	[[nodiscard]] options& opts() noexcept { return _options; }
 	[[nodiscard]] const options& opts() const noexcept { return _options; }
 
+	// --- aliases --------------------------------------------------------------
+	//
+	// The state OWNS its alias text, per ADR-0007. Legacy's aliases were the last
+	// blocker to a zero-leak gate: it strdup()s the text, points parse trees into
+	// it, and can therefore never free it - the "leak" LeakSanitizer reports there
+	// cannot be fixed without a use-after-free. Storing std::string here means the
+	// text outlives every use and is released in the destructor.
+
+	void set_alias(std::string_view name, std::string_view value);
+	void unset_alias(std::string_view name);
+	[[nodiscard]] bool lookup_alias(std::string_view name, std::string_view& value) const override;
+	[[nodiscard]] bool has_aliases() const noexcept { return !_aliases.empty(); }
+
 	[[nodiscard]] bool interactive() const noexcept { return _interactive; }
 	void set_interactive(bool v) noexcept { _interactive = v; }
 
@@ -117,6 +132,7 @@ private:
 
 	std::unordered_map<std::string, variable, lesh::transparent_string_hash, std::equal_to<>> _vars;
 	std::string _ifs_default = " \t\n";
+	std::unordered_map<std::string, std::string, lesh::transparent_string_hash, std::equal_to<>> _aliases;
 	std::vector<std::string> _positional;
 	std::string _script_name = "lesh";
 	int _pid = 0;
