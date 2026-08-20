@@ -153,6 +153,36 @@ cat <<'EOT'
 hello $x
 EOT
 
+--- a backslash-quoted delimiter suppresses expansion and still terminates [xfail(legacy): legacy has no here-documents]
+cat <<\EOT
+hello $x `false`
+EOT
+echo after
+
+--- a partly quoted delimiter has quote removal applied [xfail(legacy): legacy has no here-documents]
+cat <<E'O'T
+body
+EOT
+echo after
+
+--- a delimiter quoted mid-word with a backslash still terminates [xfail(legacy): legacy has no here-documents]
+cat <<EO\T
+body
+EOT
+echo after
+
+--- a double-quoted delimiter fragment has quote removal applied [xfail(legacy): legacy has no here-documents]
+cat <<"EO"T
+body
+EOT
+echo after
+
+--- <<- strips tabs with a backslash-quoted delimiter [xfail(legacy): legacy has no here-documents]
+cat <<-\EOT
+	hello $x
+	EOT
+echo after
+
 --- two here-documents on one line, in order [xfail(legacy): legacy has no here-documents]
 cat <<A; cat <<B
 first
@@ -248,3 +278,15 @@ x=before; f() { x=after; }; f; echo $x
 
 --- a function can be recursive [xfail(legacy): legacy has no functions]
 countdown() { if [ $1 -gt 0 ]; then echo $1; countdown $(($1 - 1)); fi; }; countdown 3
+
+--- PPID is set at startup [xfail(legacy): legacy does not set PPID]
+[ "$PPID" -gt 1 ] && echo ok
+
+--- PPID is not exported
+env | grep -c '^PPID='
+
+--- PPID is an ordinary variable and can be assigned [xfail(legacy): legacy does not set PPID]
+PPID=42; echo "$PPID"
+
+--- PPID does not change in a subshell [xfail(legacy): legacy does not set PPID]
+outer=$PPID; inner=$( echo "$PPID" ); [ "$outer" = "$inner" ] && echo same

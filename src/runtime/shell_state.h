@@ -100,12 +100,39 @@ public:
 
 	// set -e: exit on a command failing. set -u: unset parameter is an error.
 	// set -x: trace. Held here rather than as globals so a subshell can copy them.
+	//
+	// The POSIX option letters lesh does not yet honour are still RECORDED, because
+	// POSIX requires the shell to accept them on its own command line and in `set`.
+	// Rejecting them is what kept lesh from reading a single byte of the yash signal
+	// suite, which invokes the testee as `sh +i +m`. Recorded-but-inert is marked as
+	// such below so it is a known gap rather than a silent lie; honouring them is
+	// issue #31's business.
 	struct options {
-		bool exit_on_error = false;
-		bool error_on_unset = false;
-		bool trace = false;
-		bool no_glob = false;  // set -f
+		bool exit_on_error = false;   // -e
+		bool error_on_unset = false;  // -u
+		bool trace = false;           // -x
+		bool no_glob = false;         // -f
+		// Accepted and recorded, not yet honoured:
+		bool all_export = false;      // -a
+		bool notify = false;          // -b
+		bool no_clobber = false;      // -C
+		bool hash_all = false;        // -h
+		bool monitor = false;         // -m, job control: out of scope per ADR-0001
+		bool no_exec = false;         // -n
+		bool verbose = false;         // -v
+		bool ignore_eof = false;      // -o ignoreeof
+		bool no_log = false;          // -o nolog
+		bool vi = false;              // -o vi, the line editor's business (Phase 4)
 	};
+
+	// Applies one option letter or `-o` name. Returns false when the option is not
+	// one POSIX names, which is an error rather than something to shrug at.
+	//
+	// Shared by the `set` builtin and by command-line parsing, because POSIX gives
+	// them the same option set and two tables would drift apart.
+	[[nodiscard]] static bool apply_option_letter(options& o, char letter, bool enable);
+	[[nodiscard]] static bool apply_option_name(options& o, std::string_view name,
+	                                            bool enable);
 	[[nodiscard]] options& opts() noexcept { return _options; }
 	[[nodiscard]] const options& opts() const noexcept { return _options; }
 

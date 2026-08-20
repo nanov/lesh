@@ -199,14 +199,17 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 			break;  // a plain operand also ends the options and sets $1..
 
 		const bool enable = arg[0] == '-';
+		// One option table, shared with command-line parsing (runtime/invocation.h),
+		// so `set -m` and `sh -m` cannot disagree about which letters exist.
 		for (const char c : arg.substr(1)) {
-			switch (c) {
-				case 'e': state.opts().exit_on_error = enable; break;
-				case 'u': state.opts().error_on_unset = enable; break;
-				case 'x': state.opts().trace = enable; break;
-				case 'f': state.opts().no_glob = enable; break;
-				default: break;
+			if (c == 'o') {
+				// `set -o name`. A bare `set -o` lists the options, which is issue #31.
+				if (argv[i + 1] == nullptr)
+					break;
+				(void)shell_state::apply_option_name(state.opts(), argv[++i], enable);
+				break;
 			}
+			(void)shell_state::apply_option_letter(state.opts(), c, enable);
 		}
 	}
 

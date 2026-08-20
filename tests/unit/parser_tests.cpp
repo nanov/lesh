@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -198,4 +199,58 @@ TEST_F(ParserTest, SourceIsNotModified) {
 
 TEST_F(ParserTest, NodeStaysSmall) {
 	EXPECT_EQ(sizeof(node), 24u);
+}
+
+// Here-document delimiters and quote removal. POSIX applies quote removal to the
+// delimiter word, so every spelling below ends its body at a line reading `EOT`.
+//
+// Only the fully quoted forms used to work. `<<\EOT` did not, which meant the body
+// ran to end of input - and `<<\EOT` is the spelling the yash conformance suite
+// uses in every one of its here-documents, so twenty signal files scored zero for
+// this and nothing else. See issue #33.
+namespace {
+
+// The body text of the first here_doc node in the tree, or nullopt when the parse
+// produced none.
+std::optional<std::string_view> first_here_doc_body(const tree& t) {
+	for (node_index n = 0; n < t.node_count(); ++n) {
+		if (t[n].kind == node_kind::here_doc && t[n].aux != 0xFFFFFFFFu)
+			return t.here_doc_text(t[n].aux);
+	}
+	return std::nullopt;
+}
+
+} // namespace
+
+TEST_F(ParserTest, HereDocDelimiterQuoteRemovalAcrossSpellings) {
+	struct spelling {
+		const char* delimiter;
+		const char* what;
+	};
+	// Each of these must terminate at the line `EOT`.
+	const spelling spellings[] = {
+		{"EOT", "unquoted"},
+		{"'EOT'", "fully single-quoted"},
+		{"\"EOT\"", "fully double-quoted"},
+		{"\\EOT", "backslash before the first character"},
+		{"EO\\T", "backslash mid-word"},
+		{"E'O'T", "single-quoted fragment"},
+		{"\"EO\"T", "double-quoted fragment"},
+	};
+	for (const auto& s : spellings) {
+		const std::string src = std::string("cat <<") + s.delimiter + "\nbody\nEOT\necho after\n";
+		const tree t = parse_it(src);
+		const auto body = first_here_doc_body(t);
+		ASSERT_TRUE(body.has_value()) << s.what;
+		EXPECT_EQ(*body, "body\n") << s.what << " (" << s.delimiter << ")";
+		EXPECT_FALSE(t.has_errors()) << s.what;
+	}
+}
+
+TEST_F(ParserTest, HereDocDelimiterDoesNotMatchAPrefixOrSuffix) {
+	// A line must equal the delimiter, not merely start with it.
+	const tree t = parse_it("cat <<\\EOT\nEOTX\nXEOT\nEOT\n");
+	const auto body = first_here_doc_body(t);
+	ASSERT_TRUE(body.has_value());
+	EXPECT_EQ(*body, "EOTX\nXEOT\n");
 }

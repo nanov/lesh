@@ -53,6 +53,7 @@ x .d88"               z`    ^%    .uef^"
 #include "legacy/zsh_parser_plus.h"
 
 #include "runtime/executor.h"
+#include "runtime/invocation.h"
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
@@ -183,9 +184,14 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 	return last_status;
 }
 
-[[noreturn]] void usage_error(const char* message) {
-	std::fprintf(stderr, "lesh: %s\n", message);
-	std::fprintf(stderr, "usage: lesh [-i] [-c command | script] [args...]\n");
+[[noreturn]] void usage_error(const char* message, const char* operand = nullptr) {
+	if (operand != nullptr)
+		std::fprintf(stderr, "lesh: %s: %s\n", message, operand);
+	else
+		std::fprintf(stderr, "lesh: %s\n", message);
+	std::fprintf(stderr,
+	             "usage: lesh [-abCefhimnsuvx] [-o option]... "
+	             "[-c command | script] [args...]\n");
 	// POSIX: a shell that cannot parse its own invocation exits >0; 2 is the
 	// conventional choice, matching a syntax error.
 	std::exit(2);
@@ -225,35 +231,23 @@ std::string read_all(std::istream& in) {
 int main(int argc, char **argv, char **envp) {
 	const bool use_next = select_front_end() == front_end::next;
 
-	const char* command_string = nullptr;
-	const char* script_path = nullptr;
-	bool force_interactive = false;
+	// Command-line parsing lives in runtime/invocation.h, not here: main() cannot
+	// be unit-tested, and getting this wrong silently gated 3,600 conformance
+	// assertions (issue #33).
+	const lesh::runtime::invocation inv = lesh::runtime::parse_invocation(argc, argv);
+	if (inv.error != nullptr)
+		usage_error(inv.error, inv.error_operand);
 
-	int i = 1;
-	for (; i < argc; ++i) {
-		const std::string_view arg = argv[i];
-		if (arg == "--") { ++i; break; }
-		if (arg.size() < 2 || arg[0] != '-') break;
-		if (arg == "-c") {
-			if (++i >= argc) usage_error("-c requires an argument");
-			command_string = argv[i];
-		} else if (arg == "-i") {
-			force_interactive = true;
-		} else if (arg == "-s") {
-			// Read commands from stdin. This is the default already; accepted so
-			// harnesses that pass it explicitly are not rejected.
-		} else {
-			usage_error("unknown option");
-		}
-	}
-	if (!command_string && i < argc)
-		script_path = argv[i++];
+	const char* const command_string = inv.command_string;
+	const char* const script_path = inv.script_path;
+	const int i = inv.first_argument;
 
 	// POSIX: interactive means -i, or no operands with both stdin and stderr
 	// attached to a terminal. Everything user-facing hangs off this one decision
-	// rather than off separate ad-hoc checks.
-	const bool interactive = force_interactive ||
-		(!command_string && !script_path && isatty(STDIN_FILENO) && isatty(STDERR_FILENO));
+	// rather than off separate ad-hoc checks. `+i` says NOT interactive explicitly,
+	// which is why the flag is a tri-state rather than a bool.
+	const bool interactive = inv.interactive.value_or(
+		!command_string && !script_path && isatty(STDIN_FILENO) && isatty(STDERR_FILENO));
 
 	setenv("TERM", "xterm-256color", 1);
 
@@ -271,6 +265,11 @@ int main(int argc, char **argv, char **envp) {
 		// line editor's business and stays on legacy until Phase 4.
 		lesh::runtime::shell_state next_state;
 		next_state.set_interactive(interactive);
+		next_state.opts() = inv.options;
+		// $0. With -c the operand after the command string is the command name, not
+		// the first positional parameter - which is why first_argument is past it.
+		if (inv.command_name != nullptr)
+			next_state.set_script_name(inv.command_name);
 		std::vector<std::string> args;
 		for (int a = i; a < argc; ++a)
 			args.emplace_back(argv[a]);
@@ -284,7 +283,6 @@ int main(int argc, char **argv, char **envp) {
 				std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
 				return 127;
 			}
-			next_state.set_script_name(script_path);
 			return run_next_front_end(read_all(script), next_state);
 		}
 		if (!interactive)

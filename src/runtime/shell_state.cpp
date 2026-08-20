@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <string>
 #include <unistd.h>
 
 extern char** environ;
@@ -47,6 +48,15 @@ shell_state::shell_state() {
 		_vars.emplace(std::string(entry.substr(0, eq)),
 		              variable{std::string(entry.substr(eq + 1)), true});
 	}
+
+	// PPID is a variable POSIX requires the shell to set at startup, not a special
+	// parameter - it is assignable and it is NOT exported, which is what dash does
+	// too. Set after the environment is copied so an inherited PPID cannot win.
+	//
+	// It was missing, and the yash signal tests use `kill -s SIG $PPID` from a child
+	// shell for every case whose sender is another process: ninety of the 180 cases
+	// per file could not send the signal at all.
+	_vars.insert_or_assign("PPID", variable{std::to_string(getppid()), false});
 }
 
 shell_state::~shell_state() = default;
@@ -158,6 +168,45 @@ void shell_state::unset(std::string_view name) {
 bool shell_state::is_exported(std::string_view name) const {
 	const auto it = _vars.find(name);
 	return it != _vars.end() && it->second.exported;
+}
+
+// The one table of POSIX shell options. `set` and the command line both route
+// through here so they cannot disagree about which letters exist.
+bool shell_state::apply_option_letter(options& o, char letter, bool enable) {
+	switch (letter) {
+		case 'a': o.all_export = enable; return true;
+		case 'b': o.notify = enable; return true;
+		case 'C': o.no_clobber = enable; return true;
+		case 'e': o.exit_on_error = enable; return true;
+		case 'f': o.no_glob = enable; return true;
+		case 'h': o.hash_all = enable; return true;
+		case 'm': o.monitor = enable; return true;
+		case 'n': o.no_exec = enable; return true;
+		case 'u': o.error_on_unset = enable; return true;
+		case 'v': o.verbose = enable; return true;
+		case 'x': o.trace = enable; return true;
+		default: return false;
+	}
+}
+
+// The `-o name` spellings, which POSIX lists alongside the letters. `ignoreeof`,
+// `nolog` and `vi` have no letter at all, which is why this is a second table
+// rather than a lookup from name to letter.
+bool shell_state::apply_option_name(options& o, std::string_view name, bool enable) {
+	if (name == "allexport") { o.all_export = enable; return true; }
+	if (name == "errexit")   { o.exit_on_error = enable; return true; }
+	if (name == "ignoreeof") { o.ignore_eof = enable; return true; }
+	if (name == "monitor")   { o.monitor = enable; return true; }
+	if (name == "noclobber") { o.no_clobber = enable; return true; }
+	if (name == "noexec")    { o.no_exec = enable; return true; }
+	if (name == "noglob")    { o.no_glob = enable; return true; }
+	if (name == "nolog")     { o.no_log = enable; return true; }
+	if (name == "notify")    { o.notify = enable; return true; }
+	if (name == "nounset")   { o.error_on_unset = enable; return true; }
+	if (name == "verbose")   { o.verbose = enable; return true; }
+	if (name == "vi")        { o.vi = enable; return true; }
+	if (name == "xtrace")    { o.trace = enable; return true; }
+	return false;
 }
 
 char** shell_state::environment_block() {

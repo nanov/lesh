@@ -194,6 +194,8 @@ add_library(lesh_runtime STATIC
 	src/runtime/pattern.cpp
 	src/runtime/pattern.h
 	src/runtime/expander.h
+	src/runtime/invocation.cpp
+	src/runtime/invocation.h
 	src/runtime/shell_state.cpp
 	src/runtime/signals.cpp
 	src/runtime/signals.h
@@ -213,6 +215,7 @@ add_executable(lesh_tests
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
+	tests/unit/invocation_tests.cpp
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
