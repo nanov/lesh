@@ -142,9 +142,18 @@ void signal_state::reset_for_subshell() {
 	// POSIX: a subshell resets traps to default, EXCEPT those set to ignore, which
 	// remain ignored. The asymmetry exists so `trap '' INT` genuinely protects a
 	// whole subtree, while a handler belongs to the shell that set it.
+	//
+	// The command TEXT is kept even though the disposition goes back to default.
+	// Those are two different things, and conflating them made both halves wrong:
+	// `trap` in a subshell must still report the traps it INHERITED - that is the
+	// only portable way to save and restore them, `saved=$(trap)`, and POSIX.1-2024
+	// requires it - while the actions themselves must no longer be taken. dash
+	// reports nothing here and is behind the standard on it.
 	for (int i = 0; i < kMaxSignal; ++i) {
-		if (_entries[i].how == disposition::handler)
-			reset(i);
+		if (_entries[i].how == disposition::handler) {
+			_entries[i].how = disposition::default_action;
+			install(i);  // the text stays; only the action reverts
+		}
 	}
 	// Pending signals do not carry into a subshell either.
 	for (int i = 0; i < kMaxSignal; ++i)

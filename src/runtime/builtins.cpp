@@ -262,11 +262,21 @@ void print_trap(const signal_state& sigs, int signo, bool include_default) {
 			std::fputs("trap -- ", stdout);
 			print_single_quoted(sigs.trap_command(signo));
 			break;
-		case disposition::default_action:
+		case disposition::default_action: {
+			// A command may still be recorded here: a subshell reverts the ACTION to
+			// default but keeps the text, so `trap` reports what it inherited. That
+			// is what makes `saved=$(trap)` able to save a parent's traps.
+			const std::string_view inherited = sigs.trap_command(signo);
+			if (!inherited.empty()) {
+				std::fputs("trap -- ", stdout);
+				print_single_quoted(inherited);
+				break;
+			}
 			if (!include_default)
 				return;
 			std::fputs("trap -- -", stdout);
 			break;
+		}
 	}
 	std::printf(" %.*s\n", static_cast<int>(name.size()), name.data());
 }

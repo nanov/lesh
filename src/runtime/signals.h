@@ -41,6 +41,9 @@ public:
 	void reset(int signo);
 
 	[[nodiscard]] disposition disposition_of(int signo) const;
+	// The recorded command. Non-empty even after a subshell reset the disposition to
+	// default, because `trap` must still REPORT what it inherited - see
+	// reset_for_subshell.
 	[[nodiscard]] std::string_view trap_command(int signo) const;
 
 	// Signals that arrived since the last check. Consumed by the executor between

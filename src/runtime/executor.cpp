@@ -27,6 +27,15 @@ using syntax::tree;
 
 namespace {
 
+// A variable's value before an assignment prefix overwrote it, so a function call
+// can put it back. Owns its strings: the state's own storage is what is being
+// overwritten, so a view into it would dangle.
+struct saved_variable {
+	std::string name;
+	std::string value;
+	bool was_set = false;
+};
+
 // Turns a wait(2) status into the value POSIX defines for `$?`.
 int status_from_wait(int wait_status) noexcept {
 	if (WIFEXITED(wait_status))
@@ -802,7 +811,9 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 			dup2(devnull, STDIN_FILENO);
 			close(devnull);
 		}
+		_exit_trap_ran = false;
 		const int status = run_node(t, t.child_of(t[n], 0));
+		run_exit_trap();
 		std::fflush(nullptr);
 		_exit(status);
 	}
@@ -825,9 +836,15 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 		setpgid(0, 0);
 		// POSIX: a subshell resets traps to default, except those set to ignore.
 		_state.signals().reset_for_subshell();
+		// The subshell gets its own EXIT trap, and the flag must be cleared for it:
+		// a subshell forked from INSIDE the parent's EXIT trap inherits a raised
+		// flag and would skip its own. `trap '(trap "echo x" EXIT)' EXIT` is exactly
+		// that shape.
+		_exit_trap_ran = false;
 		const int status = t[n].children_count > 0
 		                   ? run_node(t, t.child_of(t[n], 0))
 		                   : 0;
+		run_exit_trap();
 		std::fflush(nullptr);
 		_exit(status);
 	}
@@ -1007,18 +1024,44 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		int status = 0;
 		std::fflush(nullptr);
 		const bool ok = apply_redirections(t, n, &saved);
+		// POSIX: an assignment prefixing a FUNCTION call affects the current
+		// environment for the duration of the call, and whether it persists
+		// afterwards is unspecified. dash and bash both restore, and so does the
+		// conformance suite's expectation: `foo=2; foo=3 f` shows 3 inside f and 2
+		// after. Applying them AFTER the call - which is what this did - both hid
+		// them from the function and made them permanent.
+		std::vector<saved_variable> restore_vars;
+		if (ok) {
+			restore_vars.reserve(assignments.size());
+			for (const auto& a : assignments) {
+				const size_t eq = a.find('=');
+				if (eq == std::string_view::npos)
+					continue;
+				saved_variable sv;
+				sv.name.assign(a.substr(0, eq));
+				std::string_view previous;
+				sv.was_set = _state.lookup(sv.name, previous);
+				if (sv.was_set)
+					sv.value.assign(previous);
+				restore_vars.push_back(std::move(sv));
+				apply_assignment(a);
+			}
+		}
 		bool ran = false;
 		if (ok)
 			ran = try_run_function(t, argv, status);
+		for (const auto& sv : restore_vars) {
+			if (sv.was_set)
+				_state.set(sv.name, sv.value);
+			else
+				_state.unset(sv.name);
+		}
 		std::fflush(nullptr);
 		restore_fds(saved);
 		if (!ok)
 			return 1;
-		if (ran) {
-			for (const auto& a : assignments)
-				apply_assignment(a);
+		if (ran)
 			return status;
-		}
 	}
 
 	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
@@ -1286,6 +1329,11 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 		dup2(pipe_fds[1], STDOUT_FILENO);
 		close(pipe_fds[1]);
 
+		// A subshell environment, so the traps reset here too. Without this the
+		// PARENT's EXIT trap ran inside every command substitution - `trap 'echo T'
+		// EXIT; x=$(echo body)` put T into x.
+		_state.signals().reset_for_subshell();
+		_exit_trap_ran = false;
 		// The substitution's contents are a fresh parse. Nesting works because this
 		// is the same code path, reached recursively.
 		buffer_pool inner_pool{BUFFER_POOL_SIZE};

@@ -19,6 +19,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Signal-related tests hang against a shell without job control or trap. Listed
@@ -71,8 +72,9 @@ def parse_results(trs: Path) -> tuple[int, int, int]:
     return passed, passed + failed, skipped
 
 
-def run_case(runner: Path, shell: str, case: Path, timeout: float) -> tuple[str, str]:
-    """Runs one case in its own process group. Returns (outcome, detail)."""
+def run_case(runner: Path, shell: str, case: Path,
+             timeout: float) -> tuple[str, str, float]:
+    """Runs one case in its own process group. Returns (outcome, detail, seconds)."""
     try:
         proc = subprocess.Popen(
             # runner.name, not str(runner): cwd is already the suite directory, so a
@@ -86,8 +88,9 @@ def run_case(runner: Path, shell: str, case: Path, timeout: float) -> tuple[str,
             start_new_session=True,  # own group, so killpg reaches grandchildren
         )
     except OSError as e:
-        return "error", str(e)
+        return "error", str(e), 0.0
 
+    started = time.monotonic()
     try:
         out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -98,17 +101,18 @@ def run_case(runner: Path, shell: str, case: Path, timeout: float) -> tuple[str,
         except (ProcessLookupError, PermissionError):
             proc.kill()
         proc.communicate()
-        return "timeout", ""
+        return "timeout", "", time.monotonic() - started
 
+    elapsed = time.monotonic() - started
     passed, total, skipped = parse_results(case.with_suffix(".trs"))
     if total == 0:
         # The suite declined to run its own cases - a missing prerequisite, not a
         # failure of the shell. Distinguishing this from a runner malfunction is
         # the difference between "not measured" and "broken".
         if skipped > 0:
-            return "suite-skipped", f"{skipped} cases skipped by the suite"
-        return "error", "no assertions ran"
-    return "counted", f"{passed}/{total}"
+            return "suite-skipped", f"{skipped} cases skipped by the suite", elapsed
+        return "error", "no assertions ran", elapsed
+    return "counted", f"{passed}/{total}", elapsed
 
 
 def main() -> int:
@@ -117,7 +121,12 @@ def main() -> int:
                     help="directory holding run-test.sh and the .tst files")
     ap.add_argument("--shell", default="./build/debug/lesh")
     ap.add_argument("--frontend", choices=["legacy", "next"], default="next")
-    ap.add_argument("--timeout", type=float, default=10.0)
+    # 10 seconds was the original default, and it was WRONG: a signal file holds 180
+    # cases, each spawning several processes, and takes a few seconds on an idle
+    # machine. Anything else running pushed it past the line, so six files dropped out
+    # of the denominator and the score moved with the machine's load rather than with
+    # the shell. A timeout that decides the score is a scoreboard bug, not a setting.
+    ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--include-signal-tests", action="store_true",
                     help="run the job-control tests too; they hang without terminal ownership")
     ap.add_argument("--verbose", "-v", action="store_true")
@@ -146,19 +155,28 @@ def main() -> int:
     assertions_total = 0
     files = {"counted": 0, "timeout": 0, "error": 0, "skipped": 0,
              "suite-skipped": 0}
+    slow: list[tuple[str, float]] = []
 
     for case in cases:
         if not args.include_signal_tests and is_excluded(case.name):
             files["skipped"] += 1
             continue
-        outcome, detail = run_case(runner, os.path.abspath(args.shell), case, args.timeout)
+        outcome, detail, elapsed = run_case(runner, os.path.abspath(args.shell),
+                                            case, args.timeout)
         files[outcome] += 1
+        # Report anything that got close to the limit, so the next timeout is seen
+        # coming instead of silently shrinking the denominator.
+        if outcome != "timeout" and elapsed > args.timeout / 4:
+            slow.append((case.name, elapsed))
         if outcome == "counted":
             p, t_ = detail.split("/")
             assertions_passed += int(p)
             assertions_total += int(t_)
         if args.verbose or outcome in ("timeout", "error", "suite-skipped"):
             print(f"  {outcome:8} {case.name} {detail}")
+
+    for name, elapsed in sorted(slow, key=lambda p: -p[1]):
+        print(f"  slow     {name} took {elapsed:.1f}s of a {args.timeout:.0f}s limit")
 
     pct = (100.0 * assertions_passed / assertions_total) if assertions_total else 0.0
     print(f"\nyash POSIX subset, front end '{args.frontend}': "
