@@ -1,6 +1,0 @@
-# Note the blocking nature of opening a FIFO
-mkfifo fifo1 fifo2
-echo foo >fifo1 &
-cat fifo1 >fifo2 &
-cat fifo2 &
-wait $!

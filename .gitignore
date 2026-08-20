@@ -63,5 +63,8 @@ compile_commands.json
 # Serena tool state
 .serena/
 
-# yash suite results, regenerated on every run
+# yash suite scratch, regenerated on every run. The tmp.NNN directories are
+# per-test working copies the suite creates and cleans up itself - they were
+# committed once because a run was in flight when third_party/ was added.
 third_party/yash-tests/*.trs
+third_party/yash-tests/tmp.*/

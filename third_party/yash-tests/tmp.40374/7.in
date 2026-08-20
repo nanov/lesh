@@ -1,3 +1,0 @@
-a=1
-(a=2; echo $a; exit; echo not reached)
-echo $a
