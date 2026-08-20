@@ -240,10 +240,21 @@ target_link_libraries(lesh_header_self_containment PRIVATE lesh_runtime lesh_sub
 find_program(DASH_EXECUTABLE dash)
 find_package(Python3 COMPONENTS Interpreter)
 if(DASH_EXECUTABLE AND Python3_Interpreter_FOUND)
-	add_test(NAME spec_dash
+	# Both front ends are measured, continuously. Parity is tracked as the new
+	# front end grows rather than discovered at the end of the migration - see #8,
+	# and note that legacy's defects masked each other until they were fixed one
+	# at a time.
+	add_test(NAME spec_dash_legacy
 		COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/spec_run.py
 			--shell $<TARGET_FILE:lesh>
 			--ref ${DASH_EXECUTABLE}
+			--frontend legacy
+			${PROJECT_SOURCE_DIR}/tests/spec)
+	add_test(NAME spec_dash_next
+		COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/spec_run.py
+			--shell $<TARGET_FILE:lesh>
+			--ref ${DASH_EXECUTABLE}
+			--frontend next
 			${PROJECT_SOURCE_DIR}/tests/spec)
 else()
 	message(STATUS "spec_dash test skipped: need dash and python3")

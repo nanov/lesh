@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -121,7 +122,39 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// Own process group, so a hung command can be killed as a group and cannot
 		// orphan its children to init. See the note on tree_walking_executor.
 		setpgid(0, 0);
-		execve(argv[0], argv.data(), _state.environment_block());
+
+		// PATH search. execve takes a path, not a command name, and macOS has no
+		// execvpe - so either the environment goes through `environ` and we use
+		// execvp, or the search is explicit. Explicit, because the child's
+		// environment is built from shell state and assigning to environ to smuggle
+		// it into execvp is the kind of hidden coupling this design avoids.
+		char** child_env = _state.environment_block();
+		if (std::strchr(argv[0], '/') != nullptr) {
+			execve(argv[0], argv.data(), child_env);
+		} else {
+			std::string_view path_value;
+			if (!_state.lookup("PATH", path_value))
+				path_value = "/usr/bin:/bin";
+			std::string candidate;
+			size_t at = 0;
+			int last_errno = ENOENT;
+			while (at <= path_value.size()) {
+				const size_t colon = path_value.find(':', at);
+				const std::string_view dir = path_value.substr(
+					at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
+				candidate.assign(dir.empty() ? std::string_view{"."} : dir);
+				candidate += '/';
+				candidate += argv[0];
+				execve(candidate.c_str(), argv.data(), child_env);
+				// Only ENOENT means "keep looking"; anything else is the real answer.
+				if (errno != ENOENT)
+					last_errno = errno;
+				if (colon == std::string_view::npos)
+					break;
+				at = colon + 1;
+			}
+			errno = last_errno;
+		}
 		// POSIX: 127 when the command was not found, 126 when it was found but
 		// could not be executed.
 		std::fprintf(stderr, "lesh: %s: %s\n", argv[0], std::strerror(errno));

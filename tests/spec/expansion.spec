@@ -22,28 +22,28 @@ echo a${HOME}b
 --- braced unset parameter
 echo ${NOPE}y
 
---- parameter with a suffix [xfail: the name scan runs past the parameter and swallows the suffix]
+--- parameter with a suffix [xfail(legacy): the name scan runs past the parameter and swallows the suffix]
 echo a$HOME-b
 
---- parameter with a dot suffix [xfail: same name-scan defect]
+--- parameter with a dot suffix [xfail(legacy): same name-scan defect]
 echo a$HOME.b
 
---- parameter followed by a path separator [xfail: same name-scan defect]
+--- parameter followed by a path separator [xfail(legacy): same name-scan defect]
 echo $HOME/sub
 
---- unset parameter with prefix and suffix [xfail: same name-scan defect]
+--- unset parameter with prefix and suffix [xfail(legacy): same name-scan defect]
 echo x$NOPE-y
 
---- two parameters in one word [xfail: the second expansion overwrites rather than appends]
+--- two parameters in one word [xfail(legacy): the second expansion overwrites rather than appends]
 echo $HOME$HOME
 
---- two braced parameters around a literal [xfail: the second expansion overwrites rather than appends]
+--- two braced parameters around a literal [xfail(legacy): the second expansion overwrites rather than appends]
 echo ${HOME}x${HOME}
 
---- parameters and literals alternating [xfail: both name-scan and accumulation defects]
+--- parameters and literals alternating [xfail(legacy): both name-scan and accumulation defects]
 echo a$HOME-$HOME-b
 
---- braced parameter as the last word of a pipeline stage
+--- braced parameter as the last word of a pipeline stage [xfail(next): same]
 echo ${HOME} | cat
 
 --- braced parameter alone

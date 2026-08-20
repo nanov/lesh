@@ -51,6 +51,10 @@ x .d88"               z`    ^%    .uef^"
 #include "legacy/shell_state.h"
 #include "legacy/zsh_parser_plus.h"
 
+#include "runtime/executor.h"
+#include "runtime/shell_state.h"
+#include "syntax/parser.h"
+
 #include "replxx.hxx"
 #include <sol/sol.hpp>
 
@@ -188,14 +192,23 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 
 } // namespace
 
+// Runs input through the replacement front end: lex, parse, execute.
+//
+// Incomplete on purpose - pipelines, command substitution, compound commands and
+// here-documents are not implemented, and each says so rather than silently
+// doing nothing. The differential harness can therefore measure the new front
+// end against dash today, which is the whole point of the strangler seam: parity
+// is tracked continuously rather than discovered at the end.
+int run_next_front_end(std::string_view source) {
+	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
+	lesh::runtime::shell_state state;
+	lesh::runtime::tree_walking_executor executor{pool, state};
+	const lesh::syntax::tree t = lesh::syntax::parse(pool, source);
+	return executor.run(t);
+}
+
 int main(int argc, char **argv, char **envp) {
-	if (select_front_end() == front_end::next) {
-		// The replacement front end (issues #9 through #12) is not built yet. Fail
-		// loudly rather than silently falling back, so a harness run against
-		// LESH_FRONTEND=next can never be mistaken for a passing legacy run.
-		std::fprintf(stderr, "lesh: LESH_FRONTEND=next is not implemented yet\n");
-		return 2;
-	}
+	const bool use_next = select_front_end() == front_end::next;
 
 	const char* command_string = nullptr;
 	const char* script_path = nullptr;
@@ -238,10 +251,19 @@ int main(int argc, char **argv, char **envp) {
 	zsh_parser.init_aliases();
 
 	if (command_string) {
+		if (use_next)
+			return run_next_front_end(command_string);
 		std::string line{command_string};
 		bool should_exit = false;
 		int last_status = 0;
 		return run_line(zsh_parser, line, should_exit, last_status);
+	}
+
+	if (use_next) {
+		// Only -c is wired to the new front end so far. Refuse the rest rather than
+		// falling back to legacy, which would make a harness run look like a pass.
+		std::fprintf(stderr, "lesh: LESH_FRONTEND=next currently supports -c only\n");
+		return 2;
 	}
 
 	if (script_path) {

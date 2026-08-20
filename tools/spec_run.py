@@ -24,7 +24,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-CASE_RE = re.compile(r"^---\s+(?P<name>.+?)\s*(?:\[xfail:\s*(?P<xfail>[^\]]*)\])?\s*$")
+_FRONTEND = None
+
+# `[xfail: reason]` applies to every front end; `[xfail(next): reason]` to one.
+# Scoping became necessary the moment both front ends were live: they fail
+# different things, and one shared marker list would hide a regression in
+# whichever front end happened not to be under test.
+CASE_RE = re.compile(
+    r"^---\s+(?P<name>.+?)\s*"
+    r"(?:\[xfail(?:\((?P<scope>[a-z]+)\))?:\s*(?P<xfail>[^\]]*)\])?\s*$")
 
 
 @dataclass
@@ -32,6 +40,7 @@ class Case:
     name: str
     code: str
     xfail: str | None
+    xfail_scope: str | None  # None = all front ends
     path: Path
     line: int
 
@@ -46,18 +55,18 @@ class Run:
 
 def parse_spec(path: Path) -> list[Case]:
     cases: list[Case] = []
-    name = xfail = None
+    name = xfail = scope = None
     start = 0
     body: list[str] = []
 
     def flush():
         if name is not None and (code := "\n".join(body).strip()):
-            cases.append(Case(name, code, xfail, path, start))
+            cases.append(Case(name, code, xfail, scope, path, start))
 
     for lineno, raw in enumerate(path.read_text().splitlines(), 1):
         if m := CASE_RE.match(raw):
             flush()
-            name, xfail, start, body = m["name"], m["xfail"], lineno, []
+            name, xfail, scope, start, body = m["name"], m["xfail"], m["scope"], lineno, []
         elif name is None and (not raw.strip() or raw.lstrip().startswith("#")):
             continue  # file header
         else:
@@ -79,6 +88,8 @@ def child_env() -> dict[str, str]:
     env = dict(os.environ)
     opts = [o for o in env.get("ASAN_OPTIONS", "").split(":") if o and not o.startswith("detect_leaks")]
     env["ASAN_OPTIONS"] = ":".join(opts + ["detect_leaks=0"])
+    if _FRONTEND is not None:
+        env["LESH_FRONTEND"] = _FRONTEND
     return env
 
 
@@ -117,8 +128,13 @@ def main() -> int:
     ap.add_argument("--ref", default="dash", help="reference shell (dash for the POSIX floor)")
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--verbose", "-v", action="store_true", help="show diffs for expected failures too")
+    ap.add_argument("--frontend", default=None, choices=["legacy", "next"],
+                    help="which lesh front end to exercise (sets LESH_FRONTEND)")
     ap.add_argument("paths", nargs="*", default=["tests/spec"])
     args = ap.parse_args()
+
+    global _FRONTEND
+    _FRONTEND = args.frontend
 
     files: list[Path] = []
     for p in map(Path, args.paths):
@@ -128,6 +144,9 @@ def main() -> int:
         return 2
 
     passed = xfailed = failed = xpassed = 0
+
+    if args.frontend:
+        print(f"front end under test: {args.frontend}")
 
     for path in files:
         print(f"\n{path}")
@@ -143,7 +162,11 @@ def main() -> int:
             # stderr text is implementation-specific; compare only whether it is empty.
             problems += diff("stderr?", str(bool(got.stderr)), str(bool(ref.stderr)))
 
-            if problems and case.xfail is not None:
+            # A scoped marker applies only when that front end is under test.
+            expected_to_fail = case.xfail is not None and (
+                case.xfail_scope is None or case.xfail_scope == (args.frontend or "legacy"))
+
+            if problems and expected_to_fail:
                 xfailed += 1
                 print(f"  xfail  {case.name}  ({case.xfail})")
                 if args.verbose:
@@ -152,7 +175,7 @@ def main() -> int:
                 failed += 1
                 print(f"  FAIL   {case.name}  ({path}:{case.line})")
                 print("\n".join(problems))
-            elif case.xfail is not None:
+            elif expected_to_fail:
                 xpassed += 1
                 print(f"  XPASS  {case.name}  -- now passes, remove the xfail marker")
             else:
