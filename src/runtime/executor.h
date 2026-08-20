@@ -77,6 +77,12 @@ private:
 	bool consume_loop_flow(bool& should_break);
 	// Parses and runs source in this environment. Used by `eval` and `.`.
 	int run_source(std::string_view source);
+	// `exec`. Returns only when there is no command to become, or the exec failed;
+	// on success this process IS the command. See the definition for why it is not
+	// a builtins.cpp builtin.
+	int run_exec(const syntax::tree& t, syntax::node_index n,
+	             arena_array<char*>& argv,
+	             const arena_array<std::string_view>& assignments, bool demoted);
 	int run_negation(const syntax::tree& t, syntax::node_index n);
 
 	// True when a failing command must exit the shell rather than merely end a list.

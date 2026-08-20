@@ -395,3 +395,48 @@ false & wait $!; echo "one=$?"; true & wait $!; echo "two=$?"
 
 --- wait on a pid that is not a child reports 127 [xfail(legacy): legacy has no asynchronous lists]
 wait 99999; echo "wait=$?"
+
+--- exec replaces the shell rather than forking [xfail(legacy): legacy has no exec builtin]
+exec echo replaced; echo notreached
+
+--- exec with no command runs only the redirections [xfail(legacy): legacy has no exec builtin]
+exec; echo reached; exec 2>/dev/null; echo still-here
+
+--- exec redirection outlives the command [xfail(legacy): legacy has no exec builtin]
+F=/tmp/lesh_spec_exec_redir; (exec > $F; echo written); cat $F; rm -f $F
+
+--- an assignment prefixing exec persists because exec is a special builtin [xfail(legacy): legacy has no exec builtin]
+x=1 exec; echo "x=$x"
+
+--- an assignment prefixing exec reaches the new image's environment [xfail(legacy): legacy has no exec builtin]
+LESH_SPEC_EXEC=bar exec sh -c 'echo "got=$LESH_SPEC_EXEC"'
+
+--- exec in a subshell replaces only the subshell [xfail(legacy): legacy has no exec builtin]
+(exec echo inner); echo "after=$?"
+
+--- exec in a pipeline stage replaces only that stage [xfail(legacy): legacy has no exec builtin]
+exec echo piped | cat; echo "after=$?"
+
+--- exec with a command that is not found reports 127 and exits [xfail(legacy): legacy has no exec builtin]
+(exec ./_lesh_no_such_command_); echo "sub=$?"; exec ./_lesh_no_such_command_; echo notreached
+
+--- exec with a file that is not executable reports 126 and exits [xfail(legacy): legacy has no exec builtin]
+exec /etc/hosts; echo notreached
+
+--- a redirection failure on exec exits a non-interactive shell [xfail(legacy): legacy has no exec builtin]
+exec < /_lesh_no_such_file_; echo notreached
+
+--- command exec demotes the special builtin so a redirection failure is survivable [xfail(legacy): legacy has no exec builtin]
+command exec < /_lesh_no_such_file_; status=$?; echo "survived=$status"
+
+--- exec keeps the fd it opened inside a grouping [xfail(legacy): legacy has no exec builtin]
+{ exec 4>&3; } 3>&2; echo grouped >&4; echo "after=$?"
+
+--- exec preserves the process id [xfail(legacy): legacy has no exec builtin]
+exec sh -c "[ \$\$ -eq $$ ] && echo same-pid"
+
+--- an ignored signal stays ignored across exec [xfail(legacy): legacy has no exec builtin]
+trap '' INT; exec sh -c 'kill -INT $$; echo survived'
+
+--- the EXIT trap runs when exec fails [xfail(legacy): legacy has no exec builtin]
+trap 'echo trapped' EXIT; exec ./_lesh_no_such_command_; echo notreached

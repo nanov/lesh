@@ -73,8 +73,14 @@ void exec_as_script(std::string_view self, const char* file, char** argv, char**
 	execve(self_owned.c_str(), rewritten.data(), env);
 }
 
-[[noreturn]] void exec_or_die(char** argv, char** env, std::string_view path_value,
-                              std::string_view self_path) {
+// Searches PATH and execs, returning only on failure - and then the errno that
+// says why, rather than acting on it.
+//
+// Split out of exec_or_die because the `exec` builtin must be able to SURVIVE a
+// failure: POSIX lets an interactive shell report and carry on, and a process
+// that has already _exit()ed cannot. A forked child still wants exec_or_die.
+int search_and_exec(char** argv, char** env, std::string_view path_value,
+                    std::string_view self_path) {
 	if (std::strchr(argv[0], '/') != nullptr) {
 		execve(argv[0], argv, env);
 		if (errno == ENOEXEC)
@@ -105,11 +111,17 @@ void exec_as_script(std::string_view self, const char* file, char** argv, char**
 		}
 		errno = last_errno;
 	}
-	std::fprintf(stderr, "lesh: %s: %s\n", argv[0], std::strerror(errno));
+	return errno;
+}
+
+[[noreturn]] void exec_or_die(char** argv, char** env, std::string_view path_value,
+                              std::string_view self_path) {
+	const int failure = search_and_exec(argv, env, path_value, self_path);
+	std::fprintf(stderr, "lesh: %s: %s\n", argv[0], std::strerror(failure));
 	// POSIX: 127 when the command was not found, 126 when it was found but could
 	// not be executed. _exit, not exit: never flush buffers inherited from the
 	// parent.
-	_exit(errno == ENOENT ? 127 : 126);
+	_exit(failure == ENOENT ? 127 : 126);
 }
 
 // A redirection's default fd when none was written: `>` means 1, `<` means 0.
@@ -963,6 +975,111 @@ void tree_walking_executor::apply_assignment(std::string_view text) {
 	_state.set(text.substr(0, eq), ex.expand_assignment_value(text.substr(eq + 1)));
 }
 
+// `exec [--] [command [argument...]]`.
+//
+// This cannot be a builtins.cpp builtin. A builtin is handed argv and returns a
+// status, and exec's whole contract is that on success it NEVER returns - the
+// shell is gone. It also needs its redirections applied WITHOUT saving them,
+// which is the one place that distinction is observable: `exec >log` is how a
+// script redirects itself for the rest of its life. So it lives here beside
+// `eval`, `.` and `wait`, which are in the executor for the same kind of reason.
+//
+// `demoted` is true when the command was written `command exec ...`, which POSIX
+// says makes a special builtin behave like a regular one - so its errors stop
+// being fatal to the shell. exec-p.tst's 'redirection error on exec' case checks
+// exactly that, by requiring the shell to survive and report 1..125.
+//
+// Returns only when there was no command to become, or the exec failed.
+int tree_walking_executor::run_exec(const tree& t, node_index n,
+                                    arena_array<char*>& argv,
+                                    const arena_array<std::string_view>& assignments,
+                                    bool demoted) {
+	const bool fatal = !demoted && !_state.interactive();
+
+	// Flush BEFORE redirecting. A builtin writes through stdio, so bytes queued
+	// earlier still sit in the FILE* buffer and would otherwise land in the file
+	// `exec` has just opened - the same trap the builtin path documents.
+	std::fflush(nullptr);
+	// nullptr for `restore`: exec's redirections OUTLIVE the command, whether or
+	// not a command follows. That is the whole difference from every other
+	// builtin, all of which save and put their fds back.
+	if (!apply_redirections(t, n, nullptr)) {
+		// POSIX: a redirection error on a SPECIAL builtin is fatal to a
+		// non-interactive shell. Verified against dash, which exits 2 for both
+		// `exec <missing` and `exec >&3` on a closed fd, and survives with status 2
+		// under `command exec`. The EXIT trap still runs, which is why this sets
+		// the flag rather than calling _exit.
+		if (fatal)
+			_exit_requested = true;
+		return 2;
+	}
+
+	// POSIX XBD 12.2 guideline 10: `--` ends the options, and exec has none, so it
+	// is simply skipped. dash does NOT do this - `dash -c 'exec -- echo hi'` says
+	// `exec: --: not found` - and fails both `-- separator` cases in exec-p.tst.
+	// Divergence recorded rather than copied: dash is behind the standard here.
+	size_t first = 1;
+	if (argv[1] != nullptr && std::string_view{argv[1]} == "--")
+		first = 2;
+
+	if (argv[first] == nullptr) {
+		// No command: the redirections were the whole point. The assignments persist
+		// because exec is a special builtin, and they persist UNEXPORTED - dash
+		// leaves `FOO=bar exec` visible to the shell but absent from `env`.
+		for (const auto& a : assignments)
+			apply_assignment(a);
+		return 0;
+	}
+
+	// Drop `exec` and any `--` by shifting the rest down; the arena owns the
+	// strings and the trailing nullptr moves with them.
+	for (size_t i = 0; i + first < argv.size(); ++i)
+		argv[i] = argv[i + first];
+	argv.truncate(argv.size() - first);
+
+	// An assignment prefixing exec belongs to the new image's ENVIRONMENT, not
+	// just to shell state: `FOO=bar exec env` prints FOO=bar in dash. There is no
+	// "afterwards" to restore it for, so this is exported outright.
+	{
+		expander ex{_pool, _state, &_runner, true, &_state, &_state};
+		for (const auto& a : assignments) {
+			const size_t eq = a.find('=');
+			if (eq == std::string_view::npos)
+				continue;
+			_state.set_exported(a.substr(0, eq),
+			                    ex.expand_assignment_value(a.substr(eq + 1)));
+		}
+	}
+
+	std::string_view path_value;
+	if (!_state.lookup("PATH", path_value))
+		path_value = "/usr/bin:/bin";
+	// Nothing after this point runs on success: execve replaces the image. Flush
+	// first or anything still buffered dies with it.
+	std::fflush(nullptr);
+	const int failure = search_and_exec(argv.data(), _state.environment_block(),
+	                                   path_value, _state.own_path());
+
+	// dash's shape, minus the line number lesh does not track:
+	// `dash: 1: exec: ./_no_such_command_: not found`. exec-p.tst only requires
+	// stderr to be non-empty (test_O -d), so this is not compared anywhere - but a
+	// message that names the builtin is what makes the failure findable, and
+	// `not found` rather than strerror's `No such file or directory` is what every
+	// other shell prints for a command search that came up empty.
+	std::fprintf(stderr, "lesh: exec: %s: %s\n", argv[0],
+	             failure == ENOENT ? "not found" : std::strerror(failure));
+	// POSIX: 127 when the command was not found, 126 when it was found but could
+	// not be executed. Confirmed against dash: `exec ./_no_such_command_` is 127,
+	// `exec ./mode-000-file` and `exec /tmp` are both 126 with `Permission denied`.
+	const int status = failure == ENOENT ? 127 : 126;
+	// The failure exits a NON-INTERACTIVE shell. An interactive one reports and
+	// survives, which is exec-p.tst's 'executing non-existing command (relative,
+	// interactive)' case - dash fails that one by exiting anyway.
+	if (fatal)
+		_exit_requested = true;
+	return status;
+}
+
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// POSIX 2.9.1: a command with no command name completes with the status of the
 	// LAST command substitution it performed, and only zero when it performed none.
@@ -1071,6 +1188,16 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// This is the cycle the ports in #11 were designed to survive: parsing inside
 	// execution, with the parse seeing the same aliases and the execution seeing
 	// the same state.
+
+	// `exec` replaces this process, so it lives here too. Until this landed it was
+	// in kSpecialBuiltins with no handler anywhere, so try_run_builtin found
+	// nothing and returned success: `exec echo hi; echo notreached` printed only
+	// `notreached`. A stub that silently succeeds is worse than an absent builtin -
+	// the same mistake `command` made earlier on #31, which cost 19 of 49
+	// assertions in command-p.tst.
+	if (std::string_view{argv[0]} == "exec")
+		return run_exec(t, n, argv, assignments, bypass_functions);
+
 	// `wait` needs the executor's record of background jobs, so it lives here
 	// alongside eval and . rather than in builtins.cpp.
 	if (std::string_view{argv[0]} == "wait") {
@@ -1250,6 +1377,16 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 					setpgid(0, group);
 					if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
 					if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
+					// `exec` in a pipeline stage replaces only THAT stage's process, so it
+					// is dispatched here rather than through try_run_builtin, which has no
+					// entry for it and would have made `exec echo foo | cat` print
+					// nothing. run_exec applies the stage's redirections itself, so it must
+					// come before the apply_redirections below rather than after it.
+					if (std::string_view{argv[0]} == "exec") {
+						const int exec_status = run_exec(t, stage, argv, assignments, false);
+						std::fflush(nullptr);
+						_exit(exec_status);
+					}
 					int status = 0;
 					arena_array<saved_fd> ignored{_pool, 2};
 					(void)apply_redirections(t, stage, &ignored);

@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <fstream>
 #include <string>
 
 using namespace lesh::runtime;
@@ -221,4 +223,93 @@ TEST_F(ExecutorTest, WaitWithNoOperandsIsAlwaysZero) {
 TEST_F(ExecutorTest, WaitOnANonChildReportsTheStatusPosixDefines) {
 	// 127, and no diagnostic: this is a specified result, not a failure.
 	EXPECT_EQ(run("wait 99999"), 127);
+}
+
+// --- exec --------------------------------------------------------------------
+//
+// `exec` was in kSpecialBuiltins with no handler anywhere, so try_run_builtin
+// found nothing and reported success: `exec echo hi; echo notreached` printed
+// only `notreached`. Every case below is a behaviour that stub silently had
+// wrong. The replacing cases run inside a subshell on purpose - an `exec` at the
+// top level of these tests would replace the test binary itself.
+
+TEST_F(ExecutorTest, ExecWithNoCommandKeepsTheShellRunning) {
+	// Only the redirections happen, and the shell carries on. Reaching `exit 42`
+	// is the proof; a shell that had been replaced could not.
+	EXPECT_EQ(run("exec; exit 42"), 42);
+}
+
+TEST_F(ExecutorTest, ExecReplacesTheProcessRatherThanForking) {
+	// The `exit 42` after it never runs, which is the only observable difference
+	// between replacing this process and spawning a child.
+	EXPECT_EQ(run("(exec /usr/bin/true; exit 42)"), 0);
+	EXPECT_EQ(run("(exec /usr/bin/false; exit 42)"), 1);
+}
+
+TEST_F(ExecutorTest, ExecRedirectionOutlivesTheCommand) {
+	// `exec >file` is how a script redirects itself for good, and it is the one
+	// place where "apply without saving" is observable. Inside a subshell so the
+	// test binary's own stdout survives.
+	const std::string path = ::testing::TempDir() + "lesh_exec_redirect.txt";
+	ASSERT_EQ(run("(exec >" + path + "; /bin/echo written)"), 0);
+	std::ifstream written{path};
+	std::string line;
+	std::getline(written, line);
+	EXPECT_EQ(line, "written") << "the redirection did not outlive the exec";
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ExecFailureExitsANonInteractiveShell) {
+	// POSIX: 127 not found, 126 found but not executable, and a non-interactive
+	// shell EXITS - so `exit 42` must be unreachable in both.
+	EXPECT_EQ(run("exec /nonexistent/command/xyz; exit 42"), 127);
+	EXPECT_EQ(run("exec /etc/hosts; exit 42"), 126);
+}
+
+TEST_F(ExecutorTest, ExecFailureLeavesAnInteractiveShellAlive) {
+	// The other half of the same POSIX sentence, and the half dash gets wrong: it
+	// exits interactively too. exec-p.tst asserts the shell survives and reports
+	// 127, so lesh follows the standard rather than the reference shell.
+	state.set_interactive(true);
+	EXPECT_EQ(run("exec /nonexistent/command/xyz; exit 42"), 42);
+}
+
+TEST_F(ExecutorTest, ExecRedirectionFailureIsFatalToANonInteractiveShell) {
+	// A redirection error on a SPECIAL builtin kills a non-interactive shell.
+	// dash exits 2 here, for both a missing file and a closed fd.
+	EXPECT_EQ(run("exec </nonexistent/file/xyz; exit 42"), 2);
+	EXPECT_EQ(run("exec >&9; exit 42"), 2);
+}
+
+TEST_F(ExecutorTest, CommandPrefixDemotesExecSoARedirectionFailureIsSurvivable) {
+	// POSIX: `command` makes a special builtin behave like a regular one, which
+	// removes the "exits the shell" half. exec-p.tst's 'redirection error on exec'
+	// case tests exactly this and requires a status of 1..125.
+	EXPECT_EQ(run("command exec </nonexistent/file/xyz; exit 42"), 42);
+}
+
+TEST_F(ExecutorTest, ExecAssignmentPersistsWhenThereIsNoCommand) {
+	// exec is a special builtin, so a prefixing assignment outlives it. dash
+	// leaves it visible to the shell and absent from `env`, so it is set, not
+	// exported.
+	run("PERSISTED=yes exec");
+	std::string_view value;
+	ASSERT_TRUE(state.lookup("PERSISTED", value));
+	EXPECT_EQ(value, "yes");
+}
+
+TEST_F(ExecutorTest, ExecAcceptsTheDoubleDashSeparator) {
+	// POSIX XBD 12.2 guideline 10. dash does NOT accept it - `exec -- echo hi`
+	// reports `exec: --: not found` - and fails both `-- separator` cases in
+	// exec-p.tst. A deliberate divergence from the reference shell.
+	EXPECT_EQ(run("exec --; exit 42"), 42);
+	EXPECT_EQ(run("(exec -- /usr/bin/false; exit 42)"), 1);
+}
+
+TEST_F(ExecutorTest, ExecInAPipelineStageReplacesOnlyThatStage) {
+	// The stage's own process is replaced and the SHELL survives, so `exit 42`
+	// still runs. Without the dispatch in run_pipeline this printed nothing at
+	// all: try_run_builtin has no `exec` entry and reported success.
+	EXPECT_EQ(run("/usr/bin/true | exec /usr/bin/false"), 1);
+	EXPECT_EQ(run("/usr/bin/true | exec /usr/bin/false; exit 42"), 42);
 }
