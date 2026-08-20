@@ -170,3 +170,12 @@ EOT
 --- an empty here-document body [xfail(legacy): legacy has no here-documents]
 cat <<EOT
 EOT
+
+--- arithmetic expansion [xfail: #30 - $(( )) is not implemented]
+echo $((1 + 2))
+
+--- arithmetic in an assignment [xfail: #30]
+i=1; i=$((i + 1)); echo $i
+
+--- arithmetic as a loop counter [xfail: #30]
+i=0; while [ $i -lt 3 ]; do i=$((i+1)); done; echo $i
