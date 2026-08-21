@@ -414,14 +414,8 @@ private:
 		bool has_in = false;
 		if (accept(reserved::kw_in)) {
 			has_in = true;
-			while (peek().kind == token_kind::word && peek_reserved() == reserved::none) {
-				const uint32_t at = advance();
-				node w;
-				w.kind = node_kind::word;
-				w.first_token = at;
-				w.last_token = at;
-				_scratch.push(_tree.add_node(w));
-			}
+			while (peek().kind == token_kind::word && peek_reserved() == reserved::none)
+				_scratch.push(word_node(advance(), node_kind::word));
 		}
 		while (is_separator(peek().kind))
 			advance();
@@ -446,14 +440,8 @@ private:
 		const uint32_t mark = mark_scratch();
 		advance();  // `case`
 
-		if (peek().kind == token_kind::word) {   // the subject
-			const uint32_t at = advance();
-			node w;
-			w.kind = node_kind::word;
-			w.first_token = at;
-			w.last_token = at;
-			_scratch.push(_tree.add_node(w));
-		}
+		if (peek().kind == token_kind::word)    // the subject
+			_scratch.push(word_node(advance(), node_kind::word));
 		accept(reserved::kw_in);
 		while (is_separator(peek().kind))
 			advance();
@@ -468,12 +456,7 @@ private:
 				advance();
 
 			while (peek().kind == token_kind::word) {
-				const uint32_t at = advance();
-				node w;
-				w.kind = node_kind::word;
-				w.first_token = at;
-				w.last_token = at;
-				_scratch.push(_tree.add_node(w));
+				_scratch.push(word_node(advance(), node_kind::word));
 				++patterns;
 				if (peek().kind != token_kind::pipe)
 					break;
@@ -865,18 +848,12 @@ private:
 						continue;
 				}
 				const uint32_t at = advance();
-				node w;
-				w.first_token = at;
-				w.last_token = at;
-				if (!seen_command_name && looks_like_assignment(text_of_token(at))) {
-					w.kind = node_kind::assignment;
-				} else {
-					w.kind = node_kind::word;
+				node_kind kind = node_kind::word;
+				if (!seen_command_name && looks_like_assignment(text_of_token(at)))
+					kind = node_kind::assignment;
+				else
 					seen_command_name = true;
-				}
-				if (_tree.token_at(at).is_error())
-					w.error = parse_error::unterminated_word;
-				_scratch.push(_tree.add_node(w));
+				_scratch.push(word_node(at, kind));
 				continue;
 			}
 
@@ -1105,6 +1082,10 @@ private:
 			n.kind = node_kind::here_doc;
 			n.first_token = first;
 			n.last_token = delimiter;
+			// `cat <<"EOF` - the DELIMITER is a word, and an unterminated one makes
+			// the redirection as unrunnable as an unterminated argument does.
+			if (_tree.token_at(delimiter).is_error())
+				n.error = parse_error::unterminated_word;
 			n.aux = _tree.add_here_doc(placeholder);
 			const node_index node = _tree.add_node(n);
 			// The body starts after the next newline, so it cannot be collected
@@ -1130,6 +1111,11 @@ private:
 		n.kind = node_kind::redirect;
 		n.first_token = first;
 		n.last_token = target;
+		// `cat > "x` opened a file called `x` with the quote still open, and
+		// reported "No such file or directory" for a name the shell should never
+		// have expanded. dash calls it a syntax error, and so does this.
+		if (_tree.token_at(target).is_error())
+			n.error = parse_error::unterminated_word;
 		n.aux = fd;
 		return _tree.add_node(n);
 	}
@@ -1141,6 +1127,28 @@ private:
 		n.first_token = at;
 		n.last_token = at;
 		return _tree.add_node(n);
+	}
+
+	// A node for one word token, carrying that token's own defect.
+	//
+	// The defect has to travel with the word or nothing downstream can see it:
+	// tree::has_errors() is what stops a tree with an unterminated quote in it from
+	// being executed, and a word built without this step is a word the shell runs
+	// anyway. Recorded here, in the one place a word node is made, rather than at
+	// each of the four grammatical positions that make one - the command's own
+	// words did it and the `for` list, the `case` subject and its patterns did not,
+	// so `for i in "a; do echo $i; done` was accepted in silence (#47).
+	//
+	// The kind is a parameter because an assignment prefix is the same token with
+	// the same defect: `x="abc` is as unterminated as `echo "abc`.
+	[[nodiscard]] node_index word_node(uint32_t at, node_kind kind) noexcept {
+		node w;
+		w.kind = kind;
+		w.first_token = at;
+		w.last_token = at;
+		if (_tree.token_at(at).is_error())
+			w.error = parse_error::unterminated_word;
+		return _tree.add_node(w);
 	}
 
 	[[nodiscard]] std::string_view text_of_token(uint32_t i) const noexcept {

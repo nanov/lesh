@@ -56,11 +56,25 @@ enum class token_kind : uint16_t {
 // says so and carries where. This is what lets the same lexer serve a parser that
 // must not throw and a highlighter that runs on every keystroke over half-typed
 // input.
+//
+// ORTHOGONAL to lexer::incomplete(). An error says the token is DEFECTIVE as it
+// stands; incomplete says more input could still complete it. Both are true of
+// `echo "x`, which an interactive shell continues and a script must reject.
+// Neither is a stand-in for the other: a trailing backslash and an unterminated
+// here-document are incomplete without being defective, and dash runs both.
 enum class token_error : uint8_t {
 	none,
 	unterminated_single_quote,
 	unterminated_double_quote,
 	unterminated_backquote,
+	// `$(`, `$((` and `${` with the input running out before the closing
+	// delimiter. These were once reported as incomplete and NOT as errors, so
+	// `lesh -c 'echo $('` printed nothing and reported success (#47), and
+	// `lesh -c 'echo $((1'` reached an expander that strips `$((` and `))` from a
+	// segment too short to have them and recursed until the stack ran out.
+	unterminated_command_sub,
+	unterminated_arithmetic,
+	unterminated_parameter_expansion,
 	unexpected_byte,
 };
 

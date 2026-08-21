@@ -279,18 +279,78 @@ public:
 		return best;
 	}
 
-	// The lexer reported the input ran out mid-construct. Separate from
-	// has_errors(): an interactive shell answers this with a continuation prompt.
+	// The lexer reported the input ran out mid-construct. ORTHOGONAL to
+	// has_errors(), not a weaker form of it:
+	//
+	//   incomplete() && has_errors()   `echo "x`   - more input would fix it, but
+	//                                              as it stands it is a defect
+	//   incomplete() && !has_errors()  `echo a\`   - and an unterminated
+	//                                              here-document; dash runs both
+	//   !incomplete() && has_errors()  `echo ;;`   - malformed, no continuation helps
+	//
+	// A caller reading interactively asks THIS FIRST and answers it with a
+	// continuation prompt; only when no more input is coming does the defect
+	// become a diagnostic. A caller with the whole input already in hand - `-c`, a
+	// script, stdin - has nothing to continue, so it asks has_errors() alone.
+	// Collapsing the two either loses the continuation prompt or makes a trailing
+	// backslash a syntax error, and dash proves it is not one.
 	[[nodiscard]] bool incomplete() const noexcept { return _incomplete; }
 	void set_incomplete(bool v) noexcept { _incomplete = v; }
 
-	// True when any node is an error node. Distinct from "the parse failed",
-	// because it never does.
-	[[nodiscard]] bool has_errors() const noexcept {
-		for (const node& n : _nodes)
-			if (n.is_error())
-				return true;
-		return false;
+	// The first node carrying a defect, or no_node. Nodes are added as they are
+	// completed, so among defective ones the first is the earliest in the source -
+	// which is the one worth naming in a diagnostic.
+	[[nodiscard]] node_index first_error() const noexcept {
+		for (uint32_t i = 0; i < _nodes.size(); ++i)
+			if (is_defective(_nodes[i]))
+				return i;
+		return no_node;
+	}
+
+	// True when any node is defective. Distinct from "the parse failed", because it
+	// never does.
+	//
+	// An ERROR NODE is not the only defect a tree can hold. A word whose quote was
+	// never closed is still a word - that is what the line editor wants to
+	// highlight and what completion wants to be inside of (ADR-0002) - so the
+	// parser records the defect in the node's `error` field and leaves the kind
+	// alone. Testing only the kind made that field invisible to the one check that
+	// consults it: `lesh -c "echo it's"` printed `it` and reported success (#47).
+	[[nodiscard]] bool has_errors() const noexcept { return first_error() != no_node; }
+
+	// What a defective node left unterminated, as a phrase for a diagnostic, or
+	// nullptr when its tokens say nothing more than "syntax error".
+	//
+	// dash names the construct - `Syntax error: Unterminated quoted string` - and
+	// lesh can too for the cost of one lookup, because the lexer already recorded
+	// WHICH byte opened it. Tokens are scanned rather than indexed because the
+	// defect is not always the node's first one: a redirect's first token is the
+	// operator and the unterminated word is its target.
+	[[nodiscard]] const char* error_detail(const node& n) const noexcept {
+		for (uint32_t i = n.first_token; i <= n.last_token && i < _tokens.size(); ++i) {
+			switch (_tokens[i].error) {
+				case token_error::unterminated_single_quote:
+				case token_error::unterminated_double_quote:
+					return "unterminated quoted string";
+				case token_error::unterminated_backquote:
+				case token_error::unterminated_command_sub:
+					return "unterminated command substitution";
+				case token_error::unterminated_arithmetic:
+					return "unterminated arithmetic expansion";
+				case token_error::unterminated_parameter_expansion:
+					return "unterminated parameter expansion";
+				case token_error::unexpected_byte:
+				case token_error::none:
+					break;
+			}
+		}
+		return nullptr;
+	}
+
+	// A defect is either the node's own kind or the error it carries. One
+	// definition, so has_errors() and first_error() cannot come to disagree.
+	[[nodiscard]] static constexpr bool is_defective(const node& n) noexcept {
+		return n.is_error() || n.error != parse_error::none;
 	}
 
 private:

@@ -568,6 +568,23 @@ void tree_walking_executor::echo_if_verbose(std::string_view unit, bool enabled)
 		std::fwrite(unit.data(), 1, unit.size(), stderr);
 }
 
+// Says what is wrong with a tree that will not be run.
+//
+// Named rather than generic: dash prints `Syntax error: Unterminated quoted
+// string`, and a bare `lesh: syntax error` for `echo it's` reads as a complaint
+// about the script rather than about the apostrophe that caused it. Nothing in
+// either test suite compares the text - the yash suite's `-d` only requires
+// stderr to be non-empty, and the differential harness compares stderr for
+// emptiness alone - so the wording is free to be useful.
+static void report_syntax_error(const tree& t) {
+	const syntax::node_index at = t.first_error();
+	const char* detail = at == syntax::no_node ? nullptr : t.error_detail(t[at]);
+	if (detail != nullptr)
+		std::fprintf(stderr, "lesh: syntax error: %s\n", detail);
+	else
+		std::fprintf(stderr, "lesh: syntax error\n");
+}
+
 int tree_walking_executor::run_parsed(const tree& t) {
 	if (t.root() == syntax::no_node)
 		return _state.last_status();
@@ -580,8 +597,13 @@ int tree_walking_executor::run_parsed(const tree& t) {
 	// The shell EXITS, rather than this one command merely reporting: input read
 	// one command at a time would otherwise carry on to the next line, where dash
 	// stops. The EXIT trap still runs, as it does in dash.
+	//
+	// The test is has_errors() and never incomplete(): a caller holding the whole
+	// input has nothing left to continue, so an unterminated construct is a defect
+	// here even though an interactive reader would answer it with a prompt. See
+	// tree::incomplete() for why the two are separate questions.
 	if (!_state.interactive() && t.has_errors()) {
-		std::fprintf(stderr, "lesh: syntax error\n");
+		report_syntax_error(t);
 		_exit_requested = true;
 		return 2;
 	}
@@ -956,7 +978,7 @@ int tree_walking_executor::run_source(std::string_view source) {
 			// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
 			// exactly as one at the top level does. Returning a status and carrying on
 			// let `eval fi; echo not reached` reach the echo.
-			std::fprintf(stderr, "lesh: syntax error\n");
+			report_syntax_error(parsed);
 			_exit_requested = true;
 			return 2;
 		}

@@ -188,7 +188,21 @@ point at it.
 
 **Error node** _[lesh]_:
 A tree node standing in for input the parser could not make sense of. What makes the
-parser total.
+parser total. Not the only way a tree records a problem — see **Defect**.
+
+**Defect** _[lesh]_:
+Something wrong with a node, recorded in that node's own error field. Distinct from
+an error node, which is a defect that has no other shape: a word whose quote was
+never closed is still a word, so the defect travels on the word and the kind is left
+alone. "Does this tree hold a defect" is the question an executor asks before running
+it, and asking it of the kind alone is how an unterminated quote came to execute.
+
+**Incomplete** _[lesh]_:
+Said of input the lexer ran out of mid-construct, so more of it would help.
+Orthogonal to a defect, not a milder form of one: an unterminated quote is both, and
+a trailing backslash is incomplete without being defective. A reader answers
+incomplete with a continuation prompt; an executor holding the whole input has
+nothing to continue and answers the defect with a diagnostic.
 
 **LLE** _[lesh]_:
 The Lesh Line Editor. lesh's own terminal input layer, named after zsh's ZLE.

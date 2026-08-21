@@ -187,6 +187,7 @@ token lexer::lex_word(lex_mode mode) noexcept {
 		// split at the space and the closing brace leaked into the next word.
 		if (c == '$' && peek(1) == '{') {
 			literal = false;
+			const uint32_t opened_at = _position;
 			_position += 2;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
@@ -195,14 +196,22 @@ token lexer::lex_word(lex_mode mode) noexcept {
 				++_position;
 			}
 			if (depth > 0) {
+				// Incomplete AND defective: `echo ${x` is a word the shell must refuse,
+				// not a word it runs without its expansion. Reported as incomplete only,
+				// it reached the executor and printed nothing at status zero (#47).
 				_incomplete = true;
-				return finish();
+				return finish(token_error::unterminated_parameter_expansion, opened_at);
 			}
 			continue;
 		}
 
 		if (c == '$' && peek(1) == '(') {
 			literal = false;
+			const uint32_t opened_at = _position;
+			// `$((` is arithmetic, and counting parens closes it correctly either way -
+			// but the two are worth telling apart in a diagnostic, which is the only
+			// reason this is looked at here rather than by counting alone.
+			const bool arithmetic = peek(2) == '(';
 			_position += 2;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
@@ -212,7 +221,9 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			}
 			if (depth > 0) {
 				_incomplete = true;
-				return finish();
+				return finish(arithmetic ? token_error::unterminated_arithmetic
+				                         : token_error::unterminated_command_sub,
+				              opened_at);
 			}
 			continue;
 		}
@@ -341,6 +352,10 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 
 	if (c == '$') {
 		const char next = peek(1);
+		// The three expansions below report the same defect the command-mode scan
+		// reports, on the same construct. Saying it in only one of the two scans is
+		// what let `echo $(` through: the word carried no error, so the tree the
+		// executor refused to run was not the tree it was given (#47).
 		if (next == '(' && peek(2) == '(') {
 			_position += 3;
 			int depth = 1;
@@ -351,8 +366,11 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 			}
 			if (!at_end() && peek() == ')')
 				++_position;
-			else if (at_end())
+			else if (at_end()) {
 				_incomplete = true;
+				return finish(token_kind::seg_arithmetic,
+				              token_error::unterminated_arithmetic, start);
+			}
 			return finish(token_kind::seg_arithmetic);
 		}
 		if (next == '(') {
@@ -363,8 +381,11 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 				else if (peek() == ')') --depth;
 				++_position;
 			}
-			if (depth > 0)
+			if (depth > 0) {
 				_incomplete = true;
+				return finish(token_kind::seg_command_sub,
+				              token_error::unterminated_command_sub, start);
+			}
 			return finish(token_kind::seg_command_sub);
 		}
 		if (next == '{') {
@@ -377,8 +398,11 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 				else if (peek() == '}') --depth;
 				++_position;
 			}
-			if (depth > 0)
+			if (depth > 0) {
 				_incomplete = true;
+				return finish(token_kind::seg_parameter,
+				              token_error::unterminated_parameter_expansion, start);
+			}
 			return finish(token_kind::seg_parameter);
 		}
 		if (lesh::string_utils::is_valid_var_name_first_char(static_cast<unsigned char>(next))) {

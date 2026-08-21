@@ -177,6 +177,44 @@ TEST(Lexer, UnterminatedDoubleQuoteIsIncompleteNotMalformed) {
 	EXPECT_TRUE(lx.incomplete());
 }
 
+// An unterminated expansion is a DEFECT and not merely incomplete. Reported as
+// incomplete alone, it reached the executor and ran: `lesh -c 'echo $('` printed
+// nothing and exited zero, and `echo $((1` recursed until the stack ran out (#47).
+TEST(Lexer, UnterminatedExpansionsCarryTheirOwnError) {
+	const struct { const char* src; token_error error; } cases[] = {
+		{"echo $(x", token_error::unterminated_command_sub},
+		{"echo `x", token_error::unterminated_backquote},
+		{"echo $((1", token_error::unterminated_arithmetic},
+		{"echo ${x", token_error::unterminated_parameter_expansion},
+	};
+	for (const auto& c : cases) {
+		lexer lx{c.src};
+		std::ignore = lx.next();
+		const token t = lx.next();
+		EXPECT_EQ(t.kind, token_kind::word) << c.src;
+		EXPECT_EQ(t.error, c.error) << c.src;
+		EXPECT_EQ(t.error_offset, 5u) << "points at what opened it: " << c.src;
+		EXPECT_TRUE(lx.incomplete()) << c.src;
+	}
+}
+
+// The same claim from the interior scan, which is the one the expander and a
+// highlighter run. Making it in only one of the two scans is how `echo $(`
+// escaped: the word carried no error at all.
+TEST(Lexer, WordInteriorReportsUnterminatedExpansionsToo) {
+	const struct { const char* src; token_error error; } cases[] = {
+		{"$(x", token_error::unterminated_command_sub},
+		{"$((1", token_error::unterminated_arithmetic},
+		{"${x", token_error::unterminated_parameter_expansion},
+	};
+	for (const auto& c : cases) {
+		lexer lx{c.src};
+		const token t = lx.next(lex_mode::word_interior);
+		EXPECT_EQ(t.error, c.error) << c.src;
+		EXPECT_TRUE(lx.incomplete()) << c.src;
+	}
+}
+
 TEST(Lexer, TrailingBackslashIsIncompleteWithoutBeingAnError) {
 	lexer lx{"echo a\\"};
 	std::ignore = lx.next();

@@ -146,9 +146,91 @@ TEST_F(ParserTest, RedirectionWithNoTargetIsAnErrorNodeNotAFailure) {
 	EXPECT_TRUE(found);
 }
 
-TEST_F(ParserTest, UnterminatedQuoteIsIncompleteNotAnError) {
+TEST_F(ParserTest, UnterminatedQuoteIsBothIncompleteAndADefect) {
+	// The two channels are orthogonal, and #47 turned on reading them as a
+	// hierarchy. Incomplete is for the reader: more input would fix this, so an
+	// interactive shell prompts. has_errors() is for the executor: as it stands the
+	// tree must not run, which is why `lesh -c "echo it's"` printed `it` at status
+	// zero for as long as only the node KIND was consulted.
 	const tree t = parse_it("echo 'abc");
 	EXPECT_TRUE(t.incomplete()) << "an interactive shell answers this with a continuation prompt";
+	EXPECT_TRUE(t.has_errors()) << "a shell with the whole input in hand has nothing to continue";
+}
+
+TEST_F(ParserTest, IncompleteWithoutADefectIsNotAnError) {
+	// dash runs both of these and exits zero, so neither may become a syntax
+	// error. They are what stops the fix for #47 from being "incomplete implies
+	// error" - and an unterminated here-document is the case #21 depends on.
+	for (const std::string_view src : {"echo a\\", "cat <<EOF\nbody"}) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.incomplete()) << src;
+		EXPECT_FALSE(t.has_errors()) << "more input would complete it; it is not malformed: " << src;
+	}
+}
+
+TEST_F(ParserTest, AWordCarriesItsTokensDefectInEveryPosition) {
+	// Only a simple command's own words recorded the defect, so `for i in "a` and
+	// `case "a in` were accepted in silence. The word node is built in one place
+	// now precisely so a new position cannot forget.
+	const std::string_view cases[] = {
+		"echo \"abc",                      // argument
+		"x=\"abc",                         // assignment prefix
+		"cat > \"abc",                     // redirection target
+		"cat <<\"EOF\nx\nEOF",             // here-document delimiter
+		"for i in \"a; do echo; done",     // for list
+		"case \"a in b) echo;; esac",      // case subject
+		"case a in \"b) echo;; esac",      // case pattern
+		"echo $(",                         // command substitution
+		"echo ${x",                        // parameter expansion
+		"echo $((1",                       // arithmetic expansion
+		"echo `",                          // backquote
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << src;
+	}
+}
+
+TEST_F(ParserTest, ADefectiveNodeNamesWhatWasLeftUnterminated) {
+	// The diagnostic is worth the lookup: `lesh: syntax error` for `echo it's`
+	// reads as a complaint about the script rather than about the apostrophe.
+	const struct { std::string_view src; std::string_view detail; } cases[] = {
+		{"echo it's", "unterminated quoted string"},
+		{"echo \"x", "unterminated quoted string"},
+		{"echo $(", "unterminated command substitution"},
+		{"echo `", "unterminated command substitution"},
+		{"echo $((1", "unterminated arithmetic expansion"},
+		{"echo ${x", "unterminated parameter expansion"},
+		// The defect is the TARGET, which is not a redirect node's first token.
+		{"cat > \"x", "unterminated quoted string"},
+	};
+	for (const auto& c : cases) {
+		const tree t = parse_it(c.src);
+		const node_index at = t.first_error();
+		ASSERT_NE(at, no_node) << c.src;
+		ASSERT_NE(t.error_detail(t[at]), nullptr) << c.src;
+		EXPECT_EQ(std::string_view(t.error_detail(t[at])), c.detail) << c.src;
+	}
+}
+
+TEST_F(ParserTest, AnUnterminatedWordStillEndsTheReadUnit) {
+	// A parser that consumes nothing and returns is a hang, not a diagnostic, and
+	// the incremental reader (#40) calls this in a loop until the cursor reaches
+	// the end. The unterminated construct swallows the rest of the input, so the
+	// cursor must land at the end in ONE call.
+	for (const std::string_view src : {"echo one\necho \"two\necho three\n",
+	                                   "echo one\necho $(\necho three\n"}) {
+		size_t at = 0;
+		const tree first = parse_next_command(pool, src, at);
+		EXPECT_FALSE(first.has_errors()) << "the first line is well formed: " << src;
+		ASSERT_GT(at, 0u) << src;
+
+		const size_t before = at;
+		const tree second = parse_next_command(pool, src, at);
+		EXPECT_TRUE(second.has_errors()) << src;
+		EXPECT_GT(at, before) << "a call that consumes nothing never ends: " << src;
+		EXPECT_EQ(at, src.size()) << "the defect ran to the end of the input: " << src;
+	}
 }
 
 TEST_F(ParserTest, ParsingNeverFailsOnHalfTypedInput) {
