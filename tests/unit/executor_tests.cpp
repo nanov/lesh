@@ -108,6 +108,45 @@ TEST(ShellState, OwnsItsValuesRatherThanBorrowingThem) {
 	EXPECT_EQ(value, "value that goes away");
 }
 
+TEST(ShellState, AliasesAreListedSortedByName) {
+	// Sorted because the map is unordered and POSIX leaves the order unspecified: a
+	// stable order is what makes the listing diffable, which is what alias-p.tst's
+	// `alias >save_1; unalias -a; eval alias $(cat save_1); alias >save_2; diff`
+	// round trip asks of it.
+	shell_state state;
+	state.set_alias("c", "3");
+	state.set_alias("a", "1");
+	state.set_alias("b", "2");
+	const auto rows = state.aliases();
+	ASSERT_EQ(rows.size(), 3u);
+	EXPECT_EQ(rows[0].name, "a");
+	EXPECT_EQ(rows[1].name, "b");
+	EXPECT_EQ(rows[2].name, "c");
+	EXPECT_EQ(rows[0].value, "1");
+}
+
+TEST(ShellState, UnsetAliasSaysWhetherThereWasOne) {
+	// POSIX makes `unalias nosuch` an ERROR, and the builtin cannot report one it
+	// is not told about: unalias used to return 0 whatever happened.
+	shell_state state;
+	state.set_alias("a", "1");
+	EXPECT_TRUE(state.unset_alias("a"));
+	EXPECT_FALSE(state.unset_alias("a")) << "the second removal has nothing to remove";
+	EXPECT_FALSE(state.unset_alias("never-defined"));
+}
+
+TEST(ShellState, ClearAliasesRemovesEveryOne) {
+	// `unalias -a`, which used to be looked up as an alias NAMED `-a` - removing
+	// nothing, reporting nothing, and passing its conformance case anyway because
+	// the listing it was compared against printed nothing either.
+	shell_state state;
+	state.set_alias("a", "1");
+	state.set_alias("b", "2");
+	state.clear_aliases();
+	EXPECT_FALSE(state.has_aliases());
+	EXPECT_TRUE(state.aliases().empty());
+}
+
 TEST(ShellState, UnsetRemoves) {
 	shell_state state;
 	std::ignore = state.set("GONE", "here");

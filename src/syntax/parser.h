@@ -36,4 +36,26 @@ public:
 tree parse(buffer_pool& pool, std::string_view source,
            const alias_source* aliases = nullptr) noexcept;
 
+// Parses ONE complete command out of `source`, starting at `position`, and moves
+// `position` past what was read.
+//
+// A shell does not read its input all at once: POSIX substitutes an alias when
+// the command containing it is READ, so `alias e=echo` on one line is in effect
+// for the next line and not for the rest of its own. Parsing a whole script first
+// made every such script wrong, which is the larger of the two reasons alias-p.tst
+// scored 13/67 (#40; the other was that a token from an alias body could not be
+// read back at all - see tree::add_text_region). dash reads the same unit,
+// and so does `-c`: `dash -c 'alias e=echo<newline>e hi'` prints hi, while
+// `dash -c 'alias e=echo; e hi'` reports `e: not found`.
+//
+// The unit is a complete command terminated by a NEWLINE of the input, not by
+// `;`, and a newline inside a compound command or inside an alias body does not
+// end one.
+//
+// `position` reaches `source.size()` when nothing executable is left, which is
+// what ends the caller's loop. The whole source is passed every time so that
+// spans stay offsets into the real input.
+tree parse_next_command(buffer_pool& pool, std::string_view source, size_t& position,
+                        const alias_source* aliases = nullptr) noexcept;
+
 } // namespace lesh::syntax

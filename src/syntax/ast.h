@@ -3,6 +3,7 @@
 #include "substrate/arena_array.h"
 #include "syntax/token.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string_view>
 
@@ -131,11 +132,37 @@ class tree {
 public:
 	tree(buffer_pool& pool, std::string_view source) noexcept
 		: _source(source), _nodes(pool, 32), _children(pool, 64), _tokens(pool, 32),
-		  _here_docs(pool, 4) {}
+		  _here_docs(pool, 4), _regions(pool, 4),
+		  _region_end(static_cast<uint32_t>(source.size())) {}
 
 	// --- construction ---------------------------------------------------------
 
 	uint32_t add_token(const token& t) noexcept { return _tokens.push(t); }
+
+	// Registers text a token may point into that is NOT the input, and returns the
+	// virtual offset of its first byte.
+	//
+	// An alias's replacement is RE-SCANNED as if it had been typed, so the tokens
+	// it yields have no position in the input at all. Left pointing at their offset
+	// within the alias body, they were read back as a slice of the input: with
+	// `alias e=echo`, the four bytes of `echo` came out as the first four bytes of
+	// the script and the shell looked for a command called `alia`. Alias
+	// substitution could therefore never actually run a command (#40) - #27 built
+	// the read-time machinery, but nothing that executed a substituted word.
+	//
+	// Regions give those tokens somewhere real to point. The input keeps
+	// [0, source.size()), so every span into what the user typed is still its true
+	// position - which is what the line editor's highlighting needs (#10) - and each
+	// registered region takes the next len bytes above it.
+	//
+	// The view must outlive the tree. Alias text does: shell_state owns it
+	// (ADR-0007), and a parse finishes before any command can redefine an alias.
+	uint32_t add_text_region(std::string_view text) noexcept {
+		const uint32_t base = _region_end;
+		_regions.push(text);
+		_region_end += static_cast<uint32_t>(text.size());
+		return base;
+	}
 
 	// Here-doc bodies are stored separately and referenced by index from a
 	// here_doc node's `aux`, because a body is a source range rather than tokens.
@@ -185,12 +212,42 @@ public:
 			return {};
 		const token& first = _tokens[n.first_token];
 		const token& last = _tokens[n.last_token];
+		// A node can START in an alias body and END in the input - that is exactly
+		// what `alias e='echo '` followed by `e foo` produces, because a definition
+		// ending in a blank makes the next word eligible too. Subtracting then would
+		// wrap the length round to four billion.
+		if (last.end_offset() < first.offset)
+			return {first.offset, first.length};
 		return {first.offset, last.end_offset() - first.offset};
 	}
 
 	[[nodiscard]] std::string_view text_of(const node& n) const noexcept {
 		const span s = span_of(n);
-		return _source.substr(s.offset, s.length);
+		return text_at(s.offset, s.length);
+	}
+
+	[[nodiscard]] std::string_view text_of_token(const token& t) const noexcept {
+		return text_at(t.offset, t.length);
+	}
+
+	// The bytes at a virtual offset: the input, or an alias body registered above
+	// it. See add_text_region.
+	//
+	// The length is CLAMPED to the region the offset falls in rather than trusted,
+	// because a node's span can begin in one region and end in another and there is
+	// no run of bytes that means. Reading past the region instead would read
+	// whatever happens to sit after somebody else's std::string.
+	[[nodiscard]] std::string_view text_at(uint32_t offset, uint32_t length) const noexcept {
+		if (offset < _source.size())
+			return _source.substr(offset, std::min<size_t>(length, _source.size() - offset));
+		uint32_t base = static_cast<uint32_t>(_source.size());
+		for (const std::string_view& region : _regions) {
+			const uint32_t end = base + static_cast<uint32_t>(region.size());
+			if (offset < end)
+				return region.substr(offset - base, std::min<size_t>(length, end - offset));
+			base = end;
+		}
+		return {};
 	}
 
 	// The deepest node whose span contains a byte offset. This is what completion
@@ -242,6 +299,10 @@ private:
 	arena_array<uint32_t> _children;
 	arena_array<token> _tokens;
 	arena_array<here_doc_body> _here_docs;
+	// Text that is not the input: one entry per alias substitution. See
+	// add_text_region.
+	arena_array<std::string_view> _regions;
+	uint32_t _region_end = 0;
 	node_index _root = no_node;
 	bool _incomplete = false;
 };

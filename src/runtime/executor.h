@@ -5,6 +5,7 @@
 #include "runtime/shell_state.h"
 #include "syntax/ast.h"
 
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,20 @@ public:
 		: _pool(pool), _state(state), _runner(*this) {}
 
 	[[nodiscard]] int run(const syntax::tree& t) override;
+
+	// Reads and runs a whole input the way POSIX says a shell reads one: ONE
+	// COMPLETE COMMAND at a time, each executed before the next is read.
+	//
+	// That timing is observable, and not only by aliases: `alias e=echo` takes
+	// effect for the line after it and not for the rest of its own line, `set -v`
+	// echoes each command as it is read, and a syntax error halfway down a script
+	// runs everything above it. Parsing the whole input first got all three wrong -
+	// alias-p.tst scored 13/67 for that one reason, with a working substitution
+	// mechanism behind it (#40).
+	//
+	// Takes the source rather than a tree, because it does the parsing itself: it
+	// is the read loop, and the trees it produces have to outlive it.
+	[[nodiscard]] int run_input(std::string_view source, bool echo_when_verbose = true);
 
 	// The port the expander takes (#11). The executor supplies it, rather than the
 	// expander depending on the executor - which is what breaks the cycle every
@@ -69,6 +84,11 @@ private:
 		pid_t group = 0;  // 0 means "this child becomes the group leader"
 	};
 
+	// Runs one already-parsed tree, WITHOUT the EXIT trap: read a command at a
+	// time, the trap belongs at the end of the input rather than at the end of
+	// every command in it.
+	int run_parsed(const syntax::tree& t);
+	void echo_if_verbose(std::string_view unit, bool enabled);
 	int run_node(const syntax::tree& t, syntax::node_index n);
 	int run_simple_command(const syntax::tree& t, syntax::node_index n);
 	int run_pipeline(const syntax::tree& t, syntax::node_index n);
@@ -259,6 +279,14 @@ private:
 		syntax::node_index body;
 	};
 	std::unordered_map<std::string, defined_function> _functions;
+
+	// Every tree run_input has parsed, kept alive for the whole run.
+	//
+	// A deque, not a vector: _functions points INTO these trees, and a vector
+	// reallocating would move them out from under it. Reading one command at a time
+	// is what makes this necessary - a whole-input parse had exactly one tree and
+	// the question never came up.
+	std::deque<syntax::tree> _input_trees;
 
 	// Guards runaway recursion. A shell function that calls itself unconditionally
 	// would otherwise exhaust the stack rather than reporting anything.

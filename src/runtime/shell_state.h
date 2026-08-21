@@ -247,9 +247,24 @@ public:
 	// text outlives every use and is released in the destructor.
 
 	void set_alias(std::string_view name, std::string_view value);
-	void unset_alias(std::string_view name);
+	// False when there was no such alias, which POSIX makes an error for `unalias`.
+	bool unset_alias(std::string_view name);
+	// `unalias -a`.
+	void clear_aliases() noexcept { _aliases.clear(); }
 	[[nodiscard]] bool lookup_alias(std::string_view name, std::string_view& value) const override;
 	[[nodiscard]] bool has_aliases() const noexcept { return !_aliases.empty(); }
+
+	// Every alias, sorted by name, for the listing form of `alias`. Sorted for the
+	// same reason variables() is: the map is unordered, POSIX leaves the order
+	// unspecified, and a stable order is what makes the listing diffable - which is
+	// exactly what alias-p.tst's `alias >save_1; unalias -a; eval alias $(cat
+	// save_1); alias >save_2; diff save_1 save_2` round trip asks of it. dash prints
+	// in hash order, so this is a deliberate divergence in a place POSIX left open.
+	struct alias_row {
+		std::string_view name;
+		std::string_view value;
+	};
+	[[nodiscard]] std::vector<alias_row> aliases() const;
 
 	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
 	[[nodiscard]] const signal_state& signals() const noexcept { return _signals; }

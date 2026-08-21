@@ -181,3 +181,104 @@ x=outer; x=inner read v </dev/null; printf '[%s]\n' "$x"
 
 --- an assignment prefix persists on a special builtin [xfail(legacy): legacy has no export builtin]
 x=outer; x=inner export y; printf '[%s]\n' "$x"
+
+# --- alias substitution at read time (#40) ----------------------------------
+#
+# Aliases are the one feature whose behaviour depends on WHEN the shell reads its
+# input, so most of these arrive on stdin: a definition takes effect for the next
+# command read, which is the line after it. `-c` behaves the same way now, and the
+# case above still holds for one LINE - `alias g=x; g` does not substitute, because
+# the whole line was read before any of it ran.
+
+--- an alias defined on one line is substituted on the next [stdin] [xfail(legacy): legacy's alias model differs]
+alias e=echo
+e hi
+
+--- a substituted alias runs the command its text names, not a slice of the script [stdin] [xfail(legacy): legacy's alias model differs]
+alias e=echo
+e one two three
+
+--- a definition ending in a blank makes the next word eligible too [stdin] [xfail(legacy): legacy's alias model differs]
+alias c=cat e='echo '
+e c c cat
+
+--- an alias may expand to a reserved word, because the replacement is re-scanned [stdin] [xfail(legacy): legacy's alias model differs]
+alias i='if echo' t='then echo'
+i if; t then; fi
+
+--- a reserved word is never itself replaced by an alias [stdin] [xfail(legacy): legacy's alias model differs]
+alias if=: then=: fi=: do=: done=: for=: in=:
+if true; then echo then; else echo else; fi
+for a in A; do echo $a; done
+
+--- the command word after an assignment prefix is substituted [stdin] [xfail(legacy): legacy's alias model differs]
+alias e=echo
+a=A e after-assignment
+
+--- the command word after a redirection prefix is substituted [stdin] [xfail(legacy): legacy's alias model differs]
+alias e=echo
+>/dev/null e not-printed
+echo done
+
+--- an alias expanding to nothing but a blank leaves the exit status alone [stdin] [xfail(legacy): legacy's alias model differs]
+alias b=' '
+set +e
+false
+b
+echo $?
+
+--- an alias is re-scanned so it can expand twice [stdin] [xfail(legacy): legacy's alias model differs]
+alias echo='echo % ' e='echo echo'
+e !
+
+--- a line continuation inside a word does not stop it being an alias [stdin] [xfail(legacy): legacy's alias model differs]
+alias eeee=echo
+ee\
+e\
+e ok
+
+--- the listing quotes a value containing a blank so it can be read back [stdin] [xfail(legacy): legacy has no alias listing]
+alias e='echo hi'
+alias
+
+--- a printed alias can be fed back in [stdin] [xfail(legacy): legacy has no alias listing]
+alias e='echo hi'
+save="$(alias e)"
+unalias e
+eval alias "$save"
+e
+
+--- alias with no operands prints nothing when there are none [xfail(legacy): legacy has no alias listing]
+alias; echo "[$?]"
+
+--- unalias -a removes every alias [stdin]
+alias a=1 b=2 c=3
+unalias -a
+alias
+echo done
+
+--- unalias of an alias that does not exist is an error [xfail(legacy): legacy's unalias reports nothing]
+unalias nosuch; echo "[$?]"
+
+--- alias reports an operand it cannot find and still defines the others [xfail(legacy): legacy has no alias listing]
+alias nosuch x=1; echo "[$?]"; alias x
+
+--- a newline after a pipe continues the pipeline [stdin] [xfail(legacy): beyond legacy's single-pass parser]
+echo foo |
+cat
+
+--- a newline after && continues the list, and the right side is still conditional [stdin] [xfail(legacy): beyond legacy's single-pass parser]
+false &&
+echo not-printed
+echo done
+
+--- an alias that expands to nothing lets the pipeline continue on the next line [stdin] [xfail(legacy): legacy's alias model differs]
+alias a=
+echo foo | a
+cat
+
+--- set -v echoes each command as it is read, comments and all [stdin]
+set -v
+echo one
+# a comment
+echo two

@@ -4,6 +4,8 @@
 
 #include <optional>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace lesh::syntax;
@@ -282,4 +284,165 @@ TEST_F(ParserTest, AmpersandMakesAListAsynchronousInsideCompoundCommands) {
 				found = true;
 		EXPECT_TRUE(found) << "no async_list in " << w.what << ": " << w.source;
 	}
+}
+
+// --- reading one complete command at a time (#40) ----------------------------
+
+namespace {
+
+// The alias table the parser is given, as a test double. The real one is
+// shell_state, which the parser deliberately does not know about (#27).
+class fake_aliases final : public alias_source {
+public:
+	void define(std::string name, std::string value) {
+		_entries.emplace_back(std::move(name), std::move(value));
+	}
+	bool lookup_alias(std::string_view name, std::string_view& value) const override {
+		for (const auto& [n, v] : _entries)
+			if (n == name) {
+				value = v;
+				return true;
+			}
+		return false;
+	}
+private:
+	std::vector<std::pair<std::string, std::string>> _entries;
+};
+
+// The command name of the first simple command in a tree, as text.
+std::string_view first_command_name(const tree& t) {
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::simple_command && t[n].children_count > 0) {
+			const node& word = t[t.child_of(t[n], 0)];
+			return t.text_of(word);
+		}
+	return {};
+}
+
+} // namespace
+
+TEST_F(ParserTest, ParseNextCommandStopsAtTheEndOfTheFirstLine) {
+	const std::string_view source = "echo one\necho two\n";
+	size_t at = 0;
+	const tree first = parse_next_command(pool, source, at);
+	EXPECT_EQ(first[first.root()].children_count, 1u);
+	EXPECT_EQ(first_command_name(first), "echo");
+	EXPECT_EQ(at, 9u) << "the cursor must sit at the start of the second line";
+
+	const tree second = parse_next_command(pool, source, at);
+	EXPECT_EQ(second[second.root()].children_count, 1u);
+	EXPECT_EQ(at, source.size()) << "nothing executable is left";
+}
+
+TEST_F(ParserTest, ParseNextCommandKeepsACompoundCommandWhole) {
+	// The unit ends at a newline of the INPUT at top level - not at one inside a
+	// construct, or `if` would be read without its body.
+	const std::string_view source = "if true\nthen\necho hi\nfi\necho after\n";
+	size_t at = 0;
+	const tree first = parse_next_command(pool, source, at);
+	ASSERT_EQ(first[first.root()].children_count, 1u);
+	EXPECT_EQ(first[first.child_of(first[first.root()], 0)].kind, node_kind::if_clause);
+	EXPECT_FALSE(first.has_errors());
+	EXPECT_EQ(source.substr(at), "echo after\n");
+}
+
+TEST_F(ParserTest, ParseNextCommandSkipsAHereDocumentBody) {
+	// The body is not commands, and the cursor has to land past it: the resume
+	// point comes from the lexer AFTER the parser seeks it over the body.
+	const std::string_view source = "cat <<\\END\nnot a command\nEND\necho after\n";
+	size_t at = 0;
+	const tree first = parse_next_command(pool, source, at);
+	EXPECT_FALSE(first.has_errors());
+	EXPECT_EQ(source.substr(at), "echo after\n");
+}
+
+TEST_F(ParserTest, ParseNextCommandTerminatesOnTrailingBlanksAndComments) {
+	// Every call must ADVANCE the cursor, or a comment or blank line at the end of a
+	// script is an infinite read loop. Blank lines are read as the empty commands
+	// they are, one per call, and nothing is left over.
+	const std::string_view source = "echo hi\n# just a comment\n\n";
+	size_t at = 0;
+	size_t commands = 0;
+	for (int rounds = 0; at < source.size(); ++rounds) {
+		ASSERT_LT(rounds, 8) << "the read loop is not making progress";
+		const size_t before = at;
+		const tree t = parse_next_command(pool, source, at);
+		EXPECT_GT(at, before) << "a call that consumes nothing never ends";
+		commands += t[t.root()].children_count;
+	}
+	EXPECT_EQ(commands, 1u) << "a comment and a blank line are not commands";
+}
+
+TEST_F(ParserTest, ATokenFromAnAliasBodyReadsBackAsTheAliasText) {
+	// The bug this whole ticket turned on: a token from an alias body carried its
+	// offset within the BODY, and the tree read that offset out of the source - so
+	// `alias e=echo` produced a command called `alia` and alias substitution could
+	// never actually run anything.
+	fake_aliases aliases;
+	aliases.define("e", "echo");
+	const tree t = parse(pool, "e hi", &aliases);
+	EXPECT_EQ(first_command_name(t), "echo");
+}
+
+TEST_F(ParserTest, AliasReplacementIsRescannedSoItCanYieldAKeyword) {
+	fake_aliases aliases;
+	aliases.define("i", "if true");
+	const tree t = parse(pool, "i; then echo hi; fi", &aliases);
+	ASSERT_EQ(t[t.root()].children_count, 1u);
+	EXPECT_EQ(t[t.child_of(t[t.root()], 0)].kind, node_kind::if_clause);
+}
+
+TEST_F(ParserTest, AReservedWordIsNeverReplacedByAnAlias) {
+	// POSIX checks a word against the reserved words BEFORE the alias table, so an
+	// alias cannot shadow `if`.
+	fake_aliases aliases;
+	aliases.define("if", ":");
+	const tree t = parse(pool, "if true; then echo hi; fi", &aliases);
+	ASSERT_EQ(t[t.root()].children_count, 1u);
+	EXPECT_EQ(t[t.child_of(t[t.root()], 0)].kind, node_kind::if_clause);
+}
+
+TEST_F(ParserTest, ADefinitionEndingInABlankMakesTheNextWordEligible) {
+	// `alias e='echo ' c=cat` makes `e c` run cat, and the word after THAT is not
+	// eligible - one word, not the rest of the line.
+	fake_aliases aliases;
+	aliases.define("e", "echo ");
+	aliases.define("c", "cat");
+	const tree t = parse(pool, "e c c", &aliases);
+	node_index command = no_node;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::simple_command)
+			command = n;
+	ASSERT_NE(command, no_node);
+	ASSERT_EQ(t[command].children_count, 3u);
+	EXPECT_EQ(t.text_of(t[t.child_of(t[command], 0)]), "echo");
+	EXPECT_EQ(t.text_of(t[t.child_of(t[command], 1)]), "cat");
+	EXPECT_EQ(t.text_of(t[t.child_of(t[command], 2)]), "c");
+}
+
+TEST_F(ParserTest, TheCommandWordAfterAnAssignmentPrefixIsSubstituted) {
+	// POSIX substitutes for the COMMAND WORD, which is the first word that is not
+	// an assignment.
+	fake_aliases aliases;
+	aliases.define("s", "sh");
+	const tree t = parse(pool, "a=A s -c :", &aliases);
+	node_index command = no_node;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::simple_command)
+			command = n;
+	ASSERT_NE(command, no_node);
+	ASSERT_EQ(t[command].children_count, 4u);
+	EXPECT_EQ(t[t.child_of(t[command], 0)].kind, node_kind::assignment);
+	EXPECT_EQ(t.text_of(t[t.child_of(t[command], 1)]), "sh");
+}
+
+TEST_F(ParserTest, ANewlineAfterAPipeContinuesThePipeline) {
+	// POSIX spells it `linebreak` in the grammar. Without it, reading one command
+	// at a time ended the unit at the newline and the right-hand side was lost.
+	const std::string_view source = "echo foo |\ncat\n";
+	size_t at = 0;
+	const tree t = parse_next_command(pool, source, at);
+	ASSERT_EQ(t[t.root()].children_count, 1u);
+	EXPECT_EQ(t[t.child_of(t[t.root()], 0)].kind, node_kind::pipeline);
+	EXPECT_EQ(at, source.size());
 }

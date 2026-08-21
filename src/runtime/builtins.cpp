@@ -1493,17 +1493,43 @@ builtin_result builtin_times(shell_state&, char**) {
 	return {0};
 }
 
+// One `name='value'` line of an `alias` listing, quoted so the shell reads it
+// back as exactly these bytes.
+//
+// POSIX requires the listing to be in a form that can be RE-INPUT, and a value
+// containing a blank or a quote is what decides whether it really can: printing
+// `e=echo hi` raw defines an alias `e` whose value is `echo` when fed back. This
+// is the same defect as the `trap` listing in #33 and the `readonly` listing in
+// #35, which is why it uses their quoting helper rather than a third one.
+//
+// The NAME is printed raw, as dash does: a name needing quotes could not have
+// been written on the left of an `=` in the first place.
+void print_alias(std::string_view name, std::string_view value) {
+	std::printf("%.*s=", static_cast<int>(name.size()), name.data());
+	print_single_quoted(value);
+	std::fputc('\n', stdout);
+}
+
 builtin_result builtin_alias(shell_state& state, char** argv) {
-	if (argv[1] == nullptr)
-		return {0};  // listing aliases: not implemented, not an error
+	// No operands: every alias, sorted. It printed NOTHING before - a listing that
+	// produces no output fails every case that inspects one, and it made `unalias -a`
+	// look correct while doing nothing (#40).
+	if (argv[1] == nullptr) {
+		for (const auto& row : state.aliases())
+			print_alias(row.name, row.value);
+		return {0};
+	}
 	int status = 0;
 	for (size_t i = 1; argv[i] != nullptr; ++i) {
 		const std::string_view arg{argv[i]};
-		if (const size_t eq = arg.find('='); eq != std::string_view::npos) {
+		// The `=` is searched from the SECOND byte, so `=foo` is a lookup of an alias
+		// named `=foo` rather than an assignment to the empty name. dash does the
+		// same, and POSIX gives `alias` no options at all - which is why `-p` and
+		// `--` are operands here and not flags, and are reported as not found.
+		if (const size_t eq = arg.find('=', 1); eq != std::string_view::npos) {
 			state.set_alias(arg.substr(0, eq), arg.substr(eq + 1));
 		} else if (std::string_view value; state.lookup_alias(arg, value)) {
-			std::printf("%.*s=%.*s\n", static_cast<int>(arg.size()), arg.data(),
-			            static_cast<int>(value.size()), value.data());
+			print_alias(arg, value);
 		} else {
 			std::fprintf(stderr, "lesh: alias: %.*s: not found\n",
 			             static_cast<int>(arg.size()), arg.data());
@@ -1514,9 +1540,24 @@ builtin_result builtin_alias(shell_state& state, char** argv) {
 }
 
 builtin_result builtin_unalias(shell_state& state, char** argv) {
-	for (size_t i = 1; argv[i] != nullptr; ++i)
-		state.unset_alias(argv[i]);
-	return {0};
+	// `-a` removes every alias. It used to be looked up as the NAME `-a`, which
+	// removed nothing and reported nothing - and the case that asserts it passed
+	// anyway, because `alias` printed nothing to compare against. Two silent
+	// failures cancelling out is exactly what #38 found in sigurg5-p.tst.
+	if (argv[1] != nullptr && std::string_view{argv[1]} == "-a") {
+		state.clear_aliases();
+		return {0};
+	}
+	int status = 0;
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		// POSIX: removing an alias that does not exist is an ERROR. Returning 0 made
+		// `unalias true; unalias true` succeed twice.
+		if (!state.unset_alias(argv[i])) {
+			std::fprintf(stderr, "lesh: unalias: %s: not found\n", argv[i]);
+			status = 1;
+		}
+	}
+	return {status};
 }
 
 builtin_result builtin_shift(shell_state& state, char** argv) {

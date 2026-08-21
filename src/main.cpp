@@ -199,43 +199,26 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 
 } // namespace
 
-// Runs input through the replacement front end: lex, parse, execute.
+// Runs input through the replacement front end: read, parse, execute, one
+// complete command at a time.
 //
-// Incomplete on purpose - pipelines, command substitution, compound commands and
-// here-documents are not implemented, and each says so rather than silently
-// doing nothing. The differential harness can therefore measure the new front
-// end against dash today, which is the whole point of the strangler seam: parity
-// is tracked continuously rather than discovered at the end.
-int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state) {
+// The read loop lives in the executor, not here: it owns the trees, and a
+// function defined by one command is a node in the tree that command was parsed
+// from. See tree_walking_executor::run_input.
+//
+// `echo_when_verbose` is false for `-c`: POSIX makes `set -v` a property of
+// reading INPUT, and dash prints nothing for `dash -v -c 'echo hi'`.
+int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state,
+                       bool echo_when_verbose = true) {
 	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
 	lesh::runtime::tree_walking_executor executor{pool, state};
-	const lesh::syntax::tree t = lesh::syntax::parse(pool, source, &state);
-	return executor.run(t);
+	return executor.run_input(source, echo_when_verbose);
 }
 
-// `set -v`: the shell writes its input to standard error as it READS it.
-//
-// lesh reads a script or standard input in one go, so the whole of it is echoed
-// before any of it runs, where dash - which reads a command at a time -
-// interleaves the echo with the output. Only the ORDER differs, and only between
-// two different streams: option-p.tst compares stdout and stderr separately and
-// cannot see it. The same one-unit read is already recorded as the reason an alias
-// defined in a script does not affect its later lines.
-//
-// Not applied to `-c`: POSIX makes verbose a property of reading INPUT, and dash
-// prints nothing for `dash -v -c 'echo hi'`.
-void echo_input_if_verbose(const lesh::runtime::shell_state& state,
-                           std::string_view source) {
-	if (!state.opts().verbose)
-		return;
-	std::fwrite(source.data(), 1, source.size(), stderr);
-}
-
-// Reads a whole stream. Scripts are parsed as ONE unit, which has an observable
-// consequence: an alias defined in a script does not affect later lines of the
-// same script, because POSIX substitutes aliases when a command is READ and the
-// whole file is read at once. dash reads a complete command at a time. Closing
-// that gap needs the incremental input source deferred from #15 and #21.
+// Reads a whole stream. The bytes are still slurped up front - stdin is drained
+// so `read` can share the descriptor with the script (#31) - but they are PARSED
+// one command at a time, which is what makes an alias defined on one line take
+// effect on the next.
 std::string read_all(std::istream& in) {
 	std::string out;
 	std::string line;
@@ -294,7 +277,8 @@ int main(int argc, char **argv, char **envp) {
 		next_state.set_positional(std::move(args));
 
 		if (command_string)
-			return run_next_front_end(command_string, next_state);
+			// `-c` does not echo under `set -v`; see run_next_front_end.
+			return run_next_front_end(command_string, next_state, false);
 		if (script_path) {
 			std::ifstream script{script_path};
 			if (!script) {
@@ -302,7 +286,6 @@ int main(int argc, char **argv, char **envp) {
 				return 127;
 			}
 			const std::string source = read_all(script);
-			echo_input_if_verbose(next_state, source);
 			return run_next_front_end(source, next_state);
 		}
 		// `-i` with input that is not a terminal is an ordinary POSIX invocation:
@@ -314,7 +297,6 @@ int main(int argc, char **argv, char **envp) {
 		// files run the shell under test as `sh -i` with the case piped in.
 		if (!interactive || !isatty(STDIN_FILENO)) {
 			const std::string source = read_all(std::cin);
-			echo_input_if_verbose(next_state, source);
 			return run_next_front_end(source, next_state);
 		}
 		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");

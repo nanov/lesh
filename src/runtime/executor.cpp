@@ -191,8 +191,7 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	// explicit fd, or the sentinel when none was written.
 	const token& op_token = t.token_at(self.last_token - 1);
 	const std::string_view target_text =
-		t.source().substr(t.token_at(self.last_token).offset,
-		                  t.token_at(self.last_token).length);
+		t.text_of_token(t.token_at(self.last_token));
 
 	// The target is a word and gets expanded: `> $out` has to work. Field
 	// splitting must not apply - POSIX makes a redirection target expanding to
@@ -532,6 +531,44 @@ void tree_walking_executor::restore_fds(arena_array<saved_fd>& saved) {
 }
 
 int tree_walking_executor::run(const tree& t) {
+	const int status = run_parsed(t);
+	// The EXIT trap runs on the way out, whether that is the end of input or an
+	// explicit `exit` - which is why it cannot live at the `exit` builtin.
+	run_exit_trap();
+	return status;
+}
+
+int tree_walking_executor::run_input(std::string_view source, bool echo_when_verbose) {
+	int status = _state.last_status();
+	size_t at = 0;
+	while (at < source.size()) {
+		const size_t from = at;
+		// The trees are kept, not dropped: a function defined by one command is a
+		// node in the tree that command was parsed from, and the next command may
+		// call it. Reading a command at a time is what makes that lifetime visible -
+		// with one whole-input parse it held for free.
+		_input_trees.push_back(syntax::parse_next_command(_pool, source, at, &_state));
+		echo_if_verbose(source.substr(from, at - from), echo_when_verbose);
+		status = run_parsed(_input_trees.back());
+		if (_exit_requested)
+			break;
+	}
+	run_exit_trap();
+	return status;
+}
+
+// `set -v`: the shell writes its input to standard error AS IT READS IT.
+//
+// Per command rather than once for the whole input, which is both what dash does
+// and what makes `set -v` partway through a script echo only the rest of it. The
+// bytes are the input's own, comments and blank lines included, so the echo of a
+// whole script is byte-identical to the script.
+void tree_walking_executor::echo_if_verbose(std::string_view unit, bool enabled) {
+	if (enabled && _state.opts().verbose)
+		std::fwrite(unit.data(), 1, unit.size(), stderr);
+}
+
+int tree_walking_executor::run_parsed(const tree& t) {
 	if (t.root() == syntax::no_node)
 		return _state.last_status();
 
@@ -539,8 +576,13 @@ int tree_walking_executor::run(const tree& t) {
 	// anything. The parser deliberately recovers and returns a tree - that is what
 	// the line editor needs (#10) - but recovery is for INSPECTION, not execution.
 	// Running the parts that parsed is what made `echo a;; echo b` print both.
+	//
+	// The shell EXITS, rather than this one command merely reporting: input read
+	// one command at a time would otherwise carry on to the next line, where dash
+	// stops. The EXIT trap still runs, as it does in dash.
 	if (!_state.interactive() && t.has_errors()) {
 		std::fprintf(stderr, "lesh: syntax error\n");
+		_exit_requested = true;
 		return 2;
 	}
 
@@ -564,9 +606,6 @@ int tree_walking_executor::run(const tree& t) {
 			break;
 		}
 	}
-	// The EXIT trap runs on the way out, whether that is the end of input or an
-	// explicit `exit` - which is why it cannot live at the `exit` builtin.
-	run_exit_trap();
 	return status;
 }
 
@@ -815,8 +854,7 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 	(void)name;
 	const bool has_in = (self.aux & 0x80000000u) != 0;
 	const uint32_t name_token = self.aux & 0x7FFFFFFFu;
-	const std::string_view var = t.source().substr(t.token_at(name_token).offset,
-	                                               t.token_at(name_token).length);
+	const std::string_view var = t.text_of_token(t.token_at(name_token));
 
 	// Every child but the last is a word to iterate; the last is the body.
 	const uint32_t word_count = self.children_count - 1;
@@ -901,25 +939,36 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 // both must see the shell's own state rather than a copy - which is what makes
 // `. ./config` able to set variables the caller then reads.
 int tree_walking_executor::run_source(std::string_view source) {
-	// A nested pool: the tree lives only as long as this call. Functions defined
-	// here would not outlive it, which is the same limitation #25 recorded.
+	// A nested pool: the trees live only as long as this call. Functions defined
+	// here would not outlive it, which is the same limitation #25 recorded. A deque
+	// of them rather than one, because POSIX says `eval` and `.` READ their
+	// argument as shell input - and a shell reads one command at a time, so
+	// `eval 'alias e=echo<newline>e hi'` prints hi in dash. The trees must all
+	// stand while any of them runs: a function defined by one is a node in it.
 	buffer_pool nested{BUFFER_POOL_SIZE};
-	const tree parsed = syntax::parse(nested, source, &_state);
-	if (parsed.has_errors() && !_state.interactive()) {
-		// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
-		// exactly as one at the top level does. Returning a status and carrying on
-		// let `eval fi; echo not reached` reach the echo.
-		std::fprintf(stderr, "lesh: syntax error\n");
-		_exit_requested = true;
-		return 2;
-	}
-	const node& program = parsed[parsed.root()];
+	std::deque<tree> trees;
 	int status = _state.last_status();
-	for (uint32_t i = 0; i < program.children_count; ++i) {
-		status = run_node(parsed, parsed.child_of(program, i));
-		_state.set_last_status(status);
-		if (_flow != control_flow::normal || _exit_requested)
-			break;
+	size_t at = 0;
+	while (at < source.size()) {
+		trees.push_back(syntax::parse_next_command(nested, source, at, &_state));
+		const tree& parsed = trees.back();
+		if (parsed.has_errors() && !_state.interactive()) {
+			// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
+			// exactly as one at the top level does. Returning a status and carrying on
+			// let `eval fi; echo not reached` reach the echo.
+			std::fprintf(stderr, "lesh: syntax error\n");
+			_exit_requested = true;
+			return 2;
+		}
+		if (parsed.root() == syntax::no_node)
+			continue;
+		const node& program = parsed[parsed.root()];
+		for (uint32_t i = 0; i < program.children_count; ++i) {
+			status = run_node(parsed, parsed.child_of(program, i));
+			_state.set_last_status(status);
+			if (_flow != control_flow::normal || _exit_requested)
+				return status;
+		}
 	}
 	return status;
 }
@@ -945,7 +994,7 @@ int tree_walking_executor::run_function_definition(const tree& t, node_index n) 
 	if (self.children_count == 0)
 		return 0;
 	const token& name_token = t.token_at(self.aux);
-	const std::string name{t.source().substr(name_token.offset, name_token.length)};
+	const std::string name{t.text_of_token(name_token)};
 	// A redefinition replaces the previous body, which is what POSIX requires and
 	// what makes reloading an rc file work.
 	_functions[name] = {&t, t.child_of(self, 0)};
@@ -1498,6 +1547,14 @@ bool tree_walking_executor::try_run_executor_builtin(
 }
 
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
+	// A command with NO WORDS AT ALL is not a command: it is what is left when an
+	// alias substituted to nothing but blanks, and POSIX leaves `$?` alone for it.
+	// `set +e; false; b` with `alias b=' '` reports 1 in dash, where returning 0
+	// here reported success for a line that never ran anything. Distinct from a word
+	// that EXPANDS to nothing - `$unset` alone is a command that ran and succeeded.
+	if (t[n].children_count == 0)
+		return _state.last_status();
+
 	// POSIX 2.9.1: a command with no command name completes with the status of the
 	// LAST command substitution it performed, and only zero when it performed none.
 	// So `x=$(exit 3); echo $?` prints 3. Counting substitutions is how "performed

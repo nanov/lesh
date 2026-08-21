@@ -152,21 +152,47 @@ constexpr bool ends_command(token_kind k) noexcept {
 
 class parser_impl {
 public:
+	// `from` is where in `source` to start. The whole source is handed over even
+	// when only a tail of it is to be parsed, so every span in the tree is an
+	// offset into the input the user actually wrote - which is what keeps $LINENO
+	// and a line editor's highlighting honest when input is read one command at a
+	// time.
 	parser_impl(buffer_pool& pool, std::string_view source,
-	            const alias_source* aliases) noexcept
-		: _lexer(source), _tree(pool, source), _scratch(pool, 64), _aliases(aliases) {
+	            const alias_source* aliases, uint32_t from = 0) noexcept
+		: _lexer(source, from), _tree(pool, source), _scratch(pool, 64),
+		  _aliases(aliases), _input_cursor(from) {
 		fill();
 	}
 
 	tree take() noexcept { return std::move(_tree); }
 
-	void parse_program() noexcept {
+	void parse_program() noexcept { parse_body(false); }
+
+	// One complete command, so the caller can run it before the next is read.
+	void parse_complete_command() noexcept { parse_body(true); }
+
+	// Where reading stopped, as a byte offset into the source. Only meaningful
+	// after parse_complete_command: it is what the next call must start from.
+	[[nodiscard]] uint32_t input_cursor() const noexcept { return _input_cursor; }
+
+private:
+	void parse_body(bool one_command) noexcept {
 		const uint32_t mark = mark_scratch();
 		const uint32_t first = _index;
 
 		while (peek().kind != token_kind::end) {
 			if (is_separator(peek().kind)) {
+				// A NEWLINE of the input ends a complete command: POSIX substitutes an
+				// alias when the command is READ, so `alias e=echo` on one line has to
+				// take effect before the next line is read. A newline drawn from an
+				// ALIAS BODY ends nothing - `alias b='cat | c - ; a '` yields two
+				// commands from one word, and stopping inside the body would throw the
+				// rest of it away.
+				const bool ends_command = one_command && _alias_stack.empty() &&
+				                          peek().kind == token_kind::newline;
 				advance();
+				if (ends_command)
+					break;
 				continue;
 			}
 
@@ -183,6 +209,12 @@ public:
 				_scratch.push(error_node(advance(), parse_error::unexpected_operator));
 		}
 
+		// Nothing but blanks, comments or end of input is left, and the cursor
+		// recorded by fill() still points before them. Saying so ends the caller's
+		// read loop; leaving it where it was would offer the same bytes again.
+		if (peek().kind == token_kind::end)
+			_input_cursor = static_cast<uint32_t>(_tree.source().size());
+
 		node n;
 		n.kind = node_kind::program;
 		n.first_token = first;
@@ -191,7 +223,6 @@ public:
 		_tree.set_root(_tree.add_node(n));
 	}
 
-private:
 	static constexpr bool is_separator(token_kind k) noexcept {
 		return k == token_kind::newline || k == token_kind::semi || k == token_kind::amp;
 	}
@@ -245,6 +276,29 @@ private:
 		}
 	}
 
+	// POSIX allows a newline after `&&`, `||` and `|` - the grammar spells it
+	// `linebreak` - and the continuation line is part of the SAME command. Without
+	// this, `echo foo |` followed by `cat` on the next line lost the right-hand side
+	// of the pipeline entirely and printed nothing, and `false &&` followed by a
+	// command ran that command unconditionally, because reading one command at a
+	// time ended the unit at the newline.
+	void skip_linebreak() noexcept {
+		for (;;) {
+			while (peek().kind == token_kind::newline)
+				advance();
+			// An alias that substituted to NOTHING leaves the newline it stood in front
+			// of, and the linebreak rule then applies again: with `alias a=`,
+			// `echo foo | a` followed by `cat` is one pipeline of two commands in dash.
+			// Substituting here rather than only in parse_command_or_compound is what
+			// makes that true: the empty replacement has to be read before the newline
+			// after it can be recognised as a linebreak.
+			const uint32_t before = _index;
+			substitute_word();
+			if (_index == before)
+				return;
+		}
+	}
+
 	// Consumes a reserved word if it is next. Recovery depends on this returning
 	// false rather than throwing: `if x; then y` with no `fi` must still parse.
 	bool accept(reserved want) noexcept {
@@ -263,14 +317,27 @@ private:
 		// `)` closes a subshell or a case pattern, and `;;` ends a case item. Both
 		// end a compound list without being reserved words, and without them the
 		// list loops making no progress and error-nodes the closer.
-		while (peek().kind != token_kind::end &&
-		       peek().kind != token_kind::rparen &&
-		       peek().kind != token_kind::dsemi &&
-		       !at_list_terminator()) {
+		for (;;) {
 			if (is_separator(peek().kind)) {
 				advance();
 				continue;
 			}
+			// The word here is in COMMAND POSITION, so an alias has to be substituted
+			// before the word is tested for CLOSING the list: `alias d='do echo'` and
+			// `alias dn='done | cat -'` are how alias-p.tst spells a loop, and the
+			// terminator test on the un-substituted word saw neither.
+			substitute_word();
+			// A replacement may BEGIN with a separator - `alias r='<newline>)<newline>'`
+			// is how alias-p.tst closes a subshell - and the separator has to be
+			// consumed here rather than handed to a command parser that would consume
+			// nothing and trip the progress guarantee into an error node.
+			if (is_separator(peek().kind))
+				continue;
+			if (peek().kind == token_kind::end ||
+			    peek().kind == token_kind::rparen ||
+			    peek().kind == token_kind::dsemi ||
+			    at_list_terminator())
+				break;
 			const uint32_t before = _index;
 			_scratch.push(parse_list_item());
 			if (_index == before)  // progress guarantee, as in parse_program
@@ -482,15 +549,45 @@ private:
 	[[nodiscard]] bool at_function_definition() noexcept {
 		if (peek().kind != token_kind::word || peek_reserved() != reserved::none)
 			return false;
-		char* ignored = nullptr;
-		(void)ignored;
-		// Look ahead without consuming: lex from the current position on a copy.
-		syntax::lexer probe{_tree.source(), _tree.token_at(_index).end_offset()};
-		const token after_name = probe.next(lex_mode::command);
-		if (after_name.kind != token_kind::lparen)
-			return false;
-		const token after_paren = probe.next(lex_mode::command);
-		return after_paren.kind == token_kind::rparen;
+		token after[2];
+		probe_ahead(after, 2);
+		return after[0].kind == token_kind::lparen &&
+		       after[1].kind == token_kind::rparen;
+	}
+
+	// Lexes the next tokens WITHOUT consuming them, from wherever the next token
+	// would actually come from: the innermost alias body first, the ones outside it
+	// next, the input last.
+	//
+	// Probing the input alone was wrong the moment an alias could supply the
+	// lookahead: `alias def='f()'` puts both parentheses in the alias body, and a
+	// probe over the source saw whatever happened to sit at a virtual offset past
+	// the end of it. Copies, because a probe must consume nothing - a lexer owns no
+	// input and copying one is three words.
+	void probe_ahead(token* out, size_t count) noexcept {
+		// Text and position rather than lexer copies, so nothing here needs a lexer
+		// that can be default-constructed. A lexer owns neither, which is what makes
+		// resuming one at a recorded position the same operation as starting it.
+		struct probe_frame { std::string_view text; uint32_t at; };
+		probe_frame bodies[kMaxAliasDepth];
+		size_t depth = 0;
+		for (const auto& frame : _alias_stack) {
+			if (depth == static_cast<size_t>(kMaxAliasDepth))
+				break;
+			bodies[depth++] = {frame.lex.source(), frame.lex.position()};
+		}
+		probe_frame input{_tree.source(), _lexer.position()};
+		for (size_t i = 0; i < count; ++i) {
+			for (;;) {
+				probe_frame& from = depth == 0 ? input : bodies[depth - 1];
+				lexer probe{from.text, from.at};
+				out[i] = probe.next(lex_mode::command);
+				from.at = probe.position();
+				if (out[i].kind != token_kind::end || depth == 0)
+					break;
+				--depth;
+			}
+		}
 	}
 
 	node_index parse_function_definition() noexcept {
@@ -538,7 +635,25 @@ private:
 		return _tree.add_node(n);
 	}
 
+	// Offers the word the parser is looking at to alias substitution.
+	//
+	// Called from two kinds of place. In COMMAND POSITION, because that is where
+	// POSIX substitutes an alias - `ls foo` substitutes ls, `echo ls` does not - and
+	// BEFORE the word is classified, because the replacement is RE-SCANNED and may
+	// itself be a keyword (`alias i='if echo'`), a function definition
+	// (`alias def='f()'`) or a `!`. Substituting inside parse_command, after the
+	// keyword and function-definition tests had already run on the un-substituted
+	// word, is why a third of alias-p.tst failed while substitution itself worked.
+	//
+	// And from fill(), for the word a TRAILING BLANK in a definition made eligible,
+	// wherever that word sits. See the call there.
+	void substitute_word() noexcept {
+		if (_aliases != nullptr)
+			try_substitute_alias();
+	}
+
 	[[nodiscard]] node_index parse_command_or_compound() noexcept {
+		substitute_word();
 		if (peek().kind == token_kind::lparen)
 			return attach_trailing_redirects(parse_subshell());
 		if (at_function_definition())
@@ -570,20 +685,43 @@ private:
 	struct alias_frame {
 		lexer lex;
 		std::string_view text;
+		// Where this body lives in the tree's virtual text space, so the tokens it
+		// yields can be read back. See tree::add_text_region.
+		uint32_t base;
+		// The definition ended in a blank, which makes the word AFTER this body
+		// eligible for substitution as well. Recorded on the frame rather than
+		// checked at substitution time because the eligible word is the one drawn
+		// once this body RUNS OUT - `alias e='echo '` followed by `e c c` substitutes
+		// the first `c`, not the `echo` inside the body.
+		bool trailing_blank;
 	};
 
 	void fill() noexcept {
 		// Draw from an alias body while one is active, popping when it runs out.
+		bool eligible = false;
 		while (!_alias_stack.empty()) {
-			const token t = _alias_stack.back().lex.next(lex_mode::command);
+			token t = _alias_stack.back().lex.next(lex_mode::command);
 			if (t.kind != token_kind::end) {
+				// The lexer reports offsets within the body it was handed; the tree
+				// addresses that body above the input. Without the shift a token from an
+				// alias reads back as a slice of the script.
+				t.offset += _alias_stack.back().base;
+				if (t.is_error())
+					t.error_offset += _alias_stack.back().base;
 				_index = _tree.add_token(t);
+				if (eligible)
+					substitute_word();
 				return;
 			}
+			eligible = eligible || _alias_stack.back().trailing_blank;
 			_alias_stack.pop_back();
 			_alias_depth = _alias_stack.size();
 		}
 
+		// Where the input stands BEFORE this token is drawn from it. A caller reading
+		// one command at a time resumes here, so the lookahead token this fill is
+		// about to produce is read again rather than lost.
+		_input_cursor = _lexer.position();
 		_index = _tree.add_token(_lexer.next(lex_mode::command));
 		if (_lexer.incomplete())
 			_tree.set_incomplete(true);
@@ -593,11 +731,29 @@ private:
 		// lexed as commands.
 		if (!_pending_here_docs.empty() &&
 		    _tree.token_at(_index).kind == token_kind::newline) {
-			const uint32_t resume = collect_here_doc_bodies(
-				_tree.token_at(_index).end_offset());
-			_lexer.seek(resume);
+			const uint32_t after_newline = _tree.token_at(_index).end_offset();
+			// A body is read from the INPUT, on the lines after the one that opened it.
+			// A newline drawn from an ALIAS body has no such line, and seeking the
+			// input lexer to an alias offset would silently skip the rest of the
+			// script - so the here-doc is left unterminated, which is what it is.
+			if (after_newline <= _tree.source().size())
+				_lexer.seek(collect_here_doc_bodies(after_newline));
+			else {
+				_pending_here_docs.clear();
+				_tree.set_incomplete(true);
+			}
 		}
+
+		// The trailing-blank rule reaches out of the alias body and into the input:
+		// `alias e='echo '` makes the `c` of `e c` eligible too. Applied as the word
+		// is READ rather than at each grammatical position that might ask, which is
+		// what gets the argument, case-pattern and `for`-word positions right without
+		// a call in each of them - `alias c='case a in ' p='(a)'` closes a case
+		// clause with `c p`.
+		if (eligible)
+			substitute_word();
 	}
+
 	[[nodiscard]] const token& peek() const noexcept { return _tree.token_at(_index); }
 	uint32_t advance() noexcept {
 		const uint32_t consumed = _index;
@@ -610,6 +766,7 @@ private:
 		node_index left = parse_pipeline();
 		while (peek().kind == token_kind::and_if || peek().kind == token_kind::or_if) {
 			const uint32_t op = advance();
+			skip_linebreak();
 			const node_index right = parse_pipeline();
 
 			const node_index pair[2] = {left, right};
@@ -627,6 +784,9 @@ private:
 
 	node_index parse_pipeline() noexcept {
 		const uint32_t first = _index;
+
+		// Before the `!` test, because an alias may expand to one: `alias e='! echo'`.
+		substitute_word();
 
 		// `! pipeline` inverts the pipeline's status: zero becomes one and anything
 		// non-zero becomes zero. POSIX puts Bang in the pipeline production, so it
@@ -646,6 +806,7 @@ private:
 		_scratch.push(parse_command_or_compound());
 		while (peek().kind == token_kind::pipe) {
 			advance();
+			skip_linebreak();
 			_scratch.push(parse_command_or_compound());
 		}
 
@@ -670,12 +831,6 @@ private:
 		const uint32_t mark = mark_scratch();
 		bool seen_command_name = false;
 
-		// Alias substitution, at command position only. POSIX substitutes an alias
-		// when the word is a command NAME - `ls foo` substitutes ls, `echo ls` does
-		// not - which is the same rule reserved words follow.
-		if (_aliases != nullptr && _scratch.size() == mark)
-			try_substitute_alias();
-
 		while (!ends_command(peek().kind)) {
 			// A reserved word is only a keyword in COMMAND position. `echo done`
 			// prints `done`, while `echo yes; done` ends the loop - the `;` is what
@@ -692,6 +847,23 @@ private:
 			}
 
 			if (t.kind == token_kind::word) {
+				// POSIX substitutes an alias for the COMMAND WORD, which is the first
+				// word that is not an assignment: `alias s=sh; a=A s -c ...` runs sh, and
+				// `alias e=echo; >/dev/null e x` runs echo. The word that opened the
+				// command was already offered before it was classified (see
+				// substitute_word); this is the one that follows a prefix.
+				//
+				// Round again only when something was actually replaced - the
+				// replacement may carry its own prefix, as ` >&- c >/dev/null ` does, and
+				// its command word deserves the same turn. A word that is not an alias
+				// falls through and is consumed, so the loop cannot spin.
+				if (!seen_command_name && _scratch.size() > mark &&
+				    !looks_like_assignment(text_of_token(_index))) {
+					const uint32_t before = _index;
+					substitute_word();
+					if (_index != before)
+						continue;
+				}
 				const uint32_t at = advance();
 				node w;
 				w.first_token = at;
@@ -805,17 +977,66 @@ private:
 		return at;
 	}
 
-	// Replaces a command word with its alias definition, if it has one.
+	// The alias name a word spells once its LINE CONTINUATIONS are removed, for a
+	// word the lexer did not call plainly literal.
+	//
+	// `ee\<newline>e\<newline>e` is the name `eeee`: a line continuation quotes
+	// nothing, and dash substitutes an alias for it. Every other backslash and quote
+	// does quote, and blocks substitution outright - `ech\o` is never an alias - so
+	// this accepts only the bytes POSIX allows in an alias name and refuses the rest
+	// rather than guessing. False also for a name longer than the buffer, which is
+	// not a name any script writes.
+	[[nodiscard]] static bool name_across_line_continuations(
+		std::string_view text, char* buffer, size_t capacity,
+		std::string_view& name) noexcept {
+		size_t at = 0;
+		bool joined_any = false;
+		for (size_t i = 0; i < text.size(); ++i) {
+			if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\n') {
+				++i;
+				joined_any = true;
+				continue;
+			}
+			const unsigned char c = static_cast<unsigned char>(text[i]);
+			const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			                     (c >= '0' && c <= '9') || c == '_' || c == '!' ||
+			                     c == '%' || c == ',' || c == '@';
+			if (!allowed || at == capacity)
+				return false;
+			buffer[at++] = text[i];
+		}
+		if (!joined_any)
+			return false;  // nothing was joined, so the word is quoted some other way
+		name = std::string_view{buffer, at};
+		return true;
+	}
+
+	// Replaces a word with its alias definition, if it has one.
+	//
+	// A RESERVED WORD is never substituted, whatever its position. POSIX checks the
+	// word against the reserved words first and only then against the alias table,
+	// so `alias if=:` cannot shadow `if` - while an alias that EXPANDS to `if` still
+	// produces the keyword, because the replacement is re-scanned. The rule holds
+	// for a word a trailing blank made eligible too: `alias forx='for x ' do=';'`
+	// leaves `forx do echo $x; done` looping over the positional parameters, which
+	// is the case alias-p.tst calls an inapplicable substitution.
 	void try_substitute_alias() noexcept {
 		for (int guard = 0; guard < kMaxAliasDepth; ++guard) {
 			if (peek().kind != token_kind::word || peek().is_error())
 				return;
+			if (peek_reserved() != reserved::none)
+				return;
 			// A quoted word is never an alias: `\ls` and `'ls'` are how you bypass
-			// one, and flag_literal is exactly that test.
-			if ((peek().flags & syntax::flag_literal) == 0)
+			// one, and flag_literal is exactly that test - with one exception, a LINE
+			// CONTINUATION, which quotes nothing.
+			char joined[64];
+			std::string_view name;
+			if ((peek().flags & syntax::flag_literal) != 0)
+				name = text_of_token(_index);
+			else if (!name_across_line_continuations(text_of_token(_index), joined,
+			                                        sizeof joined, name))
 				return;
 
-			const std::string_view name = text_of_token(_index);
 			std::string_view value;
 			if (!_aliases->lookup_alias(name, value))
 				return;
@@ -829,15 +1050,18 @@ private:
 					return;
 
 			// Replace the word: drop it and lex the definition in its place.
-			_alias_stack.push_back({lexer{value}, value});
+			const bool trailing_blank =
+				!value.empty() && (value.back() == ' ' || value.back() == '\t');
+			_alias_stack.push_back(
+				{lexer{value}, value, _tree.add_text_region(value), trailing_blank});
 			_alias_depth = _alias_stack.size();
 			fill();
 
-			// POSIX: a definition ending in a blank makes the NEXT word eligible
-			// too. That is what makes `alias sudo='sudo '` work with an aliased
-			// command after it.
-			if (value.empty() || (value.back() != ' ' && value.back() != '\t'))
-				return;
+			// Round again, because POSIX RE-SCANS the replacement: the first word of
+			// the definition is itself subject to substitution, which is what makes
+			// `alias e='echo echo'` with an aliased `echo` expand twice. The loop used
+			// to be entered only when the definition ended in a blank, which confused
+			// re-scanning with the trailing-blank rule and got both wrong.
 		}
 	}
 
@@ -920,8 +1144,7 @@ private:
 	}
 
 	[[nodiscard]] std::string_view text_of_token(uint32_t i) const noexcept {
-		const token& t = _tree.token_at(i);
-		return _tree.source().substr(t.offset, t.length);
+		return _tree.text_of_token(_tree.token_at(i));
 	}
 
 	// Children accumulate here and are committed to the tree as a contiguous run
@@ -947,6 +1170,7 @@ private:
 	static constexpr int kMaxAliasDepth = 16;
 	std::vector<uint32_t> _strip_tabs_for;
 	uint32_t _index = 0;
+	uint32_t _input_cursor = 0;
 };
 
 } // namespace
@@ -955,6 +1179,14 @@ tree parse(buffer_pool& pool, std::string_view source,
            const alias_source* aliases) noexcept {
 	parser_impl p{pool, source, aliases};
 	p.parse_program();
+	return p.take();
+}
+
+tree parse_next_command(buffer_pool& pool, std::string_view source, size_t& position,
+                        const alias_source* aliases) noexcept {
+	parser_impl p{pool, source, aliases, static_cast<uint32_t>(position)};
+	p.parse_complete_command();
+	position = p.input_cursor();
 	return p.take();
 }
 

@@ -84,9 +84,22 @@ void shell_state::set_alias(std::string_view name, std::string_view value) {
 	_aliases.emplace(std::string(name), std::string(value));
 }
 
-void shell_state::unset_alias(std::string_view name) {
-	if (const auto it = _aliases.find(name); it != _aliases.end())
-		_aliases.erase(it);
+bool shell_state::unset_alias(std::string_view name) {
+	const auto it = _aliases.find(name);
+	if (it == _aliases.end())
+		return false;
+	_aliases.erase(it);
+	return true;
+}
+
+std::vector<shell_state::alias_row> shell_state::aliases() const {
+	std::vector<alias_row> rows;
+	rows.reserve(_aliases.size());
+	for (const auto& [name, value] : _aliases)
+		rows.push_back({name, value});
+	std::sort(rows.begin(), rows.end(),
+	          [](const alias_row& a, const alias_row& b) { return a.name < b.name; });
+	return rows;
 }
 
 bool shell_state::lookup_alias(std::string_view name, std::string_view& value) const {
