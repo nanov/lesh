@@ -8,16 +8,43 @@ IS the expectation, so nothing drifts and nothing needs regenerating.
 dash is authoritative for the POSIX floor; zsh only for the curated zsh layer.
 Where they disagree about POSIX, dash wins. See docs/adr/0001.
 
+HOW A CASE IS INVOKED (issue #41). Until #41 every case ran as `shell -c code` and
+nothing else, so no case could see a bug in how the shell reads its own command
+line or its own standard input - and two real ones escaped: `+i` taken for a script
+pathname (#33, 3,600 conformance assertions), and `read` returning EOF forever when
+the script arrived on fd 0 (#31, read-p.tst at 1/32). Two mechanisms close that:
+
+  - `[stdin]` on a case feeds the body to the shell on file descriptor 0 with no
+    arguments at all, which is the path every real script and every yash case
+    takes. A per-case directive, rather than a separate corpus file or a second
+    run of the whole corpus in the other mode: the invocation form is a property
+    of what a case is testing, not of the file it happens to sit in. Running all
+    321 cases both ways would double the wall clock to re-assert three hundred
+    that do not care, and would need a mode-scoped xfail axis on top, because
+    `-c` and stdin legitimately differ - `set -v` echoes input and not `-c`, and
+    a `read` on fd 0 competes with the script arriving there.
+  - `$TESTEE` in the environment of every case names the shell CURRENTLY UNDER
+    TEST, absolute. A case can therefore re-invoke it with any argv it likes and
+    the comparison stays honest: lesh-invoking-lesh against dash-invoking-dash.
+    This is what the yash suite does, and it is why the yash suite found what this
+    corpus could not. A case that needs a particular argv[0] makes its own symlink
+    (`ln -s "$TESTEE" $d/sh`) - in the case, where it is visible, rather than in
+    the harness, where it would be a guess. dash's option parsing turned out not
+    to depend on argv[0]; the yash suite's symlink is for PATH resolution.
+
 Every case runs in its own process group and is killed by group on timeout. Of the
 shell test runners surveyed for issue #4, only FreeBSD's kyua did this; every other
 one used a plain timeout, which kills the direct child and orphans its grandchildren.
 That is not theoretical - a single hung case cost this project a CPU core for 19
 minutes. macOS ships no setsid(1), which is why this is Python rather than shell.
+A case that re-invokes `$TESTEE` makes this load-bearing twice over: the shell the
+harness spawns is no longer the only process to reap.
 """
 
 import argparse
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,13 +53,18 @@ from pathlib import Path
 
 _FRONTEND = None
 
-# `[xfail: reason]` applies to every front end; `[xfail(next): reason]` to one.
-# Scoping became necessary the moment both front ends were live: they fail
+# A case header is `--- name` followed by any number of bracketed directives:
+#
+#   [stdin]                 feed the body to the shell on fd 0 instead of -c
+#   [xfail: reason]         known failure on every front end
+#   [xfail(next): reason]   known failure on one front end
+#
+# xfail scoping became necessary the moment both front ends were live: they fail
 # different things, and one shared marker list would hide a regression in
 # whichever front end happened not to be under test.
-CASE_RE = re.compile(
-    r"^---\s+(?P<name>.+?)\s*"
-    r"(?:\[xfail(?:\((?P<scope>[a-z]+)\))?:\s*(?P<xfail>[^\]]*)\])?\s*$")
+CASE_RE = re.compile(r"^---\s+(?P<name>.+?)\s*(?P<tags>(?:\[[^\]]*\]\s*)*)$")
+TAG_RE = re.compile(r"\[([^\]]*)\]")
+XFAIL_RE = re.compile(r"^xfail(?:\((?P<scope>[a-z]+)\))?:\s*(?P<reason>.*)$")
 
 
 @dataclass
@@ -41,6 +73,7 @@ class Case:
     code: str
     xfail: str | None
     xfail_scope: str | None  # None = all front ends
+    on_stdin: bool  # `[stdin]`: the body arrives on fd 0, not as -c
     path: Path
     line: int
 
@@ -53,20 +86,43 @@ class Run:
     timed_out: bool
 
 
+def parse_directives(tags: str, where: str) -> tuple[bool, str | None, str | None]:
+    """Read a case header's bracketed directives. Returns (on_stdin, xfail, scope).
+
+    An unrecognised directive is a hard error rather than a warning or a silent
+    skip. A misspelled `[stdni]` that quietly ran the case as `-c` would recreate
+    the exact blind spot #41 exists to close - a case that looks like it covers
+    the stdin path and does not.
+    """
+    on_stdin = False
+    xfail = scope = None
+    for tag in TAG_RE.findall(tags):
+        directive = tag.strip()
+        if directive == "stdin":
+            on_stdin = True
+        elif m := XFAIL_RE.match(directive):
+            xfail, scope = m["reason"], m["scope"]
+        else:
+            raise SystemExit(f"{where}: unknown case directive [{tag}]")
+    return on_stdin, xfail, scope
+
+
 def parse_spec(path: Path) -> list[Case]:
     cases: list[Case] = []
     name = xfail = scope = None
+    on_stdin = False
     start = 0
     body: list[str] = []
 
     def flush():
         if name is not None and (code := "\n".join(body).strip()):
-            cases.append(Case(name, code, xfail, scope, path, start))
+            cases.append(Case(name, code, xfail, scope, on_stdin, path, start))
 
     for lineno, raw in enumerate(path.read_text().splitlines(), 1):
         if m := CASE_RE.match(raw):
             flush()
-            name, xfail, scope, start, body = m["name"], m["xfail"], m["scope"], lineno, []
+            name, start, body = m["name"], lineno, []
+            on_stdin, xfail, scope = parse_directives(m["tags"], f"{path}:{lineno}")
         elif name is None and (not raw.strip() or raw.lstrip().startswith("#")):
             continue  # file header
         else:
@@ -75,7 +131,20 @@ def parse_spec(path: Path) -> list[Case]:
     return cases
 
 
-def child_env() -> dict[str, str]:
+def testee_path(shell: str) -> str:
+    """Absolute path to `shell`, for $TESTEE.
+
+    Absolute because a case that re-invokes the shell is free to `cd` first, and
+    `--shell ./build/debug/lesh` would then resolve to nothing. Per-shell because
+    the whole point is that a case comparing `"$TESTEE" +i +m` compares
+    lesh-invoking-lesh against dash-invoking-dash; one shared value would compare
+    lesh against lesh and pass no matter what either shell did.
+    """
+    found = shutil.which(shell)
+    return str(Path(found if found else shell).resolve())
+
+
+def child_env(testee: str) -> dict[str, str]:
     """Environment for the shells under test.
 
     Leak detection is turned OFF here deliberately. This harness measures
@@ -90,22 +159,31 @@ def child_env() -> dict[str, str]:
     env["ASAN_OPTIONS"] = ":".join(opts + ["detect_leaks=0"])
     if _FRONTEND is not None:
         env["LESH_FRONTEND"] = _FRONTEND
+    # The shell under test, reachable from inside a case. See the module docstring.
+    env["TESTEE"] = testee
     return env
 
 
-def run_shell(shell: str, code: str, timeout: float) -> Run:
-    """Run one snippet in its own process group, reaping the whole group on timeout."""
+def run_shell(shell: str, testee: str, code: str, timeout: float, on_stdin: bool) -> Run:
+    """Run one snippet in its own process group, reaping the whole group on timeout.
+
+    `on_stdin` picks the invocation form. The default is `shell -c code`; a
+    `[stdin]` case is instead spawned with NO arguments and the body written to fd
+    0, which is what a script really looks like to a shell and is the path that
+    hid #31.
+    """
     proc = subprocess.Popen(
-        [shell, "-c", code],
+        [shell] if on_stdin else [shell, "-c", code],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if on_stdin else subprocess.DEVNULL,
         text=True,
-        env=child_env(),
+        env=child_env(testee),
         start_new_session=True,  # own process group, so killpg reaches grandchildren
     )
     try:
-        out, err = proc.communicate(timeout=timeout)
+        # A script ends in a newline; parse_spec strips the body, so put it back.
+        out, err = proc.communicate(code + "\n" if on_stdin else None, timeout=timeout)
         return Run(out, err, proc.returncode, False)
     except subprocess.TimeoutExpired:
         try:
@@ -144,6 +222,8 @@ def main() -> int:
         return 2
 
     passed = xfailed = failed = xpassed = 0
+    ref_testee = testee_path(args.ref)
+    shell_testee = testee_path(args.shell)
 
     if args.frontend:
         print(f"front end under test: {args.frontend}")
@@ -151,8 +231,9 @@ def main() -> int:
     for path in files:
         print(f"\n{path}")
         for case in parse_spec(path):
-            ref = run_shell(args.ref, case.code, args.timeout)
-            got = run_shell(args.shell, case.code, args.timeout)
+            ref = run_shell(args.ref, ref_testee, case.code, args.timeout, case.on_stdin)
+            got = run_shell(args.shell, shell_testee, case.code, args.timeout, case.on_stdin)
+            label = f"{case.name} [stdin]" if case.on_stdin else case.name
 
             problems: list[str] = []
             if got.timed_out:
@@ -168,19 +249,19 @@ def main() -> int:
 
             if problems and expected_to_fail:
                 xfailed += 1
-                print(f"  xfail  {case.name}  ({case.xfail})")
+                print(f"  xfail  {label}  ({case.xfail})")
                 if args.verbose:
                     print("\n".join(problems))
             elif problems:
                 failed += 1
-                print(f"  FAIL   {case.name}  ({path}:{case.line})")
+                print(f"  FAIL   {label}  ({path}:{case.line})")
                 print("\n".join(problems))
             elif expected_to_fail:
                 xpassed += 1
-                print(f"  XPASS  {case.name}  -- now passes, remove the xfail marker")
+                print(f"  XPASS  {label}  -- now passes, remove the xfail marker")
             else:
                 passed += 1
-                print(f"  pass   {case.name}")
+                print(f"  pass   {label}")
 
     total = passed + xfailed + failed + xpassed
     print(f"\n{total} cases against {args.ref}: "

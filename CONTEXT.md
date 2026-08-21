@@ -216,6 +216,14 @@ zsh-inspired features admitted on top by explicit decision.
 The shell a differential test compares against. dash is authoritative for the floor;
 zsh only for the curated layer.
 
+**Shell under test** _[lesh]_:
+Whichever shell a differential case is currently running in — lesh in one half of a
+comparison, the reference shell in the other. Named `$TESTEE` in a case's
+environment, absolute, so a case may re-invoke it with arbitrary argv and the
+comparison stays lesh-invoking-lesh against dash-invoking-dash.
+_Avoid_: "testee" on its own, which does not say under test of what; and "the shell"
+in a case that re-invokes, where it names two different processes.
+
 **Strangler** _[lesh]_:
 The migration in which the new front end is built beside the old parser and driven to
 parity before the old one is deleted.
