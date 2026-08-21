@@ -255,7 +255,14 @@ public:
 	[[nodiscard]] const signal_state& signals() const noexcept { return _signals; }
 
 	[[nodiscard]] bool interactive() const noexcept { return _interactive; }
-	void set_interactive(bool v) noexcept { _interactive = v; }
+	// Told to the signal state as well, because POSIX scopes "a signal ignored on
+	// entry cannot be trapped" to a NON-interactive shell and signal_state has to
+	// answer that on its own - see signal_state::cannot_be_trapped. Setting one and
+	// not the other would silently make an interactive shell untrappable.
+	void set_interactive(bool v) noexcept {
+		_interactive = v;
+		_signals.set_interactive(v);
+	}
 
 private:
 	struct variable {

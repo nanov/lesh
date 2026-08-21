@@ -796,6 +796,17 @@ void print_trap(const signal_state& sigs, int signo, bool include_default) {
 	const std::string_view name = signal_state::signal_name(signo);
 	if (name.empty())
 		return;
+	// A signal ignored on entry to a non-interactive shell prints NOTHING, with or
+	// without -p: there is no trap to report and nothing a caller could restore,
+	// since the condition cannot be changed. `trap -- - INT` would be worse than
+	// silence, because it names the default action for a signal that is ignored.
+	//
+	// This is a recorded divergence (ADR-0001). dash and zsh accept the trap
+	// command, list it, and then never run it; bash lists nothing and so does this.
+	// A listing that names an action the shell will not take is the same failure as
+	// a builtin that succeeds without doing anything.
+	if (sigs.cannot_be_trapped(signo))
+		return;
 	switch (sigs.disposition_of(signo)) {
 		case disposition::ignore:
 			std::fputs("trap -- ", stdout);

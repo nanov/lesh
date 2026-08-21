@@ -84,6 +84,25 @@ public:
 	// which is the order the conformance suite checks.
 	void ignore_interrupts_for_async();
 
+	// POSIX XCU 2.11, the other half: a signal that was ALREADY IGNORED when a
+	// NON-INTERACTIVE shell was invoked cannot be trapped or reset, for the whole
+	// life of that shell. True for exactly those signals, and set_trap, set_ignore
+	// and reset are all no-ops for them (issue #37).
+	//
+	// This is a THIRD axis, independent of the two an entry already carries. The
+	// DISPOSITION is what this shell has asked for, and a subshell changes it. The
+	// recorded COMMAND TEXT outlives a disposition that has reverted. This fact is
+	// about how the PROCESS started: it is fixed in the constructor and nothing can
+	// change it afterwards, which is why it is not a fourth disposition value.
+	[[nodiscard]] bool cannot_be_trapped(int signo) const;
+
+	// The rule above is scoped to a non-interactive shell, so this mirrors
+	// shell_state's flag. A mirror rather than a parameter on set_trap, because the
+	// constructor captures the entry dispositions BEFORE main() has decided whether
+	// the shell is interactive; and not a back-pointer, because signal_state is a
+	// member of the very state it would point at.
+	void set_interactive(bool v) noexcept { _interactive = v; }
+
 	// Name to number, accepting `INT`, `SIGINT`, `2`, and `EXIT`. Returns -1 when
 	// the name is not recognised - and "not recognised" is a real answer, not a
 	// gap: the conformance suite probes `trap : RTMAX RTMIN` and SKIPS its
@@ -102,8 +121,14 @@ private:
 	struct entry {
 		disposition how = disposition::default_action;
 		std::string command;
+		// Ignored when this PROCESS started, read from the kernel in the constructor.
+		// A plain bool and not volatile sig_atomic_t: nothing in signal context ever
+		// looks at it - the readers are this class and the `trap` builtin, both of
+		// which run between commands like every other part of the shell.
+		bool ignored_on_entry = false;
 	};
 	std::vector<entry> _entries;
+	bool _interactive = false;
 };
 
 // Set by the installed handler, checked by the executor. Free functions with

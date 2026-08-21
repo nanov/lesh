@@ -285,7 +285,23 @@ const std::vector<name_entry>& signal_table() {
 
 } // namespace
 
-signal_state::signal_state() : _entries(kMaxSignal) {}
+signal_state::signal_state() : _entries(kMaxSignal) {
+	// ISSUE #37. Which signals arrived already ignored has to be captured HERE, and
+	// nowhere later: install() is the only thing that changes a disposition, and it
+	// is reachable only through set_trap / set_ignore / reset, which need a running
+	// `trap` - so this constructor is provably earlier than any of them. shell_state
+	// holds this as a member, so it is also earlier than the executor exists.
+	//
+	// sigaction with a null ACT only reports, so this asks the kernel what it
+	// inherited without disturbing anything. Signals the platform will not admit to
+	// (the numbers glibc reserves for its threading library) fail the call and stay
+	// false, which is right: nothing can send them.
+	for (int signo = 1; signo < kMaxSignal; ++signo) {
+		struct sigaction current{};
+		if (sigaction(signo, nullptr, &current) == 0)
+			_entries[signo].ignored_on_entry = current.sa_handler == SIG_IGN;
+	}
+}
 
 int signal_state::signal_number(std::string_view name) {
 	if (name.empty())
@@ -338,8 +354,20 @@ void signal_state::install(int signo) {
 	sigaction(signo, &sa, nullptr);
 }
 
+bool signal_state::cannot_be_trapped(int signo) const {
+	if (signo <= 0 || signo >= kMaxSignal)
+		return false;  // EXIT is a condition, not an inherited disposition
+	// The rule is scoped to a NON-interactive shell, and that scoping is load
+	// bearing rather than pedantry. dash and bash both apply the rule to an
+	// interactive shell as well, and the conformance suite says they are wrong to:
+	// sigurg6-p.tst runs the testee as `sh -i` with SIGURG already ignored and
+	// requires `trap 'echo trapped' URG` to FIRE. Dropping this term would trade
+	// the four sig*2 files for the four sig*6 ones.
+	return _entries[signo].ignored_on_entry && !_interactive;
+}
+
 void signal_state::set_trap(int signo, std::string command) {
-	if (signo < 0 || signo >= kMaxSignal)
+	if (signo < 0 || signo >= kMaxSignal || cannot_be_trapped(signo))
 		return;
 	_entries[signo].how = disposition::handler;
 	_entries[signo].command = std::move(command);
@@ -347,7 +375,10 @@ void signal_state::set_trap(int signo, std::string command) {
 }
 
 void signal_state::set_ignore(int signo) {
-	if (signo < 0 || signo >= kMaxSignal)
+	// `trap '' SIG` asks for the state such a signal is already in, so refusing it
+	// changes no behaviour - only what `trap` lists afterwards, which is the point:
+	// the listing must not name a disposition this shell set, because it did not.
+	if (signo < 0 || signo >= kMaxSignal || cannot_be_trapped(signo))
 		return;
 	_entries[signo].how = disposition::ignore;
 	_entries[signo].command.clear();
@@ -355,7 +386,11 @@ void signal_state::set_ignore(int signo) {
 }
 
 void signal_state::reset(int signo) {
-	if (signo < 0 || signo >= kMaxSignal)
+	// The half of the rule that KILLS a shell when it is missing: `trap - INT` in a
+	// script whose parent ignored SIGINT restored the default action, so the next
+	// `kill -s INT $$` - or a keyboard interrupt aimed at the parent's whole
+	// process group - terminated a shell POSIX says must survive.
+	if (signo < 0 || signo >= kMaxSignal || cannot_be_trapped(signo))
 		return;
 	_entries[signo].how = disposition::default_action;
 	_entries[signo].command.clear();
@@ -403,6 +438,12 @@ void signal_state::reset_for_subshell() {
 	// only portable way to save and restore them, `saved=$(trap)`, and POSIX.1-2024
 	// requires it - while the actions themselves must no longer be taken. dash
 	// reports nothing here and is behind the standard on it.
+	//
+	// A signal ignored on entry needs nothing here and gets nothing: set_trap can
+	// never have made it a handler, so the loop below cannot reach it, and the
+	// kernel disposition it arrived with is still SIG_IGN. That is also how a CHILD
+	// shell learns the same fact - SIG_IGN survives execve, so the child's own
+	// constructor rediscovers it rather than being told (issue #37).
 	for (int i = 0; i < kMaxSignal; ++i) {
 		if (_entries[i].how == disposition::handler) {
 			_entries[i].how = disposition::default_action;

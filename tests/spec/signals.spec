@@ -73,3 +73,42 @@ trap : STOP TSTP TTIN TTOU; echo $?
 
 --- SIGSTOP's default action stops the shell and a subshell resumes it [xfail(legacy): legacy has no kill builtin, so `kill -s STOP $$` runs /bin/kill]
 (kill -s STOP $$; s=$?; kill -s CONT $$; exit $s); echo st=$?
+
+# ISSUE #37. POSIX XCU 2.11: a signal ignored on entry to a NON-INTERACTIVE shell
+# cannot be trapped or reset. Every case below needs a shell whose SIGINT or
+# SIGURG is ALREADY ignored, which no `sh -c` snippet can create for itself - so
+# the case ignores the signal and then re-invokes `$TESTEE`, and the comparison
+# stays honest because dash does the same to dash. Without $TESTEE (#41) this rule
+# cannot be expressed differentially at all.
+#
+# The interactive half of the rule is deliberately NOT here. dash applies the rule
+# to `sh -i` as well and POSIX does not, so a differential case would only assert
+# dash's bug; the exclusion is covered by sigurg6-p.tst, which runs the testee
+# interactively with SIGURG ignored and requires the trap to fire.
+
+--- a signal ignored on entry cannot be RESET, which is the half that killed the shell [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+trap '' INT; "$TESTEE" -c 'trap - INT; kill -s INT $$; echo survived-reset'; echo "status=$?"
+
+--- a signal ignored on entry cannot be TRAPPED, so the handler never runs [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+trap '' INT; "$TESTEE" -c 'trap "echo trapped" INT; kill -s INT $$; echo after'
+
+--- trap on such a signal still reports success, because POSIX asks for no error [xfail(legacy): same quote-expansion defect]
+trap '' URG; "$TESTEE" -c 'trap "echo x" URG; echo $?; trap - URG; echo $?'
+
+--- the rule survives a subshell, where an ordinary handler would not [xfail(legacy): same quote-expansion defect]
+trap '' URG; "$TESTEE" -c '( trap "echo trapped" URG; kill -s URG $$; echo after )'
+
+--- a child shell inherits SIG_IGN and so discovers the rule for itself [xfail(legacy): same quote-expansion defect]
+trap '' URG; "$TESTEE" -c '"$TESTEE" -c "trap \"echo trapped\" URG; kill -s URG \$\$; echo after"'
+
+--- exec carries it, because SIG_IGN survives execve [xfail(legacy): same quote-expansion defect]
+trap '' INT; "$TESTEE" -c 'exec "$TESTEE" -c "trap - INT; kill -s INT \$\$; echo survived-exec"'
+
+--- the rule is per signal: another signal in the same shell traps normally [xfail(legacy): same quote-expansion defect]
+trap '' URG; "$TESTEE" -c 'trap "echo trapped" USR1; kill -s USR1 $$; echo after'
+
+--- an EXIT trap is unaffected, since EXIT has no inherited disposition [xfail(legacy): same quote-expansion defect]
+trap '' INT; "$TESTEE" -c 'trap "echo bye" EXIT; echo hi'
+
+--- trap lists nothing for a signal it cannot trap [xfail: divergence - dash and zsh accept the trap command, list it back, and then never run it; bash lists nothing and lesh follows bash, because a listing that names an action the shell will not take is the same defect as a builtin that succeeds without doing anything. See ADR-0001.]
+trap '' URG; "$TESTEE" -c 'trap "echo x" URG; trap; echo end'

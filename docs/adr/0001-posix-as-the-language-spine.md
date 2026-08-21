@@ -45,3 +45,15 @@ difference is written down here and carried as an `[xfail: divergence ...]` case
   `kill -s SIGURG` work; dash recognises only the unprefixed spellings POSIX lists
   and rejects both. bash, ksh, yash and zsh all accept the prefix, POSIX does not
   forbid the wider set, and no case in the conformance suite asserts rejection.
+- **`trap` lists nothing for a signal it cannot trap** (issue #37). A signal ignored
+  on entry to a non-interactive shell cannot be trapped or reset. dash and zsh
+  nevertheless accept the trap command, list it back, and then never run it; bash
+  records nothing and lists nothing, and lesh follows bash. A listing that names an
+  action the shell will not take is the same defect as a builtin that succeeds
+  without doing anything, and the listing is required to be re-inputtable.
+- **The "ignored on entry" rule applies only to a NON-interactive shell** (issue
+  #37). POSIX XCU 2.11 scopes it that way; dash and bash both apply it to an
+  interactive shell as well. The conformance suite agrees with POSIX rather than
+  with them - `sigurg6-p.tst` runs the testee as `sh -i` with SIGURG already
+  ignored and requires the trap to fire - so this divergence is measured by the
+  suite rather than carried as a corpus case, which would only assert dash's bug.

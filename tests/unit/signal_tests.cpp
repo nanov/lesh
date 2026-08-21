@@ -4,6 +4,45 @@
 
 using namespace lesh::runtime;
 
+namespace {
+
+// Restores one signal's real disposition when it goes out of scope.
+//
+// Needed because signal_state's constructor READS the process's current
+// dispositions (issue #37), so a test that leaves one changed changes what the
+// next test's constructor believes the process started with. set_ignore installs
+// SIG_IGN for real, and a later set_trap on the same signal would then be a
+// no-op - by the very rule these tests assert - with nothing to say why.
+class saved_disposition {
+public:
+	explicit saved_disposition(int signo) : _signo(signo) {
+		sigaction(_signo, nullptr, &_old);
+	}
+	~saved_disposition() { sigaction(_signo, &_old, nullptr); }
+	saved_disposition(const saved_disposition&) = delete;
+	saved_disposition& operator=(const saved_disposition&) = delete;
+
+	// Puts the signal in the state a shell INHERITS when its parent ignored it.
+	void ignore() const {
+		struct sigaction sa{};
+		sa.sa_handler = SIG_IGN;
+		sigemptyset(&sa.sa_mask);
+		sigaction(_signo, &sa, nullptr);
+	}
+
+	[[nodiscard]] void* installed() const {
+		struct sigaction current{};
+		sigaction(_signo, nullptr, &current);
+		return reinterpret_cast<void*>(current.sa_handler);
+	}
+
+private:
+	int _signo;
+	struct sigaction _old{};
+};
+
+} // namespace
+
 TEST(Signals, NamesResolveWithAndWithoutPrefix) {
 	EXPECT_EQ(signal_state::signal_number("INT"), SIGINT);
 	EXPECT_EQ(signal_state::signal_number("SIGINT"), SIGINT);
@@ -118,6 +157,7 @@ TEST(Signals, PendingCoversTheWholeSignalRange) {
 }
 
 TEST(Signals, DispositionsRoundTrip) {
+	const saved_disposition guard{SIGUSR1};
 	signal_state s;
 	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::default_action);
 
@@ -136,6 +176,8 @@ TEST(Signals, SubshellResetsHandlersButKeepsIgnores) {
 	// POSIX's asymmetry, and the thing several conformance cases test: a subshell
 	// resets traps to default EXCEPT those set to ignore, so `trap '' INT`
 	// protects a whole subtree while a handler belongs to the shell that set it.
+	const saved_disposition usr1{SIGUSR1};
+	const saved_disposition usr2{SIGUSR2};
 	signal_state s;
 	s.set_trap(SIGUSR1, "echo handler");
 	s.set_ignore(SIGUSR2);
@@ -167,4 +209,86 @@ TEST(Signals, PendingIsConsumedOnce) {
 
 	EXPECT_FALSE(s.take_pending(signo)) << "taking must clear the flag";
 	EXPECT_FALSE(s.any_pending());
+}
+
+TEST(Signals, ASignalIgnoredOnEntryCannotBeTrappedOrReset) {
+	// ISSUE #37, POSIX XCU 2.11. This single rule is the whole difference between
+	// sigint1-p.tst at 177/180 and sigint2-p.tst at 74/180: the sig*2 files are the
+	// sig*1 files with the signal already ignored when the shell was invoked, and
+	// all 180 of their cases require the shell to survive it.
+	const saved_disposition guard{SIGUSR1};
+	guard.ignore();
+	signal_state s;  // its constructor is what reads "how the process started"
+
+	ASSERT_TRUE(s.cannot_be_trapped(SIGUSR1));
+
+	s.set_trap(SIGUSR1, "echo handler");
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::default_action);
+	EXPECT_EQ(s.trap_command(SIGUSR1), "")
+		<< "nothing may be recorded, because nothing may be reported by `trap`";
+
+	s.set_ignore(SIGUSR1);
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::default_action);
+
+	s.reset(SIGUSR1);
+	// The assertion that actually matters. The kernel disposition is what a CHILD
+	// shell inherits across fork and execve, and it is how that child discovers the
+	// same fact about itself - so if reset() had reached sigaction here, every
+	// `target=child` and `target=exec` case in the sig*2 files would still fail.
+	EXPECT_EQ(guard.installed(), reinterpret_cast<void*>(SIG_IGN));
+}
+
+TEST(Signals, AnInteractiveShellMayStillTrapASignalIgnoredOnEntry) {
+	// POSIX scopes the rule to a NON-interactive shell, and the suite holds it to
+	// that: sigurg6-p.tst runs the testee as `sh -i` with SIGURG already ignored and
+	// requires the trap to fire. dash and bash both apply the rule interactively
+	// anyway; following them there would have traded the sig*2 files for the sig*6.
+	const saved_disposition guard{SIGUSR1};
+	guard.ignore();
+	signal_state s;
+	s.set_interactive(true);
+
+	EXPECT_FALSE(s.cannot_be_trapped(SIGUSR1));
+	s.set_trap(SIGUSR1, "echo handler");
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::handler);
+}
+
+TEST(Signals, ASignalAtItsDEFAULTDispositionIsUntouchedByTheRule) {
+	// The regression canary in unit form. sigint1-p.tst - the same 180 combinations
+	// with an inherited DEFAULT disposition - was already at 177/180, so a rule that
+	// leaked into this case would have cost more than it bought.
+	const saved_disposition guard{SIGUSR1};
+	signal_state s;
+
+	ASSERT_FALSE(s.cannot_be_trapped(SIGUSR1));
+	s.set_trap(SIGUSR1, "echo handler");
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::handler);
+	s.reset(SIGUSR1);
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::default_action);
+}
+
+TEST(Signals, IgnoredOnEntrySurvivesASubshell) {
+	// A subshell reverts handlers and keeps ignores; this fact is neither, and is
+	// immutable for the life of the PROCESS rather than of the shell environment.
+	const saved_disposition guard{SIGUSR1};
+	guard.ignore();
+	signal_state s;
+
+	s.reset_for_subshell();
+
+	EXPECT_TRUE(s.cannot_be_trapped(SIGUSR1));
+	s.set_trap(SIGUSR1, "echo handler");
+	EXPECT_EQ(s.disposition_of(SIGUSR1), disposition::default_action);
+	EXPECT_EQ(guard.installed(), reinterpret_cast<void*>(SIG_IGN));
+}
+
+TEST(Signals, TheEXITConditionIsNeverLockedByTheRule) {
+	// EXIT is condition 0, not a signal, so it has no inherited disposition to be
+	// ignored - and `trap 'cleanup' EXIT` in a script whose parent ignored something
+	// must keep working. An off-by-one that let 0 test as "ignored on entry" would
+	// disable every EXIT trap in the shell.
+	signal_state s;
+	EXPECT_FALSE(s.cannot_be_trapped(kExitTrap));
+	s.set_trap(kExitTrap, "echo bye");
+	EXPECT_EQ(s.disposition_of(kExitTrap), disposition::handler);
 }
