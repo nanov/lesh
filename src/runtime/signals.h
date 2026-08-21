@@ -22,7 +22,25 @@ namespace lesh::runtime {
 
 // POSIX's `EXIT` trap is signal number 0, which is not a real signal.
 inline constexpr int kExitTrap = 0;
-inline constexpr int kMaxSignal = 32;
+
+// One PAST the highest signal number the platform can deliver, taken from the C
+// library rather than written down: 32 on macOS, 65 on glibc, where the real-time
+// signals live above 32. It was the literal 32 that made SIGRTMIN..SIGRTMAX
+// untrappable on Linux no matter what the name table said (issue #38).
+//
+// It must stay a compile-time CONSTANT, because it sizes g_pending, which the
+// installed handler writes. A signal handler may not allocate, so that array can
+// never become a container and can never be sized at run time. Every state added
+// per signal from here on inherits the same rule.
+#if defined(NSIG)
+inline constexpr int kMaxSignal = NSIG;
+#elif defined(_NSIG)
+inline constexpr int kMaxSignal = _NSIG;
+#else
+// No supported platform lacks NSIG; 65 spans glibc's real-time range so that a
+// missing macro can never be the reason a signal is unreachable.
+inline constexpr int kMaxSignal = 65;
+#endif
 
 enum class disposition {
 	default_action,  // whatever the signal normally does
@@ -67,8 +85,15 @@ public:
 	void ignore_interrupts_for_async();
 
 	// Name to number, accepting `INT`, `SIGINT`, `2`, and `EXIT`. Returns -1 when
-	// the name is not recognised.
+	// the name is not recognised - and "not recognised" is a real answer, not a
+	// gap: the conformance suite probes `trap : RTMAX RTMIN` and SKIPS its
+	// real-time cases when the shell rejects them, so claiming a signal the
+	// platform does not have would turn skips into wrong passes.
 	[[nodiscard]] static int signal_number(std::string_view name);
+	// Number to name, without the SIG prefix. Empty for a number the platform has
+	// no name for. The table behind both is built from what the PLATFORM defines
+	// rather than from a list typed by hand - see signals.cpp, which is where the
+	// bug was that made SIGURG unreachable.
 	[[nodiscard]] static std::string_view signal_name(int signo);
 
 private:

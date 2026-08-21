@@ -28,3 +28,20 @@ on top, admitted one feature at a time by explicit decision.
 - Job control is not scheduled in Phases 0-5. POSIX places it in the User
   Portability option rather than the mandatory core.
 - The single-pass parser cannot reach this target. See ADR-0002.
+
+## Recorded divergences from dash
+
+dash is the reference, not the specification. Where lesh deliberately differs, the
+difference is written down here and carried as an `[xfail: divergence ...]` case in
+`tests/spec`, so it stays a decision rather than becoming a drift.
+
+- **`kill -l` lists what the PLATFORM has, not what dash has** (issue #38). dash
+  carries a fixed table of 32 signals; on glibc that omits `SIGRTMIN..SIGRTMAX`,
+  which the platform really does define and which `trap` there really can take.
+  lesh derives the list from `<signal.h>` and the C library, so the two lists agree
+  on macOS and lesh's is longer on Linux. The corpus therefore asserts the shape and
+  the round-trip properties of the list rather than its full text.
+- **The `SIG` prefix is accepted on a signal name** (issue #38). `trap : SIGURG` and
+  `kill -s SIGURG` work; dash recognises only the unprefixed spellings POSIX lists
+  and rejects both. bash, ksh, yash and zsh all accept the prefix, POSIX does not
+  forbid the wider set, and no case in the conformance suite asserts rejection.

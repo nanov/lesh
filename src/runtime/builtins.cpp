@@ -914,11 +914,53 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 	return {status};
 }
 
+// `kill -l EXIT_STATUS`: POSIX's inverse of `kill -s`, and a gap here is not
+// local. The suite's own run-test.sh renders every signalled exit with
+// `kill -l "$actual_exit_status"`, and kill1-p.tst asserts both readings of the
+// one operand - `kill -l 9` is KILL, and `kill -l $?` after a child died of
+// SIGKILL is also KILL.
+//
+// The two readings never collide, because NSIG is 32 on macOS and 65 on glibc and
+// a shell reports a signalled child as 128+n: at or below 128 the operand is a
+// signal number, above it the 128 comes back off. `kill -l 128` is therefore an
+// error, not EXIT - signal 0 is the null signal and has no name. dash agrees on
+// every one of those.
+builtin_result kill_list_one(const char* operand) {
+	std::string_view text{operand};
+	if (!is_unsigned_integer(text)) {
+		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
+		             operand);
+		return {1};
+	}
+	int value = 0;
+	for (const char c : text) {
+		value = value * 10 + (c - '0');
+		if (value > 1024)
+			break;  // no signal number is anywhere near this; stop before overflow
+	}
+	const int signo = value > 128 ? value - 128 : value;
+	const std::string_view name = signal_state::signal_name(signo);
+	if (signo <= 0 || name.empty()) {
+		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
+		             operand);
+		return {1};
+	}
+	std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
+	return {0};
+}
+
 builtin_result builtin_kill(shell_state&, char** argv) {
 	int signo = SIGTERM;
 	size_t first = 1;
 
 	if (argv[1] != nullptr && std::strcmp(argv[1], "-l") == 0) {
+		if (argv[2] != nullptr)
+			return kill_list_one(argv[2]);  // dash reads only the first operand too
+		// `0` leads the list because the null signal is a legal `kill -s` operand
+		// and has no name of its own; printing `EXIT` there would be a category
+		// error - EXIT is a `trap` condition, not something you can send. dash
+		// prints exactly this, one name per line, in numeric order.
+		std::puts("0");
 		for (int i = 1; i < kMaxSignal; ++i) {
 			const std::string_view name = signal_state::signal_name(i);
 			if (!name.empty())
@@ -926,15 +968,21 @@ builtin_result builtin_kill(shell_state&, char** argv) {
 		}
 		return {0};
 	}
+	const char* signal_operand = nullptr;
 	if (argv[1] != nullptr && std::strcmp(argv[1], "-s") == 0 && argv[2] != nullptr) {
-		signo = signal_state::signal_number(argv[2]);
+		signal_operand = argv[2];
 		first = 3;
 	} else if (argv[1] != nullptr && argv[1][0] == '-' && argv[1][1] != '\0') {
-		signo = signal_state::signal_number(argv[1] + 1);
+		signal_operand = argv[1] + 1;
 		first = 2;
 	}
+	if (signal_operand != nullptr)
+		signo = signal_state::signal_number(signal_operand);
 	if (signo < 0) {
-		std::fprintf(stderr, "lesh: kill: bad signal\n");
+		// Naming the operand matters: the whole of issue #38 presented itself as
+		// this message with nothing in it to say WHICH signal the shell had never
+		// heard of.
+		std::fprintf(stderr, "lesh: kill: %s: bad signal\n", signal_operand);
 		return {1};
 	}
 
