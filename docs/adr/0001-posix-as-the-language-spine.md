@@ -75,3 +75,15 @@ difference is written down here and carried as an `[xfail: divergence ...]` case
   shell. dash additionally hands its interactive `SIG_IGN` straight to a forked child,
   which then survives a SIGTERM aimed at itself; it is inconsistent with its own
   `exec`, which does drop the ignore. bash and lesh drop it in both.
+- **`return` with no operand inside a TRAP ACTION reports the status the trap
+  interrupted** (issue #33's machinery, extended by the control-flow work). POSIX
+  gives `exit` and `return` the same default - the status of the last command
+  executed - and says of `exit` that when it "is executed in a trap action, the
+  last command is considered to be the command that executed immediately preceding
+  the trap action". dash applies that to `exit` and not to `return`; bash and zsh
+  apply it to neither. The conformance suite asserts it for `exit` four times in
+  `exit-p.tst`, all four of which dash passes, and once for `return` in
+  `return-p.tst`'s 'default exit status in function in trap', which expects 19
+  where dash, bash and zsh all answer 0. A shell whose two spellings of "the last
+  command" answer the same question differently is the real defect, so lesh
+  applies the rule to both.

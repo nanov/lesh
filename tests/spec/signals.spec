@@ -223,3 +223,6 @@ trap 'echo A; exit 4; echo B' USR1; kill -s USR1 $$; echo after
 
 --- an exit in a subshell's EXIT trap is the subshell's status [xfail(legacy): legacy has no trap builtin]
 ( trap 'exit 7' EXIT; exit 1 ); echo "sub=$?"
+
+--- return with no operand in a trap reports the status the trap interrupted [xfail: divergence from dash - ADR-0001. POSIX makes "the last command" the one before the trap action for `return` as much as for `exit`, which is what return-p.tst's 'default exit status in function in trap' requires (19, not 0). dash applies the rule to `exit` only; bash and zsh to neither]
+fn() { true; return; }; trap 'fn; echo trapped $?' EXIT; (exit 19); exit

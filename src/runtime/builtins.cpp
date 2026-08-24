@@ -1815,7 +1815,21 @@ builtin_result builtin_continue(shell_state&, char** argv) {
 
 builtin_result builtin_return(shell_state& state, char** argv) {
 	const size_t operand = first_operand(argv);
-	return {argv[operand] != nullptr ? std::atoi(argv[operand]) : state.last_status(),
+	// The same rule `exit` follows, and for the same reason: POSIX gives both the
+	// status of the last command executed, and inside a TRAP ACTION "the last
+	// command" is the one that ran immediately before the action. So
+	// `fn() { true; return; }` called from a trap reports the status the trap
+	// interrupted rather than `true`'s - return-p.tst's 'default exit status in
+	// function in trap', which expects 19 and not 0.
+	//
+	// DIVERGENCE FROM dash, recorded in ADR-0001: dash, bash and zsh all report
+	// the body's own last command here, while all four of the equivalent `exit`
+	// cases in exit-p.tst agree with the conformance suite - and dash itself
+	// applies the rule to `exit`. A shell whose `exit` and `return` answer the same
+	// question differently would be the real defect.
+	return {argv[operand] != nullptr
+	        ? std::atoi(argv[operand])
+	        : state.trap_entry_status().value_or(state.last_status()),
 	        control_flow::return_from};
 }
 

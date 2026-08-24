@@ -1030,3 +1030,22 @@ TEST_F(ExecutorTest, ASubshellInATrapDoesNotInheritTheEntryStatus) {
 	// the moment the entry status was added without shell_state::enter_subshell.
 	EXPECT_EQ(capture("( trap '((exit 2); exit); echo $?' EXIT; exit 1 )"), "2\n");
 }
+
+TEST_F(ExecutorTest, ReturnWithNoOperandInATrapReportsTheEntryStatus) {
+	// The same rule `exit` follows inside a trap action, and return-p.tst's
+	// 'default exit status in function in trap' is what asserts it: `fn` runs
+	// `true` and then `return`, and the status reported is the one the trap
+	// INTERRUPTED - 19 - rather than `true`'s zero.
+	//
+	// A divergence from dash, recorded in ADR-0001: dash applies the rule to `exit`
+	// and not to `return`, bash and zsh to neither.
+	EXPECT_EQ(capture("( fn() { true; return; }; trap 'fn; echo trapped $?' EXIT; "
+	                  "(exit 19); exit )"),
+	          "trapped 19\n");
+	// An operand still wins, and outside a trap nothing changes.
+	EXPECT_EQ(capture("( fn() { true; return 3; }; trap 'fn; echo trapped $?' EXIT; "
+	                  "(exit 19); exit )"),
+	          "trapped 3\n");
+	EXPECT_EQ(capture("fn() { true; return; }; (exit 19); fn; echo plain $?"),
+	          "plain 0\n");
+}
