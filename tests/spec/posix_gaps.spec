@@ -1202,3 +1202,45 @@ echo $(( 0 && + )); echo st=$?
 
 --- arithmetic that evaluates is untouched by any of this [xfail(legacy): legacy has no arithmetic expansion]
 echo $((6/2)) $((1+1)); echo st=$?
+
+# A SYNTAX ERROR INSIDE `$(...)` REACHES THE OUTER SHELL (#57). The child
+# refused and _exit(2)ed, and nothing read that status - so the body is now
+# parsed on THIS side of the fork, where the refusal is a fact rather than an
+# exit code indistinguishable from `exit 2`.
+#
+# Written one command per LINE. dash parses a substitution when it parses the
+# command around it, so `echo before; echo $(if true)` on ONE line refuses the
+# whole line and prints nothing; lesh reads a command at a time and would print
+# `before` first. The line is where the two agree.
+
+--- a syntax error inside a command substitution stops the shell [stdin] [xfail(legacy): legacy has no if clause, so the substitution body runs `if` as a command name]
+echo before
+echo $(if true)
+echo reached
+
+--- an unexpected token inside a command substitution stops the shell [stdin] [xfail(legacy): legacy accepts `;;` and carries on]
+echo before
+echo $(echo ;;)
+echo reached
+
+--- a syntax error inside a command substitution in an assignment stops the shell [stdin] [xfail(legacy): legacy has no if clause, so the substitution body runs `if` as a command name]
+echo before
+v=$(if true)
+echo reached
+
+--- a syntax error inside a BACKQUOTED substitution stops the shell [stdin] [xfail(legacy): legacy has no if clause, so the substitution body runs `if` as a command name]
+echo before
+echo `if true`
+echo reached
+
+# The boundary the fix must not cross: a RUNTIME failure inside a substitution
+# is not a syntax error, and dash reports it through $? and carries on.
+
+--- a runtime syntax error inside a substitution is the substitution's status, not the shell's [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+x=$(eval "if true"); echo "st=$? x=[$x]"; echo reached
+
+--- a command substitution that exits non-zero does not stop anything [xfail(legacy): legacy has no command substitution]
+echo "[$(exit 7)]"; echo st=$?
+
+--- a command substitution running a missing command does not stop anything [xfail(legacy): legacy has no command substitution]
+echo "[$(_lesh_no_such_command_zz 2>/dev/null)]"; echo st=$?

@@ -961,22 +961,46 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				std::string_view code = substitution_body(without_continuations(body));
 				if (!body.empty() && body[0] == '`')
 					code = unescape_backquotes(code, ctx.double_quoted);
-				if (_runner->run_and_capture(code, captured)) {
-					std::string_view result{captured.data(), captured.size()};
-					// POSIX: trailing newlines are removed from the result.
-					while (!result.empty() && result.back() == '\n')
-						result.remove_suffix(1);
-					if (ctx.split) {
-						// The result is glob-eligible: cmdsub-p.tst's 'pathname expansion
-						// on result of command substitution' requires `$(echo 'dumm*ile')`
-						// to become the matching filename. Missing here while the same
-						// rule was applied to a variable's value two branches up.
-						if (has_pattern_characters(result))
-							_field_globbable = true;
-						append_split(result, out);
-					} else {
-						append_value(result, ctx);
-					}
+				switch (_runner->run_and_capture(code, captured)) {
+					case substitution_result::malformed:
+						// The body is not shell input. Fatal to a non-interactive shell,
+						// exactly as an unterminated construct inside an expansion is (#48)
+						// and as a syntax error at the top level is - the fault is in the
+						// input either way, and the runner has already reported it. This is
+						// the whole of #57: the answer was a bool, `false` meant only "the
+						// fork failed", and the refusal had nowhere to go.
+						_fatal_error = true;
+						status = expansion_status::malformed_expansion;
+						break;
+
+					case substitution_result::unavailable:
+						// No pipe or no process. The shell is out of resources rather than
+						// the input being wrong, so this is not the input's fault - but it is
+						// still not a substitution that produced nothing, which is what
+						// discarding the old `false` made it look like. The runner has
+						// reported the errno; a non-interactive shell stops rather than
+						// running a command with a word that silently lost its middle.
+						_fatal_error = true;
+						status = expansion_status::expansion_error;
+						break;
+
+					case substitution_result::ok: {
+						std::string_view result{captured.data(), captured.size()};
+						// POSIX: trailing newlines are removed from the result.
+						while (!result.empty() && result.back() == '\n')
+							result.remove_suffix(1);
+						if (ctx.split) {
+							// The result is glob-eligible: cmdsub-p.tst's 'pathname expansion
+							// on result of command substitution' requires `$(echo 'dumm*ile')`
+							// to become the matching filename. Missing here while the same
+							// rule was applied to a variable's value two branches up.
+							if (has_pattern_characters(result))
+								_field_globbable = true;
+							append_split(result, out);
+						} else {
+							append_value(result, ctx);
+						}
+					} break;
 				}
 			} break;
 

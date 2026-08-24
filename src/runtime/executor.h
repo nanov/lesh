@@ -349,8 +349,12 @@ private:
 	// returns because the stage became an external command.
 	int run_pipeline_stage(const syntax::tree& t, syntax::node_index stage);
 
-	// Runs a whole tree with stdout captured. Used by command substitution.
-	[[nodiscard]] bool capture(std::string_view code, arena_array<char>& out);
+	// Parses and runs `code` with stdout captured. Used by command substitution.
+	//
+	// Three answers rather than two: see substitution_result, and #57 for what the
+	// bool could not say.
+	[[nodiscard]] substitution_result capture(std::string_view code,
+	                                          arena_array<char>& out);
 
 	// Adapts this executor to the expander's port. A member rather than a global,
 	// so nesting works: `$(a $(b) c)` needs the inner capture to reach the same
@@ -358,7 +362,8 @@ private:
 	class runner_adapter final : public command_runner {
 	public:
 		explicit runner_adapter(tree_walking_executor& owner) noexcept : _owner(owner) {}
-		bool run_and_capture(std::string_view code, arena_array<char>& out) override {
+		substitution_result run_and_capture(std::string_view code,
+		                                    arena_array<char>& out) override {
 			return _owner.capture(code, out);
 		}
 	private:

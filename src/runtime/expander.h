@@ -58,6 +58,25 @@ public:
 	[[nodiscard]] virtual std::string_view option_flags() const = 0;
 };
 
+// What a command substitution DID. Three answers, not two.
+//
+// It was a bool, and the bool could not say the thing that mattered: a body that
+// will not PARSE is a different answer from one that ran and failed, and the
+// difference is exactly what #57 lost. The child refused, `_exit(2)`, and its
+// status was indistinguishable from a body that ran `exit 2` - so nothing could
+// act on it and `echo $(if true)` reported success.
+enum class substitution_result {
+	ok,
+	// The substitution could not be performed at all: no pipe, or no process.
+	// The shell is out of resources rather than the input being wrong.
+	unavailable,
+	// The body is not shell input, and has already been reported. POSIX makes a
+	// syntax error fatal to a non-interactive shell wherever it appears, and this
+	// is one - dash refuses `$(if true)` at 2 without running the command around
+	// it.
+	malformed,
+};
+
 // The port that breaks the cycle.
 //
 // Rather than the expander depending on the executor, the executor supplies
@@ -70,8 +89,8 @@ public:
 class command_runner {
 public:
 	virtual ~command_runner() = default;
-	[[nodiscard]] virtual bool run_and_capture(std::string_view code,
-	                                           arena_array<char>& out) = 0;
+	[[nodiscard]] virtual substitution_result run_and_capture(std::string_view code,
+	                                                          arena_array<char>& out) = 0;
 };
 
 // Assigning to a parameter from ${x=default}. Separate from arithmetic's port

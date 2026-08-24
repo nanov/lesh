@@ -2804,17 +2804,47 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 	return _state.opts().pipefail ? rightmost_failure : last_status;
 }
 
-bool tree_walking_executor::capture(std::string_view code, arena_array<char>& out) {
+substitution_result tree_walking_executor::capture(std::string_view code,
+                                                  arena_array<char>& out) {
+	// PARSED ON THIS SIDE OF THE FORK, and that is the whole of #57.
+	//
+	// The parse used to happen in the child, which refused correctly and `_exit(2)`,
+	// and nothing could read that: an exit status of 2 from a body that will not
+	// parse is byte-identical to one from a body that ran `exit 2`, so `echo
+	// $(if true)` printed its diagnostic and then reported success. A syntax error
+	// is a property of the INPUT, and the only place it can be told apart from a
+	// status is where the parser runs.
+	//
+	// dash reaches the same answer from the other direction - it parses a
+	// substitution while parsing the command around it - and refuses at 2 without
+	// running anything. Parsing here costs nothing and saves a fork: a body that
+	// will not parse no longer forks at all.
+	//
+	// The tree must outlive the child's run(), and it does: fork copies the address
+	// space, so the child inherits this pool as it stands.
+	buffer_pool inner_pool{BUFFER_POOL_SIZE};
+	const tree inner = syntax::parse(inner_pool, code, &_state);
+	// has_errors() and never incomplete(): the body arrived whole, so there is no
+	// more input to continue it with - the same reading run_parsed gives the top
+	// level, and the reason `$(if true` and `$(if true)` answer alike.
+	if (inner.has_errors()) {
+		report_syntax_error(inner);
+		return substitution_result::malformed;
+	}
+
 	int pipe_fds[2];
-	if (pipe(pipe_fds) == -1)
-		return false;
+	if (pipe(pipe_fds) == -1) {
+		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		return substitution_result::unavailable;
+	}
 
 	std::fflush(nullptr);
 	const pid_t pid = fork();
 	if (pid == -1) {
+		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
 		close(pipe_fds[0]);
 		close(pipe_fds[1]);
-		return false;
+		return substitution_result::unavailable;
 	}
 
 	if (pid == 0) {
@@ -2830,10 +2860,8 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 		// EXIT; x=$(echo body)` put T into x.
 		_state.enter_subshell();
 		_exit_trap_ran = false;
-		// The substitution's contents are a fresh parse. Nesting works because this
-		// is the same code path, reached recursively.
-		buffer_pool inner_pool{BUFFER_POOL_SIZE};
-		const tree inner = syntax::parse(inner_pool, code, &_state);
+		// The tree was parsed above, before the fork, and nesting still works
+		// because this is the same code path reached recursively.
 		const int status = run(inner);
 		std::fflush(nullptr);
 		_exit(status);
@@ -2858,7 +2886,7 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 	waitpid(pid, &wait_status, 0);
 	_state.set_last_status(status_from_wait(wait_status));
 	++_substitutions;
-	return true;
+	return substitution_result::ok;
 }
 
 } // namespace lesh::runtime

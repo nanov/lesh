@@ -75,16 +75,25 @@ public:
 
 // A runner that records what it was asked to execute, so tests can assert the
 // expander asked rather than assuming.
+//
+// `answer` is what it reports back. The default is `ok`, which is every existing
+// test; the other two are what the real runner says when the body will not parse
+// or when there is no process to run it in, and the expander has to tell all
+// three apart (#57).
 class FakeRunner final : public command_runner {
 public:
 	std::vector<std::string> asked;
 	std::string reply;
+	substitution_result answer = substitution_result::ok;
 
-	bool run_and_capture(std::string_view code, lesh::arena_array<char>& out) override {
+	substitution_result run_and_capture(std::string_view code,
+	                                    lesh::arena_array<char>& out) override {
 		asked.emplace_back(code);
+		if (answer != substitution_result::ok)
+			return answer;
 		for (const char c : reply)
 			out.push(c);
-		return true;
+		return answer;
 	}
 };
 
@@ -834,4 +843,59 @@ TEST_F(ExpanderTest, ARefusedArithmeticAssignmentStaysTheVariableAssignmentError
 	expand("echo $((x=1))", nullptr, &status, &fatal, &vars);
 	EXPECT_TRUE(fatal);
 	EXPECT_EQ(status, expansion_status::expansion_error);
+}
+
+// --- a syntax error inside a substitution crosses the fork (#57) --------------
+
+TEST_F(ExpanderTest, ASubstitutionBodyThatWillNotParseIsAFatalExpansionError) {
+	// The whole of #57 at this layer. The answer used to be a bool, so the runner
+	// could say only "I produced output" or "I could not run at all" - and a child
+	// that refused `if true` and _exit(2)ed was indistinguishable from one that ran
+	// `exit 2`. The refusal therefore had nowhere to go, and `echo $(if true)`
+	// printed the diagnostic and then reported success.
+	FakeRunner runner;
+	runner.answer = substitution_result::malformed;
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	const auto fields = expand("echo $(if true)", &runner, &status, &fatal);
+	EXPECT_TRUE(fatal);
+	EXPECT_EQ(status, expansion_status::malformed_expansion)
+		<< "the INPUT is at fault, which is what malformed_expansion means (#48)";
+	EXPECT_EQ(fields, (std::vector<std::string>{"echo"}));
+	ASSERT_EQ(runner.asked.size(), 1u);
+	EXPECT_EQ(runner.asked[0], "if true");
+}
+
+TEST_F(ExpanderTest, ASubstitutionThatCouldNotBeRunAtAllIsFatalToo) {
+	// No pipe or no process: not the input's fault, and not a substitution that
+	// produced nothing either - which is what discarding the old `false` made it
+	// look like.
+	//
+	// The FIELD is still built out of the literal bytes around it - `a$(x)b` is
+	// `ab` - and that is exactly the wrong answer the flag exists to stop: nothing
+	// in the field says the middle went missing. It never reaches a command,
+	// because fatal_error() is consulted first.
+	FakeRunner runner;
+	runner.answer = substitution_result::unavailable;
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	EXPECT_EQ(expand("echo a$(x)b", &runner, &status, &fatal),
+	          (std::vector<std::string>{"echo", "ab"}));
+	EXPECT_TRUE(fatal);
+	EXPECT_EQ(status, expansion_status::expansion_error);
+}
+
+TEST_F(ExpanderTest, ASubstitutionThatRanIsNotAnErrorWhateverItsCommandDid) {
+	// The boundary. A body that parses and then FAILS at run time - a missing
+	// command, an `exit 7` - is an ordinary result: POSIX gives its status to the
+	// command with no command name (#50) and the shell carries on. dash agrees:
+	// `x=$(eval "if true")` reports 2 through $? and runs the next line.
+	FakeRunner runner;
+	runner.reply = "out\n";
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	EXPECT_EQ(expand("echo $(x)", &runner, &status, &fatal),
+	          (std::vector<std::string>{"echo", "out"}));
+	EXPECT_FALSE(fatal);
+	EXPECT_EQ(status, expansion_status::ok);
 }
