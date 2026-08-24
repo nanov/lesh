@@ -710,3 +710,28 @@ TEST_F(ExecutorTest, TheSeparatorPrecedesTheOperandOfEvalAndDot) {
 	// filename that does not exist.
 	EXPECT_NE(run(". -- -- 2>/dev/null"), 0);
 }
+
+// --- control flow unwinds before the operator that follows it ------------------
+
+TEST_F(ExecutorTest, ABreakBeforeAndDoesNotRunTheRightHandSide) {
+	// `break` reports 0, and 0 is exactly what `&&` continues on, so reading the
+	// left operand's STATUS alone ran the echo. break-p.tst's 'breaking before &&'.
+	EXPECT_EQ(capture("for i in 1; do break && echo reached1; echo reached2; done"), "");
+	EXPECT_EQ(capture("for i in 1; do continue && echo reached1; echo reached2; done"),
+	          "");
+	EXPECT_EQ(capture("f() { return && echo reached1; echo reached2; }; f"), "");
+	// The `||` forms passed already, 0 being what `||` stops on - kept so a fix
+	// that swapped the two operators would be caught.
+	EXPECT_EQ(capture("for i in 1; do break || echo reached1; echo reached2; done"), "");
+	EXPECT_EQ(capture("f() { return || echo reached1; echo reached2; }; f"), "");
+	// `exit` unwinds through the operator too, and there the status is visible.
+	EXPECT_EQ(run("exit 5 && echo reached"), 5);
+}
+
+TEST_F(ExecutorTest, AnUnwindBeforeAndKeepsTheStatusTheBuiltinReported) {
+	// The and-or list reports the LEFT operand, not zero from a right-hand side it
+	// never ran. `break` and a bare `return` both report 0, so a non-zero `return`
+	// is what distinguishes the two.
+	EXPECT_EQ(run("f() { return 7 && echo reached; }; f"), 7);
+	EXPECT_EQ(capture("f() { return 7 && echo reached; }; f; echo st=$?"), "st=7\n");
+}

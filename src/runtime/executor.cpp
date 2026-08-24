@@ -864,6 +864,22 @@ int tree_walking_executor::run_and_or(const tree& t, node_index n) {
 	}
 	_state.set_last_status(left);
 
+	// A `break`, `continue`, `return` or `exit` in the LEFT operand unwinds PAST
+	// the operator rather than being something the list gets to test: POSIX makes
+	// the unwind immediate, so `break && echo x` never reaches the echo.
+	//
+	// Reading `left` alone ran the right-hand side of every one of them, because
+	// `break`, `continue` and a bare `return` all report 0 and 0 is exactly what
+	// `&&` continues on - break-p.tst's 'breaking before &&', continue-p.tst's
+	// 'continuing before &&' and return-p.tst's 'returning before &&'. The `||`
+	// cases passed only because 0 is also what `||` stops on.
+	//
+	// `_status_tested` is deliberately left alone: this list did not short-circuit
+	// on a STATUS, and the unwind reaches the enclosing construct before any
+	// `set -e` test does.
+	if (_flow != control_flow::normal || _exit_requested)
+		return left;
+
 	const bool is_and = t.token_at(self.aux).kind == syntax::token_kind::and_if;
 	if (is_and ? (left != 0) : (left == 0)) {
 		// Short-circuit: the list's LAST command never ran, so this status was

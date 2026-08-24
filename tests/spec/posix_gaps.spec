@@ -935,3 +935,23 @@ printf 'echo sourced\n(exit 3)\n' >script; . -- ./script; echo "st=$?"
 
 --- a separator with no operand after it leaves the default [xfail: divergence - dash rejects the separator itself; POSIX XCU 1.4 discards it and `exit --` is then `exit`]
 (exit 41); exit --
+
+# Control flow unwinds PAST the operator that follows it. `break`, `continue` and
+# a bare `return` all report 0, and 0 is what `&&` continues on, so an and-or list
+# that read only the left operand's status ran the right-hand side of every one of
+# them.
+
+--- a break before && does not run the right-hand side [xfail(legacy): legacy has no compound commands]
+for i in 1; do break && echo reached1; echo reached2; done; echo "st=$?"
+
+--- a continue before && does not run the right-hand side [xfail(legacy): legacy has no compound commands]
+for i in 1 2; do echo "in $i"; continue && echo reached1; echo reached2; done
+
+--- a return before && does not run the right-hand side [xfail(legacy): legacy has no functions]
+f() { return && echo reached1; echo reached2; }; f; echo "st=$?"
+
+--- an and-or list reports the operand the unwind came from [xfail(legacy): legacy has no functions]
+f() { return 7 && echo reached; }; f; echo "st=$?"
+
+--- an exit before && does not run the right-hand side [xfail(legacy): legacy has no exit builtin and runs /bin/exit, which does not exist]
+exit 5 && echo reached
