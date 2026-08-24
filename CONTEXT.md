@@ -169,7 +169,10 @@ Turns tokens into a tree. Always returns a tree; invalid input yields error node
 
 **Expander** _[lesh]_:
 Turns one word plus the shell state into fields. Called by the executor per command,
-at execution time.
+at execution time. Also the last line of defence against a **defect** the front end
+could not see: the word scan counts braces, so an unterminated construct inside
+`${x-...}` is only lexed when the default is expanded, and refusing it is the
+expander's job (#48). Re-entrant, and therefore depth-limited.
 
 **Executor** _[lesh]_:
 Runs a tree. An interface, so the back end stays replaceable.

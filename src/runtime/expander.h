@@ -85,6 +85,11 @@ enum class expansion_status {
 	command_substitution_unavailable,  // no runner supplied - completion's mode
 	unsupported_construct,             // a construct that is not implemented
 	parameter_unset,                   // ${x?message} fired
+	// An unterminated construct INSIDE an expansion, or expansion nested deeper
+	// than the shell will follow. Separate from unsupported_construct because the
+	// INPUT is at fault rather than the shell, and POSIX makes it fatal to a
+	// non-interactive shell the way a syntax error is (#48).
+	malformed_expansion,
 };
 
 class expander {
@@ -154,6 +159,29 @@ private:
 	// Reports an unset parameter under `set -u` and records the fatal error.
 	// Returns true when it fired, so a caller can skip substituting nothing.
 	bool report_unset(std::string_view name) noexcept;
+
+	// Reports an unterminated construct found inside an expansion and records the
+	// fatal error. Worded exactly as the parser words it, because which layer
+	// caught it is lesh's business and not the user's.
+	void report_malformed(syntax::token_error error) noexcept;
+
+	// How deep expansion may nest.
+	//
+	// The expander is re-entrant BY DESIGN - a parameter default, an assignment
+	// value and arithmetic's inner text all re-enter expand_text - so nesting in
+	// the input is nesting on the C++ stack, and refusing malformed input bounds
+	// the recursion only by the LENGTH of the input, which is not a bound. Measured
+	// on the perfectly well-formed `${x-${x-...hi...}}`: 1500 levels expanded,
+	// 2000 overflowed the stack on the debug build. dash is not a counterexample,
+	// only a bigger frame budget - it prints `hi` at 16000 and takes SIGSEGV at
+	// 18000, so the reference implementation has this bug too and answers it with
+	// a crash.
+	//
+	// 256 mirrors the executor's kMaxFunctionDepth, for the same reason and with
+	// the same shape of answer: a diagnostic and a non-zero status, never a silent
+	// empty result. Human-written expansion nests less than ten deep.
+	static constexpr int kMaxExpansionDepth = 256;
+	int _depth = 0;
 
 	bool lookup_parameter(std::string_view name, std::string_view& out) noexcept;
 	std::string_view int_to_scratch(int value) noexcept;

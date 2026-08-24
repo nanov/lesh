@@ -15,12 +15,42 @@ namespace lesh::runtime {
 using syntax::lex_mode;
 using syntax::lexer;
 using syntax::token;
+using syntax::token_error;
 using syntax::token_kind;
 
 namespace {
 
 bool is_ifs(char c, std::string_view ifs) noexcept {
 	return ifs.find(c) != std::string_view::npos;
+}
+
+// True for an unterminated construct whose DELIMITERS this file strips off the
+// segment before working on what is left. An unterminated one means the bytes it
+// would strip are not there, and the arithmetic case then re-expands the segment
+// unchanged - which is how `${x-$((1}` came to recurse until the stack ran out.
+//
+// The two QUOTE errors are deliberately absent. Whether a quote inside `${x-...}`
+// is a quote at all depends on the double-quote context POSIX 2.6.2 gives it -
+// `dash -c 'echo "${x-'"'"'}"'` prints one single quote at status zero - and
+// expand_assignment_value re-lexes its text without that context yet (#42). So
+// refusing there would trade a crash for a diagnostic on input dash accepts.
+// Every case is listed and there is no default, so a new token_error cannot be
+// left out of this decision silently - the release build takes -Wswitch as an
+// error.
+constexpr bool is_unterminated_substitution(token_error error) noexcept {
+	switch (error) {
+		case token_error::unterminated_command_sub:
+		case token_error::unterminated_backquote:
+		case token_error::unterminated_arithmetic:
+		case token_error::unterminated_parameter_expansion:
+			return true;
+		case token_error::unterminated_single_quote:
+		case token_error::unterminated_double_quote:
+		case token_error::unexpected_byte:
+		case token_error::none:
+			return false;
+	}
+	return false;
 }
 
 // The body of a parameter segment: what sits between `${` and `}`, or after `$`.
@@ -220,6 +250,17 @@ bool expander::report_unset(std::string_view name) noexcept {
 	return true;
 }
 
+// The word scan could not see this one, so the expander is where it is reported.
+// Worded as the parser words it, from the same table, so `echo $((1` and
+// `echo ${x-$((1}` - the same defect one nesting level apart - do not answer
+// differently depending on which layer noticed.
+void expander::report_malformed(token_error error) noexcept {
+	const char* phrase = syntax::error_phrase(error);
+	std::fprintf(stderr, "lesh: syntax error: %s\n",
+	             phrase != nullptr ? phrase : "malformed expansion");
+	_fatal_error = true;
+}
+
 // Formats an integer into arena storage so the returned view outlives the call.
 std::string_view expander::int_to_scratch(int value) noexcept {
 	char digits[24];
@@ -234,6 +275,18 @@ std::string_view expander::int_to_scratch(int value) noexcept {
 expansion_status expander::expand_text(std::string_view text, bool quoted,
                                        arena_array<std::string_view>& out,
                                        lex_mode mode) noexcept {
+	// BOUNDED. Every nesting level in the input is a frame on this stack: a
+	// parameter default and arithmetic's inner text both come back here through
+	// expand_assignment_value. 2000 levels of the WELL-FORMED `${x-${x-...}}`
+	// exhausted the stack on the debug build, so refusing malformed input is not
+	// enough on its own - see kMaxExpansionDepth (#48).
+	if (_depth >= kMaxExpansionDepth) {
+		std::fprintf(stderr, "lesh: expansion nested too deeply\n");
+		_fatal_error = true;
+		return expansion_status::malformed_expansion;
+	}
+	++_depth;
+
 	expansion_status status = expansion_status::ok;
 	lexer lx{text};
 
@@ -241,6 +294,18 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 		const token seg = lx.next(mode);
 		if (seg.kind == token_kind::end)
 			break;
+		// Refused HERE because nothing upstream could have refused it. `${x-$((1}`
+		// is well formed at the command level - the word scan counts braces and the
+		// `}` closes the expansion - so the parser sees no defect and the damage is
+		// entirely inside the expansion. The lexer had recorded it on the segment
+		// all along; this loop simply never asked, and the arithmetic case below
+		// then stripped `$((` and `))` from a segment too short to hold them and
+		// re-expanded the same bytes forever (#48).
+		if (is_unterminated_substitution(seg.error)) {
+			report_malformed(seg.error);
+			status = expansion_status::malformed_expansion;
+			break;
+		}
 		const std::string_view body = text.substr(seg.offset, seg.length);
 
 		switch (seg.kind) {
@@ -550,6 +615,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				break;
 		}
 	}
+	--_depth;
 	return status;
 }
 

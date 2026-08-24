@@ -78,6 +78,35 @@ enum class token_error : uint8_t {
 	unexpected_byte,
 };
 
+// What an unterminated construct is CALLED in a diagnostic, or nullptr when the
+// error says nothing beyond "syntax error".
+//
+// Beside the enum rather than in the tree, because TWO layers name the same
+// defects on the same constructs: the parser, over the tokens of a defective
+// node, and the expander, over one segment of a word it is expanding. The second
+// is not optional - `${x-$((1}` is well formed at the command level, because the
+// word scan counts braces and the `}` closes the expansion, so the unterminated
+// `$((` is only ever seen when the default is expanded (#48). Two copies of these
+// phrases would drift, and the user cannot tell which layer caught it.
+[[nodiscard]] constexpr const char* error_phrase(token_error error) noexcept {
+	switch (error) {
+		case token_error::unterminated_single_quote:
+		case token_error::unterminated_double_quote:
+			return "unterminated quoted string";
+		case token_error::unterminated_backquote:
+		case token_error::unterminated_command_sub:
+			return "unterminated command substitution";
+		case token_error::unterminated_arithmetic:
+			return "unterminated arithmetic expansion";
+		case token_error::unterminated_parameter_expansion:
+			return "unterminated parameter expansion";
+		case token_error::unexpected_byte:
+		case token_error::none:
+			break;
+	}
+	return nullptr;
+}
+
 // Hints the lexer can supply for free, because it already looked at every byte.
 enum token_flags : uint8_t {
 	flag_none = 0,

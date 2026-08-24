@@ -78,6 +78,66 @@ echo three
 --- a syntax error stops a script read from a file [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
 d=$(mktemp -d); printf 'echo one\necho "two\necho three\n' > $d/s; "$TESTEE" $d/s; echo "status=$?"
 
+# MALFORMED NESTING THE WORD SCAN CANNOT SEE (#48). Everything above is refused by
+# the parser, because the defect is on a word and `has_errors()` finds it. These
+# are not: `${x-$((1}` is well formed AT THE COMMAND LEVEL - the word scan counts
+# braces, so the `}` closes the parameter expansion and the unterminated `$((`
+# inside the default is never lexed until the default is EXPANDED. Every case here
+# aborted the shell before this fix, on a stack overflow: the expander stripped
+# `$((` and `))` from a segment too short to hold them and re-expanded the same
+# bytes until the stack ran out.
+#
+# So these are refused by the EXPANDER, with the parser's own wording, from the
+# same table of phrases. dash refuses them at parse time; the last two cases of
+# this section are where that difference is visible, and they are marked as the
+# divergences they are rather than left to be discovered.
+#
+# Unterminated QUOTES inside a default are deliberately NOT refused - the
+# second-to-last case says why. That is #42's, not this one's.
+
+--- an unterminated arithmetic expansion inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-$((1}
+
+--- an unterminated arithmetic expansion inside a nested default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-${y-$((1}}
+
+--- an unterminated arithmetic expansion in an alternate value is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+x=1; echo ${x+$((1}
+
+--- an unterminated arithmetic expansion in a trim pattern is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+x=abc; echo ${x#$((1}
+
+--- an unterminated command substitution inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-$(}
+
+--- an unterminated backquote inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-`}
+
+--- an unterminated parameter expansion inside arithmetic is refused [xfail(legacy): legacy never expands arithmetic, so it echoes the parens as literal text]
+echo $((${x-))
+
+--- a malformed expansion in an assignment value is refused [xfail(legacy): legacy never expands a parameter, so the assignment takes the braces as its value]
+v=${x-$((1}
+echo not reached
+
+--- a malformed expansion in a redirection target is refused [xfail(legacy): legacy never expands a parameter, so it creates a file named after the braces]
+cat > ${x-$((1}
+
+--- a TERMINATED arithmetic expansion inside a parameter default still expands [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-$((1+2))}
+
+--- a TERMINATED command substitution inside a parameter default still expands [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+echo ${x-`echo hi`}
+
+--- an unterminated quote inside a parameter default is not refused [xfail: #42 - dash reports a syntax error; lesh expands the default to nothing instead. Whether a quote inside `${x-...}` is a quote at all depends on the double-quote context POSIX 2.6.2 gives it, and expand_assignment_value re-lexes its text without that context - so refusing it here would also refuse `echo "${x-'}"`, which dash prints as one single quote at status zero]
+echo ${x-'a}
+
+--- a malformed expansion in a for list diagnoses but does not stop the shell [xfail: #47's remaining gap - the for list and the case subject are the two expansion sites that never consult expander::fatal_error(), so a fatal expansion error there is reported and then ignored. `for i in ${x?}` behaves the same way and predates this fix, which only made the gap visible on a second kind of input: before it, this input aborted the shell on a stack overflow. dash exits 2]
+for i in ${x-$((1}; do echo $i; done
+
+--- a default the operator never reaches is never refused [xfail: divergence - dash refuses this at PARSE time, so it refuses it whether or not x is set. lesh's word scan counts braces and cannot see inside `${...}`, which is #42's to change, so the defect is found when the default is expanded - and a default that is not needed is not expanded. The crash this replaces was in the same position]
+x=1; echo ${x-$((1}
+
 --- a trailing backslash is incomplete without being an error
 echo one\
 

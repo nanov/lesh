@@ -82,8 +82,14 @@ protected:
 	FakeParams params;
 
 	// Expands the first word of a command and returns its fields.
+	//
+	// `fatal_out` reports expander::fatal_error(), which is a SEPARATE channel from
+	// the returned status and the only one a defect inside a parameter default can
+	// travel on: expand_assignment_value returns a value, so it has no status to
+	// hand back to expand_text. It is also the channel the executor acts on.
 	std::vector<std::string> expand(std::string_view src, command_runner* runner = nullptr,
-	                                expansion_status* status_out = nullptr) {
+	                                expansion_status* status_out = nullptr,
+	                                bool* fatal_out = nullptr) {
 		const tree t = parse(pool, src);
 		const node_index cmd = t.child_of(t[t.root()], 0);
 		expander ex{pool, params, runner};
@@ -100,6 +106,8 @@ protected:
 		}
 		if (status_out != nullptr)
 			*status_out = last;
+		if (fatal_out != nullptr)
+			*fatal_out = ex.fatal_error();
 
 		std::vector<std::string> out;
 		for (const auto& f : fields)
@@ -257,4 +265,117 @@ TEST_F(ExpanderTest, CommandSubstitutionResultIsNotSplitWhenQuoted) {
 	FakeRunner runner;
 	runner.reply = "a b";
 	EXPECT_EQ(expand("echo \"$(x)\"", &runner), (std::vector<std::string>{"echo", "a b"}));
+}
+
+// --- malformed nesting the word scan cannot see (#48) ------------------------
+
+TEST_F(ExpanderTest, UnterminatedArithmeticInsideAParameterDefaultIsRefused) {
+	// The whole of #48. `${x-$((1}` is well formed AT THE COMMAND LEVEL - the word
+	// scan counts braces, the `}` closes the parameter expansion - so no defect
+	// reaches the parser and the damage is entirely inside the expansion. The
+	// arithmetic case then strips `$((` and `))` from a segment too short to hold
+	// them, so expand_text and expand_assignment_value re-expanded the same four
+	// bytes until the stack ran out. Before the check below this test did not fail,
+	// it CRASHED: ASan reported a stack overflow alternating between the two.
+	bool fatal = false;
+	const auto fields = expand("echo ${x-$((1}", nullptr, nullptr, &fatal);
+	EXPECT_TRUE(fatal);
+	EXPECT_EQ(fields, (std::vector<std::string>{"echo"}));
+}
+
+TEST_F(ExpanderTest, EveryParameterOperatorRefusesAnUnterminatedArithmetic) {
+	// Not one shape but nine: every operator that EXPANDS its argument reached the
+	// same recursion, and each was confirmed to crash on its own rather than
+	// trusted to share a code path with `-`.
+	//
+	// Which operators need x SET is the point of the split. `${x-d}` expands its
+	// default only when x is absent, while `${x+d}` and the trim forms expand
+	// theirs only when it is present - so an argument the operator never reaches is
+	// never lexed, and never refused. That is the visible edge of reporting this at
+	// expansion time rather than at parse time, and it is asserted below.
+	for (const std::string_view form : {"${x-$((1}", "${x:-$((1}", "${x=$((1}",
+	                                    "${x:=$((1}", "${x?$((1}", "${x:?$((1}"}) {
+		params.vars.erase("x");
+		bool fatal = false;
+		const std::string src = std::string("echo ") + std::string(form);
+		const auto fields = expand(src, nullptr, nullptr, &fatal);
+		EXPECT_TRUE(fatal) << form;
+		EXPECT_EQ(fields, (std::vector<std::string>{"echo"})) << form;
+	}
+
+	// Only the diagnostic is asserted for these: the trim forms go on to trim with
+	// the pattern they could not expand, so the field they leave behind is whatever
+	// that produced. It never reaches a command - fatal_error() stops it first -
+	// and asserting it would pin a value nothing reads.
+	for (const std::string_view form : {"${x+$((1}", "${x:+$((1}", "${x#$((1}",
+	                                    "${x%%$((1}"}) {
+		params.vars["x"] = "value";
+		bool fatal = false;
+		const std::string src = std::string("echo ") + std::string(form);
+		expand(src, nullptr, nullptr, &fatal);
+		EXPECT_TRUE(fatal) << form;
+	}
+}
+
+TEST_F(ExpanderTest, AnArgumentTheOperatorNeverReachesIsNeverRefused) {
+	// The measured cost of decision 2, pinned rather than left to be discovered.
+	// dash reports `${x-$((1}` at PARSE time, so it refuses the command whether or
+	// not x is set. lesh's word scan cannot see inside `${...}` - it counts braces,
+	// which is #42's territory to change - so the defect is found when the default
+	// is expanded, and a default that is not needed is not expanded. Recorded as a
+	// divergence in tests/spec/syntax_errors.spec too.
+	params.vars["x"] = "value";
+	bool fatal = false;
+	EXPECT_EQ(expand("echo ${x-$((1}", nullptr, nullptr, &fatal),
+	          (std::vector<std::string>{"echo", "value"}));
+	EXPECT_FALSE(fatal);
+}
+
+TEST_F(ExpanderTest, UnterminatedCommandSubstitutionInsideADefaultIsRefused) {
+	// This one never recursed - substitution_body returns nothing for a segment too
+	// short - so it expanded to an empty field at status zero, which is the silent
+	// half of the same bug: dash reports a syntax error.
+	bool fatal = false;
+	EXPECT_EQ(expand("echo ${x-$(}", nullptr, nullptr, &fatal),
+	          (std::vector<std::string>{"echo"}));
+	EXPECT_TRUE(fatal);
+}
+
+TEST_F(ExpanderTest, UnterminatedQuoteInsideADefaultIsNotRefused) {
+	// The DELIBERATE edge of the check, asserted so it cannot be widened by
+	// accident. Whether a quote inside `${x-...}` is a quote at all depends on the
+	// double-quote context POSIX 2.6.2 gives it - `dash -c 'echo "${x-'"'"'}"'`
+	// prints a single quote and exits 0 - and expand_assignment_value does not
+	// carry that context yet (#42). Refusing here would trade a crash for a
+	// diagnostic on input dash accepts, so only the constructs whose delimiters
+	// the expander STRIPS are refused.
+	bool fatal = false;
+	EXPECT_EQ(expand("echo \"${x-'}\"", nullptr, nullptr, &fatal),
+	          (std::vector<std::string>{"echo", ""}));
+	EXPECT_FALSE(fatal);
+}
+
+TEST(ExpanderDepthTest, DeeplyNestedExpansionIsRefusedRatherThanExhaustingTheStack) {
+	// Well formed, and still unbounded. Refusing an unterminated construct bounds
+	// the recursion by the length of the input, which is not a bound: every level
+	// of `${x-...}` re-enters expand_text through expand_assignment_value, so
+	// nesting in the input is nesting on the C++ stack. Measured on the debug build
+	// before the limit: 1500 levels expanded, 2000 overflowed the stack. dash gets
+	// further on the same input and then does the same thing - `hi` at 16000,
+	// SIGSEGV at 18000.
+	//
+	// Its own pool: 5000 levels of source is 25 KB, and the fixture's is sized for
+	// one command line.
+	lesh::buffer_pool pool{1024 * 1024};
+	FakeParams params;
+	expander ex{pool, params};
+
+	std::string text;
+	for (int i = 0; i < 5000; ++i)
+		text += "${x-";
+	text += "hi";
+	text.append(5000, '}');
+
+	EXPECT_TRUE(ex.expand_assignment_value(text).empty());
+	EXPECT_TRUE(ex.fatal_error());
 }

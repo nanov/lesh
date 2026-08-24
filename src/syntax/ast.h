@@ -326,24 +326,13 @@ public:
 	// WHICH byte opened it. Tokens are scanned rather than indexed because the
 	// defect is not always the node's first one: a redirect's first token is the
 	// operator and the unterminated word is its target.
+	//
+	// The phrases themselves live beside token_error, because the expander names
+	// the same defects on a bare segment token of a word it is expanding (#48).
 	[[nodiscard]] const char* error_detail(const node& n) const noexcept {
-		for (uint32_t i = n.first_token; i <= n.last_token && i < _tokens.size(); ++i) {
-			switch (_tokens[i].error) {
-				case token_error::unterminated_single_quote:
-				case token_error::unterminated_double_quote:
-					return "unterminated quoted string";
-				case token_error::unterminated_backquote:
-				case token_error::unterminated_command_sub:
-					return "unterminated command substitution";
-				case token_error::unterminated_arithmetic:
-					return "unterminated arithmetic expansion";
-				case token_error::unterminated_parameter_expansion:
-					return "unterminated parameter expansion";
-				case token_error::unexpected_byte:
-				case token_error::none:
-					break;
-			}
-		}
+		for (uint32_t i = n.first_token; i <= n.last_token && i < _tokens.size(); ++i)
+			if (const char* phrase = error_phrase(_tokens[i].error))
+				return phrase;
 		return nullptr;
 	}
 
