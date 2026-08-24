@@ -10,10 +10,12 @@ such dependency: once the direct child is gone, the result is readable.
 This is the same reaping problem tools/conformance.py has, and the reason a hung
 case can outlive its runner.
 """
-import os, signal, subprocess, sys, tempfile
+import os, pathlib, signal, subprocess, sys, tempfile
 from pathlib import Path
 
-shell, code = sys.argv[1], sys.argv[2]
+# Absolute, because the child runs in a fresh temp directory: a relative
+# "./build/debug/lesh" would be resolved against that instead of the repo.
+shell, code = str(pathlib.Path(sys.argv[1]).resolve()), sys.argv[2]
 timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
 
 work = Path(tempfile.mkdtemp(prefix="probe."))
