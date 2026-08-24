@@ -1987,19 +1987,21 @@ bool tree_walking_executor::try_run_executor_builtin(
 		// the parse seeing the same aliases and the execution seeing the same state.
 		//
 		// POSIX: the arguments are joined with spaces and read as shell input.
+		const size_t operand = first_operand(argv.data());
 		std::string joined;
-		for (size_t i = 1; argv[i] != nullptr; ++i) {
-			if (i > 1)
+		for (size_t i = operand; argv[i] != nullptr; ++i) {
+			if (i > operand)
 				joined += ' ';
 			joined += argv[i];
 		}
 		status = joined.empty() ? 0 : run_source(joined);
 	} else if (name == ".") {
-		if (argv[1] == nullptr) {
+		const size_t operand = first_operand(argv.data());
+		if (argv[operand] == nullptr) {
 			std::fprintf(stderr, "lesh: .: filename argument required\n");
 			status = 2;
 		} else {
-			status = run_file(argv[1]);
+			status = run_file(argv[operand]);
 		}
 	} else if (name == "command") {
 		// Reported HERE and not where the prefix was read, so it goes through the

@@ -754,8 +754,10 @@ builtin_result builtin_test(shell_state&, char** argv) {
 builtin_result builtin_colon(shell_state&, char**) { return {0}; }
 
 builtin_result builtin_exit(shell_state& state, char** argv) {
+	const size_t operand = first_operand(argv);
 	// POSIX: with no operand, exit with the status of the last command.
-	const int status = argv[1] != nullptr ? std::atoi(argv[1]) : state.last_status();
+	const int status = argv[operand] != nullptr ? std::atoi(argv[operand])
+	                                            : state.last_status();
 	return {status, control_flow::exit_shell};
 }
 
@@ -1743,15 +1745,20 @@ builtin_result builtin_shift(shell_state& state, char** argv) {
 }
 
 builtin_result builtin_break(shell_state&, char** argv) {
-	return {0, control_flow::break_loop, argv[1] != nullptr ? std::atoi(argv[1]) : 1};
+	const size_t operand = first_operand(argv);
+	return {0, control_flow::break_loop,
+	        argv[operand] != nullptr ? std::atoi(argv[operand]) : 1};
 }
 
 builtin_result builtin_continue(shell_state&, char** argv) {
-	return {0, control_flow::continue_loop, argv[1] != nullptr ? std::atoi(argv[1]) : 1};
+	const size_t operand = first_operand(argv);
+	return {0, control_flow::continue_loop,
+	        argv[operand] != nullptr ? std::atoi(argv[operand]) : 1};
 }
 
 builtin_result builtin_return(shell_state& state, char** argv) {
-	return {argv[1] != nullptr ? std::atoi(argv[1]) : state.last_status(),
+	const size_t operand = first_operand(argv);
+	return {argv[operand] != nullptr ? std::atoi(argv[operand]) : state.last_status(),
 	        control_flow::return_from};
 }
 

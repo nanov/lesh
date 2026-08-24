@@ -674,3 +674,39 @@ TEST_F(ExecutorTest, APrefixOnARegularExecutorBuiltinIsRestored) {
 	std::string_view value;
 	EXPECT_FALSE(state.lookup("temp", value));
 }
+
+// --- `--` ends the options of an operand-only special builtin -----------------
+//
+// POSIX XCU 1.4: a utility that takes operands and no options recognises `--` as
+// a first argument to be discarded. `break`, `continue`, `.`, `eval`, `exit` and
+// `return` are all of that shape and every one read argv[1] as its operand, so
+// `return -- 56` returned 0 and `eval -- 'echo foo'` looked for a command named
+// `--`. dash rejects all four and fails the case in each of return-p.tst,
+// exit-p.tst and eval-p.tst; the divergence is deliberate.
+
+TEST_F(ExecutorTest, TheSeparatorPrecedesTheOperandOfExitAndReturn) {
+	EXPECT_EQ(run("exit -- 56"), 56);
+	EXPECT_EQ(run("f() { return -- 56; }; f"), 56);
+	// With nothing after it the separator leaves the DEFAULT operand, not an
+	// operand of `--`: `exit --` is `exit`.
+	state.set_last_status(9);
+	EXPECT_EQ(run("(exit 41); exit --"), 41);
+}
+
+TEST_F(ExecutorTest, TheSeparatorPrecedesTheOperandOfEvalAndDot) {
+	EXPECT_EQ(capture("eval -- 'echo foo'"), "foo\n");
+	EXPECT_EQ(run("eval -- 'exit 23'"), 23);
+	// `.` too: dot-p.tst's 'option-operand separator' is `. -- ./file1`. A real
+	// script rather than /dev/null, so the assertion is that the file after the
+	// separator was READ and not merely that nothing complained.
+	const std::string script = ::testing::TempDir() + "lesh_dot_separator.sh";
+	{
+		std::ofstream out{script};
+		out << "exit 23\n";
+	}
+	EXPECT_EQ(run(". -- " + script), 23);
+	std::remove(script.c_str());
+	// Only the FIRST `--` is discarded, so a second one is an operand - here a
+	// filename that does not exist.
+	EXPECT_NE(run(". -- -- 2>/dev/null"), 0);
+}

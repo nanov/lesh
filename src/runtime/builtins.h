@@ -3,6 +3,7 @@
 #include "runtime/shell_state.h"
 
 #include <array>
+#include <cstddef>
 #include <string_view>
 
 namespace lesh::runtime {
@@ -141,6 +142,29 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	{"unalias", builtin_kind::regular, builtin_home::table},
 	{"wait", builtin_kind::regular, builtin_home::executor},
 }};
+
+// Where a utility's OPERANDS begin, having discarded a leading `--`.
+//
+// POSIX XCU 1.4 Utility Description Defaults: a standard utility that accepts
+// operands and no options "shall recognize `--` as a first argument to be
+// discarded". `break`, `continue`, `.`, `eval`, `exit` and `return` are every one
+// of that shape, and every one of them read argv[1] as its operand directly - so
+// `return -- 56` returned 0, `exit -- 56` exited 0, and `eval -- 'echo foo'`
+// looked for a command named `--`.
+//
+// ONE reading, not a sixth copy: `exec` (#31), `trap` (#33), `command` (#31),
+// `read`, `export`, `readonly` and `unset` each grew their own, and seven
+// readings of the same two bytes is how one of them comes to disagree with the
+// rest - the drift the builtin registry exists to prevent (#35).
+//
+// dash rejects all four of these - `dash -c 'exit -- 56'` says
+// `exit: Illegal number: --` - and fails 'separator preceding operand' in
+// return-p.tst, exit-p.tst and eval-p.tst for it. Divergence from the reference
+// shell recorded rather than copied, exactly as for `exec --`: dash is behind the
+// standard here.
+[[nodiscard]] constexpr size_t first_operand(char* const* argv) noexcept {
+	return argv[1] != nullptr && std::string_view{argv[1]} == "--" ? 2 : 1;
+}
 
 // argv is NUL-terminated, as for exec. Returns false when the name is not
 // implemented HERE - either it is no builtin at all, or the registry says the

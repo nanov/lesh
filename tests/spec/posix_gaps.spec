@@ -913,3 +913,25 @@ x=$(echo z) env | grep '^x='; echo "after=[$x]"
 
 --- a prefix in a pipeline stage is expanded in the stage [xfail(legacy): legacy has no command substitution]
 echo body | x=$(cat) "$TESTEE" -c 'echo "[$x]"'
+
+# `--` ends the options of the operand-only special builtins (POSIX XCU 1.4
+# Utility Description Defaults: a standard utility that accepts operands and no
+# options "shall recognize `--` as a first argument to be discarded"). dash
+# rejects it for all of them and fails 'separator preceding operand' in
+# return-p.tst, exit-p.tst and eval-p.tst; `. --` is the one it accepts, so that
+# case is not marked. The same divergence already stands for `exec --`.
+
+--- the separator precedes the operand of exit [xfail: divergence - dash reports `exit: Illegal number: --` and fails exit-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+exit -- 56
+
+--- the separator precedes the operand of return [xfail: divergence - dash reports `return: Illegal number: --` and fails return-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+f() { return -- 56; }; f; echo "st=$?"
+
+--- the separator precedes the operand of eval [xfail: divergence - dash looks for a command named -- and fails eval-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+eval -- 'echo foo'; echo "st=$?"
+
+--- the separator precedes the operand of dot [xfail(legacy): legacy has no dot builtin]
+printf 'echo sourced\n(exit 3)\n' >script; . -- ./script; echo "st=$?"
+
+--- a separator with no operand after it leaves the default [xfail: divergence - dash rejects the separator itself; POSIX XCU 1.4 discards it and `exit --` is then `exit`]
+(exit 41); exit --
