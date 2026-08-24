@@ -207,6 +207,22 @@ you would otherwise reach for "pipeline" — that word belongs to POSIX.
 Variables, scopes, functions, aliases, options, working directory, and `$?`. Read by
 both the expander and the executor.
 
+**Logical working directory** _[floor]_:
+Where the shell BELIEVES it is: `$PWD`, maintained by `cd` out of the pathnames it
+was given, with `.` and `..` resolved lexically. A symlink followed on the way in is
+unfollowed on the way out, so `cd link` then `cd ..` returns to the link's parent
+rather than the target's. What `cd -L` - the default - maintains, and what `pwd`
+prints.
+_Avoid_: calling it a cache of the physical one, or stale. It is not an optimisation
+of anything: the two name different directories deliberately, and #24 chose this one.
+
+**Physical working directory** _[floor]_:
+The directory the KERNEL says the process is in, every symlink resolved - what
+`getcwd` answers and what any pathname handed to another process resolves against.
+What `cd -P` reads back into `$PWD`. On macOS `/tmp` is a symlink to `/private/tmp`,
+which is why the difference is visible in one line there and invisible on a system
+where it is not.
+
 **Span** _[lesh]_:
 A token or node's location in the source, carried so errors and highlighting can
 point at it.
