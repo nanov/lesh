@@ -144,6 +144,93 @@ for i in ${x?}; do echo $i; done; echo after
 --- a default the operator never reaches is refused too [xfail(legacy): legacy has no parameter expansion beyond $name]
 x=1; echo ${x-$((1}
 
+# AN UNTERMINATED COMPOUND COMMAND (#49). The same user-visible defect as
+# everything above, through the PARSER's channel rather than the lexer's: there a
+# token was flagged and nothing consumed the flag, here the parse reaches end of
+# input with a construct open and returns what it has. `accept(reserved::kw_fi)`
+# returning false is what makes recovery possible - the line editor depends on it -
+# and five of the six compound commands discarded that false.
+#
+# The defect now travels on the COMPOUND NODE's own error field, which is the
+# shape #47 chose for a word: an `if` whose `fi` was never typed is still an if,
+# and `has_errors()` already consults the field.
+#
+# BOTH CHANNELS AGAIN, and the split is not the same one. Ran out of input, so
+# incomplete AND defective: `if true`. Closed by the wrong word, so defective and
+# NOT incomplete: `if true; fi` - no continuation helps. The two cases at the very
+# end of this file are the third combination, and they are what stops any of this
+# from becoming "a missing terminator is incomplete, so incomplete is an error".
+#
+# Every refusal here is xfail on legacy, which has no compound commands at all:
+# `{ echo x` runs `{` as a command name and `if true` runs `if`.
+
+--- an unterminated subshell is a syntax error [xfail(legacy): legacy runs the subshell body and reports success]
+( echo x
+
+--- an unterminated brace group is a syntax error [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+{ echo x
+
+--- an `if` with no `then` is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if true
+
+--- an `if` with no `fi` is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if true; then echo hi
+
+--- a `while` with no `do` is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+while true
+
+--- a `while` with no `done` is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+while true; do echo hi
+
+--- an `until` with no `do` is a syntax error [xfail(legacy): legacy has no until loop, so it runs `until` as a command name]
+until true
+
+--- a `for` with no `do` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in 1
+
+--- a `for` with no `done` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in 1; do echo hi
+
+--- a `case` with no `esac` is a syntax error [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+case a in
+
+--- a case item with no closing paren is a syntax error [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+case a in b echo hi;; esac
+
+--- an unterminated function body is a syntax error [xfail(legacy): legacy has no function definitions]
+f() { echo x
+
+--- a compound command closed by the wrong word is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if true; fi
+
+--- an unterminated compound command stops the input rather than truncating one command [xfail(legacy): legacy has no brace group and carries on regardless]
+echo one
+{ echo x
+echo three
+
+--- an unterminated compound command read from standard input stops the input [stdin] [xfail(legacy): legacy has no if clause and carries on regardless]
+echo one
+if true
+echo three
+
+# A linebreak is allowed between a `for` name or a `case` subject and the `in` that
+# follows it - POSIX spells it `linebreak` in both productions - and dash runs both
+# of these. The missing `in` was being DISCARDED like every other terminator, so
+# the first was already wrong (`in` was read as the first word of the body) and the
+# second passed by accident. Requiring the keyword would have made both syntax
+# errors, so the linebreak is skipped where the grammar puts one.
+
+--- a linebreak before a for loop's `in` still runs the loop [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i
+in 1 2
+do echo $i; done
+
+--- a linebreak before a case clause's `in` still runs the clause [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+case a
+in
+b) echo hi;;
+esac
+
 --- a trailing backslash is incomplete without being an error
 echo one\
 

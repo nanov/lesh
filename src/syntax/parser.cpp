@@ -349,6 +349,16 @@ private:
 		}
 	}
 
+	// The `linebreak` of the grammar, where nothing but newlines may stand: between
+	// a `for` name or a `case` subject and the `in` that may follow it. No alias is
+	// substituted here, unlike skip_linebreak - the next word is `in`, a reserved
+	// word, and offering it to the alias table would be offering the word that
+	// follows a keyword rather than one in command position.
+	void skip_newlines() noexcept {
+		while (peek().kind == token_kind::newline)
+			advance();
+	}
+
 	// POSIX allows a newline after `&&`, `||` and `|` - the grammar spells it
 	// `linebreak` - and the continuation line is part of the SAME command. Without
 	// this, `echo foo |` followed by `cat` on the next line lost the right-hand side
@@ -377,6 +387,52 @@ private:
 	bool accept(reserved want) noexcept {
 		if (peek_reserved() != want)
 			return false;
+		advance();
+		return true;
+	}
+
+	// Records that a construct is missing a token the grammar requires.
+	//
+	// THE ONE MECHANISM for all nine positions - `then`, `fi`, `do`, `done`, `in`,
+	// `esac`, `}` and the two `)` - because accept() returning false rather than
+	// throwing is exactly right for the line editor and five of the six compound
+	// commands then DISCARDED that false. `lesh -c '{ echo x'` printed x and
+	// reported success where dash reports a syntax error (#49); fixing the sites one
+	// at a time is how five of the six end up subtly different.
+	//
+	// The defect travels on the COMPOUND NODE's own error field, which is #47's
+	// shape unchanged: a word whose quote was never closed is still a word, and an
+	// `if` whose `fi` was never typed is still an if - the kind is what the line
+	// editor highlights and what node_at() puts completion inside of, so the defect
+	// goes beside it rather than replacing it. tree::has_errors() already consults
+	// the field, so nothing downstream changes.
+	//
+	// INCOMPLETE stays ORTHOGONAL, and that is the whole reason this looks at what
+	// is next. `if true` ran out of INPUT, so more of it would help and an
+	// interactive reader answers with a continuation prompt; `if true; fi` has a
+	// `fi` where `then` belongs and no continuation helps. Both are defects, only
+	// the first is incomplete - the same split the lexer keeps between an
+	// unterminated quote and a trailing backslash.
+	bool record_missing(parse_error& defect) noexcept {
+		if (peek().kind == token_kind::end)
+			_tree.set_incomplete(true);
+		// The FIRST thing missing is the one worth naming, and a construct has one
+		// error field: `if true` misses `then` and `fi` both.
+		if (defect == parse_error::none)
+			defect = parse_error::missing_terminator;
+		return false;
+	}
+
+	// Consumes a reserved word the grammar requires, or records its absence.
+	bool require(reserved want, parse_error& defect) noexcept {
+		return accept(want) || record_missing(defect);
+	}
+
+	// The same, for a construct closed by an operator rather than by a keyword: a
+	// subshell's `)` and the `)` after a case item's patterns.
+	bool require(token_kind want, parse_error& defect) noexcept {
+		if (peek().kind != want)
+			return record_missing(defect);
 		advance();
 		return true;
 	}
@@ -430,10 +486,11 @@ private:
 		const uint32_t mark = mark_scratch();
 		advance();  // `if`
 		uint32_t pairs = 0;
+		parse_error defect = parse_error::none;
 
 		for (;;) {
 			_scratch.push(parse_compound_list());   // condition
-			if (!accept(reserved::kw_then))
+			if (!require(reserved::kw_then, defect))
 				break;
 			_scratch.push(parse_compound_list());   // body
 			++pairs;
@@ -442,10 +499,11 @@ private:
 		}
 		if (accept(reserved::kw_else))
 			_scratch.push(parse_compound_list());
-		accept(reserved::kw_fi);
+		require(reserved::kw_fi, defect);
 
 		node n;
 		n.kind = node_kind::if_clause;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		n.aux = pairs;  // how many (condition, body) pairs; anything after is else
@@ -457,14 +515,16 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		advance();  // `while` / `until`
+		parse_error defect = parse_error::none;
 
 		_scratch.push(parse_compound_list());  // condition
-		if (accept(reserved::kw_do))
+		if (require(reserved::kw_do, defect))
 			_scratch.push(parse_compound_list());  // body
-		accept(reserved::kw_done);
+		require(reserved::kw_done, defect);
 
 		node n;
 		n.kind = is_until ? node_kind::until_loop : node_kind::while_loop;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		commit_children(n, mark);
@@ -475,10 +535,18 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		advance();  // `for`
+		parse_error defect = parse_error::none;
 
 		uint32_t name_token = _index;
 		if (peek().kind == token_kind::word)
 			name_token = advance();
+
+		// POSIX puts a `linebreak` between the name and `in`, so `for i<newline>in a b`
+		// is one loop. Without this the `in` was read as the first word of the BODY,
+		// and `do` was then missing - which cost nothing while a missing `do` was
+		// discarded, and would have turned a loop dash runs into a syntax error the
+		// moment it stopped being.
+		skip_newlines();
 
 		// `for x do ...` and `for x; do ...` iterate the POSITIONAL PARAMETERS;
 		// `for x in a b; do` iterates the listed words. The distinction matters and
@@ -493,12 +561,13 @@ private:
 		while (is_separator(peek().kind))
 			advance();
 
-		if (accept(reserved::kw_do))
+		if (require(reserved::kw_do, defect))
 			_scratch.push(parse_compound_list());
-		accept(reserved::kw_done);
+		require(reserved::kw_done, defect);
 
 		node n;
 		n.kind = node_kind::for_loop;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		// aux packs the name token and the has_in flag: the top bit says whether
@@ -512,10 +581,16 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		advance();  // `case`
+		parse_error defect = parse_error::none;
 
 		if (peek().kind == token_kind::word)    // the subject
 			_scratch.push(word_node(advance(), node_kind::word));
-		accept(reserved::kw_in);
+		// A `linebreak` is allowed on either side of `in`: `case a<newline>in` is one
+		// clause in dash. Without skipping it the `in` was read as the first PATTERN
+		// of the first item, which happened to produce dash's output for the cases
+		// that reach it and would have become a syntax error here.
+		skip_newlines();
+		require(reserved::kw_in, defect);
 		while (is_separator(peek().kind))
 			advance();
 
@@ -523,6 +598,7 @@ private:
 			const uint32_t item_first = _index;
 			const uint32_t item_mark = mark_scratch();
 			uint32_t patterns = 0;
+			parse_error item_defect = parse_error::none;
 
 			// An optional leading '(' is allowed before the first pattern.
 			if (peek().kind == token_kind::lparen)
@@ -535,13 +611,16 @@ private:
 					break;
 				advance();  // `|` separates alternative patterns
 			}
-			if (peek().kind == token_kind::rparen)
-				advance();
+			// The `)` closing the pattern list is what dash names for `case a in`
+			// itself - `expecting ")"`. Recorded on the ITEM rather than on the clause
+			// so `case a in a) x;; b x;; esac` points at the item that is wrong.
+			require(token_kind::rparen, item_defect);
 
 			_scratch.push(parse_compound_list());
 
 			node item;
 			item.kind = node_kind::case_item;
+			item.error = item_defect;
 			item.first_token = item_first;
 			item.last_token = _index > item_first ? _index - 1 : item_first;
 			item.aux = patterns;
@@ -555,10 +634,11 @@ private:
 			if (_index == item_first)  // progress guarantee
 				break;
 		}
-		accept(reserved::kw_esac);
+		require(reserved::kw_esac, defect);
 
 		node n;
 		n.kind = node_kind::case_clause;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		commit_children(n, mark);
@@ -569,11 +649,13 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		advance();  // `{`
+		parse_error defect = parse_error::none;
 		_scratch.push(parse_compound_list());
-		accept(reserved::kw_rbrace);
+		require(reserved::kw_rbrace, defect);
 
 		node n;
 		n.kind = node_kind::brace_group;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		commit_children(n, mark);
@@ -584,12 +666,13 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 		advance();  // `(`
+		parse_error defect = parse_error::none;
 		_scratch.push(parse_compound_list());
-		if (peek().kind == token_kind::rparen)
-			advance();
+		require(token_kind::rparen, defect);
 
 		node n;
 		n.kind = node_kind::subshell;
+		n.error = defect;
 		n.first_token = first;
 		n.last_token = _index > first ? _index - 1 : first;
 		commit_children(n, mark);

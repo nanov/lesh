@@ -191,6 +191,122 @@ TEST_F(ParserTest, AWordCarriesItsTokensDefectInEveryPosition) {
 	}
 }
 
+// --- an unterminated compound command (#49) ----------------------------------
+//
+// The parser's half of #47's defect. `accept(reserved::kw_fi)` returning false is
+// what makes recovery possible, and five of the six compound commands DISCARDED
+// that false - so `{ echo x` ran and reported success where dash reports a syntax
+// error. The two channels stay orthogonal, and which of them a shape lands in is
+// what these three tests pin down.
+
+TEST_F(ParserTest, AnUnterminatedCompoundCommandIsBothIncompleteAndADefect) {
+	// Ran out of INPUT with a construct open. Incomplete, so an interactive reader
+	// answers it with a continuation prompt; defective, so a shell holding the
+	// whole input diagnoses instead. dash reports 2 for every one of these.
+	const std::string_view cases[] = {
+		"( echo x",                    // subshell
+		"{ echo x",                    // brace group
+		"if true",                     // missing `then`
+		"if true; then echo hi",       // missing `fi`
+		"if true; then a; elif b",     // missing the second `then`
+		"if true; then a; else b",     // missing `fi` after `else`
+		"while true",                  // missing `do`
+		"while true; do echo hi",      // missing `done`
+		"until true",                  // missing `do`
+		"until true; do echo hi",      // missing `done`
+		"for i in 1",                  // missing `do`
+		"for i in 1; do echo hi",      // missing `done`
+		"for i",                       // missing `do`, with no list at all
+		"case a in",                   // missing `esac`
+		"case a in b) echo hi;;",      // missing `esac`
+		"case a in b",                 // missing `)`
+		"case a",                      // missing `in`
+		"f() { echo x",                // the body of a function definition
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << "a shell holding the whole input must refuse: " << src;
+		EXPECT_TRUE(t.incomplete()) << "more input would complete it: " << src;
+	}
+}
+
+TEST_F(ParserTest, AConstructClosedByTheWrongWordIsADefectWithoutBeingIncomplete) {
+	// The other half of the split. `if true; fi` has a `fi` where `then` belongs,
+	// and no amount of further input helps - so it is a defect that is NOT
+	// incomplete, which is what stops the fix from being "missing terminator
+	// implies incomplete". dash reports 2 for these too.
+	const std::string_view cases[] = {
+		"if true; fi",                     // `fi` where `then` belongs
+		"if true; then a; done",           // a loop's terminator on an if
+		"while true; done",                // `done` where `do` belongs
+		"for i in 1; done",                // the same, for a for loop
+		"case a in b echo hi;; esac",      // a pattern list with no `)`
+		"{ echo x; )",                     // a subshell's closer on a brace group
+		// Nested, and the OUTER construct is closed: the `fi` the subshell ran into
+		// is the if's own, so the defect is the subshell's and no continuation
+		// reaches it.
+		"if true; then ( echo x; fi",
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << src;
+		EXPECT_FALSE(t.incomplete()) << "no continuation completes this: " << src;
+	}
+}
+
+TEST_F(ParserTest, AWellFormedCompoundCommandCarriesNoDefect) {
+	// The over-eager half of the same change, and the reason it is a test rather
+	// than a hope: `error-p.tst` asserts 220 error behaviours and this is where an
+	// over-eager terminator check shows up first. The two `linebreak` forms are the
+	// ones that were only accepted because the missing `in` was being discarded.
+	const std::string_view cases[] = {
+		"( echo x )",
+		"{ echo x; }",
+		"{ echo x\n}",
+		"if true; then echo hi; fi",
+		"if true; then a; elif b; then c; else d; fi",
+		"if true\nthen\necho hi\nfi",
+		"while false; do echo hi; done",
+		"until true; do echo hi; done",
+		"for i in 1 2; do echo $i; done",
+		"for i; do echo $i; done",
+		"for i\ndo echo $i; done",
+		"for i\nin 1 2\ndo echo $i; done",   // linebreak before `in`
+		"case a in b) echo hi;; esac",
+		"case a in (b) echo hi;; esac",
+		"case a in b|c) echo hi;; esac",
+		"case a in esac",
+		"case a\nin\nb) echo hi;;\nesac",    // linebreak before `in`
+		"f() { echo x; }",
+		"if true; then ( echo x ); fi",
+		"{ if true; then echo hi; fi; }",
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_FALSE(t.has_errors()) << "this is valid POSIX: " << src;
+		EXPECT_FALSE(t.incomplete()) << src;
+	}
+}
+
+TEST_F(ParserTest, AnUnterminatedCompoundCommandStillEndsTheReadUnit) {
+	// The progress guarantee, for the parser's channel this time: the incremental
+	// reader calls parse_next_command in a loop until the cursor reaches the end,
+	// and a call that consumes nothing is a hang rather than a diagnostic.
+	const std::string_view sources[] = {"echo one\nif true\n", "echo one\n{ echo x\n",
+	                                    "echo one\ncase a in\n"};
+	for (const std::string_view src : sources) {
+		size_t at = 0;
+		const tree first = parse_next_command(pool, src, at);
+		EXPECT_FALSE(first.has_errors()) << "the first line is well formed: " << src;
+		ASSERT_GT(at, 0u) << src;
+
+		const size_t before = at;
+		const tree second = parse_next_command(pool, src, at);
+		EXPECT_TRUE(second.has_errors()) << src;
+		EXPECT_GT(at, before) << "a call that consumes nothing never ends: " << src;
+	}
+}
+
 TEST_F(ParserTest, ADefectiveNodeNamesWhatWasLeftUnterminated) {
 	// The diagnostic is worth the lookup: `lesh: syntax error` for `echo it's`
 	// reads as a complaint about the script rather than about the apostrophe.
@@ -203,6 +319,16 @@ TEST_F(ParserTest, ADefectiveNodeNamesWhatWasLeftUnterminated) {
 		{"echo ${x", "unterminated parameter expansion"},
 		// The defect is the TARGET, which is not a redirect node's first token.
 		{"cat > \"x", "unterminated quoted string"},
+		// A missing terminator has no defective TOKEN to name it - the construct's
+		// own kind does, which is why error_detail asks the node first.
+		{"( echo x", "unterminated subshell"},
+		{"{ echo x", "unterminated brace group"},
+		{"if true", "unterminated if command"},
+		{"while true", "unterminated while loop"},
+		{"until true", "unterminated until loop"},
+		{"for i in 1", "unterminated for loop"},
+		{"case a in", "unterminated case command"},
+		{"case a in b", "unterminated case pattern list"},
 	};
 	for (const auto& c : cases) {
 		const tree t = parse_it(c.src);

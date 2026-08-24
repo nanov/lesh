@@ -76,7 +76,35 @@ enum class parse_error : uint16_t {
 	unexpected_operator,   // an operator where a word was required
 	missing_operand,       // an operator with nothing after it
 	unterminated_word,     // the lexer reported the word incomplete
+	// A compound command the grammar requires a keyword or a closing token to
+	// finish, and the parse never found one: `{ echo x` with no `}`, `if true`
+	// with no `then`. Carried by the COMPOUND node, the way unterminated_word is
+	// carried by the word - a construct with a piece missing is still that
+	// construct, which is what the line editor wants to highlight (#49).
+	missing_terminator,
 };
+
+// What a compound command with a piece missing is CALLED in a diagnostic. The
+// node's kind is the whole answer.
+//
+// Which keyword was wanted is deliberately NOT recorded: `aux` is already spoken
+// for on three of these kinds, and one parse_error value per keyword would have
+// been nine mechanisms where #49 asked for one. dash names the keyword
+// (`expecting "fi"`); this names the construct, which is the same information one
+// word less precisely, and nothing in either test suite compares the text.
+[[nodiscard]] constexpr const char* unterminated_phrase(node_kind kind) noexcept {
+	switch (kind) {
+		case node_kind::if_clause:   return "unterminated if command";
+		case node_kind::while_loop:  return "unterminated while loop";
+		case node_kind::until_loop:  return "unterminated until loop";
+		case node_kind::for_loop:    return "unterminated for loop";
+		case node_kind::case_clause: return "unterminated case command";
+		case node_kind::case_item:   return "unterminated case pattern list";
+		case node_kind::subshell:    return "unterminated subshell";
+		case node_kind::brace_group: return "unterminated brace group";
+		default:                     return nullptr;
+	}
+}
 
 // 20 bytes. Children are (start, count) into the tree's child-index array, so a
 // node's children are contiguous and iterating them is sequential.
@@ -330,6 +358,12 @@ public:
 	// The phrases themselves live beside token_error, because the expander names
 	// the same defects on a bare segment token of a word it is expanding (#48).
 	[[nodiscard]] const char* error_detail(const node& n) const noexcept {
+		// A missing terminator is the NODE's own defect and its kind names it, so it
+		// is asked FIRST: a compound command spans every token of its body, and any
+		// phrase the scan below found there would describe something else.
+		if (n.error == parse_error::missing_terminator)
+			if (const char* phrase = unterminated_phrase(n.kind))
+				return phrase;
 		for (uint32_t i = n.first_token; i <= n.last_token && i < _tokens.size(); ++i)
 			if (const char* phrase = error_phrase(_tokens[i].error))
 				return phrase;
