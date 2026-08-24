@@ -185,6 +185,20 @@ protected:
 		return out;
 	}
 
+	// Expands the SUBJECT of a `case` clause - the word it matches against.
+	std::vector<std::string> subject(std::string_view src) {
+		const tree t = parse(pool, src);
+		const node_index clause = t.child_of(t[t.root()], 0);
+		expander ex{pool, params, nullptr, /*glob_enabled=*/true};
+		lesh::arena_array<std::string_view> fields{pool, 4};
+		std::ignore = ex.expand_word(t, t.child_of(t[clause], 0), fields);
+
+		std::vector<std::string> out;
+		for (const auto& f : fields)
+			out.emplace_back(f);
+		return out;
+	}
+
 	// Expands text into a single VALUE in one of the three value contexts. The
 	// three differ in their quoting rules, which is the whole reason
 	// value_context exists (#42).
@@ -607,6 +621,29 @@ TEST_F(ExpanderTest, ACasePatternIsNotFieldSplit) {
 	params.vars["p"] = "a:b";
 	params.separators = ":";
 	EXPECT_EQ(patterns("case x in $p) :; esac"), (std::vector<std::string>{"a:b"}));
+}
+
+TEST_F(ExpanderTest, ACaseSubjectIsOneValueAndNotAPattern) {
+	// POSIX subjects the word a `case` matches against to the expansions and NOT
+	// to field splitting. It was split like a command argument, and the executor
+	// compares against the first field - so `IFS=:; case a:b in 'a:b')` compared
+	// the pattern against `a` and matched nothing, and a subject holding a single
+	// blank expanded to no field at all.
+	params.vars["v"] = "a:b";
+	params.separators = ":";
+	EXPECT_EQ(subject("case $v in x) :; esac"), (std::vector<std::string>{"a:b"}));
+
+	params.separators = " \t\n";
+	params.vars["blank"] = " ";
+	EXPECT_EQ(subject("case $blank in x) :; esac"), (std::vector<std::string>{" "}));
+	EXPECT_EQ(subject("case $nope in x) :; esac"), (std::vector<std::string>{""}))
+		<< "and a subject that expands to nothing is the empty subject";
+
+	// Text, not a pattern: a backslash the subject HOLDS is one of its bytes, and
+	// escaping it would make the subject match patterns it does not equal.
+	params.vars["bs"] = "\\a";
+	EXPECT_EQ(subject("case \"$bs\" in x) :; esac"), (std::vector<std::string>{"\\a"}));
+	EXPECT_EQ(subject("case '*' in x) :; esac"), (std::vector<std::string>{"*"}));
 }
 
 TEST_F(ExpanderTest, ABackslashEscapesABraceInsideBracesEvenInDoubleQuotes) {

@@ -87,11 +87,17 @@ enum class node_kind : uint16_t {
 // knowledge over the callers, and there is no way to expand a case pattern as
 // though it were a command argument by forgetting a flag.
 enum class word_role : uint32_t {
-	// A command argument, an assignment's left half, a `for` list word, a `case`
-	// SUBJECT: split, globbed, and quote-removed.
+	// A command argument, an assignment's left half, a `for` list word: split,
+	// globbed, and quote-removed.
 	ordinary = 0,
 	// One of a `case` item's patterns.
 	pattern = 1,
+	// The word a `case` matches AGAINST. Quote-removed like an ordinary word - it
+	// is text, not a pattern - but one value rather than a field list, because
+	// POSIX subjects it to the expansions and not to field splitting, and there is
+	// nowhere for a second field to go. `IFS=:; case a:b in 'a:b')` matched
+	// nothing, having compared the pattern against `a` alone.
+	case_subject = 2,
 };
 
 enum class parse_error : uint16_t {

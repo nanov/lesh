@@ -288,7 +288,7 @@ TEST_F(ParserTest, AWellFormedCompoundCommandCarriesNoDefect) {
 	}
 }
 
-TEST_F(ParserTest, OnlyACaseItemsPatternsCarryThePatternRole) {
+TEST_F(ParserTest, ACaseClauseGivesItsWordsTheirRoles) {
 	// Which words are PATTERNS is knowledge only the parser has: `*)` and the `*`
 	// in `echo *` are the same token and the same node kind, and the expander sees
 	// no difference. Recorded on the node so the expander cannot be handed one and
@@ -298,8 +298,8 @@ TEST_F(ParserTest, OnlyACaseItemsPatternsCarryThePatternRole) {
 	ASSERT_EQ(clause.kind, node_kind::case_clause);
 
 	const node& subject = t[t.child_of(clause, 0)];
-	EXPECT_EQ(static_cast<word_role>(subject.aux), word_role::ordinary)
-		<< "the subject is an ordinary word: its quotes come off and nothing escapes";
+	EXPECT_EQ(static_cast<word_role>(subject.aux), word_role::case_subject)
+		<< "the subject is one value, but text rather than a pattern";
 
 	const node& item = t[t.child_of(clause, 1)];
 	ASSERT_EQ(item.aux, 2u) << "two alternative patterns";

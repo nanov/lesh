@@ -342,3 +342,12 @@ case b in [a\-c]) echo notreached;; esac
 
 --- an unknown class name matches nothing at all [xfail(legacy): legacy has no case clause]
 for c in a '[' ':'; do case $c in [[:nosuch:]]) echo "$c in";; *) echo "$c out";; esac; done
+
+--- a case subject is one value rather than a field list [xfail(legacy): legacy has no case clause]
+c=' '; case $c in ' ') echo space;; *) echo other;; esac
+d='a b'; case $d in 'a b') echo joined;; *) echo split;; esac
+set -- x y; case $@ in 'x y') echo at;; *) echo notat;; esac
+case $* in 'x y') echo star;; *) echo notstar;; esac
+
+--- and IFS does not break it in two [xfail(legacy): legacy has no case clause]
+IFS=:; v='a:b'; case $v in 'a:b') echo whole;; *) echo halves;; esac

@@ -634,7 +634,7 @@ private:
 		parse_error defect = parse_error::none;
 
 		if (peek().kind == token_kind::word)    // the subject
-			_scratch.push(word_node(advance(), node_kind::word));
+			_scratch.push(word_node(advance(), node_kind::word, word_role::case_subject));
 		// A `linebreak` is allowed on either side of `in`: `case a<newline>in` is one
 		// clause in dash. Without skipping it the `in` was read as the first PATTERN
 		// of the first item, which happened to produce dash's output for the cases
@@ -655,9 +655,6 @@ private:
 				advance();
 
 			while (peek().kind == token_kind::word) {
-				// The one place a word's role is anything but ordinary. The SUBJECT
-				// above is an ordinary word - `case "$x"` has its quotes removed and
-				// nothing escaped - and these are patterns.
 				_scratch.push(word_node(advance(), node_kind::word, word_role::pattern));
 				++patterns;
 				if (peek().kind != token_kind::pipe)

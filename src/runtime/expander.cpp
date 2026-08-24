@@ -1184,16 +1184,27 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 		return expansion_status::ok;
 	}
 
-	// A `case` pattern, which the parser marked because only the parser can see it.
-	// Three properties, and each is one POSIX applies to `${x#word}` already:
-	// quoting becomes escapes rather than nothing, no field splitting and so no
-	// pathname expansion, and ONE result rather than a field list - so a pattern
-	// that expands to nothing is an empty pattern that matches an empty subject,
-	// where a command argument that expands to nothing is no argument at all.
-	const bool is_pattern = n.kind == syntax::node_kind::word &&
-	                        static_cast<syntax::word_role>(n.aux) == syntax::word_role::pattern;
-	const expand_context ctx = is_pattern
-		? expand_context{.split = false, .fields = false, .pattern = true}
+	// The role the parser recorded, because only the parser can see it: `*)` and
+	// the `*` in `echo *` are the same node otherwise.
+	//
+	// Both `case` roles are ONE result rather than a field list. POSIX subjects
+	// both to the expansions and neither to field splitting - so neither is
+	// pathname-expanded either, the two applying to exactly the same text - and a
+	// second field would have nowhere to go: the executor reads pattern[0] and
+	// subject[0]. It follows that a word expanding to nothing is the EMPTY pattern
+	// or the empty subject rather than none, where a command argument that expands
+	// to nothing is no argument at all.
+	//
+	// Only the pattern is a PATTERN. A subject is text: `case "$x"` has its quotes
+	// removed and nothing escaped, or every backslash a variable holds would start
+	// escaping the byte after it.
+	const syntax::word_role role = n.kind == syntax::node_kind::word
+		? static_cast<syntax::word_role>(n.aux)
+		: syntax::word_role::ordinary;
+	const bool one_value = role != syntax::word_role::ordinary;
+	const expand_context ctx = one_value
+		? expand_context{.split = false, .fields = false,
+		                 .pattern = role == syntax::word_role::pattern}
 		: expand_context{};
 
 	arena_array<char> accumulator{_pool, 64};
@@ -1210,7 +1221,7 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	const size_t before_fields = out.size();
 	_field_globbable = false;
 	const expansion_status status = expand_text(text, ctx, out);
-	finish_field(out, /*even_if_empty=*/is_pattern);
+	finish_field(out, /*even_if_empty=*/one_value);
 
 	if (_glob_enabled && _field_globbable) {
 		arena_array<std::string_view> globbed{_pool, out.size() - before_fields + 4};
