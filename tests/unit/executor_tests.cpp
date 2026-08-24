@@ -3,6 +3,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "interactive_signal_guard.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -332,6 +334,11 @@ TEST_F(ExecutorTest, ExecFailureLeavesAnInteractiveShellAlive) {
 	// The other half of the same POSIX sentence, and the half dash gets wrong: it
 	// exits interactively too. exec-p.tst asserts the shell survives and reports
 	// 127, so lesh follows the standard rather than the reference shell.
+	//
+	// The guard puts the interactive SIGNAL defaults back afterwards (#52); this
+	// case also exercises the pair of them, because `exec` drops those dispositions
+	// before execve and has to restore them when there is nothing to become.
+	const lesh::testing::interactive_disposition_guard dispositions;
 	state.set_interactive(true);
 	EXPECT_EQ(run("exec /nonexistent/command/xyz; exit 42"), 42);
 }

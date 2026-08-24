@@ -57,3 +57,21 @@ difference is written down here and carried as an `[xfail: divergence ...]` case
   with them - `sigurg6-p.tst` runs the testee as `sh -i` with SIGURG already
   ignored and requires the trap to fire - so this divergence is measured by the
   suite rather than carried as a corpus case, which would only assert dash's bug.
+- **An interactive shell CATCHES SIGINT rather than dying of it** (issue #52). POSIX
+  XCU 2.11 has an interactive shell ignore SIGQUIT and SIGTERM and catch SIGINT, so
+  the interrupt abandons the command being run and the shell reads on. dash gets the
+  first two right and dies on the third: with input that is not a terminal its
+  top-level unwind exits with status 130 instead of reading the next command, which
+  is five assertions per file that dash fails in `sigint5-p.tst` and `sigint6-p.tst`.
+  bash abandons the command and carries on, the conformance suite requires that, and
+  lesh follows bash. `$?` afterwards is `128 + SIGINT`, which is zsh's answer and
+  dash's exit status; bash answers 1 and is the outlier.
+- **The interactive default action does not survive into a subshell** (issue #52).
+  It belongs to the process that reads commands and has a prompt to return to, so a
+  subshell, a command substitution and any command the shell runs take the default
+  action back. dash and bash both keep sparing the subshell; the suite says both are
+  wrong - `sigterm5-p.tst` requires `( "$TESTEE" -c 'kill -s TERM $PPID' )` under
+  `sh -i +m` to be killed - so this one is settled by the suite rather than by either
+  shell. dash additionally hands its interactive `SIG_IGN` straight to a forked child,
+  which then survives a SIGTERM aimed at itself; it is inconsistent with its own
+  `exec`, which does drop the ignore. bash and lesh drop it in both.

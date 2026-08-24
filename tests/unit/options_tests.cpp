@@ -3,6 +3,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "interactive_signal_guard.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -115,6 +117,11 @@ TEST_F(OptionsTest, DollarDashReportsTheLettersThatAreOn) {
 TEST_F(OptionsTest, InteractiveIsReportedInDollarDashThoughSetCannotToggleIt) {
 	// POSIX lists `i` among the flags `$-` reports and dash prints it, but `set`
 	// has no `-i`: interactive is decided at invocation.
+	//
+	// The guard is not tidiness: set_interactive also installs the interactive
+	// SIGNAL defaults (#52), so without it this test leaves the test binary itself
+	// ignoring SIGTERM and changes what a later signal_state believes it inherited.
+	const lesh::testing::interactive_disposition_guard dispositions;
 	state.set_interactive(true);
 	EXPECT_EQ(state.option_flags(), "i");
 	shell_state::options o;

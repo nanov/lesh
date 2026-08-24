@@ -101,7 +101,37 @@ public:
 	// constructor captures the entry dispositions BEFORE main() has decided whether
 	// the shell is interactive; and not a back-pointer, because signal_state is a
 	// member of the very state it would point at.
-	void set_interactive(bool v) noexcept { _interactive = v; }
+	//
+	// It also turns the interactive DEFAULTS on, which is why it is no longer a
+	// one-liner: the two are separate axes and the difference is load bearing, see
+	// drop_interactive_defaults.
+	void set_interactive(bool v);
+
+	// POSIX XCU 2.11, the third part: an interactive shell IGNORES SIGQUIT and
+	// SIGTERM and CATCHES SIGINT, so that a keyboard interrupt or a stray `kill`
+	// abandons the command being run instead of ending the session. It applies only
+	// where no trap has been set - an explicit `trap` wins - and only to those three
+	// signals, which is why sighup5/6-p.tst and sigurg5/6-p.tst are the canaries
+	// that say the rule did not spread (issue #52).
+	//
+	// A SEPARATE AXIS from _interactive, and not a term in cannot_be_trapped's
+	// predicate, because a subshell keeps one and loses the other. A subshell of an
+	// interactive shell is still allowed to trap a signal ignored on entry - #37's
+	// rule stays lifted, and sigint6-p.tst's `ignore -> clear` subshell case needs
+	// it - while the DEFAULT ACTION belongs to the process that reads commands and
+	// has a prompt to return to. sigint5-p.tst requires exactly that split: the same
+	// `kill` spares the shell in `main` context and kills it in `subshell`.
+	void drop_interactive_defaults();
+	// Puts them back. The one caller is `exec` FAILING on an interactive shell: it
+	// reports and carries on, so the shell it carries on as must still be the one
+	// POSIX describes.
+	void restore_interactive_defaults();
+
+	// True when `signo` has arrived and the interactive default is all there is to
+	// answer it, so the executor must abandon the command it is running rather than
+	// run a trap or die. Only SIGINT ever gets here: SIGQUIT and SIGTERM are
+	// SIG_IGN under the same rule, so they never arrive at all.
+	[[nodiscard]] bool interrupts_command(int signo) const;
 
 	// Name to number, accepting `INT`, `SIGINT`, `2`, and `EXIT`. Returns -1 when
 	// the name is not recognised - and "not recognised" is a real answer, not a
@@ -126,9 +156,29 @@ private:
 		// looks at it - the readers are this class and the `trap` builtin, both of
 		// which run between commands like every other part of the shell.
 		bool ignored_on_entry = false;
+		// The SIG_IGN this process was GIVEN is still what the kernel holds, because
+		// nothing this shell installed has replaced it. Starts equal to
+		// ignored_on_entry and only ever goes false, in install().
+		//
+		// It is not a second spelling of that flag: `trap - INT` in an INTERACTIVE
+		// shell whose SIGINT arrived ignored genuinely reverts to the default action
+		// (#37 lifts its rule for an interactive shell), so a subshell of that shell
+		// must die - while a subshell of one that never touched SIGINT must keep the
+		// SIG_IGN it inherited and survive. `how` is default_action in both cases and
+		// cannot tell them apart; this is what does.
+		bool inherited_ignore_stands = false;
 	};
+	// True when the interactive defaults are installed: see
+	// drop_interactive_defaults for why this is not _interactive.
+	void set_interactive_defaults(bool on);
+	// True when `signo` is one of the three POSIX names and the interactive default
+	// is in force for this process. Says nothing about whether a trap has been set,
+	// which is the caller's business.
+	[[nodiscard]] bool interactive_default(int signo) const;
+
 	std::vector<entry> _entries;
 	bool _interactive = false;
+	bool _interactive_defaults = false;
 };
 
 // Set by the installed handler, checked by the executor. Free functions with

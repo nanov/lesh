@@ -1,47 +1,13 @@
 #include "runtime/signals.h"
 
+#include "interactive_signal_guard.h"
+
 #include <gtest/gtest.h>
 
 using namespace lesh::runtime;
+using lesh::testing::interactive_disposition_guard;
+using lesh::testing::saved_disposition;
 
-namespace {
-
-// Restores one signal's real disposition when it goes out of scope.
-//
-// Needed because signal_state's constructor READS the process's current
-// dispositions (issue #37), so a test that leaves one changed changes what the
-// next test's constructor believes the process started with. set_ignore installs
-// SIG_IGN for real, and a later set_trap on the same signal would then be a
-// no-op - by the very rule these tests assert - with nothing to say why.
-class saved_disposition {
-public:
-	explicit saved_disposition(int signo) : _signo(signo) {
-		sigaction(_signo, nullptr, &_old);
-	}
-	~saved_disposition() { sigaction(_signo, &_old, nullptr); }
-	saved_disposition(const saved_disposition&) = delete;
-	saved_disposition& operator=(const saved_disposition&) = delete;
-
-	// Puts the signal in the state a shell INHERITS when its parent ignored it.
-	void ignore() const {
-		struct sigaction sa{};
-		sa.sa_handler = SIG_IGN;
-		sigemptyset(&sa.sa_mask);
-		sigaction(_signo, &sa, nullptr);
-	}
-
-	[[nodiscard]] void* installed() const {
-		struct sigaction current{};
-		sigaction(_signo, nullptr, &current);
-		return reinterpret_cast<void*>(current.sa_handler);
-	}
-
-private:
-	int _signo;
-	struct sigaction _old{};
-};
-
-} // namespace
 
 TEST(Signals, NamesResolveWithAndWithoutPrefix) {
 	EXPECT_EQ(signal_state::signal_number("INT"), SIGINT);
@@ -291,4 +257,179 @@ TEST(Signals, TheEXITConditionIsNeverLockedByTheRule) {
 	EXPECT_FALSE(s.cannot_be_trapped(kExitTrap));
 	s.set_trap(kExitTrap, "echo bye");
 	EXPECT_EQ(s.disposition_of(kExitTrap), disposition::handler);
+}
+
+// ISSUE #52. POSIX XCU 2.11's third rule: an interactive shell IGNORES SIGQUIT and
+// SIGTERM and CATCHES SIGINT, so a keyboard interrupt abandons the command being
+// run instead of ending the session.
+//
+// Every case below guards the real dispositions, because set_interactive now
+// INSTALLS three of them for real - and SIGTERM left as SIG_IGN would make the
+// test binary itself unkillable for the rest of the run.
+
+TEST(Signals, AnInteractiveShellIgnoresSIGQUITAndSIGTERM) {
+	const interactive_disposition_guard guard;
+	signal_state s;
+	s.set_interactive(true);
+
+	EXPECT_EQ(guard.quit().installed(), reinterpret_cast<void*>(SIG_IGN));
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN));
+	// The KERNEL disposition changed and the shell's own view did not: `trap` must
+	// keep reporting the default action, because that is what the user asked for.
+	// Recording it as disposition::ignore would have made `trap` list an ignore
+	// nobody set, and an explicit `trap` would then have had to fight it out.
+	EXPECT_EQ(s.disposition_of(SIGQUIT), disposition::default_action);
+	EXPECT_EQ(s.trap_command(SIGTERM), "");
+}
+
+TEST(Signals, AnInteractiveShellCatchesSIGINTRatherThanIgnoringIt) {
+	const interactive_disposition_guard guard;
+	signal_state s;
+	s.set_interactive(true);
+
+	// SIG_IGN would have been the easy answer and it is the WRONG one: POSIX has the
+	// shell abandon the current command and prompt again, so the interrupt has to be
+	// delivered somewhere the executor can see it. A shell that merely survived would
+	// spin in `while :; do :; done` forever, where bash abandons the loop.
+	EXPECT_NE(guard.interrupt().installed(), reinterpret_cast<void*>(SIG_IGN));
+	EXPECT_NE(guard.interrupt().installed(), reinterpret_cast<void*>(SIG_DFL));
+	EXPECT_TRUE(s.interrupts_command(SIGINT));
+	// And only SIGINT: the other two never arrive, so nothing may ask the executor
+	// to abandon a command on their behalf.
+	EXPECT_FALSE(s.interrupts_command(SIGQUIT));
+	EXPECT_FALSE(s.interrupts_command(SIGTERM));
+}
+
+TEST(Signals, TheInteractiveDefaultReachesOnlyTheThreeSignalsPOSIXNames) {
+	// The over-reach canary in unit form. sighup5/6-p.tst and sigurg5/6-p.tst were
+	// already 180/180 before this rule existed, because SIGHUP does terminate an
+	// interactive shell and SIGURG is discarded whatever the mode. A rule that
+	// sprayed across all signals would have cost those four files.
+	const interactive_disposition_guard touched;
+	const saved_disposition hup{SIGHUP};
+	const saved_disposition urg{SIGURG};
+	const saved_disposition usr1{SIGUSR1};
+	// What the process held BEFORE, rather than SIG_DFL written down: the assertion
+	// is that set_interactive did not touch these, and comparing against a constant
+	// would instead assert whatever the test binary happens to start with.
+	void* const was_hup = hup.installed();
+	void* const was_urg = urg.installed();
+	void* const was_usr1 = usr1.installed();
+	signal_state s;
+	s.set_interactive(true);
+
+	EXPECT_EQ(hup.installed(), was_hup);
+	EXPECT_EQ(urg.installed(), was_urg);
+	EXPECT_EQ(usr1.installed(), was_usr1);
+	EXPECT_FALSE(s.interrupts_command(SIGHUP));
+}
+
+TEST(Signals, ANonInteractiveShellIsLeftAtTheDefaultAction) {
+	const interactive_disposition_guard guard;
+	signal_state s;
+	s.set_interactive(false);
+
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_DFL));
+	EXPECT_FALSE(s.interrupts_command(SIGINT));
+}
+
+TEST(Signals, AnExplicitTrapWinsOverTheInteractiveDefault) {
+	// The suite's `command -> command` cases passed before this rule existed and had
+	// to keep passing: a trap the user set must run, and an interrupt must not
+	// abandon the command out from under it.
+	const interactive_disposition_guard guard;
+	signal_state s;
+	s.set_interactive(true);
+
+	s.set_trap(SIGINT, "echo trapped");
+	EXPECT_EQ(s.disposition_of(SIGINT), disposition::handler);
+	EXPECT_FALSE(s.interrupts_command(SIGINT))
+		<< "the trap body answers the signal, not the interactive default";
+
+	// `trap '' INT` on an interactive shell is a real ignore, not the default one,
+	// and `trap` must be able to say so.
+	s.set_ignore(SIGINT);
+	EXPECT_EQ(s.disposition_of(SIGINT), disposition::ignore);
+	EXPECT_EQ(guard.interrupt().installed(), reinterpret_cast<void*>(SIG_IGN));
+
+	// And `trap - INT` goes back to the interactive default rather than to SIG_DFL,
+	// which is the whole of sigint5-p.tst's `clear -> clear` case.
+	s.reset(SIGINT);
+	EXPECT_EQ(s.disposition_of(SIGINT), disposition::default_action);
+	EXPECT_TRUE(s.interrupts_command(SIGINT));
+}
+
+TEST(Signals, ASubshellTakesTheDefaultActionBackButKeepsTheRightToTrap) {
+	// The split that makes this a SEPARATE axis from _interactive. A subshell of an
+	// interactive shell is not the process with a prompt to return to, so SIGTERM
+	// kills it again - while it is still an interactive SHELL, so #37's rule stays
+	// lifted for it. sigint5-p.tst needs both halves in the one file: the same
+	// `kill` spares the shell in `main` context and kills it in `subshell`.
+	const interactive_disposition_guard guard;
+	const saved_disposition usr1{SIGUSR1};
+	usr1.ignore();
+	signal_state s;
+	s.set_interactive(true);
+	ASSERT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN));
+
+	s.reset_for_subshell();
+
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_DFL));
+	EXPECT_FALSE(s.interrupts_command(SIGINT));
+	EXPECT_FALSE(s.cannot_be_trapped(SIGUSR1))
+		<< "#37's interactive exemption is a different axis and must survive";
+}
+
+TEST(Signals, AnInheritedIgnoreIsNotOverwrittenByTheInteractiveDefault) {
+	// The case that would have cost more than the rule bought. A signal IGNORED on
+	// entry is already spared, so the interactive default has nothing to add - and
+	// must not overwrite it, because SIG_IGN is the one disposition a child inherits
+	// across fork and execve. Writing SIG_DFL over it when the subshell drops the
+	// defaults again would kill the subshell and the child shell in sigterm6-p.tst's
+	// `keep -> keep`, which #37 made survive.
+	const interactive_disposition_guard guard;
+	guard.terminate().ignore();
+	signal_state s;
+	s.set_interactive(true);
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN));
+
+	s.reset_for_subshell();
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN))
+		<< "the inherited ignore has to reach the subshell";
+}
+
+TEST(Signals, AnExplicitResetGivesUpTheInheritedIgnoreForGood) {
+	// The other half of the pair above, and why one bool cannot serve for both.
+	// `trap - TERM` on an INTERACTIVE shell whose SIGTERM arrived ignored genuinely
+	// reverts to the default action - #37 lifts its rule for an interactive shell -
+	// so a subshell of THAT shell must die where a subshell of an untouched one
+	// survives. disposition_of() is default_action in both cases and cannot tell
+	// them apart.
+	const interactive_disposition_guard guard;
+	guard.terminate().ignore();
+	signal_state s;
+	s.set_interactive(true);
+
+	s.reset(SIGTERM);
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN))
+		<< "the interactive default still spares the shell itself";
+
+	s.reset_for_subshell();
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_DFL));
+}
+
+TEST(Signals, DroppingTheDefaultsTwiceIsHarmlessAndRestoringPutsThemBack) {
+	// `exec` is the one caller that can drop them and then need them back: it
+	// reports and carries on when there is nothing to become, and the shell it
+	// carries on as must still be the one POSIX describes.
+	const interactive_disposition_guard guard;
+	signal_state s;
+	s.set_interactive(true);
+
+	s.drop_interactive_defaults();
+	s.drop_interactive_defaults();
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_DFL));
+
+	s.restore_interactive_defaults();
+	EXPECT_EQ(guard.terminate().installed(), reinterpret_cast<void*>(SIG_IGN));
 }

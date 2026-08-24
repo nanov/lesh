@@ -112,3 +112,81 @@ trap '' INT; "$TESTEE" -c 'trap "echo bye" EXIT; echo hi'
 
 --- trap lists nothing for a signal it cannot trap [xfail: divergence - dash and zsh accept the trap command, list it back, and then never run it; bash lists nothing and lesh follows bash, because a listing that names an action the shell will not take is the same defect as a builtin that succeeds without doing anything. See ADR-0001.]
 trap '' URG; "$TESTEE" -c 'trap "echo x" URG; trap; echo end'
+
+# ISSUE #52. POSIX XCU 2.11's third rule: an INTERACTIVE shell ignores SIGQUIT and
+# SIGTERM and catches SIGINT, so a keyboard interrupt or a stray `kill` abandons the
+# command being run rather than ending the session.
+#
+# Every case re-invokes `"$TESTEE" -i +m`, because the rule is about how the shell
+# was INVOKED and no snippet can arrange that for itself - and the comparison stays
+# honest because dash does the same to dash (#41).
+#
+# THE REFERENCE SHELL IS SPLIT ON THIS ONE, so each case says which half it is on.
+# dash ignores SIGQUIT and SIGTERM interactively and gets those right, but dies on
+# SIGINT: with input that is not a terminal its top-level unwind exits instead of
+# reading the next command, which is 5 assertions per file in sigint5/6-p.tst that
+# dash fails and lesh does not. bash gets SIGINT right - it abandons the command and
+# carries on - and is the shell lesh follows there. The conformance suite agrees with
+# bash, and neither shell gets the subshell half right (both keep sparing where POSIX
+# takes the default action back), so ADR-0001's "dash is authoritative where they
+# disagree about POSIX" is settled here by the suite rather than by either shell.
+
+--- an interactive shell ignores SIGQUIT at its top level [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+"$TESTEE" -i +m -c 'trap - QUIT
+kill -s QUIT $$
+echo spared'; echo "status=$?"
+
+--- an interactive shell ignores SIGTERM at its top level [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -i +m -c 'trap - TERM
+kill -s TERM $$
+echo spared'; echo "status=$?"
+
+--- SIGHUP still terminates an interactive shell, so the rule did not spread [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -i +m -c 'trap - HUP
+kill -s HUP $$
+echo not printed' 2>/dev/null; kill -l $?
+
+--- a NON-interactive shell is untouched: the same three signals still kill it [xfail(legacy): same quote-expansion defect]
+for s in INT QUIT TERM; do "$TESTEE" +i +m -c "kill -s $s \$\$" 2>/dev/null; kill -l $?; done
+
+--- an explicit trap wins over the interactive default [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+"$TESTEE" -i +m -c 'trap "echo trapped" TERM
+kill -s TERM $$
+echo after'
+
+--- trap '' on such a signal is a real ignore the shell can report [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+"$TESTEE" -i +m -c "trap '' TERM
+trap
+kill -s TERM \$\$
+echo after"
+
+--- trap reports the interactive default as the default action, because that is what was asked for [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+"$TESTEE" -i +m -c 'trap - TERM
+trap
+echo end'
+
+--- a subshell of an interactive shell takes the default action back [xfail: divergence - dash and bash both keep sparing the subshell, and the conformance suite says both are wrong: sigterm5-p.tst requires `( "$TESTEE" -c "kill -s TERM \$PPID" )` under `sh -i +m` to be killed, because a subshell is not the process that reads commands and has a prompt to return to]
+"$TESTEE" -i +m -c 'trap - TERM
+( "$TESTEE" -c '\''kill -s TERM $PPID'\''
+echo not printed )' 2>/dev/null; kill -l $?
+
+--- a command the interactive shell runs is not handed an unkillable SIGTERM [xfail: divergence - dash hands its interactive SIG_IGN straight to the child and the child then survives a SIGTERM aimed at itself; bash kills it, lesh follows bash, and sigterm5-p.tst's `target=child` cases require it. dash is inconsistent with its own `exec`, which DOES drop the ignore - the case below passes against it]
+"$TESTEE" -i +m -c 'trap - TERM
+"$TESTEE" -c '\''kill -s TERM $$
+echo not printed'\''' 2>/dev/null; kill -l $?
+
+--- exec hands over a killable SIGTERM, since SIG_IGN would survive execve [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -i +m -c 'trap - TERM
+exec "$TESTEE" -c '\''kill -s TERM $$
+echo not printed'\''' 2>/dev/null; kill -l $?
+
+--- an interactive shell catches SIGINT and carries on to the next command [xfail: divergence - dash dies with status 130 here: its top-level unwind exits when the input is not a terminal instead of reading on. bash prints `spared` and lesh follows bash, which is also what sigint5-p.tst requires of the 5 assertions dash fails in it]
+"$TESTEE" -i +m -c 'trap - INT
+kill -s INT $$
+echo spared'; echo "status=$?"
+
+--- catching SIGINT means ABANDONING the command, not merely surviving it [xfail: divergence - dash dies, as above. bash abandons the loop and prints the command after it, and a shell that only stayed alive would run every iteration - which is the stub this case exists to fail]
+"$TESTEE" -i +m -c 'trap - INT
+n=0
+while [ "$n" -lt 5 ]; do n=$((n+1)); kill -s INT $$; done
+echo abandoned after $n'

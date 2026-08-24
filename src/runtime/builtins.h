@@ -26,6 +26,11 @@ enum class control_flow {
 	return_from,   // `return` - needs functions (#25)
 	break_loop,    // `break` - needs loops (#19)
 	continue_loop, // `continue` - needs loops (#19)
+	// SIGINT caught by an interactive shell's default action (#52). Not something a
+	// builtin can produce - it arrives asynchronously - but it unwinds exactly the
+	// way `break` and `return` do, so every construct that already lets those out
+	// lets this out, and none of them had to learn a second mechanism.
+	interrupted,
 };
 
 struct builtin_result {

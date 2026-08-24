@@ -625,6 +625,13 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		_input_trees.push_back(syntax::parse_next_command(_pool, source, at, &_state));
 		echo_if_verbose(source.substr(from, at - from), echo_when_verbose);
 		status = run_parsed(_input_trees.back());
+		// THIS is the prompt an interrupted command returns to (#52). Clearing the
+		// unwind here and not in run_parsed is what makes the interrupt travel out of
+		// a function, an `eval` and a `.` script the same way it travels out of a
+		// loop - and clearing it before the exit test below is what leaves the EXIT
+		// trap free to run its whole body afterwards.
+		if (_flow == control_flow::interrupted)
+			_flow = control_flow::normal;
 		if (_exit_requested)
 			break;
 	}
@@ -698,6 +705,12 @@ int tree_walking_executor::run_parsed(const tree& t) {
 		run_pending_traps();
 		if (_exit_requested)
 			break;
+		// Before the `set -e` test, and deliberately: an interrupt is not a command
+		// that failed, and 130 must not exit the shell of someone who ran `set -e`.
+		if (_flow == control_flow::interrupted) {
+			status = _state.last_status();
+			break;
+		}
 		if (errexit_fires(status)) {
 			_exit_requested = true;
 			break;
@@ -717,7 +730,16 @@ void tree_walking_executor::run_pending_traps() {
 		return;  // the common case, kept cheap
 
 	int signo = 0;
+	int interrupted_by = 0;
 	while (_state.signals().take_pending(signo)) {
+		// ISSUE #52. SIGINT with no trap, in an interactive shell. Recorded and acted
+		// on AFTER the loop rather than here, so a trap on some other pending signal
+		// still gets to run its body instead of unwinding out of it on the first
+		// command.
+		if (_state.signals().interrupts_command(signo)) {
+			interrupted_by = signo;
+			continue;
+		}
 		if (_state.signals().disposition_of(signo) != disposition::handler)
 			continue;
 		const std::string command{_state.signals().trap_command(signo)};
@@ -731,6 +753,25 @@ void tree_walking_executor::run_pending_traps() {
 		_in_trap = false;
 		_state.set_last_status(saved);
 	}
+	if (interrupted_by == 0)
+		return;
+
+	// POSIX XCU 2.11 has an interactive shell CATCH SIGINT, and catching it means
+	// ABANDONING the command being run and going back to reading input - not merely
+	// surviving. The difference is visible: an interrupted `while :; do :; done` has
+	// to stop, and a shell that only stayed alive would spin in it forever. bash
+	// abandons the loop and prints the command after it; dash dies instead, which is
+	// why dash fails these cases too.
+	//
+	// "Back to reading input" is run_input's loop, which is where a prompt would be
+	// written when there is a terminal to write it to (Phase 4) and which already
+	// reads one complete command at a time. So the unwind stops there and the next
+	// command runs, whether it comes from a terminal or from the script on stdin.
+	_flow = control_flow::interrupted;
+	// `$?` afterwards. zsh reports 130 and dash exits 130; bash reports 1 and is the
+	// odd one out. Nothing in the conformance suite asserts it - every case runs
+	// `echo ok` next - so the two shells that agree win.
+	_state.set_last_status(128 + interrupted_by);
 }
 
 // Runs the EXIT trap, once, on the way out.
@@ -918,6 +959,12 @@ int tree_walking_executor::run_loop(const tree& t, node_index n, bool until) {
 		if (_flow != control_flow::normal) {
 			bool should_break = false;
 			if (consume_loop_flow(should_break))
+				return status;
+			// An interrupt is neither a break nor a continue, so consume_loop_flow
+			// leaves it standing - and the loop must stop rather than test the
+			// condition it never finished evaluating. Without this the body ran one
+			// more time before the check after it noticed (#52).
+			if (_flow == control_flow::interrupted)
 				return status;
 		}
 		const bool keep_going = until ? (cond != 0) : (cond == 0);
@@ -1301,6 +1348,14 @@ void tree_walking_executor::become_command(arena_array<char*>& argv,
                                            const arena_array<std::string_view>* assignments,
                                            const tree* t, node_index command,
                                            bool standard_path_wanted) {
+	// The interactive defaults are this SHELL's, and SIG_IGN is the one disposition
+	// that survives execve - so an interactive shell that ignores SIGTERM would hand
+	// every command it runs a disposition it cannot be killed by, and a lesh child
+	// would then read that as "ignored on entry" and refuse to trap it (#37). That
+	// is every `target=child` case in sigquit5/sigterm5-p.tst, 120 assertions per
+	// file. Dropped in the child, after the fork, so the shell itself keeps them.
+	_state.signals().drop_interactive_defaults();
+
 	// Redirections are applied AFTER the pipeline's fds, so an explicit
 	// `> file` on a pipeline stage overrides the pipe - which is what POSIX
 	// requires and what `a | b > out` means.
@@ -1585,8 +1640,15 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 	// Nothing after this point runs on success: execve replaces the image. Flush
 	// first or anything still buffered dies with it.
 	std::fflush(nullptr);
+	// Same reason as in become_command, and here it matters even more: there is no
+	// fork, so this process IS the one being replaced. `exec "$TESTEE"` from an
+	// interactive shell must hand over a killable SIGTERM (#52).
+	_state.signals().drop_interactive_defaults();
 	const int failure = search_and_exec(argv.data(), _state.environment_block(),
 	                                   path_value, _state.own_path());
+	// The exec did not happen, and an interactive shell reports and carries on - so
+	// the dispositions dropped for an image that never arrived have to come back.
+	_state.signals().restore_interactive_defaults();
 
 	// dash's shape, minus the line number lesh does not track:
 	// `dash: 1: exec: ./_no_such_command_: not found`. exec-p.tst only requires

@@ -298,8 +298,12 @@ signal_state::signal_state() : _entries(kMaxSignal) {
 	// false, which is right: nothing can send them.
 	for (int signo = 1; signo < kMaxSignal; ++signo) {
 		struct sigaction current{};
-		if (sigaction(signo, nullptr, &current) == 0)
+		if (sigaction(signo, nullptr, &current) == 0) {
 			_entries[signo].ignored_on_entry = current.sa_handler == SIG_IGN;
+			// Nothing has replaced it yet, by construction: install() is the only thing
+			// that writes a disposition and it has not run.
+			_entries[signo].inherited_ignore_stands = _entries[signo].ignored_on_entry;
+		}
 	}
 }
 
@@ -341,8 +345,25 @@ void signal_state::install(int signo) {
 	if (signo == kExitTrap || signo <= 0 || signo >= kMaxSignal)
 		return;  // EXIT is not a real signal; there is nothing to install
 
+	// Whatever the kernel was given on entry is gone from here on, and the
+	// interactive default has to know: see entry::inherited_ignore_stands.
+	_entries[signo].inherited_ignore_stands = false;
+
+	// ISSUE #52. The interactive default is COMPUTED rather than stored, so `trap`
+	// keeps reporting the disposition this shell actually asked for - which for
+	// these three is the default action, and prints nothing. Storing it as a
+	// disposition would have made `trap` list an ignore the user never set, and an
+	// explicit `trap` would have had to fight it back out.
+	disposition effective = _entries[signo].how;
+	if (effective == disposition::default_action && interactive_default(signo))
+		// SIGQUIT and SIGTERM are ignored outright; SIGINT is CAUGHT, because POSIX
+		// has the shell abandon the current command and prompt again rather than
+		// discard the interrupt. What "prompt again" means with a script on stdin is
+		// tree_walking_executor::run_pending_traps.
+		effective = signo == SIGINT ? disposition::handler : disposition::ignore;
+
 	struct sigaction sa{};
-	switch (_entries[signo].how) {
+	switch (effective) {
 		case disposition::default_action: sa.sa_handler = SIG_DFL; break;
 		case disposition::ignore:         sa.sa_handler = SIG_IGN; break;
 		case disposition::handler:        sa.sa_handler = record_signal; break;
@@ -352,6 +373,49 @@ void signal_state::install(int signo) {
 	// into EINTR that callers would have to retry by hand.
 	sa.sa_flags = SA_RESTART;
 	sigaction(signo, &sa, nullptr);
+}
+
+bool signal_state::interactive_default(int signo) const {
+	if (!_interactive_defaults)
+		return false;
+	// The three POSIX names and nothing else. SIGHUP does terminate an interactive
+	// shell and SIGURG is discarded whatever the mode, which is why sighup5/6-p.tst
+	// and sigurg5/6-p.tst were already 180/180 and are the canaries for over-reach.
+	return signo == SIGINT || signo == SIGQUIT || signo == SIGTERM;
+}
+
+void signal_state::set_interactive_defaults(bool on) {
+	if (_interactive_defaults == on)
+		return;  // nothing installed, so nothing to undo
+	_interactive_defaults = on;
+	for (const int signo : {SIGINT, SIGQUIT, SIGTERM}) {
+		// The one case that must be left alone. An inherited SIG_IGN this shell has
+		// never replaced already spares it, so the interactive default has nothing to
+		// add - and must not overwrite it, because SIG_IGN is the ONE disposition a
+		// child inherits across fork and execve. Writing SIG_DFL here would kill the
+		// subshell and the child shell in sigterm6-p.tst's `keep -> keep`, which
+		// POSIX says survive, and it is #37's rule that makes them survive.
+		if (_entries[signo].inherited_ignore_stands)
+			continue;
+		install(signo);
+	}
+}
+
+void signal_state::set_interactive(bool v) {
+	_interactive = v;
+	set_interactive_defaults(v);
+}
+
+void signal_state::drop_interactive_defaults() { set_interactive_defaults(false); }
+
+void signal_state::restore_interactive_defaults() { set_interactive_defaults(_interactive); }
+
+bool signal_state::interrupts_command(int signo) const {
+	// A trap WINS: the disposition has to still be the default action for the
+	// interactive default to be what answers the signal. The suite's `command ->
+	// command` cases assert exactly that, and they passed before this rule existed.
+	return signo == SIGINT && _entries[signo].how == disposition::default_action &&
+	       interactive_default(signo);
 }
 
 bool signal_state::cannot_be_trapped(int signo) const {
@@ -444,6 +508,18 @@ void signal_state::reset_for_subshell() {
 	// kernel disposition it arrived with is still SIG_IGN. That is also how a CHILD
 	// shell learns the same fact - SIG_IGN survives execve, so the child's own
 	// constructor rediscovers it rather than being told (issue #37).
+	//
+	// ISSUE #52, and it is the whole reason the interactive default is a separate
+	// axis. A subshell is not the process that reads commands and has a prompt to
+	// return to, so it takes the DEFAULT ACTION for SIGINT, SIGQUIT and SIGTERM
+	// again - while it keeps being allowed to trap a signal ignored on entry,
+	// because that permission is about being an interactive SHELL. sigint5-p.tst
+	// requires both halves of that split in the one file: the same `kill` spares the
+	// shell in `main` context and kills it in `subshell`.
+	//
+	// Before the loop below, so a handler being reverted here is installed once, as
+	// the plain default action rather than as the interactive one.
+	drop_interactive_defaults();
 	for (int i = 0; i < kMaxSignal; ++i) {
 		if (_entries[i].how == disposition::handler) {
 			_entries[i].how = disposition::default_action;

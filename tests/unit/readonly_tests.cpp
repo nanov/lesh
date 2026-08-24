@@ -4,6 +4,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "interactive_signal_guard.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -93,6 +95,11 @@ TEST_F(ReadonlyTest, AssignmentToAReadonlyVariableIsFatalToANonInteractiveShell)
 TEST_F(ReadonlyTest, AnInteractiveShellReportsAndCarriesOn) {
 	// The other half of the same POSIX sentence, and the reason the fatality lives
 	// in one place rather than in each writer.
+	//
+	// The guard restores the interactive SIGNAL defaults set_interactive installs
+	// (#52), which are nothing to do with this test and everything to do with the
+	// next one.
+	const lesh::testing::interactive_disposition_guard dispositions;
 	state.set_interactive(true);
 	EXPECT_EQ(capture("readonly a=1; a=2 2>/dev/null; echo reached"), "reached\n");
 }
