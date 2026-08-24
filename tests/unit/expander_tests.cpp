@@ -88,6 +88,29 @@ public:
 	}
 };
 
+// The mutable state arithmetic needs. Separate from FakeParams because
+// arithmetic ASSIGNS, and the expander refuses to evaluate at all without it -
+// which is completion's mode and a case these tests have to be able to pick.
+class FakeVars final : public arithmetic_variables {
+public:
+	std::map<std::string, int64_t> values;
+	bool refuse = false;
+
+	int64_t get(std::string_view name) const override {
+		const auto it = values.find(std::string(name));
+		return it == values.end() ? 0 : it->second;
+	}
+	bool set(std::string_view name, int64_t value) override {
+		if (refuse)
+			return false;
+		values[std::string(name)] = value;
+		return true;
+	}
+	bool defined(std::string_view name) const override {
+		return values.count(std::string(name)) != 0;
+	}
+};
+
 class ExpanderTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
@@ -99,12 +122,16 @@ protected:
 	// the returned status and the only one a defect inside a parameter default can
 	// travel on: expand_value returns a value, so it has no status to
 	// hand back to expand_text. It is also the channel the executor acts on.
+	//
+	// `vars` supplies the mutable state arithmetic needs; nullptr is completion's
+	// mode, where arithmetic is not evaluated at all.
 	std::vector<std::string> expand(std::string_view src, command_runner* runner = nullptr,
 	                                expansion_status* status_out = nullptr,
-	                                bool* fatal_out = nullptr) {
+	                                bool* fatal_out = nullptr,
+	                                arithmetic_variables* vars = nullptr) {
 		const tree t = parse(pool, src);
 		const node_index cmd = t.child_of(t[t.root()], 0);
-		expander ex{pool, params, runner};
+		expander ex{pool, params, runner, true, vars};
 		lesh::arena_array<std::string_view> fields{pool, 8};
 
 		expansion_status last = expansion_status::ok;
@@ -744,4 +771,67 @@ TEST(ExpanderDepthTest, DeeplyNestedExpansionIsRefusedRatherThanExhaustingTheSta
 
 	EXPECT_TRUE(ex.expand_value(text, value_context::assignment).empty());
 	EXPECT_TRUE(ex.fatal_error());
+}
+
+// --- an expansion that cannot be performed is an ERROR, not an empty field (#39)
+
+TEST_F(ExpanderTest, ArithmeticThatWillNotEvaluateIsAFatalExpansionError) {
+	// The line #39 named. The evaluator already refused every one of these -
+	// `division by zero`, `unexpected end of expression` - and the refusal was
+	// turned into `unsupported_construct` above it, which nothing treats as fatal.
+	// So `echo $((1/0))` printed an empty line and reported SUCCESS, which is a
+	// wrong answer rather than a missing feature. dash reports and exits 2.
+	FakeVars vars;
+	for (const std::string_view form : {"$((1/0))", "$((--))", "$((1%0))",
+	                                    "$(( 0 && + ))", "$((1+))"}) {
+		bool fatal = false;
+		expansion_status status = expansion_status::ok;
+		const std::string src = std::string("echo ") + std::string(form);
+		const auto fields = expand(src, nullptr, &status, &fatal, &vars);
+		EXPECT_TRUE(fatal) << form;
+		EXPECT_EQ(status, expansion_status::expansion_error) << form;
+		EXPECT_EQ(fields, (std::vector<std::string>{"echo"})) << form;
+	}
+}
+
+TEST_F(ExpanderTest, AnErrorAndAnUnimplementedConstructAreNoLongerTheSameAnswer) {
+	// The half of #39 that is about the enum rather than about the flag.
+	// `unsupported_construct` was standing for BOTH "lesh has not built that" and
+	// "this expansion failed", and collapsing the two is how a real error came to
+	// travel on a value nothing acts on. Completion is the case that keeps the
+	// distinction honest: with no mutable state there is nothing to evaluate
+	// against, so `$((1/0))` is genuinely unsupported THERE and must not be fatal -
+	// a line editor drawing a suggestion may not kill the shell.
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	expand("echo $((1/0))", nullptr, &status, &fatal, nullptr);
+	EXPECT_FALSE(fatal) << "completion's mode expands without the power to fail";
+	EXPECT_EQ(status, expansion_status::unsupported_construct);
+}
+
+TEST_F(ExpanderTest, ArithmeticThatEvaluatesIsUntouchedByAnyOfThis) {
+	// The line the check must not cross, asserted so it cannot widen by accident.
+	FakeVars vars;
+	vars.values["i"] = 7;
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	EXPECT_EQ(expand("echo $((6/2)) $((i+1)) $((0 && 1/0))", nullptr, &status, &fatal, &vars),
+	          (std::vector<std::string>{"echo", "3", "8", "0"}));
+	EXPECT_FALSE(fatal);
+	EXPECT_EQ(status, expansion_status::ok)
+		<< "and a short-circuited division by zero is not evaluated at all (#56)";
+}
+
+TEST_F(ExpanderTest, ARefusedArithmeticAssignmentStaysTheVariableAssignmentError) {
+	// It was already fatal, and it must not start printing an ARITHMETIC
+	// diagnostic on top of the readonly one shell_state has already produced: the
+	// expression is fine, the variable refused the write. Two errors for one cause
+	// is what the branch order prevents.
+	FakeVars vars;
+	vars.refuse = true;
+	bool fatal = false;
+	expansion_status status = expansion_status::ok;
+	expand("echo $((x=1))", nullptr, &status, &fatal, &vars);
+	EXPECT_TRUE(fatal);
+	EXPECT_EQ(status, expansion_status::expansion_error);
 }

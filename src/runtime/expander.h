@@ -119,6 +119,17 @@ enum class expansion_status {
 	// INPUT is at fault rather than the shell, and POSIX makes it fatal to a
 	// non-interactive shell the way a syntax error is (#48).
 	malformed_expansion,
+	// POSIX 2.8.1's EXPANSION ERROR: the expansion was attempted and could not be
+	// performed. Arithmetic that will not evaluate (`$((1/0))`, `$((--))`) and a
+	// name that cannot be assigned (`${1=x}`) are the two.
+	//
+	// Its own value because unsupported_construct was standing for this AND for
+	// "lesh has not built that", and a real error wearing an unimplemented
+	// construct's value is precisely how `echo $((1/0))` reached the command line
+	// as an empty field at status zero (#39). The two want opposite treatment:
+	// this one is fatal to a non-interactive shell, and an unbuilt construct must
+	// not be.
+	expansion_error,
 };
 
 class expander {
@@ -286,6 +297,12 @@ private:
 	// fatal error. Worded exactly as the parser words it, because which layer
 	// caught it is lesh's business and not the user's.
 	void report_malformed(syntax::token_error error) noexcept;
+
+	// Reports arithmetic that would not evaluate and records the fatal error.
+	// `expression` is the text as the evaluator received it, which dash prints
+	// too - `$((1/0))` and `$((x/0))` are the same complaint about different
+	// input, and the message that names neither is the one nobody can act on.
+	void report_arithmetic(const char* why, std::string_view expression) noexcept;
 
 	// How deep expansion may nest.
 	//

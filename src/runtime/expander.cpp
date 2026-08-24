@@ -523,6 +523,21 @@ void expander::report_malformed(token_error error) noexcept {
 	_fatal_error = true;
 }
 
+// Arithmetic that would not evaluate. POSIX 2.8.1 makes it an EXPANSION ERROR,
+// which is fatal to a non-interactive shell - and until this existed there was no
+// message at all: `echo $((1/0))` printed an empty line and reported success.
+//
+// dash's shape, minus the line number lesh does not track:
+// `dash: 1: arithmetic expression: division by zero: "1/0"`. The expression is
+// quoted back because the evaluator's `why` alone cannot say which of several
+// `$(( ))` on a line is the one that failed.
+void expander::report_arithmetic(const char* why, std::string_view expression) noexcept {
+	std::fprintf(stderr, "lesh: arithmetic expression: %s: \"%.*s\"\n",
+	             why != nullptr ? why : "invalid expression",
+	             static_cast<int>(expression.size()), expression.data());
+	_fatal_error = true;
+}
+
 // Formats an integer into arena storage so the returned view outlives the call.
 std::string_view expander::int_to_scratch(int value) noexcept {
 	char digits[24];
@@ -782,7 +797,12 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							// assign anything.
 							std::fprintf(stderr, "lesh: %.*s: bad variable name\n",
 							             static_cast<int>(p.name.size()), p.name.data());
-							status = expansion_status::unsupported_construct;
+							// An expansion error, not an unsupported construct. It was the
+							// latter, alongside a genuinely-unbuilt construct and alongside
+							// `$((1/0))`, which is how one value came to mean both "fatal" and
+							// "harmless" (#39). Nothing read it here - `_fatal_error` carried
+							// the decision - but the value said the wrong thing.
+							status = expansion_status::expansion_error;
 							_fatal_error = true;
 							break;
 						}
@@ -991,10 +1011,24 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 					// A refused assignment - `readonly x; echo $((x=1))` - is a variable
 					// assignment error rather than a malformed expression, and POSIX makes
 					// it fatal to a non-interactive shell. shell_state has already named
-					// the variable, the way dash does.
-					if (r.assignment_refused)
+					// the variable, the way dash does, so there is nothing to add here.
+					if (r.assignment_refused) {
 						_fatal_error = true;
-					status = expansion_status::unsupported_construct;
+						status = expansion_status::expansion_error;
+						break;
+					}
+					// EVERY other refusal is an expansion error too, and this is the line
+					// #39 named: it turned all of them into unsupported_construct, which
+					// nothing treats as fatal, so `echo $((1/0))` and `echo $((--))`
+					// reached the command line as an empty field at status zero. The
+					// evaluator had already refused both; the report was thrown away above
+					// it.
+					//
+					// unsupported_construct now means only what it says - a construct lesh
+					// has not built - and the one such case here is the branch above, where
+					// there is no mutable state to evaluate against.
+					report_arithmetic(r.error, resolved);
+					status = expansion_status::expansion_error;
 					break;
 				}
 				// POSIX applies `set -u` inside arithmetic too, so `$((x))` on an

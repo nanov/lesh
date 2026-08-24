@@ -1173,3 +1173,32 @@ nt=0
 
 --- test -nt and -ot with both operands missing are false, which dash agrees with [xfail(legacy): legacy mis-splits the line - `test: YYYYY;: unexpected operator` - so the second command's operand lands in the first]
 test XXXXX -nt YYYYY; printf 'nt=%s ' $?; test XXXXX -ot YYYYY; echo "ot=$?"
+
+# AN EXPANSION ERROR IS FATAL TO A NON-INTERACTIVE SHELL (#39).
+#
+# POSIX 2.8.1 makes an expansion error end a non-interactive shell, and dash
+# answers 2 for every shape of it. Arithmetic was the shape with no diagnostic
+# at all: the evaluator already refused each of these, and the refusal was
+# turned into `unsupported construct` above it, which reached the command line
+# as an empty field at status zero.
+
+--- division by zero is an expansion error [xfail(legacy): legacy has no arithmetic expansion]
+echo $((1/0)); echo st=$?
+
+--- a malformed arithmetic expression is an expansion error [xfail(legacy): legacy has no arithmetic expansion]
+echo $((--)); echo st=$?
+
+--- an arithmetic error in the middle of a word stops the whole command [xfail(legacy): legacy has no arithmetic expansion]
+echo A$((1/0))B; echo st=$?
+
+--- an arithmetic error in an assignment leaves the variable alone [xfail(legacy): legacy has no arithmetic expansion]
+x=$((1/0)); echo "st=$? x=$x"
+
+--- an arithmetic error in a special builtin's operand stops the shell [xfail(legacy): legacy has no arithmetic expansion]
+: $((1/0)); echo reached
+
+--- a short-circuited operand that will not parse is still an error [xfail(legacy): legacy has no arithmetic expansion]
+echo $(( 0 && + )); echo st=$?
+
+--- arithmetic that evaluates is untouched by any of this [xfail(legacy): legacy has no arithmetic expansion]
+echo $((6/2)) $((1+1)); echo st=$?
