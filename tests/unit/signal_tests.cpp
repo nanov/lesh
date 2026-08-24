@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
 using namespace lesh::runtime;
 using lesh::testing::interactive_disposition_guard;
 using lesh::testing::saved_disposition;
@@ -20,6 +22,34 @@ TEST(Signals, NumbersAreAccepted) {
 	// `trap - 2` is legal, so a bare number must resolve.
 	EXPECT_EQ(signal_state::signal_number("2"), 2);
 	EXPECT_EQ(signal_state::signal_number("0"), kExitTrap);
+}
+
+TEST(Signals, ANumberPastTheCeilingIsRefusedRatherThanOverflowed) {
+	// ISSUE #62. The accumulator was an unbounded `int`, so
+	// `trap - 99999999999999999999` overflowed it - undefined behaviour, and an
+	// abort under the debug preset's UBSan - on the way to an answer the ceiling
+	// below already had. kMaxSignal bounds the whole valid set and the accumulator
+	// only grows, so a number that has passed the ceiling can never come back under
+	// it and the loop can stop there.
+	EXPECT_EQ(signal_state::signal_number("99999999999999999999"), -1);
+	EXPECT_EQ(signal_state::signal_number("9223372036854775808"), -1);
+	EXPECT_EQ(signal_state::signal_number(std::to_string(kMaxSignal)), -1);
+
+	// THE WRAP WAS NOT MERELY UNDEFINED, it landed on real signals. 2^32 wraps an
+	// int to 0, which is kExitTrap, so `trap - 4294967296` used to CLEAR THE EXIT
+	// TRAP; 2^32 + 2 wraps to SIGINT. A saturating answer would have had the same
+	// defect in a tidier form - clamping to the ceiling names whatever signal sits
+	// there - which is why this site refuses instead of clamping.
+	EXPECT_EQ(signal_state::signal_number("4294967296"), -1)
+		<< "wrapping an int landed on the EXIT condition";
+	EXPECT_EQ(signal_state::signal_number("4294967298"), -1)
+		<< "wrapping an int landed on SIGINT";
+
+	// The ceiling is the only thing that moved: every number below it still
+	// resolves, leading zeros included.
+	EXPECT_EQ(signal_state::signal_number(std::to_string(kMaxSignal - 1)), kMaxSignal - 1);
+	EXPECT_EQ(signal_state::signal_number("0000000002"), 2);
+	EXPECT_EQ(signal_state::signal_number("00"), kExitTrap);
 }
 
 TEST(Signals, UnknownNamesAreRejectedRatherThanGuessed) {

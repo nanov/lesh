@@ -1262,3 +1262,52 @@ case a in *) echo star;; esac
 
 --- nounset leaves a defaulted case subject alone [xfail(legacy): legacy has no case clause]
 set -u; case ${x-ok} in ok) echo defaulted;; esac
+
+# UNCHECKED INTEGER ACCUMULATORS (#62), the three left after #59 fixed the
+# arithmetic evaluator's. Each was reachable from a single line and each was
+# undefined behaviour - an abort under the debug preset's UBSan, a silent wrap in
+# release - so what a value MEANS at each site is what these assert, not how it is
+# computed. #59's answer for arithmetic was "an over-large literal saturates";
+# none of the three wanted it, because none of them is computing a number.
+
+--- the integer limits are test operands rather than overflows [xfail(legacy): legacy has no command lists, so the `;` and everything after it reach `test` as operands]
+test -9223372036854775808 -eq 1; echo "a=$?"
+test -9223372036854775808 -lt 0; echo "b=$?"
+test 9223372036854775807 -gt 0; echo "c=$?"
+test -9223372036854775808 -eq -9223372036854775808; echo "d=$?"
+
+# `test` COMPARES, so an operand it cannot represent has no nearest answer worth
+# giving: it is a usage error and stays one. dash and bash both report and exit 2.
+# Saturating - arithmetic's answer - would silently compare a number the script
+# never wrote.
+
+--- a test operand past the integer limit is a usage error rather than a saturated comparison [xfail(legacy): legacy has no command lists or redirections]
+test 9223372036854775808 -gt 0 2>/dev/null; echo "a=$?"
+test -9223372036854775809 -eq 1 2>/dev/null; echo "b=$?"
+test 99999999999999999999 -eq 1 2>/dev/null; echo "c=$?"
+
+# A SIGNAL NUMBER has a bounded valid set, so there is nothing above the ceiling
+# for a large one to become - a saturated signal number would name a real signal
+# the script never asked for. Run in a subshell because a special builtin's error
+# ends a non-interactive lesh where it does not end dash, which is a separate
+# difference and not this one.
+
+--- a signal number too large to be one is refused rather than overflowed [xfail(legacy): legacy has no subshells and no trap builtin, so it runs `trap` as a command name]
+( trap - 99999999999999999999 ) 2>/dev/null; echo "a=$?"
+( trap : 99999999999999999999 ) 2>/dev/null; echo "b=$?"
+( trap - 99 ) 2>/dev/null; echo "c=$?"
+( trap : 2 ) 2>/dev/null; echo "d=$?"
+
+--- kill refuses a signal number too large to be one [xfail(legacy): legacy has no command lists, and its kill is the external one]
+kill -s 99999999999999999999 $$ 2>/dev/null; echo "a=$?"
+
+# A FILE DESCRIPTOR is an int, so a number too large to be one is not invalid in
+# some new way - it is invalid the way an unopened fd is, and takes the same
+# diagnostic and status. dash reaches the same answer by a different road: its
+# parser takes only a SINGLE digit after `>&`, so it refuses the word outright.
+
+--- a redirection fd too large to be one is refused [xfail(legacy): legacy has no redirections, so `>&99999999999999999999` is an echo operand]
+echo hi >&99999999999999999999
+
+--- an input redirection fd too large to be one is refused [xfail(legacy): legacy has no redirections, so cat reads the script's own stdin]
+cat <&99999999999999999999

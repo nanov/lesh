@@ -453,7 +453,20 @@ bool test_integer(std::string_view text, int64_t& out) {
 	                                : static_cast<uint64_t>(INT64_MAX);
 	if (magnitude > limit)
 		return false;
-	out = negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
+	// NEGATED IN THE UNSIGNED DOMAIN, because -INT64_MIN has no int64_t to be. The
+	// limit above deliberately ADMITS the magnitude 2^63, so INT64_MIN is a legal
+	// operand - dash, bash and zsh all compare `test -9223372036854775808 -eq 1`
+	// without complaint - and negating the signed conversion of it was undefined
+	// behaviour on the one value the range check exists to let through (#62).
+	// Unsigned wrapping is defined, and 0 - 2^63 converts back to exactly INT64_MIN.
+	//
+	// SATURATING WOULD BE THE WRONG SHAPE HERE, unlike arithmetic's over-large
+	// literal (#59): `test` is comparing, not computing, so an operand it cannot
+	// represent is a usage error and stays one - the `magnitude > limit` return
+	// above, which reaches the caller as `Illegal number` and status 2, exactly as
+	// dash and bash answer. A clamped operand would silently compare a number the
+	// script never wrote.
+	out = static_cast<int64_t>(negative ? uint64_t{0} - magnitude : magnitude);
 	return true;
 }
 

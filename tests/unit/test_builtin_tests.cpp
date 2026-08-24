@@ -109,6 +109,32 @@ TEST_F(TestBuiltinTest, StringAndIntegerComparison) {
 	EXPECT_EQ(run("test 10 -gt 9"), 0) << "numeric, not lexicographic";
 }
 
+TEST_F(TestBuiltinTest, TheNegativeLimitIsAnOperandAndNotAnOverflow) {
+	// ISSUE #62. `test -9223372036854775808 -eq 1` is a LEGAL comparison - dash,
+	// bash and zsh all answer 1 with no diagnostic - and test_integer's range check
+	// admits the magnitude 2^63 for exactly that reason. The value was then built
+	// by NEGATING the signed conversion of it, and -INT64_MIN has no int64_t to be,
+	// so the one operand the check exists to let through was the one that reached
+	// undefined behaviour: an abort under the debug preset's UBSan, and in release
+	// a wrap that made `test -9223372036854775808 -lt 0` FALSE.
+	EXPECT_EQ(run("test -9223372036854775808 -eq 1"), 1);
+	EXPECT_EQ(run("test -9223372036854775808 -lt 0"), 0)
+		<< "the negative limit is negative";
+	EXPECT_EQ(run("test -9223372036854775808 -eq -9223372036854775808"), 0);
+	EXPECT_EQ(run("test -9223372036854775808 -lt -9223372036854775807"), 0)
+		<< "and is the smallest operand there is";
+	EXPECT_EQ(run("test 9223372036854775807 -gt 0"), 0) << "the positive limit too";
+
+	// ONE PAST EITHER LIMIT STAYS A USAGE ERROR rather than saturating, which is
+	// where this site parts company with arithmetic's over-large literal (#59).
+	// `test` compares rather than computes, so an operand it cannot represent has
+	// no nearest value worth standing in for it; dash and bash both report and exit
+	// 2, and a clamped operand would silently compare a number nobody wrote.
+	EXPECT_EQ(fails("test -9223372036854775809 -eq 1"), 2);
+	EXPECT_EQ(fails("test 9223372036854775808 -gt 0"), 2);
+	EXPECT_EQ(fails("test -99999999999999999999 -lt 0"), 2);
+}
+
 TEST_F(TestBuiltinTest, FileTests) {
 	EXPECT_EQ(run("test -e /"), 0);
 	EXPECT_EQ(run("test -d /"), 0);

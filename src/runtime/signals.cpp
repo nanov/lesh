@@ -318,8 +318,22 @@ int signal_state::signal_number(std::string_view name) {
 			if (c < '0' || c > '9')
 				return -1;
 			value = value * 10 + (c - '0');
+			// THE VALID SET IS BOUNDED BY kMaxSignal, and the accumulator only ever
+			// grows, so a number that has already passed the ceiling can never come
+			// back under it. Refusing it here rather than after the whole string has
+			// been read gives `trap - 99999999999999999999` the same answer
+			// `trap - 99` already gets - `bad signal`, status 1, which is dash's
+			// `bad trap` at status 1 - instead of overflowing the accumulator on the
+			// way to it, which is undefined behaviour (#62).
+			//
+			// Not saturated, unlike an arithmetic literal (#59): a clamped signal
+			// number would name a real signal, so `trap '' 99999999999999999999`
+			// would install a handler for whatever sits at the ceiling. There is no
+			// value here that "too large" can safely become.
+			if (value >= kMaxSignal)
+				return -1;
 		}
-		return value < kMaxSignal ? value : -1;
+		return value;
 	}
 
 	std::string_view bare = name;

@@ -317,6 +317,23 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 					std::fprintf(stderr, "lesh: %s: bad file descriptor\n", path);
 					return false;
 				}
+				// A FILE DESCRIPTOR IS AN `int`, so a number too large to be one is not
+				// invalid in some new way - it is invalid in the way `>&99` already is,
+				// and it takes the SAME diagnostic and the same status rather than a
+				// second one invented here (#62). The accumulator used to overflow on the
+				// way to that answer, which is undefined behaviour.
+				//
+				// Saturating, which is what #59 chose for an over-large arithmetic
+				// literal, would be meaningless at this site: a literal that will not fit
+				// still has a nearest representable value to stand in for it, whereas
+				// there is no "largest file descriptor" for a clamp to land on - every
+				// candidate is either a descriptor the script never wrote or one it did
+				// not mean. So the number is refused, and the diagnostic names the
+				// descriptor the script actually asked for.
+				if (source > (INT_MAX - (c - '0')) / 10) {
+					std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(EBADF));
+					return false;
+				}
 				source = source * 10 + (c - '0');
 			}
 			// POSIX 2.7.5/2.7.6: `>&n` is an error unless n is open for OUTPUT and

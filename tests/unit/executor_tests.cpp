@@ -292,6 +292,38 @@ TEST_F(ExecutorTest, WaitOnANonChildReportsTheStatusPosixDefines) {
 	EXPECT_EQ(run("wait 99999"), 127);
 }
 
+TEST_F(ExecutorTest, AFileDescriptorTooLargeToBeOneIsRefusedLikeAnyOtherBadFd) {
+	// ISSUE #62. The `>&n` parser accumulated into an unbounded `int`, so
+	// `>&99999999999999999999` overflowed it - undefined behaviour, and an abort
+	// under the debug preset's UBSan.
+	//
+	// A FILE DESCRIPTOR IS AN `int`, which is what settles the question the ticket
+	// actually asked: a number too large to be one is not invalid in a new way, so
+	// it takes the same diagnostic and the same status as the unopened fd on the
+	// first line rather than a second answer invented for it. Saturating - #59's
+	// answer for an over-large arithmetic literal - has no meaning here, because
+	// there is no "largest file descriptor" for a clamp to land on.
+	//
+	// Every case redirects stderr FIRST: redirections apply left to right, so a
+	// `2>/dev/null` written afterwards would not be in place when the failing one
+	// reports.
+	EXPECT_EQ(run("echo hi 2>/dev/null >&99"), 2) << "the in-range unopened fd";
+	EXPECT_EQ(run("echo hi 2>/dev/null >&99999999999999999999"), 2);
+	EXPECT_EQ(run("cat 2>/dev/null <&99999999999999999999"), 2);
+
+	// THE WRAP WAS NOT MERELY UNDEFINED, it silently hit a descriptor that was
+	// open: 2^32 + 1 wraps an int to 1, so `>&4294967297` duplicated STDOUT and
+	// reported success - a redirection that went somewhere real and somewhere the
+	// script never named.
+	EXPECT_EQ(run("echo hi 2>/dev/null >&4294967297"), 2)
+		<< "wrapping an int landed on the open stdout";
+
+	// The guard sits at INT_MAX, so every descriptor that could really exist is
+	// still admitted and still fails for the ordinary reason.
+	EXPECT_EQ(run("echo hi 2>/dev/null >&2147483647"), 2);
+	EXPECT_EQ(run("echo hi 2>/dev/null >&1"), 0) << "a real fd still duplicates";
+}
+
 // --- exec --------------------------------------------------------------------
 //
 // `exec` was in kSpecialBuiltins with no handler anywhere, so try_run_builtin
