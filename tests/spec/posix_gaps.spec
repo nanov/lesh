@@ -810,3 +810,71 @@ set -- -a -b; OPTIND=99; getopts ab o; echo "st=$? [$o] [$OPTIND]"
 
 --- a non-numeric or unset OPTIND restarts the parse [xfail: divergence - dash routes the value through its numeric parser inside the assignment hook and aborts the shell with "Illegal number"; POSIX specifies only the value 1]
 set -- -abc; getopts abc o; unset OPTIND; getopts abc o; echo "[$o]"; OPTIND=junk; getopts abc o; echo "[$o]"
+
+# The `command` builtin (#31). It was once implemented for `-v` alone and let every
+# other use silently succeed, which regressed command-p.tst from 38/49 to 19/49 -
+# the original sin the whole project's stub-that-succeeds rule was written from.
+# `-V` and `-p` were then taken for command NAMES, which is the same failure one
+# step out: `command -p ls` reported `-p: No such file or directory` and
+# `command -V echo` the same. One of the 14 assertions that DID pass passed only
+# because of that message, which is a non-zero status.
+#
+# `-v` output is compared as a CATEGORY rather than as text wherever a pathname
+# would appear: the two shells search the same PATH but they do not run in the
+# same directory, so `/*` or not is the assertion and the bytes are not.
+
+--- command -v names every reserved word [xfail(legacy): legacy has no command builtin]
+command -v if; command -v then; command -v while; command -v esac; command -v '!'; command -v '{'; command -v '}'
+
+--- command -V says which category a name falls in [xfail(legacy): legacy has no command builtin]
+command -V if; command -V :; command -V read; command -V export
+
+--- command describes an alias as a command line that re-creates it [xfail(legacy): legacy has no command builtin]
+alias abc='echo ABC'
+c="$(command -v abc)"
+unalias abc
+eval "$c"
+abc
+command -V abc
+
+--- command describes a function by name [xfail(legacy): legacy has no command builtin and no functions]
+f() { :; }; command -v f; command -V f
+
+--- command -v is silent about a name it cannot find and command -V is not [xfail(legacy): legacy has no command builtin]
+PATH= command -v _no_such_command_; echo "v=$?"; PATH= command -V _no_such_command_; echo "V=$?"
+
+--- command -p searches the standard path when PATH is empty [xfail(legacy): legacy has no command builtin]
+PATH= command -p echo foo bar | command -p cat
+
+--- command -pv finds a standard utility with PATH empty [xfail(legacy): legacy has no command builtin]
+PATH= command -pv cat >/dev/null; echo "v=$?"; PATH= command -pV cat >/dev/null; echo "V=$?"
+
+--- command -V wins over -v whichever order they came in [xfail(legacy): legacy has no command builtin]
+command -v -V :; command -V -v :
+
+--- command rejects an option it does not have [xfail(legacy): legacy has no command builtin]
+command -z cat 2>/dev/null; echo "st=$?"
+
+--- command with nothing to run succeeds [xfail(legacy): legacy has no command builtin]
+command; echo "bare=$?"; command --; echo "sep=$?"; command -p; echo "p=$?"
+
+--- command -- ends the options, so -v after it is a command name [xfail(legacy): legacy has no command builtin]
+command -- -v 2>/dev/null; echo "st=$?"
+
+--- command runs an external command in a pipeline stage
+echo hi | command cat
+
+--- a function named command shadows the builtin, and only the first prefix [xfail(legacy): legacy has no command builtin and no functions]
+command() { echo FUNCTION; }; command XXX; command command echo hi
+
+--- command in a pipeline stage bypasses a function of the same name [xfail(legacy): legacy has no command builtin and no functions]
+cat() { echo FUNCTION; }; echo hi | command cat
+
+--- command -v describes an external command by its absolute pathname [xfail(legacy): legacy has no command builtin]
+case "$(command -v cat)" in (/*cat) echo pathname;; (*) echo "[$(command -v cat)]";; esac
+
+--- a regular built-in utility is described by a pathname [xfail: divergence - dash writes the bare name for `command -v echo` and fails command-p.tst's 'output of describing non-special built-in (-v)'; POSIX XCU writes a REGULAR built-in utility, one that also exists on PATH, as an absolute pathname and reserves the bare name for the built-ins that must be built in]
+case "$(command -v echo)" in (/*) echo pathname;; (*) echo name;; esac
+
+--- a command name containing a slash is described by an absolute pathname [xfail: divergence - dash writes the operand back exactly as typed and fails command-p.tst's 'output of describing external command (-v, with slash)'; POSIX XCU requires an absolute pathname for a command_name containing a slash]
+: >foo; chmod a+x foo; case "$(command -v ./foo)" in (/*/foo) echo absolute;; (*) echo relative;; esac

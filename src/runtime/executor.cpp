@@ -7,6 +7,7 @@
 #include "syntax/parser.h"
 
 #include <cerrno>
+#include <climits>
 #include <fcntl.h>
 #include <csignal>
 #include <cstdio>
@@ -28,15 +29,6 @@ using syntax::tree;
 
 namespace {
 
-// A variable's value before an assignment prefix overwrote it, so a function call
-// can put it back. Owns its strings: the state's own storage is what is being
-// overwritten, so a view into it would dangle.
-struct saved_variable {
-	std::string name;
-	std::string value;
-	bool was_set = false;
-};
-
 // Turns a wait(2) status into the value POSIX defines for `$?`.
 int status_from_wait(int wait_status) noexcept {
 	if (WIFEXITED(wait_status))
@@ -44,6 +36,50 @@ int status_from_wait(int wait_status) noexcept {
 	if (WIFSIGNALED(wait_status))
 		return 128 + WTERMSIG(wait_status);
 	return 0;
+}
+
+// The path `command -p` searches: the one the system guarantees finds the standard
+// utilities, whatever $PATH holds. That is the whole point of the option -
+// `PATH= command -p cat` must still run cat, which is command-p.tst's 'executing
+// with standard path'.
+std::string_view standard_path() {
+	static const std::string value = [] {
+		const size_t needed = confstr(_CS_PATH, nullptr, 0);
+		if (needed == 0)
+			return std::string{"/usr/bin:/bin"};
+		std::string out(needed, '\0');
+		confstr(_CS_PATH, out.data(), needed);
+		// confstr counts the terminating NUL; a string_view over it would carry the
+		// NUL into the middle of a candidate pathname.
+		out.resize(needed - 1);
+		return out;
+	}();
+	return value;
+}
+
+// A pathname made absolute against the LOGICAL working directory - $PWD when it
+// can be believed, and the real one otherwise, which is the rule `cd` and `pwd`
+// already follow.
+//
+// POSIX requires `command -v` to write an ABSOLUTE pathname, and both a relative
+// operand (`command -v ./foo`) and a relative PATH entry (`PATH=. command -v foo`)
+// reach here.
+std::string absolute_pathname(const shell_state& state, std::string_view path) {
+	if (!path.empty() && path[0] == '/')
+		return std::string{path};
+	std::string base;
+	if (std::string_view pwd; state.lookup("PWD", pwd) && !pwd.empty() && pwd[0] == '/') {
+		base.assign(pwd);
+	} else {
+		char buffer[PATH_MAX];
+		if (getcwd(buffer, sizeof(buffer)) == nullptr)
+			return std::string{path};
+		base.assign(buffer);
+	}
+	if (base.empty() || base.back() != '/')
+		base += '/';
+	base.append(path);
+	return base;
 }
 
 // Searches PATH and execs. Never returns on success.
@@ -1227,7 +1263,8 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 
 pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context& ctx,
                                    const arena_array<std::string_view>* assignments,
-                                   const tree* t, node_index command) {
+                                   const tree* t, node_index command,
+                                   bool standard_path) {
 	// Built-ins run in this process, so their output sits in our stdout buffer.
 	// Flush before forking or the child inherits a copy and prints it again.
 	std::fflush(nullptr);
@@ -1253,7 +1290,7 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 			close(ctx.output_fd);
 		}
 
-		become_command(argv, assignments, t, command);
+		become_command(argv, assignments, t, command, standard_path);
 	}
 
 	setpgid(pid, ctx.group == 0 ? pid : ctx.group);
@@ -1262,7 +1299,8 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 
 void tree_walking_executor::become_command(arena_array<char*>& argv,
                                            const arena_array<std::string_view>* assignments,
-                                           const tree* t, node_index command) {
+                                           const tree* t, node_index command,
+                                           bool standard_path_wanted) {
 	// Redirections are applied AFTER the pipeline's fds, so an explicit
 	// `> file` on a pipeline stage overrides the pipe - which is what POSIX
 	// requires and what `a | b > out` means.
@@ -1286,8 +1324,10 @@ void tree_walking_executor::become_command(arena_array<char*>& argv,
 		}
 	}
 
-	std::string_view path_value;
-	if (!_state.lookup("PATH", path_value))
+	// `command -p` searches the path POSIX guarantees finds the standard utilities
+	// instead of $PATH, which is what makes `PATH= command -p cat` run cat.
+	std::string_view path_value = standard_path();
+	if (!standard_path_wanted && !_state.lookup("PATH", path_value))
 		path_value = "/usr/bin:/bin";
 	exec_or_die(argv.data(), _state.environment_block(), path_value,
 	            _state.own_path());
@@ -1531,18 +1571,237 @@ builtin_result tree_walking_executor::run_unset_functions(char** argv) {
 	return {0};
 }
 
+tree_walking_executor::command_prefix
+tree_walking_executor::read_command_options(char* const* argv) noexcept {
+	command_prefix opts;
+	size_t i = 1;
+	for (; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		// POSIX XBD 12.2 guideline 10: `--` ends the options, so `command -- -v`
+		// runs a command called `-v` rather than describing one.
+		if (arg == "--") {
+			++i;
+			break;
+		}
+		if (arg.size() < 2 || arg[0] != '-')
+			break;
+		for (const char c : arg.substr(1)) {
+			if (c == 'p') {
+				opts.standard_path = true;
+			} else if (c == 'v' || c == 'V') {
+				// -V wins over -v whatever order they arrive in, which is what dash
+				// answers for BOTH `command -v -V cat` and `command -V -v cat`. "Last
+				// one wins" would disagree with dash on the first of those.
+				if (opts.describe != 'V')
+					opts.describe = c;
+			} else if (opts.bad_option == '\0') {
+				opts.bad_option = c;
+			}
+		}
+	}
+	opts.operand = i;
+	return opts;
+}
+
+tree_walking_executor::command_prefix
+tree_walking_executor::take_command_prefix(arena_array<char*>& argv) {
+	command_prefix opts;
+	// A loop, not one test: `command command echo hi` is two prefixes, and each
+	// one demotes what follows it.
+	while (argv.size() > 1 && std::string_view{argv[0]} == "command") {
+		// A FUNCTION named `command` shadows the builtin: POSIX's search order puts
+		// functions ahead of regular builtins, and `command` is regular. Stripping
+		// the prefix regardless made `command() { echo F; }; command XXX` try to run
+		// XXX, which is builtins-p.tst's 'function overrides non-special command
+		// command'.
+		//
+		// Only the FIRST prefix is subject to it. Once one has been stripped,
+		// function lookup is bypassed for everything after it - `command` included.
+		if (!opts.present && _functions.contains("command"))
+			return opts;
+		const command_prefix here = read_command_options(argv.data());
+		opts.standard_path = opts.standard_path || here.standard_path;
+		if (here.bad_option != '\0') {
+			opts.bad_option = here.bad_option;
+			return opts;
+		}
+		// The describing form reports on its operand rather than running it, so argv
+		// is left intact and `present` stays false: nothing was stripped, and a
+		// function named `command` still shadows the builtin the way it would for
+		// any other regular builtin.
+		if (here.describe != '\0') {
+			opts.describe = here.describe;
+			opts.operand = here.operand;
+			return opts;
+		}
+		// Drop `command` and its options by shifting the rest down; the arena owns
+		// the strings and the trailing nullptr moves with them. When there was
+		// nothing after the options this leaves argv holding only that nullptr,
+		// which is the caller's signal that there is no command to run.
+		for (size_t i = 0; i + here.operand < argv.size(); ++i)
+			argv[i] = argv[i + here.operand];
+		argv.truncate(argv.size() - here.operand);
+		opts.present = true;
+		if (argv.empty() || argv[0] == nullptr)
+			return opts;
+	}
+	return opts;
+}
+
+bool tree_walking_executor::search_path_for(std::string_view name, bool standard,
+                                           std::string& out) const {
+	std::string_view path_value = standard_path();
+	if (!standard && !_state.lookup("PATH", path_value))
+		path_value = "/usr/bin:/bin";
+	size_t at = 0;
+	while (at <= path_value.size()) {
+		const size_t colon = path_value.find(':', at);
+		const std::string_view dir = path_value.substr(
+			at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
+		// An EMPTY entry means the current directory, the same rule the command
+		// search itself follows.
+		std::string candidate{dir.empty() ? std::string_view{"."} : dir};
+		candidate += '/';
+		candidate.append(name);
+		if (access(candidate.c_str(), X_OK) == 0) {
+			out = absolute_pathname(_state, candidate);
+			return true;
+		}
+		if (colon == std::string_view::npos)
+			break;
+		at = colon + 1;
+	}
+	return false;
+}
+
+// `command -v name` and `command -V name`: how the shell would resolve a name,
+// without running it.
+//
+// In the executor rather than in builtins.cpp because the answer needs the
+// FUNCTION table, which lives here - the same reason `unset -f` does. It also
+// needs the reserved words, which live in the parser and are reached through
+// syntax::is_reserved_word, and the aliases and the registry, which it shares
+// with everything else.
+//
+// THE ORDER is the one dash reports: a reserved word beats everything, then an
+// alias, then a function, then a builtin, then PATH. Verified - `alias if=xyz;
+// command -v if` prints `if`, and `alias cat=xyz; command -v cat` prints the
+// alias rather than /bin/cat.
+//
+// Implementing only `-v` and letting `-V` and `-p` be taken for command names was
+// the state this file's 14/49 came from, and one of those 14 passed only because
+// `lesh: -V: No such file or directory` happens to be a non-zero status
+// ('describing non-existent command (-V)' checks nothing else).
+int tree_walking_executor::describe_command(const command_prefix& opts,
+                                           char* const* argv) {
+	// No operand at all: nothing to report, and nothing wrong either. dash answers
+	// 0 for a bare `command -v`.
+	if (argv[opts.operand] == nullptr)
+		return 0;
+	// Only the FIRST operand is described - POSIX gives the option one
+	// command_name, and dash ignores the rest of `command -v cat ls`.
+	const std::string_view name{argv[opts.operand]};
+	const int width = static_cast<int>(name.size());
+	const bool verbose = opts.describe == 'V';
+
+	if (syntax::is_reserved_word(name)) {
+		std::printf(verbose ? "%.*s is a shell keyword\n" : "%.*s\n", width, name.data());
+		return 0;
+	}
+	if (std::string_view value; _state.lookup_alias(name, value)) {
+		if (verbose) {
+			std::printf("%.*s is an alias for %.*s\n", width, name.data(),
+			            static_cast<int>(value.size()), value.data());
+		} else {
+			// POSIX writes an alias as a command line that represents its definition,
+			// which is what command-p.tst's 'describing alias (-v)' relies on: it
+			// unaliases the name and `eval`s this line to get the alias back. The
+			// `alias` keyword is what makes it that command line - without it the
+			// text is `abc='xyz'`, which on re-input assigns a VARIABLE. The listing
+			// form omits the keyword because the `alias` builtin is the context
+			// there; dash prints both exactly this way.
+			std::fputs("alias ", stdout);
+			print_alias(name, value);
+		}
+		return 0;
+	}
+	if (_functions.find(std::string{name}) != _functions.end()) {
+		std::printf(verbose ? "%.*s is a shell function\n" : "%.*s\n", width, name.data());
+		return 0;
+	}
+	std::string found;
+	if (const builtin_kind kind = classify_builtin(name); kind != builtin_kind::none) {
+		// A regular built-in UTILITY is written as the pathname the search finds for
+		// it and everything else as its own name; see builtin_report in builtins.h.
+		// The name is the fallback when the search comes up empty, because the name
+		// is still the truth about what would run.
+		const bool as_path = builtin_report_of(name) == builtin_report::pathname &&
+		                     search_path_for(name, opts.standard_path, found);
+		if (!verbose) {
+			if (as_path)
+				std::printf("%s\n", found.c_str());
+			else
+				std::printf("%.*s\n", width, name.data());
+			return 0;
+		}
+		if (kind == builtin_kind::special)
+			std::printf("%.*s is a special shell builtin\n", width, name.data());
+		else if (as_path)
+			// The pathname is repeated inside the -V line because command-p.tst's
+			// 'output of describing non-special built-in (-V)' greps the -V output for
+			// the whole of the -v output.
+			std::printf("%.*s is a shell builtin (%s)\n", width, name.data(), found.c_str());
+		else
+			std::printf("%.*s is a shell builtin\n", width, name.data());
+		return 0;
+	}
+
+	if (name.find('/') != std::string_view::npos) {
+		// A name containing a slash is used as given rather than searched for - but
+		// POSIX still requires it WRITTEN as an absolute pathname, which is the one
+		// place dash prints the operand back unchanged and fails command-p.tst's
+		// 'output of describing external command (-v, with slash)'.
+		const std::string as_given{name};
+		if (access(as_given.c_str(), X_OK) == 0)
+			found = absolute_pathname(_state, name);
+	} else {
+		(void)search_path_for(name, opts.standard_path, found);
+	}
+	if (found.empty()) {
+		// The -v form is SILENT about a name it cannot find: command-p.tst's
+		// 'describing non-existent command (-v)' requires stdout AND stderr empty.
+		//
+		// The -V form reports on STANDARD OUTPUT, with no `lesh:` in front of it,
+		// which is where dash puts it and why: "not found" is one of the ANSWERS to
+		// the question -V asks, not a diagnostic about failing to answer. dash
+		// prefixes its real diagnostics with `dash: <line>:` and prints this one
+		// bare. POSIX leaves the format unspecified either way.
+		if (verbose)
+			std::printf("%.*s: not found\n", width, name.data());
+		// 127, dash's answer, not 1: the question was what would run, and nothing
+		// would - which is the status a command search that came up empty reports.
+		return 127;
+	}
+	if (verbose)
+		std::printf("%.*s is %s\n", width, name.data(), found.c_str());
+	else
+		std::printf("%s\n", found.c_str());
+	return 0;
+}
+
 // The builtins the EXECUTOR implements instead of builtins.cpp, which is what
 // `builtin_home::executor` marks in the registry.
 //
-// One function rather than three blocks inside run_simple_command, because a
-// PIPELINE STAGE needs the same four: `echo hi | eval cat` went to
+// One function rather than five blocks inside run_simple_command, because a
+// PIPELINE STAGE needs the same ones: `echo hi | eval cat` went to
 // try_run_builtin, which has no entry for `eval`, and the false return was
 // discarded - the stage printed nothing and reported success, which is the same
-// defect as the unimplemented `test` in #35. Returns false when the name is none
-// of them.
+// defect as the unimplemented `test` in #35. `echo hi | command cat` printed
+// nothing for the same reason until `command` arrived here. Returns false when
+// the name is none of them.
 bool tree_walking_executor::try_run_executor_builtin(
 		const tree& t, node_index n, arena_array<char*>& argv,
-		const arena_array<std::string_view>& assignments, bool bypass_functions,
+		const arena_array<std::string_view>& assignments, const command_prefix& cmd,
 		int& status) {
 	const std::string_view name{argv[0]};
 
@@ -1552,87 +1811,110 @@ bool tree_walking_executor::try_run_executor_builtin(
 	// `notreached`. A stub that silently succeeds is worse than an absent builtin -
 	// the same mistake `command` made earlier on #31, which cost 19 of 49
 	// assertions in command-p.tst.
+	//
+	// It comes before the redirection scaffolding below because it is the one
+	// builtin whose redirections must NOT be put back: `exec >log` redirects the
+	// shell for the rest of its life.
 	if (name == "exec") {
-		status = run_exec(t, n, argv, assignments, bypass_functions);
+		status = run_exec(t, n, argv, assignments, cmd.present);
 		return true;
 	}
 
-	// `wait` needs the executor's record of background jobs, so it lives here
-	// alongside eval and . rather than in builtins.cpp.
-	if (name == "wait") {
-		if (argv[1] == nullptr) {
-			// POSIX: with no operands, `wait` waits for ALL known children and its
-			// status is ZERO - not the last child's. Reporting the last one made
-			// `false & wait` fail, and under `set -e` that would exit the shell.
-			for (const pid_t pid : _background) {
-				int wait_status = 0;
-				(void)waitpid(pid, &wait_status, 0);
-			}
-			_background.clear();
-			status = 0;
-			return true;
-		}
-		// With operands the status is the LAST operand's, and a child killed by a
-		// signal reports 128 + the signal number.
-		status = 0;
+	// `command` in its DESCRIBING form, `eval`, `.` and `wait`. Only the running
+	// form of `command` is stripped from argv before this point, so a `command`
+	// arriving here is asking about a name rather than to run one.
+	if (name != "command" && name != "eval" && name != "." && name != "wait")
+		return false;
+
+	// POSIX 2.9.1 order: the redirections, then the assignments, then the command -
+	// so `x=1 eval 'echo $x'` can read x, and `command -v foo >out` writes to the
+	// file. Shared by all four rather than written out per builtin, which is how
+	// `wait` came to perform no redirections at all.
+	arena_array<saved_fd> saved{_pool, 4};
+	std::fflush(nullptr);
+	const bool ok = apply_redirections(t, n, &saved);
+	if (!ok) {
+		// POSIX 2.8.1 makes a redirection error on a SPECIAL builtin fatal to a
+		// non-interactive shell. dash agrees: `dash -c 'eval : </missing; echo
+		// reached'` exits 2 without printing `reached`, while a regular builtin in
+		// the same position reports 2 and carries on. `command eval ...` demotes it,
+		// which is what cmd.present records.
+		status = kRedirectionError;
+		if (classify_builtin(name) == builtin_kind::special && !cmd.present &&
+		    !_state.interactive())
+			_exit_requested = true;
+	} else if (name == "eval") {
+		// `eval` and `.` re-enter the FRONT END from inside execution, which is why
+		// they live here at all - giving every builtin a back-reference to the
+		// executor to serve two of them would be the wrong trade. This is the cycle
+		// the ports in #11 were designed to survive: parsing inside execution, with
+		// the parse seeing the same aliases and the execution seeing the same state.
+		//
+		// POSIX: the arguments are joined with spaces and read as shell input.
+		std::string joined;
 		for (size_t i = 1; argv[i] != nullptr; ++i) {
-			const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
-			int wait_status = 0;
-			if (waitpid(target, &wait_status, 0) > 0) {
-				status = status_from_wait(wait_status);
-			} else {
-				// POSIX DEFINES the answer for a pid that is not a child: status 127.
-				// No diagnostic, because this is a specified result rather than a
-				// failure - dash is silent here too.
-				status = 127;
-			}
-			std::erase(_background, target);
+			if (i > 1)
+				joined += ' ';
+			joined += argv[i];
 		}
-		return true;
-	}
-
-	// `eval` and `.` re-enter the FRONT END from inside execution, so they live
-	// here too - giving every builtin a back-reference to the executor to serve
-	// two of them would be the wrong trade. This is the cycle the ports in #11
-	// were designed to survive: parsing inside execution, with the parse seeing
-	// the same aliases and the execution seeing the same state.
-	if (name == "eval" || name == ".") {
-		arena_array<saved_fd> saved{_pool, 4};
-		std::fflush(nullptr);
-		const bool ok = apply_redirections(t, n, &saved);
-		if (!ok) {
-			// `eval` and `.` are SPECIAL builtins, and POSIX 2.8.1 makes a
-			// redirection error on a special builtin fatal to a non-interactive
-			// shell. dash agrees: `dash -c 'eval : </missing; echo reached'` exits 2
-			// without printing `reached`, while a regular builtin in the same
-			// position reports 2 and carries on. `command eval ...` demotes it, which
-			// is what bypass_functions records.
-			status = kRedirectionError;
-			if (!bypass_functions && !_state.interactive())
-				_exit_requested = true;
-		} else if (name == "eval") {
-			// POSIX: the arguments are joined with spaces and read as shell input.
-			std::string joined;
-			for (size_t i = 1; argv[i] != nullptr; ++i) {
-				if (i > 1)
-					joined += ' ';
-				joined += argv[i];
-			}
-			status = joined.empty() ? 0 : run_source(joined);
+		status = joined.empty() ? 0 : run_source(joined);
+	} else if (name == ".") {
+		if (argv[1] == nullptr) {
+			std::fprintf(stderr, "lesh: .: filename argument required\n");
+			status = 2;
 		} else {
-			if (argv[1] == nullptr) {
-				std::fprintf(stderr, "lesh: .: filename argument required\n");
-				status = 2;
-			} else {
-				status = run_file(argv[1]);
-			}
+			status = run_file(argv[1]);
 		}
-		std::fflush(nullptr);
-		restore_fds(saved);
-		return true;
+	} else if (name == "command") {
+		// Reported HERE and not where the prefix was read, so it goes through the
+		// command's own redirections: `command -z cat 2>/dev/null` is silent in dash,
+		// and reporting it before apply_redirections above let the message out.
+		if (cmd.bad_option != '\0') {
+			std::fprintf(stderr, "lesh: command: illegal option -- %c\n", cmd.bad_option);
+			// 2, as for any other builtin's usage error, and what dash answers.
+			status = 2;
+		} else {
+			status = describe_command(cmd, argv.data());
+		}
+	} else {
+		status = run_wait(argv.data());
 	}
+	std::fflush(nullptr);
+	restore_fds(saved);
+	return true;
+}
 
-	return false;
+// `wait` needs the executor's record of background jobs, so it lives here
+// alongside eval and . rather than in builtins.cpp.
+int tree_walking_executor::run_wait(char* const* argv) {
+	if (argv[1] == nullptr) {
+		// POSIX: with no operands, `wait` waits for ALL known children and its
+		// status is ZERO - not the last child's. Reporting the last one made
+		// `false & wait` fail, and under `set -e` that would exit the shell.
+		for (const pid_t pid : _background) {
+			int wait_status = 0;
+			(void)waitpid(pid, &wait_status, 0);
+		}
+		_background.clear();
+		return 0;
+	}
+	// With operands the status is the LAST operand's, and a child killed by a
+	// signal reports 128 + the signal number.
+	int status = 0;
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
+		int wait_status = 0;
+		if (waitpid(target, &wait_status, 0) > 0) {
+			status = status_from_wait(wait_status);
+		} else {
+			// POSIX DEFINES the answer for a pid that is not a child: status 127.
+			// No diagnostic, because this is a specified result rather than a
+			// failure - dash is silent here too.
+			status = 127;
+		}
+		std::erase(_background, target);
+	}
+	return status;
 }
 
 int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
@@ -1700,26 +1982,20 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	}
 
 	// `command name args...` runs a command bypassing FUNCTION lookup. Stripping
-	// the prefix here and setting a flag is simpler than threading a mode through
+	// the prefix here and carrying a flag is simpler than threading a mode through
 	// the search, and it is the executor that owns the search order anyway.
 	//
-	// The `-v` reporting form stays in builtins.cpp. Implementing only that form
-	// and letting every other use silently succeed made `command echo hi` do
-	// nothing - a stub that succeeds is worse than an absent builtin, which is
-	// the mistake #24 explicitly warned about and I made anyway.
-	bool bypass_functions = false;
-	while (argv.size() > 1 && std::string_view{argv[0]} == "command" &&
-	       argv[1] != nullptr && std::string_view{argv[1]} != "-v") {
-		bypass_functions = true;
-		// Drop argv[0] by shifting the rest down; the arena owns the strings.
-		for (size_t i = 0; i + 1 < argv.size(); ++i)
-			argv[i] = argv[i + 1];
-		if (argv.size() > 0)
-			argv.truncate(argv.size() - 1);
-		if (argv.empty() || argv[0] == nullptr)
-			return 0;
-	}
-
+	// Implementing only `-v` and letting every other use silently succeed made
+	// `command echo hi` do nothing - a stub that succeeds is worse than an absent
+	// builtin, which is the mistake #24 explicitly warned about and I made anyway.
+	// `-V` and `-p` were then taken for command NAMES, which is the same failure
+	// one step further out: `command -p ls` reported `-p: No such file or
+	// directory`.
+	// An option `command` does not have leaves argv ALONE, `command` still at the
+	// front, so the diagnostic is written by try_run_executor_builtin with this
+	// command's redirections applied. dash is silent for `command -z cat
+	// 2>/dev/null`.
+	const command_prefix cmd = take_command_prefix(argv);
 	// A readonly name in an assignment PREFIX is a variable assignment error, and
 	// POSIX makes it fatal BEFORE the command runs: `readonly a=1; a=2 echo prefix`
 	// prints nothing at all in dash. Asked here, ahead of every dispatch path,
@@ -1733,6 +2009,14 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			return assignment_error();
 		}
 	}
+
+	// `command`, `command -p` and `command --` with nothing after them are commands
+	// that do nothing and succeed; dash reports 0 for all three. AFTER the readonly
+	// check above, not before it: `readonly a=a; a=b command` is still an assignment
+	// error that kills a non-interactive shell, which is three of error-p.tst's
+	// assertions and the regression that returning early here caused.
+	if (argv.empty() || argv[0] == nullptr)
+		return 0;
 
 	// `set -x` traces the command once, HERE - before the search order decides
 	// whether this is a function, a builtin or a PATH lookup, so every one of them
@@ -1760,7 +2044,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// fd is closed. The re-open on the real path then waits for a reader that has
 	// already gone, so `echo foo >fifo & cat fifo` lost its output and
 	// `cat fifo & echo foo >fifo` hung outright - a deadlock built out of a lookup.
-	if (!bypass_functions && classify_builtin(argv[0]) != builtin_kind::special &&
+	if (!cmd.present && classify_builtin(argv[0]) != builtin_kind::special &&
 	    _functions.find(argv[0]) != _functions.end()) {
 		arena_array<saved_fd> saved{_pool, 4};
 		int status = 0;
@@ -1819,11 +2103,11 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			return status;
 	}
 
-	// `eval`, `.`, `exec` and `wait` live in the executor rather than in
+	// `command`, `eval`, `.`, `exec` and `wait` live in the executor rather than in
 	// builtins.cpp; see try_run_executor_builtin.
 	{
 		int status = 0;
-		if (try_run_executor_builtin(t, n, argv, assignments, bypass_functions, status))
+		if (try_run_executor_builtin(t, n, argv, assignments, cmd, status))
 			return status;
 	}
 
@@ -1910,7 +2194,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			// dash, which exits 2 for `: </missing` and reports 2 and continues for
 			// `echo x </missing`. `command : </missing` is demoted to regular and
 			// survives, which is what bypass_functions records.
-			if (!bypass_functions && !_state.interactive() &&
+			if (!cmd.present && !_state.interactive() &&
 			    classify_builtin(argv[0]) == builtin_kind::special)
 				_exit_requested = true;
 		}
@@ -1940,7 +2224,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return result.status;
 	}
 
-	const pid_t pid = spawn(argv, {}, &assignments, &t, n);
+	const pid_t pid = spawn(argv, {}, &assignments, &t, n, cmd.standard_path);
 	if (pid == -1)
 		return 1;
 
@@ -1998,11 +2282,24 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 		return _substitutions != substitutions_before ? _state.last_status() : 0;
 	}
 
+	// A `command` prefix has to be stripped HERE too, and not only in
+	// run_simple_command. Without it argv[0] stayed `command`, the registry said
+	// that was a builtin, and the handler table had no entry for it - so
+	// `echo hi | command cat` ran nothing at all and reported success, which is the
+	// stub-that-succeeds failure once more.
+	const command_prefix cmd = take_command_prefix(argv);
+	if (argv.empty() || argv[0] == nullptr)
+		return 0;
+
 	// A function or builtin in a pipeline stage runs in ITS OWN process - this one -
 	// so its effects do not reach the shell. POSIX allows either, and running it in
 	// a subshell is what dash does, which is why `f | cat` cannot set a variable in
 	// the parent and `echo a | read x` cannot either.
-	const bool in_process = _functions.contains(argv[0]) ||
+	//
+	// A `command` prefix takes the FUNCTION table out of the question, so a stage
+	// written `command f` where f is only a function is an external command that
+	// will not be found - which is what dash reports for it.
+	const bool in_process = (!cmd.present && _functions.contains(argv[0])) ||
 	                        classify_builtin(argv[0]) != builtin_kind::none;
 	if (in_process) {
 		// The executor's own builtins are dispatched here rather than through
@@ -2011,7 +2308,7 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 		// apply_redirections below because each applies the stage's redirections
 		// itself where it needs them.
 		int status = 0;
-		if (try_run_executor_builtin(t, stage, argv, assignments, false, status))
+		if (try_run_executor_builtin(t, stage, argv, assignments, cmd, status))
 			return status;
 		// nullptr for `restore`: this process exists only for this stage, so there
 		// is nothing to put the fds back for. Its status matters though - a failed
@@ -2019,7 +2316,7 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 		// builtin anyway, on the unredirected fds.
 		if (!apply_redirections(t, stage, nullptr))
 			return kRedirectionError;
-		if (!try_run_function(t, argv, status)) {
+		if (cmd.present || !try_run_function(t, argv, status)) {
 			builtin_result r{};
 			(void)try_run_builtin(_state, argv.data(), r);
 			status = r.status;
@@ -2030,7 +2327,7 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 	// An external command: this process becomes it. No second fork - the stage was
 	// forked before its words were expanded, so the process that expanded them is
 	// the one that execs.
-	become_command(argv, &assignments, &t, stage);
+	become_command(argv, &assignments, &t, stage, cmd.standard_path);
 }
 
 int tree_walking_executor::run_pipeline(const tree& t, node_index n) {

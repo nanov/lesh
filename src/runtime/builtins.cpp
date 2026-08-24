@@ -1439,42 +1439,6 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 	return {status};
 }
 
-builtin_result builtin_command(shell_state& state, char** argv) {
-	// `command -v name` reports how a name would resolve. Running a command while
-	// bypassing function lookup is handled by the executor, which owns the search
-	// order; this covers the reporting form.
-	// Only the -v reporting form reaches here: the executor strips a `command`
-	// prefix before dispatch for every other use.
-	if (argv[1] != nullptr && std::strcmp(argv[1], "-v") == 0 && argv[2] != nullptr) {
-		const std::string_view name{argv[2]};
-		if (classify_builtin(name) != builtin_kind::none) {
-			std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
-			return {0};
-		}
-		std::string_view path_value;
-		if (!state.lookup("PATH", path_value))
-			path_value = "/usr/bin:/bin";
-		size_t at = 0;
-		while (at <= path_value.size()) {
-			const size_t colon = path_value.find(':', at);
-			const std::string_view dir = path_value.substr(
-				at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
-			std::string candidate{dir.empty() ? std::string_view{"."} : dir};
-			candidate += '/';
-			candidate.append(name);
-			if (access(candidate.c_str(), X_OK) == 0) {
-				std::printf("%s\n", candidate.c_str());
-				return {0};
-			}
-			if (colon == std::string_view::npos)
-				break;
-			at = colon + 1;
-		}
-		return {1};
-	}
-	return {0};
-}
-
 // True for a POSIX name: `[A-Za-z_][A-Za-z0-9_]*`. `getopts` writes through this
 // operand, so a name the shell could never assign has to be refused rather than
 // stored under a key no expansion can reach.
@@ -1714,11 +1678,10 @@ builtin_result builtin_times(shell_state&, char**) {
 //
 // The NAME is printed raw, as dash does: a name needing quotes could not have
 // been written on the left of an `=` in the first place.
-void print_alias(std::string_view name, std::string_view value) {
-	std::printf("%.*s=", static_cast<int>(name.size()), name.data());
-	print_single_quoted(value);
-	std::fputc('\n', stdout);
-}
+//
+// Declared in builtins.h because `command -v` prints one too: POSIX writes an
+// alias as a command line that re-creates it, so `eval "$(command -v abc)"` has
+// to define the same alias the listing would.
 
 builtin_result builtin_alias(shell_state& state, char** argv) {
 	// No operands: every alias, sorted. It printed NOTHING before - a listing that
@@ -1807,7 +1770,7 @@ constexpr entry kBuiltins[] = {
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
-	{"read", builtin_read}, {"command", builtin_command}, {"times", builtin_times},
+	{"read", builtin_read}, {"times", builtin_times},
 	{"trap", builtin_trap}, {"kill", builtin_kill}, {"getopts", builtin_getopts},
 	{"readonly", builtin_readonly},
 	{"test", builtin_test}, {"[", builtin_test},
@@ -1858,6 +1821,12 @@ static_assert(registry_agrees_with_handlers(),
 
 } // namespace
 
+void print_alias(std::string_view name, std::string_view value) {
+	std::printf("%.*s=", static_cast<int>(name.size()), name.data());
+	print_single_quoted(value);
+	std::fputc('\n', stdout);
+}
+
 builtin_kind classify_builtin(std::string_view name) noexcept {
 	for (const auto& d : kBuiltinRegistry)
 		if (d.name == name)
@@ -1874,6 +1843,13 @@ builtin_home builtin_home_of(std::string_view name) noexcept {
 		if (d.name == name)
 			return d.home;
 	return builtin_home::table;
+}
+
+builtin_report builtin_report_of(std::string_view name) noexcept {
+	for (const auto& d : kBuiltinRegistry)
+		if (d.name == name)
+			return d.report;
+	return builtin_report::name;
 }
 
 bool unset_selects_functions(char** argv) noexcept {

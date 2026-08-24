@@ -84,6 +84,49 @@ private:
 		pid_t group = 0;  // 0 means "this child becomes the group leader"
 	};
 
+	// A variable's value before an assignment prefix overwrote it, so the command
+	// it preceded can put it back. Owns its strings: the state's own storage is
+	// what is being overwritten, so a view into it would dangle.
+	struct saved_variable {
+		std::string name;
+		std::string value;
+		bool was_set = false;
+	};
+
+	// What a `command` prefix asked for, POSIX XCU `command`:
+	// `command [-p] name [argument...]` runs a command with function lookup
+	// bypassed, and `command [-p] -v|-V name` describes one instead of running it.
+	struct command_prefix {
+		bool present = false;        // a prefix was stripped: bypass functions, demote
+		bool standard_path = false;  // -p: search the standard path, not $PATH
+		char describe = '\0';        // -v or -V, or neither
+		char bad_option = '\0';
+		size_t operand = 1;          // where the operands begin in argv
+	};
+
+	// Reads a `command` prefix's options WITHOUT removing anything.
+	//
+	// One reading, shared by the caller that strips the prefix to run what follows
+	// and by the describing form that reports on its operand. Two readings of
+	// `-pv` would eventually disagree, which is the drift the builtin registry
+	// exists to prevent (#35).
+	[[nodiscard]] static command_prefix read_command_options(char* const* argv) noexcept;
+
+	// Strips every `command` prefix off the front of argv, leaving the command to
+	// run. argv is left ALONE when the prefix asked to DESCRIBE a name, because
+	// then there is nothing to run and describe_command reads the operand itself.
+	command_prefix take_command_prefix(arena_array<char*>& argv);
+
+	// `command -v` and `command -V`. See the definition for why it is here and not
+	// in builtins.cpp.
+	int describe_command(const command_prefix& opts, char* const* argv);
+
+	// The absolute pathname the command search finds for `name`, or false when
+	// there is no executable of that name on the path searched. `standard` picks
+	// the path `command -p` guarantees over $PATH.
+	[[nodiscard]] bool search_path_for(std::string_view name, bool standard,
+	                                   std::string& out) const;
+
 	// Runs one already-parsed tree, WITHOUT the EXIT trap: read a command at a
 	// time, the trap belongs at the end of the input rather than at the end of
 	// every command in it.
@@ -112,13 +155,15 @@ private:
 	int run_exec(const syntax::tree& t, syntax::node_index n,
 	             arena_array<char*>& argv,
 	             const arena_array<std::string_view>& assignments, bool demoted);
-	// The builtins the executor owns - `exec`, `wait`, `eval` and `.`. False when
-	// the name is none of them. See the definition, and builtin_home::executor in
-	// runtime/builtins.h.
+	// The builtins the executor owns - `command`, `exec`, `wait`, `eval` and `.`.
+	// False when the name is none of them. See the definition, and
+	// builtin_home::executor in runtime/builtins.h.
 	[[nodiscard]] bool try_run_executor_builtin(
 		const syntax::tree& t, syntax::node_index n, arena_array<char*>& argv,
-		const arena_array<std::string_view>& assignments, bool bypass_functions,
+		const arena_array<std::string_view>& assignments, const command_prefix& cmd,
 		int& status);
+	// `wait`, which needs the executor's record of background jobs.
+	int run_wait(char* const* argv);
 	// `unset -f`: the function form, which needs the function table.
 	builtin_result run_unset_functions(char** argv);
 	int run_negation(const syntax::tree& t, syntax::node_index n);
@@ -216,16 +261,21 @@ private:
 	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx,
 	                          const arena_array<std::string_view>* assignments = nullptr,
 	                          const syntax::tree* t = nullptr,
-	                          syntax::node_index command = 0);
+	                          syntax::node_index command = 0,
+	                          bool standard_path = false);
 
 	// Applies a command's redirections and its assignment prefix and BECOMES it.
 	//
 	// Split out of `spawn`, which is now this with a fork in front of it, so a
 	// pipeline stage - already running in the process forked for it - can exec
 	// without forking a second time.
+	// `standard_path` is what `command -p` asks for: the search uses the path POSIX
+	// guarantees finds the standard utilities rather than $PATH, so
+	// `PATH= command -p cat` still runs cat.
 	[[noreturn]] void become_command(arena_array<char*>& argv,
 	                                 const arena_array<std::string_view>* assignments,
-	                                 const syntax::tree* t, syntax::node_index command);
+	                                 const syntax::tree* t, syntax::node_index command,
+	                                 bool standard_path_wanted = false);
 
 	// Runs one SIMPLE-COMMAND pipeline stage, in the process forked for it and
 	// after its pipe is on its fds. Returns the status to _exit with, or never

@@ -45,10 +45,34 @@ enum class builtin_home {
 	executor,  // runtime/executor.cpp - needs the front end, the process, or jobs
 };
 
+// What `command -v` writes for a builtin: its own name, or the pathname the
+// search would find for it.
+//
+// POSIX XCU `command` requires a bare name for the built-ins that must BE built
+// in - a special builtin, and the ones whose whole purpose is to touch the
+// shell's own state - and an absolute pathname for a REGULAR built-in utility,
+// which is a utility the shell could equally have found on PATH and chose to
+// implement itself. So `command -v echo` writes /bin/echo and `command -v read`
+// writes read.
+//
+// A field rather than something derived from `kind`: kind decides the two things
+// POSIX attaches to a SPECIAL builtin (a failure exits the shell, assignments
+// persist), and every name here that is not special shares that answer while
+// splitting two ways on this one.
+//
+// dash writes the bare name for both and fails command-p.tst's 'output of
+// describing non-special built-in (-v)' for it. The divergence is recorded in
+// tests/spec/posix_gaps.spec rather than chosen quietly.
+enum class builtin_report {
+	name,      // written as itself: a special or must-be-built-in utility
+	pathname,  // written as the absolute pathname the search finds
+};
+
 struct builtin_descriptor {
 	std::string_view name;
 	builtin_kind kind;
 	builtin_home home;
+	builtin_report report = builtin_report::name;
 };
 
 // THE registry: every name POSIX gives this shell as a builtin, its kind, and
@@ -90,19 +114,25 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	// `unset` is here, but the `-f` FORM is intercepted by the executor: removing
 	// a function means reaching the function table, which lives there.
 	{"unset", builtin_kind::special, builtin_home::table},
-	// The regular builtins lesh implements.
+	// The regular builtins lesh implements. `builtin_report` splits them: the ones
+	// that exist only to change the shell it runs in are reported by name, and the
+	// ones that are also utilities on PATH are reported by pathname. `alias`,
+	// `cd`, `command`, `getopts`, `read`, `unalias` and `wait` are in the first
+	// group because none of them could do its job in a separate process at all.
 	{"alias", builtin_kind::regular, builtin_home::table},
 	{"cd", builtin_kind::regular, builtin_home::table},
-	{"command", builtin_kind::regular, builtin_home::table},
-	{"echo", builtin_kind::regular, builtin_home::table},
-	{"false", builtin_kind::regular, builtin_home::table},
+	// `command` is the executor's: the RUNNING form has to bypass the function
+	// table and the DESCRIBING form has to read it, and the table lives there.
+	{"command", builtin_kind::regular, builtin_home::executor},
+	{"echo", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
+	{"false", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"getopts", builtin_kind::regular, builtin_home::table},
-	{"kill", builtin_kind::regular, builtin_home::table},
-	{"pwd", builtin_kind::regular, builtin_home::table},
+	{"kill", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
+	{"pwd", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"read", builtin_kind::regular, builtin_home::table},
-	{"test", builtin_kind::regular, builtin_home::table},
-	{"[", builtin_kind::regular, builtin_home::table},
-	{"true", builtin_kind::regular, builtin_home::table},
+	{"test", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
+	{"[", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
+	{"true", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"unalias", builtin_kind::regular, builtin_home::table},
 	{"wait", builtin_kind::regular, builtin_home::executor},
 }};
@@ -130,5 +160,16 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 // name that is not a builtin at all - the caller has classify_builtin for that
 // question, and this one only says "not the executor's".
 [[nodiscard]] builtin_home builtin_home_of(std::string_view name) noexcept;
+
+// Prints `name='value'`, the form POSIX gives an alias definition: quoted so the
+// shell reads it back as exactly these bytes. `alias` lists with it and
+// `command -v` describes with it, because POSIX writes an alias as a command line
+// that re-creates it - `eval "$(command -v abc)"` has to define the same alias.
+void print_alias(std::string_view name, std::string_view value);
+
+// How `command -v` must write this builtin's name. `builtin_report::name` for a
+// name that is not a builtin at all, which no caller asks about: classify_builtin
+// answers that question first.
+[[nodiscard]] builtin_report builtin_report_of(std::string_view name) noexcept;
 
 } // namespace lesh::runtime

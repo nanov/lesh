@@ -1282,4 +1282,8 @@ tree parse_next_command(buffer_pool& pool, std::string_view source, size_t& posi
 	return p.take();
 }
 
+bool is_reserved_word(std::string_view text) noexcept {
+	return reserved_of(text) != reserved::none;
+}
+
 } // namespace lesh::syntax

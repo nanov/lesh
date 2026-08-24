@@ -58,4 +58,14 @@ tree parse(buffer_pool& pool, std::string_view source,
 tree parse_next_command(buffer_pool& pool, std::string_view source, size_t& position,
                         const alias_source* aliases = nullptr) noexcept;
 
+// True for one of the shell's reserved words.
+//
+// Exported because `command -v if` must print `if`, and the RUNTIME has no other
+// way to ask: a reserved word is recognised by POSITION here rather than by the
+// lexer, so the table lives inside the parser. Asking through this rather than
+// keeping a second list in the runtime is the whole point - two lists of the
+// sixteen keywords would drift, which is exactly how `test` and `readonly` came
+// to be classified with no implementation (#35).
+[[nodiscard]] bool is_reserved_word(std::string_view text) noexcept;
+
 } // namespace lesh::syntax
