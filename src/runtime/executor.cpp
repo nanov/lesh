@@ -1110,7 +1110,16 @@ int tree_walking_executor::run_source(std::string_view source) {
 	// stand while any of them runs: a function defined by one is a node in it.
 	buffer_pool nested{BUFFER_POOL_SIZE};
 	std::deque<tree> trees;
-	int status = _state.last_status();
+	// ZERO, not `$?`. POSIX gives both `eval` and `.` an exit status of zero when
+	// no command is executed, and starting from the caller's status reported the
+	// status of whatever ran BEFORE instead: `false; eval '' '' ''` reported 1 and
+	// `(exit 1); . /dev/null` reported 1, where dash reports 0 for both
+	// (eval-p.tst's 'evaluating null operands', dot-p.tst's 'empty dot script').
+	//
+	// `eval` with NO operands answered 0 already, through a `joined.empty()` test
+	// at the call site - so the two spellings of "nothing to run" disagreed, which
+	// is why the test is here and that special case is gone.
+	int status = 0;
 	size_t at = 0;
 	while (at < source.size()) {
 		trees.push_back(syntax::parse_next_command(nested, source, at, &_state));
@@ -2010,7 +2019,7 @@ bool tree_walking_executor::try_run_executor_builtin(
 				joined += ' ';
 			joined += argv[i];
 		}
-		status = joined.empty() ? 0 : run_source(joined);
+		status = run_source(joined);
 	} else if (name == ".") {
 		const size_t operand = first_operand(argv.data());
 		if (argv[operand] == nullptr) {

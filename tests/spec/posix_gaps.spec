@@ -968,3 +968,18 @@ for i in 1; do continue 0; echo reached; done 2>/dev/null; echo "st=$?"
 
 --- a non-numeric operand to break is an error [xfail(legacy): legacy has no compound commands]
 for i in 1; do break x; echo reached; done 2>/dev/null; echo "st=$?"
+
+# `eval` and `.` report ZERO when no command runs. Starting from the caller's `$?`
+# reported the status of whatever ran before instead.
+
+--- eval on null operands reports zero [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+(exit 1); eval '' '' ''; echo "st=$?"
+
+--- eval on nothing but a comment reports zero [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+(exit 1); eval '# nothing here'; echo "st=$?"
+
+--- dotting a file with no commands reports zero [xfail(legacy): legacy has no dot builtin]
+(exit 1); . /dev/null; echo "st=$?"
+
+--- a dot script still sees the caller's exit status [xfail(legacy): legacy has no dot builtin]
+printf 'echo $?\n' >script; (exit 5); . ./script

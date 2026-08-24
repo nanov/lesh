@@ -764,3 +764,32 @@ TEST_F(ExecutorTest, ALevelPastTheNestingDepthStillBreaksOutOfTheLoop) {
 	EXPECT_EQ(capture("for i in 1; do break 100; echo reached; done"), "");
 	EXPECT_EQ(capture("for i in 1; do break 99999999999999; echo reached; done"), "");
 }
+
+// --- nothing to run is status zero --------------------------------------------
+
+TEST_F(ExecutorTest, EvalWithNothingToRunReportsZero) {
+	// run_source started from the CALLER's `$?`, so `eval` on blank text reported
+	// the status of whatever ran before it. eval-p.tst's 'evaluating null
+	// operands' is `false; eval '' '' ''` expecting 0.
+	EXPECT_EQ(run("(exit 1); eval '' '' ''"), 0);
+	EXPECT_EQ(run("(exit 1); eval ''"), 0);
+	EXPECT_EQ(run("(exit 1); eval"), 0);
+	EXPECT_EQ(run("(exit 1); eval '# only a comment'"), 0);
+	// A command that DID run still decides, so this is not a blanket zero.
+	EXPECT_EQ(run("eval 'exit 3'"), 3);
+}
+
+TEST_F(ExecutorTest, DottingAFileWithNoCommandsReportsZero) {
+	// dot-p.tst's 'empty dot script': `(exit 1); . /dev/null` expects 0.
+	EXPECT_EQ(run("(exit 1); . /dev/null"), 0);
+	// And `$?` inside the script is still the caller's, which is what dot-p.tst's
+	// 'non-empty dot script' asserts - the initial status is the value RETURNED
+	// when nothing runs, not a write to `$?`.
+	const std::string script = ::testing::TempDir() + "lesh_dot_status.sh";
+	{
+		std::ofstream out{script};
+		out << "echo $?\n";
+	}
+	EXPECT_EQ(capture("(exit 5); . " + script), "5\n");
+	std::remove(script.c_str());
+}
