@@ -986,3 +986,47 @@ TEST_F(ExecutorTest, DotAndEvalAreTransparentToBreak) {
 	EXPECT_EQ(capture(". " + script + "; echo caller"), "lib\nnot reached\ncaller\n");
 	std::remove(script.c_str());
 }
+
+// --- exit inside a trap action ------------------------------------------------
+
+TEST_F(ExecutorTest, TheExitTrapRunsItsWholeBodyAfterAnExit) {
+	// `_exit_requested` already stood when the trap ran, and run_source stops at
+	// the first command whenever it does - so `trap 'echo A; echo B' EXIT; exit 1`
+	// printed A and not B. Half a cleanup handler is worse than none: the half
+	// that did not run is the half that removes the temporary files.
+	// In a SUBSHELL, because `capture` redirects a brace group and the shell's own
+	// EXIT trap runs after that redirection is undone - the subshell's runs inside
+	// it, and exercises the same code path.
+	EXPECT_EQ(capture("( trap 'echo A; echo B' EXIT; exit 1 )"), "A\nB\n");
+	EXPECT_EQ(capture("( trap 'echo A; echo B' EXIT; echo body )"), "body\nA\nB\n");
+}
+
+TEST_F(ExecutorTest, AnExitInTheExitTrapReplacesTheShellsStatus) {
+	// exit-p.tst:50 and :55: the trap's `exit` wins over the one that reached it.
+	EXPECT_EQ(run("trap 'exit 7' EXIT; exit 1"), 7);
+	EXPECT_EQ(run("trap 'exit 0' EXIT; exit 1"), 0);
+	// A body that merely RAN commands does not: exit-p.tst's 'exit status with
+	// EXIT trap' leaves the 1 the shell was already exiting with.
+	EXPECT_EQ(run("trap '(exit 2)' EXIT; (exit 1); exit"), 1);
+}
+
+TEST_F(ExecutorTest, ExitWithNoOperandInATrapReportsTheEntryStatus) {
+	// POSIX XCU `exit`: inside a trap action "the last command" is the one that ran
+	// immediately BEFORE the action, so the `(exit 1)` inside the body does not
+	// decide - exit-p.tst's 'default exit status with previous command in trap in
+	// exiting with default' expects 2.
+	EXPECT_EQ(run("trap '(exit 1); exit' EXIT; (exit 2); exit"), 2);
+	EXPECT_EQ(run("trap exit EXIT; (exit 2); exit"), 2);
+	EXPECT_EQ(run("trap exit EXIT; exit 1"), 1);
+	// And the body's own commands still update `$?` while it runs, which is why the
+	// entry status is held separately rather than read out of `$?`.
+	EXPECT_EQ(capture("( trap '(exit 2); echo $?' EXIT; exit 1 )"), "2\n");
+}
+
+TEST_F(ExecutorTest, ASubshellInATrapDoesNotInheritTheEntryStatus) {
+	// A subshell is a new execution environment, so `exit` inside one reports ITS
+	// last command and not the command the enclosing trap interrupted. exit-p.tst's
+	// 'default exit status in subshell in signal trap' expects 2, and it regressed
+	// the moment the entry status was added without shell_state::enter_subshell.
+	EXPECT_EQ(capture("( trap '((exit 2); exit); echo $?' EXIT; exit 1 )"), "2\n");
+}

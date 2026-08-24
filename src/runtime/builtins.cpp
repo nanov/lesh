@@ -756,9 +756,14 @@ builtin_result builtin_colon(shell_state&, char**) { return {0}; }
 
 builtin_result builtin_exit(shell_state& state, char** argv) {
 	const size_t operand = first_operand(argv);
-	// POSIX: with no operand, exit with the status of the last command.
-	const int status = argv[operand] != nullptr ? std::atoi(argv[operand])
-	                                            : state.last_status();
+	// POSIX: with no operand, exit with the status of the last command - except
+	// inside a TRAP ACTION, where POSIX XCU `exit` makes "the last command" the one
+	// that ran immediately BEFORE the trap action. So `trap '(exit 2); exit' INT`
+	// exits with the status of the command the signal interrupted and not with 2,
+	// which is exit-p.tst's 'default exit status in signal trap' and dash's answer.
+	const int status = argv[operand] != nullptr
+		? std::atoi(argv[operand])
+		: state.trap_entry_status().value_or(state.last_status());
 	return {status, control_flow::exit_shell};
 }
 

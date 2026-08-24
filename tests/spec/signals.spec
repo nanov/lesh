@@ -190,3 +190,36 @@ echo spared'; echo "status=$?"
 n=0
 while [ "$n" -lt 5 ]; do n=$((n+1)); kill -s INT $$; done
 echo abandoned after $n'
+
+# `exit` inside a trap action. The whole body runs even when the shell is already
+# on its way out, an explicit status REPLACES the one the shell was leaving with,
+# and with no operand the status is the one the trap action was entered with -
+# POSIX XCU `exit`: "the last command is considered to be the command that
+# executed immediately preceding the trap action".
+
+--- the EXIT trap runs its whole body after an exit [xfail(legacy): legacy has no trap builtin]
+trap 'echo A; echo B' EXIT; exit 1
+
+--- an exit in the EXIT trap replaces the shell's status [xfail(legacy): legacy has no trap builtin]
+trap 'exit 7' EXIT; exit 1
+
+--- an exit with status zero in the EXIT trap wins too [xfail(legacy): legacy has no trap builtin]
+trap 'exit 0' EXIT; exit 1
+
+--- an EXIT trap that only runs commands leaves the status alone [xfail(legacy): legacy has no trap builtin]
+trap '(exit 2)' EXIT; (exit 1); exit
+
+--- exit with no operand in the EXIT trap reports the status the trap was entered with [xfail(legacy): legacy has no trap builtin]
+trap '(exit 1); exit' EXIT; (exit 2); exit
+
+--- an exit in a signal trap replaces the shell's status [xfail(legacy): legacy has neither trap nor a kill builtin]
+trap '(exit 2); exit 3' INT; (exit 1); kill -INT $$
+
+--- exit with no operand in a signal trap reports the status the trap interrupted [xfail(legacy): legacy has neither trap nor a kill builtin]
+trap '(exit 2); exit' INT; (exit 1); kill -INT $$
+
+--- a signal trap that exits stops the commands after it [xfail(legacy): legacy has neither trap nor a kill builtin]
+trap 'echo A; exit 4; echo B' USR1; kill -s USR1 $$; echo after
+
+--- an exit in a subshell's EXIT trap is the subshell's status [xfail(legacy): legacy has no trap builtin]
+( trap 'exit 7' EXIT; exit 1 ); echo "sub=$?"

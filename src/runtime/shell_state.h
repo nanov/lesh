@@ -6,6 +6,7 @@
 #include "substrate/traits.h"
 
 #include <array>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -130,6 +131,27 @@ public:
 
 	[[nodiscard]] int last_status() const noexcept { return _last_status; }
 	void set_last_status(int status) noexcept { _last_status = status; }
+
+	// The `$?` a TRAP ACTION was entered with, held for as long as one is running.
+	//
+	// POSIX XCU `exit`: "when exit is executed in a trap action, the last command
+	// is considered to be the command that executed immediately preceding the trap
+	// action". So `exit` with no operand inside a trap reports the status the trap
+	// INTERRUPTED and not the status of whatever the body itself last ran, which is
+	// why this cannot be `last_status()`: the body's own commands do update `$?`,
+	// and `trap '(exit 2); echo $?' EXIT` prints 2.
+	//
+	// An optional, not an int, because zero is a status a trap can genuinely be
+	// entered with - the value has to be able to say "no trap action is running"
+	// rather than encoding that as a number a real trap could carry. Held here
+	// rather than in the executor because the builtins that read it - `exit` and
+	// `return` - are handed nothing but this object.
+	void set_trap_entry_status(std::optional<int> status) noexcept {
+		_trap_entry_status = status;
+	}
+	[[nodiscard]] std::optional<int> trap_entry_status() const noexcept {
+		return _trap_entry_status;
+	}
 
 	// $0 is the shell or script name; $1.. are the positional parameters. Held
 	// separately from variables because they are not variables: they have no
@@ -268,6 +290,21 @@ public:
 	};
 	[[nodiscard]] std::vector<alias_row> aliases() const;
 
+	// What a SUBSHELL changes about the state it was forked from, in ONE place.
+	//
+	// The traps reset to default (except those set to ignore, which stay ignored),
+	// and the trap action's entry status goes away: a subshell is a new execution
+	// environment, so an `exit` inside one reports ITS last command rather than the
+	// command the enclosing trap interrupted. exit-p.tst's 'default exit status in
+	// subshell in signal trap' is precisely that case - `trap '((exit 2); exit);
+	// echo $?' INT` prints 2 - and it regressed the moment the entry status was
+	// added without this, because the child inherited a value that stopped applying
+	// to it. Two facts about one event, so they live in one call.
+	void enter_subshell() {
+		_signals.reset_for_subshell();
+		_trap_entry_status.reset();
+	}
+
 	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
 	[[nodiscard]] const signal_state& signals() const noexcept { return _signals; }
 
@@ -309,6 +346,7 @@ private:
 	std::string _own_path;
 	signal_state _signals;
 	int _last_status = 0;
+	std::optional<int> _trap_entry_status;
 	size_t _getopts_offset = 0;
 	options _options;
 	bool _interactive = false;

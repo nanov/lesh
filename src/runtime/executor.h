@@ -238,7 +238,11 @@ private:
 		tree_walking_executor& _owner;
 	};
 	void run_pending_traps();
-	void run_exit_trap();
+	// Runs the EXIT trap. True when the BODY itself called `exit`, in which case
+	// `status` is the status the shell must exit with - `trap 'exit 7' EXIT` wins
+	// over the `exit 1` that reached the trap, and a body that merely ran commands
+	// does not change the status at all.
+	bool run_exit_trap(int& status);
 	// Finds and runs a dot script, `.`'s whole job. False when the script could not
 	// be found or read, having reported it: the caller decides what that costs, the
 	// answer being different for an interactive shell and for `command .`.
@@ -388,8 +392,6 @@ private:
 	// about one three constructs ago.
 	bool _expansion_error = false;
 	bool _exit_trap_ran = false;
-	// Guards against a trap body triggering its own trap recursively.
-	bool _in_trap = false;
 	// Set by break, continue and return; consumed by the enclosing loop or
 	// function. _flow_level implements `break 2`.
 	control_flow _flow = control_flow::normal;

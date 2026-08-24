@@ -611,10 +611,13 @@ void tree_walking_executor::restore_fds(arena_array<saved_fd>& saved) {
 }
 
 int tree_walking_executor::run(const tree& t) {
-	const int status = run_parsed(t);
+	int status = run_parsed(t);
 	// The EXIT trap runs on the way out, whether that is the end of input or an
-	// explicit `exit` - which is why it cannot live at the `exit` builtin.
-	run_exit_trap();
+	// explicit `exit` - which is why it cannot live at the `exit` builtin. An
+	// `exit` INSIDE the body replaces the status the shell was leaving with.
+	int from_trap = 0;
+	if (run_exit_trap(from_trap))
+		status = from_trap;
 	return status;
 }
 
@@ -645,7 +648,9 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		if (_exit_requested || _input_ended)
 			break;
 	}
-	run_exit_trap();
+	int from_trap = 0;
+	if (run_exit_trap(from_trap))
+		status = from_trap;
 	return status;
 }
 
@@ -713,8 +718,12 @@ int tree_walking_executor::run_parsed(const tree& t) {
 		status = run_node(t, t.child_of(program, i));
 		_state.set_last_status(status);
 		run_pending_traps();
-		if (_exit_requested)
+		// The status is re-read rather than kept: when a TRAP BODY exited, the
+		// status the shell leaves with is the body's and not this command's.
+		if (_exit_requested) {
+			status = _state.last_status();
 			break;
+		}
 		// Before the `set -e` test, and deliberately: an interrupt is not a command
 		// that failed, and 130 must not exit the shell of someone who ran `set -e`.
 		if (_flow == control_flow::interrupted) {
@@ -783,10 +792,21 @@ void tree_walking_executor::run_pending_traps() {
 		// The status around a trap is preserved: a trap must not clobber `$?` for
 		// the command that follows it.
 		const int saved = _state.last_status();
-		_in_trap = true;
-		(void)run_source(command);
-		_in_trap = false;
-		_state.set_last_status(saved);
+		// The status the trap action was ENTERED with, which is what `exit` and
+		// `return` with no operand report from inside it. See shell_state.
+		const std::optional<int> outer = _state.trap_entry_status();
+		_state.set_trap_entry_status(saved);
+		const int in_trap = run_source(command);
+		_state.set_trap_entry_status(outer);
+		// An `exit` in the trap BODY decides the shell's status, and lesh threw that
+		// status away: `trap '(exit 2); exit 3' INT; kill -INT $$` exited 0, the
+		// status of the `kill` the trap interrupted (exit-p.tst:83). Only when the
+		// body exited - otherwise the status around the trap is preserved, which is
+		// what makes `trap '(exit 2)' EXIT; (exit 1); exit` still exit 1.
+		if (_exit_requested)
+			_state.set_last_status(in_trap);
+		else
+			_state.set_last_status(saved);
 	}
 	if (interrupted_by == 0)
 		return;
@@ -809,16 +829,43 @@ void tree_walking_executor::run_pending_traps() {
 	_state.set_last_status(128 + interrupted_by);
 }
 
-// Runs the EXIT trap, once, on the way out.
-void tree_walking_executor::run_exit_trap() {
+// Runs the EXIT trap, once, on the way out. True when the BODY itself exited, in
+// which case `status` is the status the shell must exit with.
+bool tree_walking_executor::run_exit_trap(int& status) {
 	if (_exit_trap_ran)
-		return;
+		return false;
 	_exit_trap_ran = true;
 	if (_state.signals().disposition_of(kExitTrap) != disposition::handler)
-		return;
+		return false;
 	const std::string command{_state.signals().trap_command(kExitTrap)};
-	if (!command.empty())
-		(void)run_source(command);
+	if (command.empty())
+		return false;
+
+	// The shell is ALREADY on its way out when this runs after an `exit`, and
+	// run_source stops at the first command whenever `_exit_requested` stands - so
+	// `trap 'echo A; echo B' EXIT; exit 1` printed A and not B. The EXIT trap is
+	// where a script's cleanup lives; running one command of it is worse than
+	// running none, because the half that did not run is the half that removes the
+	// temporary files.
+	const bool already_exiting = _exit_requested;
+	_exit_requested = false;
+	// The trap action's entry status, for an `exit` with no operand inside it:
+	// `trap exit EXIT; (exit 2); exit` exits 2 (exit-p.tst).
+	const std::optional<int> outer = _state.trap_entry_status();
+	_state.set_trap_entry_status(_state.last_status());
+	const int in_trap = run_source(command);
+	_state.set_trap_entry_status(outer);
+	const bool exited_here = _exit_requested;
+	_exit_requested = already_exiting || exited_here;
+	if (!exited_here)
+		return false;
+	// `trap 'exit 7' EXIT; exit 1` exits 7: an `exit` in the trap REPLACES the
+	// status the shell was leaving with (exit-p.tst:50 and :55). A body that merely
+	// ran commands does not - which is the distinction this return value carries,
+	// and why it is not simply "the status run_source reported".
+	_state.set_last_status(in_trap);
+	status = in_trap;
+	return true;
 }
 
 int tree_walking_executor::run_node(const tree& t, node_index n) {
@@ -1368,7 +1415,7 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 	}
 	if (pid == 0) {
 		setpgid(0, 0);
-		_state.signals().reset_for_subshell();
+		_state.enter_subshell();
 		// POSIX XCU 2.11: with job control disabled, an asynchronous command has
 		// SIGINT and SIGQUIT ignored. lesh has no job control (ADR-0001 puts it in
 		// the User Portability option), so this is the ordinary case rather than the
@@ -1384,8 +1431,10 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 			close(devnull);
 		}
 		_exit_trap_ran = false;
-		const int status = run_node(t, t.child_of(t[n], 0));
-		run_exit_trap();
+		int status = run_node(t, t.child_of(t[n], 0));
+		int from_trap = 0;
+		if (run_exit_trap(from_trap))
+			status = from_trap;
 		std::fflush(nullptr);
 		_exit(status);
 	}
@@ -1409,16 +1458,18 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	if (pid == 0) {
 		setpgid(0, 0);
 		// POSIX: a subshell resets traps to default, except those set to ignore.
-		_state.signals().reset_for_subshell();
+		_state.enter_subshell();
 		// The subshell gets its own EXIT trap, and the flag must be cleared for it:
 		// a subshell forked from INSIDE the parent's EXIT trap inherits a raised
 		// flag and would skip its own. `trap '(trap "echo x" EXIT)' EXIT` is exactly
 		// that shape.
 		_exit_trap_ran = false;
-		const int status = t[n].children_count > 0
-		                   ? run_node(t, t.child_of(t[n], 0))
-		                   : 0;
-		run_exit_trap();
+		int status = t[n].children_count > 0
+		             ? run_node(t, t.child_of(t[n], 0))
+		             : 0;
+		int from_trap = 0;
+		if (run_exit_trap(from_trap))
+			status = from_trap;
 		std::fflush(nullptr);
 		_exit(status);
 	}
@@ -2739,7 +2790,7 @@ bool tree_walking_executor::capture(std::string_view code, arena_array<char>& ou
 		// A subshell environment, so the traps reset here too. Without this the
 		// PARENT's EXIT trap ran inside every command substitution - `trap 'echo T'
 		// EXIT; x=$(echo body)` put T into x.
-		_state.signals().reset_for_subshell();
+		_state.enter_subshell();
 		_exit_trap_ran = false;
 		// The substitution's contents are a fresh parse. Nesting works because this
 		// is the same code path, reached recursively.
