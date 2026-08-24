@@ -529,10 +529,30 @@ bool test_binary(const char* left, std::string_view op, const char* right,
 	if (op == "-nt" || op == "-ot" || op == "-ef") {
 		struct stat first {};
 		struct stat second {};
-		if (stat(left, &first) != 0 || stat(right, &second) != 0)
-			return false;
+		const bool have_first = stat(left, &first) == 0;
+		const bool have_second = stat(right, &second) == 0;
+		// `-ef` asks whether two pathnames name the SAME file, and a pathname that
+		// names nothing names nothing in common with anything.
 		if (op == "-ef")
-			return first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+			return have_first && have_second && first.st_dev == second.st_dev &&
+			       first.st_ino == second.st_ino;
+		// A file that does not exist has no modification time, so it cannot be newer
+		// than anything - and a file that does exist is newer than one that is not
+		// there. `test XXXXX -ot newer` is TRUE and `test newer -nt XXXXX` is TRUE,
+		// which is what test-p.tst asserts and what bash answers; two missing
+		// operands are neither newer nor older than each other.
+		//
+		// Refusing both the moment either stat failed made an ABSENT file
+		// indistinguishable from a file with the same timestamp, which is the answer
+		// dash and zsh give and the one thing a freshness test is asked for: `[ out
+		// -nt in ]` is how every hand-written build rule spells "rebuild", and with
+		// no `out` yet it said there was nothing to do.
+		if (!have_first && !have_second)
+			return false;
+		if (!have_first)
+			return op == "-ot";
+		if (!have_second)
+			return op == "-nt";
 		if (op == "-nt")
 			return first.st_mtime > second.st_mtime;
 		return first.st_mtime < second.st_mtime;

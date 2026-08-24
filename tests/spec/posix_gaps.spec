@@ -1104,3 +1104,12 @@ printf 'echo one\nexit 3\n' >script
 set -v
 eval 'echo hi'
 echo done
+
+--- test -ot against a file that does not exist [xfail: divergence from dash - ADR-0001. A file that is not there has no modification time, so an existing file is newer than it: test-p.tst and bash both say so, while dash, zsh and macOS test(1) report false the moment either stat fails]
+: >newer; test XXXXX -ot newer; echo "ot=$?"
+
+--- test -nt against a file that does not exist [xfail: divergence from dash - ADR-0001, the same rule read the other way round]
+: >newer; test newer -nt XXXXX; echo "nt=$?"
+
+--- test -nt and -ot with both operands missing are false, which dash agrees with [xfail(legacy): legacy mis-splits the line - `test: YYYYY;: unexpected operator` - so the second command's operand lands in the first]
+test XXXXX -nt YYYYY; printf 'nt=%s ' $?; test XXXXX -ot YYYYY; echo "ot=$?"

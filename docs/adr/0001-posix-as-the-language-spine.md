@@ -87,3 +87,14 @@ difference is written down here and carried as an `[xfail: divergence ...]` case
   where dash, bash and zsh all answer 0. A shell whose two spellings of "the last
   command" answer the same question differently is the real defect, so lesh
   applies the rule to both.
+- **`test -nt` and `-ot` compare against a file that does NOT exist** (issue #35's
+  builtin, extended by the control-flow work). A file that is not there has no
+  modification time, so an existing file is newer than it and it is older than
+  every existing file: `test XXXXX -ot newer` and `test newer -nt XXXXX` are both
+  true, which is what `test-p.tst` asserts and what bash answers. dash, zsh and
+  macOS's own `test(1)` all report false the moment either `stat` fails, which
+  makes an ABSENT file indistinguishable from one with an identical timestamp -
+  and telling those two apart is the entire purpose of the operator, since
+  `[ out -nt in ]` is how a hand-written build rule spells "rebuild" and there is
+  no `out` on the first run. POSIX did not define these operators when dash
+  adopted them; the suite and bash define them the useful way.

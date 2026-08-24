@@ -163,3 +163,29 @@ TEST_F(TestBuiltinTest, BracketRequiresItsClosingBracket) {
 	EXPECT_EQ(fails("["), 2);
 	EXPECT_EQ(fails("[ 1 = 1 ] extra"), 2) << "the bracket must be LAST";
 }
+
+TEST_F(TestBuiltinTest, FreshnessComparisonsAgainstAMissingFile) {
+	// A file that does not exist has no modification time: an existing file is
+	// NEWER than it, and it is OLDER than every existing file. test-p.tst asserts
+	// both (`XXXXX -ot newer` true, `newer -nt XXXXX` true) and bash answers the
+	// same; dash, zsh and macOS test(1) report false as soon as either stat fails,
+	// which is the divergence recorded in ADR-0001.
+	const std::string present = ::testing::TempDir() + "lesh_test_present";
+	{
+		std::ofstream out{present};
+		out << "x";
+	}
+	const std::string missing = ::testing::TempDir() + "lesh_test_missing_XXXXX";
+	std::remove(missing.c_str());
+	EXPECT_EQ(run("test " + missing + " -ot " + present), 0) << "missing is older";
+	EXPECT_EQ(run("test " + present + " -nt " + missing), 0) << "present is newer";
+	EXPECT_EQ(run("test " + missing + " -nt " + present), 1);
+	EXPECT_EQ(run("test " + present + " -ot " + missing), 1);
+	// Two missing operands are neither newer nor older than one another, and `-ef`
+	// is unmoved: a pathname that names nothing names nothing in common.
+	EXPECT_EQ(run("test " + missing + " -nt " + missing), 1);
+	EXPECT_EQ(run("test " + missing + " -ot " + missing), 1);
+	EXPECT_EQ(run("test " + missing + " -ef " + present), 1);
+	EXPECT_EQ(run("test " + present + " -ef " + present), 0);
+	std::remove(present.c_str());
+}
