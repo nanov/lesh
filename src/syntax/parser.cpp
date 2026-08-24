@@ -391,14 +391,18 @@ private:
 		return true;
 	}
 
-	// Records that a construct is missing a token the grammar requires.
+	// Records that a construct is missing a piece the grammar requires: a
+	// terminating keyword, or an operand.
 	//
-	// THE ONE MECHANISM for all nine positions - `then`, `fi`, `do`, `done`, `in`,
-	// `esac`, `}` and the two `)` - because accept() returning false rather than
-	// throwing is exactly right for the line editor and five of the six compound
-	// commands then DISCARDED that false. `lesh -c '{ echo x'` printed x and
-	// reported success where dash reports a syntax error (#49); fixing the sites one
-	// at a time is how five of the six end up subtly different.
+	// THE ONE MECHANISM for all nine terminator positions - `then`, `fi`, `do`,
+	// `done`, `in`, `esac`, `}` and the two `)` - because accept() returning false
+	// rather than throwing is exactly right for the line editor and five of the six
+	// compound commands then DISCARDED that false. `lesh -c '{ echo x'` printed x
+	// and reported success where dash reports a syntax error (#49); fixing the sites
+	// one at a time is how five of the six end up subtly different. It is now also
+	// the mechanism for #58's nine OPERAND positions - eight required
+	// `compound_list`s and the `for` name - which are the same defect one production
+	// earlier: `{ echo x` has no `}`, `{ }` has no command.
 	//
 	// The defect travels on the COMPOUND NODE's own error field, which is #47's
 	// shape unchanged: a word whose quote was never closed is still a word, and an
@@ -413,28 +417,49 @@ private:
 	// `fi` where `then` belongs and no continuation helps. Both are defects, only
 	// the first is incomplete - the same split the lexer keeps between an
 	// unterminated quote and a trailing backslash.
-	bool record_missing(parse_error& defect) noexcept {
+	bool record_missing(parse_error& defect, parse_error why) noexcept {
 		if (peek().kind == token_kind::end)
 			_tree.set_incomplete(true);
 		// The FIRST thing missing is the one worth naming, and a construct has one
-		// error field: `if true` misses `then` and `fi` both.
+		// error field: `if true` misses `then` and `fi` both, and `while; do` misses
+		// its condition before it misses anything else.
 		if (defect == parse_error::none)
-			defect = parse_error::missing_terminator;
+			defect = why;
 		return false;
 	}
 
 	// Consumes a reserved word the grammar requires, or records its absence.
 	bool require(reserved want, parse_error& defect) noexcept {
-		return accept(want) || record_missing(defect);
+		return accept(want) || record_missing(defect, parse_error::missing_terminator);
 	}
 
 	// The same, for a construct closed by an operator rather than by a keyword: a
 	// subshell's `)` and the `)` after a case item's patterns.
 	bool require(token_kind want, parse_error& defect) noexcept {
 		if (peek().kind != want)
-			return record_missing(defect);
+			return record_missing(defect, parse_error::missing_terminator);
 		advance();
 		return true;
+	}
+
+	// A `compound_list` position where POSIX requires at least one command, passed
+	// through so the caller can wrap the call that produced it.
+	//
+	// `compound_list` reduces to `term`, and `term` to at least one `and_or`, so an
+	// EMPTY list is a syntax error everywhere the grammar spells one - every body
+	// and every condition. dash refuses every such shape and lesh accepted all of
+	// them at status 0, two of them by looping: `while; do echo x; done` and
+	// `while true; do done` both spin, because an empty list runs to status 0 and 0
+	// is what keeps a `while` going (#58).
+	//
+	// Deliberately NOT applied to a `case` item, whose list POSIX makes optional
+	// (`case a in b) ;; esac` is valid), nor to `program`, which may be empty
+	// (`lesh -c ''` is status 0). Those two are why the CALLER decides rather than
+	// parse_compound_list itself.
+	node_index require_list(node_index list, parse_error& defect) noexcept {
+		if (_tree[list].children_count == 0)
+			record_missing(defect, parse_error::missing_operand);
+		return list;
 	}
 
 	// A sequence of and_or lists, ending at a terminator or end of input. The body
@@ -489,16 +514,20 @@ private:
 		parse_error defect = parse_error::none;
 
 		for (;;) {
-			_scratch.push(parse_compound_list());   // condition
+			// `if; then echo x; fi` printed x and reported success. Every one of these
+			// three lists is a required `compound_list` and an empty one is a syntax
+			// error - the condition of the `if` and of each `elif`, each body, and the
+			// `else` part below (#58).
+			_scratch.push(require_list(parse_compound_list(), defect));   // condition
 			if (!require(reserved::kw_then, defect))
 				break;
-			_scratch.push(parse_compound_list());   // body
+			_scratch.push(require_list(parse_compound_list(), defect));   // body
 			++pairs;
 			if (!accept(reserved::kw_elif))
 				break;
 		}
 		if (accept(reserved::kw_else))
-			_scratch.push(parse_compound_list());
+			_scratch.push(require_list(parse_compound_list(), defect));
 		require(reserved::kw_fi, defect);
 
 		node n;
@@ -517,9 +546,17 @@ private:
 		advance();  // `while` / `until`
 		parse_error defect = parse_error::none;
 
-		_scratch.push(parse_compound_list());  // condition
+		// THE HANG. An empty condition runs to status 0, and 0 is exactly what keeps a
+		// `while` going, so `while; do echo x; done` spun - a typo a user can make by
+		// hand wedging the shell. `while true; do done` is the same defect at the other
+		// list. #19's 10-million-iteration ceiling in run_loop is a guard against
+		// taking the MACHINE down, not against this: measured here, the empty
+		// condition reaches the ceiling in 40 seconds with a no-op body and about 100
+		// with `echo x`, and then returns 0 - so the ceiling turns an unbounded hang
+		// into a long one that reports SUCCESS for input dash refuses (#58).
+		_scratch.push(require_list(parse_compound_list(), defect));  // condition
 		if (require(reserved::kw_do, defect))
-			_scratch.push(parse_compound_list());  // body
+			_scratch.push(require_list(parse_compound_list(), defect));  // body
 		require(reserved::kw_done, defect);
 
 		node n;
@@ -537,9 +574,20 @@ private:
 		advance();  // `for`
 		parse_error defect = parse_error::none;
 
+		// `for name` - the one compound command whose operand is a WORD rather than a
+		// list, and the grammar makes it mandatory in all three productions. `for ; do
+		// echo x; done` ran the body zero times at status 0 where dash reports 2 (#58).
+		//
+		// The test is "is this a word", not "is this a NAME": the lexer has no
+		// reserved-word kind and the parser decides by position, so `for in in a b; do`
+		// names a variable called `in` and dash runs it. A word that is not a valid
+		// name - `for 1 in a` - is a different refusal dash spells `Bad for loop
+		// variable`, and is not this one.
 		uint32_t name_token = _index;
 		if (peek().kind == token_kind::word)
 			name_token = advance();
+		else
+			record_missing(defect, parse_error::missing_operand);
 
 		// POSIX puts a `linebreak` between the name and `in`, so `for i<newline>in a b`
 		// is one loop. Without this the `in` was read as the first word of the BODY,
@@ -561,8 +609,10 @@ private:
 		while (is_separator(peek().kind))
 			advance();
 
+		// The `do_group`'s list is required even though the WORDLIST is not: `for i in;
+		// do echo x; done` iterates nothing and is valid, `for i in a; do done` is not.
 		if (require(reserved::kw_do, defect))
-			_scratch.push(parse_compound_list());
+			_scratch.push(require_list(parse_compound_list(), defect));
 		require(reserved::kw_done, defect);
 
 		node n;
@@ -616,6 +666,9 @@ private:
 			// so `case a in a) x;; b x;; esac` points at the item that is wrong.
 			require(token_kind::rparen, item_defect);
 
+			// NOT require_list: a case item's `compound_list` is the one POSIX makes
+			// optional, so `case a in b) ;; esac` and `case a in esac` are both valid
+			// and dash runs them. The other exception is `program` itself (#58).
 			_scratch.push(parse_compound_list());
 
 			node item;
@@ -650,7 +703,11 @@ private:
 		const uint32_t mark = mark_scratch();
 		advance();  // `{`
 		parse_error defect = parse_error::none;
-		_scratch.push(parse_compound_list());
+		// `{ }` and `f() { }` both ran to status 0; dash refuses both, because the
+		// grammar is `{ compound_list }` and a compound_list holds at least one
+		// and_or. A group holding nothing but a REDIRECTION is a different thing and
+		// stays valid - `{ >/dev/null; }` is a simple command with no words (#58).
+		_scratch.push(require_list(parse_compound_list(), defect));
 		require(reserved::kw_rbrace, defect);
 
 		node n;
@@ -667,7 +724,7 @@ private:
 		const uint32_t mark = mark_scratch();
 		advance();  // `(`
 		parse_error defect = parse_error::none;
-		_scratch.push(parse_compound_list());
+		_scratch.push(require_list(parse_compound_list(), defect));  // `( )` - see above
 		require(token_kind::rparen, defect);
 
 		node n;

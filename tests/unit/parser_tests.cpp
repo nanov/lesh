@@ -339,6 +339,108 @@ TEST_F(ParserTest, ADefectiveNodeNamesWhatWasLeftUnterminated) {
 	}
 }
 
+// --- a compound command with no operand (#58) --------------------------------
+//
+// #49's defect one production earlier: there the closing keyword was missing, here
+// the thing between the keywords is. `compound_list` reduces to `term` and `term`
+// to at least one `and_or`, so an EMPTY list is a syntax error at every position
+// the grammar spells one - and lesh accepted all of them at status 0, TWO OF THEM
+// by looping forever.
+
+TEST_F(ParserTest, ACompoundCommandWithAnEmptyOperandIsADefect) {
+	// Not incomplete: the token the parser wanted is present and is not end of
+	// input, so no continuation helps. That is the same split record_missing draws
+	// for a terminator, reached through the same call. dash reports 2 for every one.
+	const std::string_view cases[] = {
+		// The four from #58's table. An empty list runs to status 0, and 0 is exactly
+		// what keeps a `while` going, which is why the second of them HUNG.
+		"if; then echo x; fi",
+		"while; do :; done",
+		"until; do echo x; done",
+		"for ; do echo x; done",
+		// An empty BODY is the same production as an empty condition, and one of
+		// these hung for the same reason.
+		"if true; then fi",
+		"if false; then a; else fi",         // the `else` part carries one too
+		"if false; then a; elif b; then fi", // and so does every `elif`
+		"while true; do done",
+		"until true; do done",
+		"for i in a; do done",
+		"{ }",                               // `{ compound_list }` with no list
+		"( )",
+		"f() { }",                           // a function body is one of those two
+		"f() ( )",
+		"if true; then { }; fi",             // nested: the INNER construct is defective
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << "dash refuses this: " << src;
+		EXPECT_FALSE(t.incomplete()) << "no continuation completes this: " << src;
+	}
+}
+
+TEST_F(ParserTest, AnEmptyListIsLegitimateWhereThePOSIXGrammarAllowsOne) {
+	// The over-eager half, and where `error-p.tst`'s 220 assertions would notice
+	// first. Two positions take an empty list on purpose - a `case` item and
+	// `program` itself - and a group holding only a REDIRECTION is a simple command
+	// with no words rather than an empty list at all. dash runs all of these.
+	const std::string_view cases[] = {
+		"case a in b) ;; esac",        // the optional case_item compound_list
+		"case a in b);; esac",
+		"case a in b) esac",
+		"case a in esac",              // no items at all
+		"",                            // `program` may be empty
+		"# nothing but a comment",
+		"\n\n",
+		"{ >/dev/null; }",             // only a redirection, which IS an and_or
+		"( >/dev/null )",
+		"for i in; do echo x; done",   // an empty WORDLIST is not an empty list
+		"for i; do echo $i; done",     // ... and neither is no wordlist
+		"while :; do :; done",
+		"if if true; then true; fi; then echo x; fi",  // a list holding one compound
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		EXPECT_FALSE(t.has_errors()) << "this is valid POSIX: " << src;
+	}
+}
+
+TEST_F(ParserTest, AMissingOperandNamesTheConstructItBelongsTo) {
+	// The phrase lookup is also what keeps the two carriers of missing_operand
+	// apart. On a compound node the kind names the construct. On the error node
+	// that a bad redirection becomes, the kind names nothing, the lookup declines,
+	// and `echo >` falls through to the token scan exactly as it did before - which
+	// is why ADefectiveNodeNamesWhatWasLeftUnterminated needed no change.
+	const struct { std::string_view src; std::string_view detail; } cases[] = {
+		{"if; then echo x; fi",    "if command with an empty condition or body"},
+		{"while; do :; done",      "while loop with an empty condition or body"},
+		{"until; do echo x; done", "until loop with an empty condition or body"},
+		{"for ; do echo x; done",  "for loop with no variable name or an empty body"},
+		{"{ }",                    "empty brace group"},
+		{"( )",                    "empty subshell"},
+	};
+	for (const auto& c : cases) {
+		const tree t = parse_it(c.src);
+		const node_index at = t.first_error();
+		ASSERT_NE(at, no_node) << c.src;
+		ASSERT_NE(t.error_detail(t[at]), nullptr) << c.src;
+		EXPECT_EQ(std::string_view(t.error_detail(t[at])), c.detail) << c.src;
+	}
+}
+
+TEST_F(ParserTest, RunningOutOfInputBeforeAnOperandIsStillIncomplete) {
+	// The third combination, and the one an interactive reader depends on: the
+	// operand is empty AND the input ended, so more of it would help. A missing
+	// operand must not cost the continuation prompt that ADR-0002 made the parser
+	// total for - `while` on a line of its own is half-typed, not malformed.
+	for (const std::string_view src : {"if", "while", "until", "for", "{", "(",
+	                                   "while ;", "if ;", "for ;"}) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << "a shell holding the whole input must refuse: " << src;
+		EXPECT_TRUE(t.incomplete()) << "more input would complete it: " << src;
+	}
+}
+
 TEST_F(ParserTest, AnUnterminatedWordStillEndsTheReadUnit) {
 	// A parser that consumes nothing and returns is a hang, not a diagnostic, and
 	// the incremental reader (#40) calls this in a loop until the cursor reaches

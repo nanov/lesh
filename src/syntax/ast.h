@@ -74,7 +74,12 @@ enum class node_kind : uint16_t {
 enum class parse_error : uint16_t {
 	none,
 	unexpected_operator,   // an operator where a word was required
-	missing_operand,       // an operator with nothing after it
+	// Something the grammar requires after a keyword or an operator, and the parse
+	// found nothing there: `echo >` with no target, `for ; do` with no name,
+	// `while; do` with an empty condition. Carried by an ERROR node when the
+	// redirection is the whole of what went wrong, and by the COMPOUND NODE itself
+	// when a construct is missing its operand - see missing_operand_phrase (#58).
+	missing_operand,
 	unterminated_word,     // the lexer reported the word incomplete
 	// A compound command the grammar requires a keyword or a closing token to
 	// finish, and the parse never found one: `{ echo x` with no `}`, `if true`
@@ -102,6 +107,30 @@ enum class parse_error : uint16_t {
 		case node_kind::case_item:   return "unterminated case pattern list";
 		case node_kind::subshell:    return "unterminated subshell";
 		case node_kind::brace_group: return "unterminated brace group";
+		default:                     return nullptr;
+	}
+}
+
+// The same, for a compound command whose OPERAND is missing rather than its
+// terminator: `while; do echo x; done` closed the condition with nothing in it,
+// `for ; do` named no variable, `{ }` holds no command. POSIX makes a
+// `compound_list` at least one `and_or`, so an empty one is a syntax error
+// wherever the grammar requires one - which is every position below and NOT a
+// `case` item or the program itself, where an empty list is legitimate.
+//
+// Which POSITION was empty is not recorded, for #49's reason: `aux` is spoken for
+// on three of these kinds and one parse_error value per position would have been
+// ten mechanisms where one does. The phrase names both places worth looking
+// instead, which is one word less precise than dash's `";" unexpected` and, as
+// #47 established, compared by nothing.
+[[nodiscard]] constexpr const char* missing_operand_phrase(node_kind kind) noexcept {
+	switch (kind) {
+		case node_kind::if_clause:   return "if command with an empty condition or body";
+		case node_kind::while_loop:  return "while loop with an empty condition or body";
+		case node_kind::until_loop:  return "until loop with an empty condition or body";
+		case node_kind::for_loop:    return "for loop with no variable name or an empty body";
+		case node_kind::subshell:    return "empty subshell";
+		case node_kind::brace_group: return "empty brace group";
 		default:                     return nullptr;
 	}
 }
@@ -363,6 +392,13 @@ public:
 		// phrase the scan below found there would describe something else.
 		if (n.error == parse_error::missing_terminator)
 			if (const char* phrase = unterminated_phrase(n.kind))
+				return phrase;
+		// A missing operand is asked for the same reason, and the phrase lookup is
+		// what keeps the two apart: missing_operand also travels on the ERROR node a
+		// bad redirection becomes, and there the kind names nothing, so the lookup
+		// declines and the token scan below answers exactly as it did before (#58).
+		if (n.error == parse_error::missing_operand)
+			if (const char* phrase = missing_operand_phrase(n.kind))
 				return phrase;
 		for (uint32_t i = n.first_token; i <= n.last_token && i < _tokens.size(); ++i)
 			if (const char* phrase = error_phrase(_tokens[i].error))

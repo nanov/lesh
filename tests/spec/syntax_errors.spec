@@ -231,6 +231,75 @@ in
 b) echo hi;;
 esac
 
+# A compound command with no OPERAND, which is #49's defect one production earlier:
+# there the closing keyword was missing, here the thing between the keywords is.
+# POSIX reduces `compound_list` to `term` and `term` to at least one `and_or`, so an
+# empty list is a syntax error wherever the grammar spells one - every condition and
+# every body. dash reports 2 for all eleven shapes below; lesh ran them all at
+# status 0, and TWO OF THEM HUNG.
+#
+# The hang is why this could not wait for a conformance score to notice it: an empty
+# list runs to status 0, and 0 is exactly what keeps a `while` going. #19's
+# 10-million-iteration ceiling does stop it - after 40 seconds with a no-op body,
+# and then at status 0 - so it guards the machine rather than the answer.
+#
+# The two looping cases use `:` as a body rather than `echo x` deliberately: before
+# the fix they spin until this runner's --timeout kills the process group, which it
+# reports as a FAILURE rather than wedging the run, and a body that writes would
+# spend those seconds filling a pipe with megabytes nothing reads.
+#
+# `until` is the same defect without the hang: an empty condition is status 0 and an
+# `until` stops when its condition succeeds, so it ran the body zero times instead.
+
+--- an `if` with an empty condition is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if; then echo x; fi
+
+--- a `while` with an empty condition is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+while; do :; done
+
+--- an `until` with an empty condition is a syntax error [xfail(legacy): legacy has no until loop, so it runs `until` as a command name]
+until; do echo x; done
+
+--- a `for` with no variable name is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for ; do echo x; done
+
+--- a `while` with an empty body is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+while true; do done
+
+--- an `if` with an empty body is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if true; then fi
+
+--- an `else` part with an empty body is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+if false; then echo a; else fi
+
+--- a `for` with an empty body is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in a; do done
+
+--- an empty brace group is a syntax error [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+{ }
+
+--- an empty subshell is a syntax error [xfail(legacy): legacy has no subshell]
+( )
+
+--- an empty function body is a syntax error [xfail(legacy): legacy has no function definitions]
+f() { }
+
+# The over-eager half. A `case` item's `compound_list` is the one POSIX makes
+# optional, and a group holding only a redirection is a simple command with no
+# words rather than an empty list - so neither may be refused.
+
+--- a case item with an empty body still runs [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+case a in a) ;; b) echo no;; esac
+echo done
+
+--- a brace group holding only a redirection still runs [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+{ >/dev/null; }
+echo done
+
+--- a for loop over an empty word list still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in; do echo x; done
+echo done
+
 --- a trailing backslash is incomplete without being an error
 echo one\
 
