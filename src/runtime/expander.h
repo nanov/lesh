@@ -80,6 +80,28 @@ public:
 	                                            std::string_view value) = 0;
 };
 
+// What a caller wants expanded into a single VALUE rather than into a field list.
+//
+// All three suppress field splitting and pathname expansion, and all three differ
+// in their QUOTING rules - which is exactly what one `quoted` flag could not say.
+// It stood for "no field splitting" and "double-quoted backslash rules" at once,
+// so a redirection operand kept the backslash in `cat <\i'n'"0"`, an assignment
+// kept it in `x=\!`, and a here-document body had its quotes REMOVED because it
+// was lexed as the interior of a word (#42).
+enum class value_context {
+	// `x=value`, and the value half of an `export`/`readonly`/prefix assignment.
+	// Unquoted backslash rules, and a tilde is eligible after an unquoted colon.
+	assignment,
+	// The word after `<` or `>`. Unquoted backslash rules; a tilde is eligible only
+	// at the start, because POSIX confines the after-colon rule to assignments.
+	redirection_operand,
+	// Between the delimiter lines of an unquoted here-document. POSIX 2.7.4 makes
+	// it behave as if double-quoted EXCEPT that `"` is not special - so `'` and `"`
+	// are ordinary bytes and a backslash escapes only `$`, `` ` ``, `\` and a
+	// newline. dash prints `a\"b 'c' "d"` unchanged.
+	here_document_body,
+};
+
 enum class expansion_status {
 	ok,
 	command_substitution_unavailable,  // no runner supplied - completion's mode
@@ -111,7 +133,7 @@ public:
 	// parameter.
 	//
 	// Sticky, and separate from the returned expansion_status, because
-	// expand_assignment_value() returns a VALUE and has no status to give back -
+	// expand_value() returns a VALUE and has no status to give back -
 	// so a redirection target or an assignment right-hand side would otherwise
 	// swallow the error the caller has to act on.
 	[[nodiscard]] bool fatal_error() const noexcept { return _fatal_error; }
@@ -124,20 +146,71 @@ public:
 	expansion_status expand_word(const syntax::tree& t, syntax::node_index word,
 	                             arena_array<std::string_view>& out) noexcept;
 
-	// Expands raw text as a single word with NO field splitting and NO pathname
-	// expansion, which is what an assignment's value requires: `x=a b` assigns
-	// "a" and runs `b`, but `x="a b"` assigns "a b" as one value, and neither is
-	// globbed. Used for assignment right-hand sides.
-	[[nodiscard]] std::string_view expand_assignment_value(std::string_view text) noexcept;
+	// Expands raw text into a single VALUE with no field splitting and no pathname
+	// expansion: `x=a b` assigns "a" and runs `b`, but `x="a b"` assigns "a b" as
+	// one value, and neither is globbed. The context says which quoting rules
+	// apply - see value_context, which exists because they are not all the same.
+	[[nodiscard]] std::string_view expand_value(std::string_view text,
+	                                            value_context context) noexcept;
 
 private:
-	// `mode` is how the TEXT is lexed; `quoted` is whether field splitting and
-	// pathname expansion apply. They are separate because an assignment value is
-	// expanded with quoted=true while its single quotes still mean single quotes.
-	expansion_status expand_text(std::string_view text, bool quoted,
-	                             arena_array<std::string_view>& out,
-	                             syntax::lex_mode mode
-	                                 = syntax::lex_mode::word_interior) noexcept;
+	// Which of POSIX's word-expansion treatments apply to a piece of text.
+	//
+	// One bool used to stand for all of these, and it has now gone wrong three
+	// times: `echo "it's"` printed `it` until the LEXING mode became its own
+	// parameter (#33), and then `cat <\i'n'"0"` kept its backslash and a
+	// here-document body lost its quotes, because "no field splitting" and
+	// "double-quoted backslash rules" were still one flag (#42). They are
+	// independent properties of a context, not faces of one.
+	struct expand_context {
+		// Field splitting applies to the result of an unquoted expansion here, and
+		// so does pathname expansion - POSIX applies the two to exactly the same
+		// text.
+		bool split = true;
+		// A FIELD LIST is being produced rather than one value, so `"$@"` may yield
+		// more than one field. Distinct from `split`: inside double quotes in a
+		// command's argument splitting is off while `"$@"` still gives one field per
+		// parameter, and in an assignment value neither holds - `x="$@"` joins.
+		bool fields = true;
+		// POSIX 2.2.3: inside double quotes a backslash escapes only `$`, `` ` ``,
+		// `"`, `\` and a newline, and `$@` keeps one field per parameter.
+		bool double_quoted = false;
+		// The text IS the result of an expansion - the argument of a `${x-word}` or
+		// `${x+word}` operator - so its own unquoted literal bytes are part of what
+		// field splitting sees. In an ordinary word they are not: `echo a b` is two
+		// words because the LEXER split them, and `echo "$x"` on `a b` is one field.
+		// But `${a+ x}` really does substitute a leading blank that then separates,
+		// which is why the two cannot share one flag.
+		bool substituted = false;
+		// How the text is LEXED, which is a third thing again: a single quote is an
+		// ordinary byte inside double quotes and in a here-document body, and a
+		// tilde is eligible only where a word begins.
+		//
+		// Last, so that a designated initialiser reads in the order POSIX applies
+		// the rules; every construction site names its fields, because a positional
+		// one silently reassigned the members the day `substituted` was added.
+		syntax::lex_mode mode = syntax::lex_mode::word_interior;
+
+		// True when a backslash before `c` escapes it. The here-document body is the
+		// case that forced this out of the double_quoted flag: it has double-quote
+		// rules minus `"`, so `\"` stays `\"` there and becomes `"` inside quotes.
+		[[nodiscard]] constexpr bool escapes(char c) const noexcept {
+			if (!double_quoted)
+				return true;  // outside quotes a backslash escapes anything
+			if (c == '$' || c == '`' || c == '\\' || c == '\n')
+				return true;
+			return c == '"' && mode != syntax::lex_mode::here_doc_body;
+		}
+	};
+
+	expansion_status expand_text(std::string_view text, expand_context ctx,
+	                             arena_array<std::string_view>& out) noexcept;
+	// Expands `text` into one value with the quoting rules of `outer`, which is what
+	// the argument of `${x=word}` and `${x?word}` needs: the value assigned or the
+	// message printed is one string, but its backslashes and quotes read the same
+	// way as the text around the expansion.
+	[[nodiscard]] std::string_view expand_to_value(std::string_view text,
+	                                               expand_context outer) noexcept;
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
 	void push_byte(char c) noexcept;

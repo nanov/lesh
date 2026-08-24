@@ -280,11 +280,15 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 	};
 
 	const char c = peek();
-	// Inside double quotes a single quote is just a byte, and a leading tilde is
-	// not eligible for tilde expansion. Everything else - $, `, \ - still is.
-	const bool in_double_quotes = mode == lex_mode::double_quote_interior;
+	// Which quote characters are quotes here. Inside double quotes a single quote
+	// is just a byte; in a here-document body BOTH are, because POSIX 2.7.4 gives
+	// the body double-quote semantics minus the `"`. Everything else - $, `, \ -
+	// is special in all three.
+	const bool quotes_are_bytes = mode == lex_mode::double_quote_interior ||
+	                              mode == lex_mode::here_doc_body;
+	const bool double_quotes_are_bytes = mode == lex_mode::here_doc_body;
 
-	if (c == '\'' && !in_double_quotes) {
+	if (c == '\'' && !quotes_are_bytes) {
 		++_position;
 		while (!at_end() && peek() != '\'')
 			++_position;
@@ -296,7 +300,7 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		return finish(token_kind::seg_single_quoted);
 	}
 
-	if (c == '"') {
+	if (c == '"' && !double_quotes_are_bytes) {
 		++_position;
 		while (!at_end() && peek() != '"') {
 			if (peek() == '\\' && _position + 1 < _source.size()) {
@@ -326,7 +330,7 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		return finish(token_kind::seg_double_quoted);
 	}
 
-	if (c == '~' && start == 0 && !in_double_quotes) {
+	if (c == '~' && start == 0 && mode == lex_mode::word_interior) {
 		// Only a leading tilde is eligible. POSIX confines tilde expansion to the
 		// start of a word (and after ':' in assignments, which is #12's problem).
 		++_position;
@@ -444,7 +448,8 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 			_position += 2;
 			continue;
 		}
-		if ((ch == '\'' && !in_double_quotes) || ch == '"' || ch == '$' || ch == '`')
+		if ((ch == '\'' && !quotes_are_bytes) || (ch == '"' && !double_quotes_are_bytes) ||
+		    ch == '$' || ch == '`')
 			break;
 		++_position;
 	}
@@ -454,7 +459,8 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 token lexer::next(lex_mode mode) noexcept {
 	_incomplete = false;
 
-	if (mode == lex_mode::word_interior || mode == lex_mode::double_quote_interior) {
+	if (mode == lex_mode::word_interior || mode == lex_mode::double_quote_interior ||
+	    mode == lex_mode::here_doc_body) {
 		if (at_end()) {
 			token t;
 			t.kind = token_kind::end;

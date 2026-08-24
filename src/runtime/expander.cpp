@@ -41,7 +41,7 @@ bool is_ifs_whitespace(char c, std::string_view ifs) noexcept {
 // The two QUOTE errors are deliberately absent. Whether a quote inside `${x-...}`
 // is a quote at all depends on the double-quote context POSIX 2.6.2 gives it -
 // `dash -c 'echo "${x-'"'"'}"'` prints one single quote at status zero - and
-// expand_assignment_value re-lexes its text without that context yet (#42). So
+// the expander re-lexes its text without that context yet (#42). So
 // refusing there would trade a crash for a diagnostic on input dash accepts.
 // Every case is listed and there is no default, so a new token_error cannot be
 // left out of this decision silently - the release build takes -Wswitch as an
@@ -143,7 +143,12 @@ parsed_parameter parse_parameter(std::string_view body) noexcept {
 	}
 
 	const char op = body[at];
-	const bool doubled = at + 1 < body.size() && body[at + 1] == op;
+	// Only `#` and `%` have a doubled form. Testing every operator for a repeated
+	// character ate the first byte of the ARGUMENT: `${u--x}` is the default `-x`,
+	// not a `--` operator, and it substituted `x` where dash gives `-x`. That was
+	// three of fsplit-p.tst's cases, whose defaults all begin with a hyphen.
+	const bool doubled = (op == '#' || op == '%') && at + 1 < body.size() &&
+	                     body[at + 1] == op;
 	switch (op) {
 		case '-': out.op = param_op::use_default; break;
 		case '=': out.op = param_op::assign_default; break;
@@ -338,12 +343,11 @@ std::string_view expander::int_to_scratch(int value) noexcept {
 	return {block, len};
 }
 
-expansion_status expander::expand_text(std::string_view text, bool quoted,
-                                       arena_array<std::string_view>& out,
-                                       lex_mode mode) noexcept {
+expansion_status expander::expand_text(std::string_view text, expand_context ctx,
+                                       arena_array<std::string_view>& out) noexcept {
 	// BOUNDED. Every nesting level in the input is a frame on this stack: a
 	// parameter default and arithmetic's inner text both come back here through
-	// expand_assignment_value. 2000 levels of the WELL-FORMED `${x-${x-...}}`
+	// expand_to_value. 2000 levels of the WELL-FORMED `${x-${x-...}}`
 	// exhausted the stack on the debug build, so refusing malformed input is not
 	// enough on its own - see kMaxExpansionDepth (#48).
 	if (_depth >= kMaxExpansionDepth) {
@@ -357,7 +361,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 	lexer lx{text};
 
 	for (;;) {
-		const token seg = lx.next(mode);
+		const token seg = lx.next(ctx.mode);
 		if (seg.kind == token_kind::end)
 			break;
 		// Refused HERE because nothing upstream could have refused it. `${x-$((1}`
@@ -379,11 +383,11 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				// Quoting suppresses pathname expansion: `echo "*.txt"` must print
 				// *.txt, not a filename. So a field is only glob-eligible when a
 				// metacharacter arrived from unquoted text.
-				if (!quoted && has_pattern_characters(body))
+				if (ctx.split && has_pattern_characters(body))
 					_field_globbable = true;
-				// Backslash removal is part of quote removal, and it behaves
-				// differently inside double quotes - there it escapes only a few
-				// bytes. Outside, it escapes anything.
+				// Backslash removal is part of quote removal, and which bytes a
+				// backslash escapes depends on the context - see
+				// expand_context::escapes, where the three sets live.
 				for (size_t i = 0; i < body.size(); ++i) {
 					if (body[i] == '\\' && i + 1 < body.size() && body[i + 1] == '\n') {
 						// A line continuation: BOTH characters vanish. Removing only
@@ -394,13 +398,18 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					}
 					if (body[i] == '\\' && i + 1 < body.size()) {
 						const char next = body[i + 1];
-						if (!quoted || next == '"' || next == '\\' || next == '$' || next == '`') {
+						if (ctx.escapes(next)) {
+							// An escaped byte is quoted, so it never separates fields even
+							// where the unescaped one would: `${a+\ x}` is one field.
 							push_byte(next);
 							++i;
 							continue;
 						}
 					}
-					push_byte(body[i]);
+					if (ctx.split && ctx.substituted)
+						append_split(body.substr(i, 1), out);
+					else
+						push_byte(body[i]);
 				}
 			} break;
 
@@ -413,15 +422,21 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 			} break;
 
 			case token_kind::seg_double_quoted: {
-				// Expansion happens inside, field splitting does not. Recursing with
-				// quoted=true is what encodes that.
+				// Expansion happens inside, field splitting does not - but whether a
+				// FIELD LIST is being built is the enclosing context's business, so
+				// `"$@"` in a command argument still gives one field per parameter
+				// while `x="$@"` joins.
 				_field_started = true;
 				if (body.size() >= 2) {
 					// The interior is lexed as the inside of double quotes: a single
 					// quote there is an ordinary byte, not the start of a quoted run.
 					const expansion_status inner =
-						expand_text(body.substr(1, body.size() - 2), true, out,
-						            lex_mode::double_quote_interior);
+						expand_text(body.substr(1, body.size() - 2),
+						            expand_context{.split = false,
+						                           .fields = ctx.fields,
+						                           .double_quoted = true,
+						                           .mode = lex_mode::double_quote_interior},
+						            out);
 					if (inner != expansion_status::ok)
 						status = inner;
 				}
@@ -438,7 +453,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				// written, which is why it is handled before anything else.
 				if (p.op == param_op::none && (p.name == "@" || p.name == "*")) {
 					const size_t count = _params.positional_count();
-					if (quoted && p.name == "@") {
+					if (ctx.double_quoted && ctx.fields && p.name == "@") {
 						for (size_t i = 1; i <= count; ++i) {
 							std::string_view arg;
 							if (!_params.positional_at(i, arg))
@@ -447,7 +462,11 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 								finish_field(out);   // one field each
 							append(arg);
 						}
-					} else if (quoted) {  // "$*"
+					} else if (!ctx.split) {
+						// One value: `"$*"`, and also `x=$@` and `x="$@"`, which dash
+						// joins - the field list `"$@"` would make has nowhere to go, and
+						// keeping only the last field is what the old flag did (`x=$@`
+						// assigned `c`).
 						const std::string_view sep = _params.ifs();
 						const char joiner = sep.empty() ? '\0' : sep[0];
 						for (size_t i = 1; i <= count; ++i) {
@@ -502,32 +521,54 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				const bool absent = !found || (p.colon && value.empty());
 
 				switch (p.op) {
+					// The argument of `-` and `+` is expanded IN PLACE, in the context
+					// of the expansion itself, rather than expanded to a value that is
+					// then appended. POSIX 2.6.2 makes the argument part of the word, so
+					// its backslashes and quotes read the way the surrounding text does
+					// and field splitting sees its STRUCTURE: `${a+\ x y}` is two fields
+					// `[ x]` and `[y]`, because the escaped blank is not a separator and
+					// the bare one is. Expanding to a value first flattened both into
+					// bytes and then split on the bytes, which is quote-p.tst's eleven
+					// 'backslashes/quotes in substitution of expansion' cases.
 					case param_op::use_default:
 						if (absent) {
-							const std::string_view d = expand_assignment_value(p.argument);
-							if (quoted) append(d); else append_split(d, out);
+							expand_context arg = ctx;
+							arg.substituted = true;
+							const expansion_status inner = expand_text(p.argument, arg, out);
+							if (inner != expansion_status::ok)
+								status = inner;
 							break;
 						}
 						goto substitute_value;
 
 					case param_op::assign_default:
 						if (absent) {
-							const std::string_view d = expand_assignment_value(p.argument);
+							// `=` is the one that needs a value as well as a substitution,
+							// and the two are NOT the same string: quote removal happens
+							// before the assignment, so the value holds a literal blank
+							// where the word held `\ ` - and the substitution then splits
+							// the VALUE, leading blank and all. quote-p.tst's 'quotes in
+							// substitution of expansion ${a=b}' turns on exactly that:
+							// `${a=\ x}` substitutes `[x]` while `${a+\ x}` gives `[ x]`.
+							const std::string_view d = expand_to_value(p.argument, ctx);
 							// A REFUSED assignment - `readonly x; : ${x=1}` - is a variable
 							// assignment error, which POSIX makes fatal to a non-interactive
 							// shell. The assigner has already reported it by name; what it
 							// cannot do is stop the command, so the flag is set here.
 							if (_assign != nullptr && !_assign->assign_parameter(p.name, d))
 								_fatal_error = true;
-							if (quoted) append(d); else append_split(d, out);
+							if (ctx.split) append_split(d, out); else append(d);
 							break;
 						}
 						goto substitute_value;
 
 					case param_op::use_alternate:
 						if (!absent) {
-							const std::string_view d = expand_assignment_value(p.argument);
-							if (quoted) append(d); else append_split(d, out);
+							expand_context arg = ctx;
+							arg.substituted = true;
+							const expansion_status inner = expand_text(p.argument, arg, out);
+							if (inner != expansion_status::ok)
+								status = inner;
 						}
 						break;
 
@@ -540,7 +581,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 								        : std::string_view{"parameter not set"};
 							const std::string_view message =
 								p.argument.empty() ? fallback
-								                   : expand_assignment_value(p.argument);
+								                   : expand_to_value(p.argument, ctx);
 							std::fprintf(stderr, "lesh: %.*s: %.*s\n",
 							             static_cast<int>(p.name.size()), p.name.data(),
 							             static_cast<int>(message.size()), message.data());
@@ -566,7 +607,27 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 						}
 						// The pattern is expanded but NOT globbed - it is a pattern,
 						// not a filename. The matcher is #23's, shared with `case`.
-						const std::string_view pat = expand_assignment_value(p.argument);
+						//
+						// Expanded with the DOUBLE-QUOTED rules whatever the enclosing
+						// context, which is deliberate and still wrong: a backslash has to
+						// survive expansion for the matcher to see `\*` as a literal
+						// asterisk, so quote removal cannot run here, and a QUOTED `*`
+						// (`${a#"*"}`) is therefore still treated as a metacharacter.
+						// Lexed as a WORD interior whatever the enclosing mode, because a
+						// quote inside `${...}` is a quote even where the surrounding text
+						// has none: `cat <<END` holding `${foo%"oo"}` trims `oo`, and a
+						// here-document body's own `"` is an ordinary byte (redir-p.tst's
+						// 'parameter expansion with unquoted here-document delimiter').
+						//
+						// Doing it properly wants the expansion to carry which bytes came
+						// out quoted, which is param-p.tst's four trim cases and
+						// quote-p.tst's 'quotes in pattern of expansions'; left as it was
+						// rather than regressed toward removing the backslashes too.
+						const std::string_view pat = expand_to_value(
+							p.argument, expand_context{.split = false,
+							                           .fields = false,
+							                           .double_quoted = true,
+							                           .mode = lex_mode::word_interior});
 						std::string_view result = value;
 						const bool prefix = p.op == param_op::trim_prefix_short ||
 						                    p.op == param_op::trim_prefix_long;
@@ -578,7 +639,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 							result = prefix ? value.substr(n)
 							                : value.substr(0, value.size() - n);
 						}
-						if (quoted) append(result); else append_split(result, out);
+						if (ctx.split) append_split(result, out); else append(result);
 						break;
 					}
 
@@ -589,12 +650,12 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 							break;
 						}
 						if (found) {
-							if (quoted) {
-								append(value);
-							} else {
+							if (ctx.split) {
 								if (has_pattern_characters(value))
 									_field_globbable = true;
 								append_split(value, out);
+							} else {
+								append(value);
 							}
 						}
 						break;
@@ -625,10 +686,17 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					// POSIX: trailing newlines are removed from the result.
 					while (!result.empty() && result.back() == '\n')
 						result.remove_suffix(1);
-					if (quoted)
-						append(result);
-					else
+					if (ctx.split) {
+						// The result is glob-eligible: cmdsub-p.tst's 'pathname expansion
+						// on result of command substitution' requires `$(echo 'dumm*ile')`
+						// to become the matching filename. Missing here while the same
+						// rule was applied to a variable's value two branches up.
+						if (has_pattern_characters(result))
+							_field_globbable = true;
 						append_split(result, out);
+					} else {
+						append(result);
+					}
 				}
 			} break;
 
@@ -639,8 +707,14 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					inner = inner.substr(3, inner.size() - 5);
 
 				// The inner text is expanded first: `$((x + $y))` is legal, and the
-				// evaluator sees only arithmetic.
-				const std::string_view resolved = expand_assignment_value(inner);
+				// evaluator sees only arithmetic. Double-quoted rules, because the
+				// evaluator wants the bytes the user wrote rather than a shell-quoted
+				// version of them.
+				const std::string_view resolved = expand_to_value(
+					inner, expand_context{.split = false,
+					                      .fields = false,
+					                      .double_quoted = true,
+					                      .mode = lex_mode::word_interior});
 
 				if (_vars == nullptr) {
 					// No mutable state - completion's mode. Evaluating would still be
@@ -676,7 +750,7 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				// results of expansions' sets `IFS=' 0'` and requires `$((708))` to
 				// become two fields.
 				const std::string_view text{digits, n > 0 ? static_cast<size_t>(n) : 0};
-				if (quoted) append(text); else append_split(text, out);
+				if (ctx.split) append_split(text, out); else append(text);
 			} break;
 
 			default:
@@ -688,7 +762,40 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 	return status;
 }
 
-std::string_view expander::expand_assignment_value(std::string_view text) noexcept {
+// One VALUE rather than a field list, in the caller's own quoting rules.
+std::string_view expander::expand_value(std::string_view text,
+                                        value_context context) noexcept {
+	expand_context ctx;
+	ctx.split = false;   // no field splitting and no pathname expansion, in all three
+	ctx.fields = false;  // and so `"$@"` joins rather than making fields nobody reads
+	switch (context) {
+		case value_context::assignment:
+		case value_context::redirection_operand:
+			// UNQUOTED backslash rules. This is the half the old single flag got
+			// wrong: `x=\!` assigned `\!` and `cat <\i'n'"0"` looked for a file
+			// called `\in0`, because suppressing field splitting also switched the
+			// backslash rules to the double-quoted ones (#42).
+			ctx.double_quoted = false;
+			ctx.mode = lex_mode::word_interior;
+			break;
+		case value_context::here_document_body:
+			// As if double-quoted, except that `"` is not special - so the quotes in
+			// the body survive. Lexed as a word interior, they did not: `it's` in a
+			// body came out as `its` and `a"b` as `ab`.
+			ctx.double_quoted = true;
+			ctx.mode = lex_mode::here_doc_body;
+			break;
+	}
+	return expand_to_value(text, ctx);
+}
+
+std::string_view expander::expand_to_value(std::string_view text,
+                                           expand_context ctx) noexcept {
+	// A value is one string, so field splitting and `"$@"`'s field list are both
+	// off however the caller's context reads.
+	ctx.split = false;
+	ctx.fields = false;
+
 	// RE-ENTRANT. Arithmetic expansion calls this from inside expand_text to
 	// resolve its own inner text, so the caller's accumulator must survive.
 	// Nulling _current on exit unconditionally clobbered it - UBSan caught the
@@ -707,9 +814,7 @@ std::string_view expander::expand_assignment_value(std::string_view text) noexce
 	_run = split_run::none;
 	_run_closed_a_field = false;
 
-	// quoted=true suppresses field splitting, which is the assignment rule: the
-	// value is one word however many blanks the expansion produced.
-	std::ignore = expand_text(text, true, discard);
+	std::ignore = expand_text(text, ctx, discard);
 
 	const size_t n = accumulator.size();
 	char* block = nullptr;
@@ -757,7 +862,7 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	// expand_text, where quoting context is still being tracked.
 	const size_t before_fields = out.size();
 	_field_globbable = false;
-	const expansion_status status = expand_text(text, false, out);
+	const expansion_status status = expand_text(text, expand_context{}, out);
 	finish_field(out);
 
 	if (_glob_enabled && _field_globbable) {

@@ -25,6 +25,12 @@ enum class lex_mode : uint8_t {
 	// instead made `echo "it's"` print `it`, because `'s"` was taken for the start
 	// of a single-quoted segment and its quotes were removed.
 	double_quote_interior,
+	// The BODY of an unquoted here-document. POSIX 2.7.4 makes it behave as if
+	// double-quoted except that `"` is not special either, so BOTH quote
+	// characters are ordinary bytes. Lexed as a word interior instead, a body
+	// containing `it's` came out as `its` and `a"b` as `ab` - quote removal on text
+	// that never had quotes (#42).
+	here_doc_body,
 	here_doc_delimiter,  // the word after << : quoting matters, expansion does not
 };
 

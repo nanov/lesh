@@ -10,6 +10,12 @@
 # loop that merely drops IFS bytes cannot produce. They print brackets so a lost
 # empty field is visible rather than invisible.
 #
+# The value-context cases at the end are #42's other half. One flag meant both "no
+# field splitting" and "double-quoted backslash rules", so switching off the first
+# switched on the second: an assignment kept the backslash in `x=\!`, a redirection
+# operand looked for a file called `\in0`, and a here-document body had its quotes
+# REMOVED because it was lexed as the interior of a word.
+#
 # Prose lives HERE and not between cases: a case body runs to the next `---`, so a
 # comment block in the middle of the file becomes part of the PRECEDING case - and
 # the legacy front end aborts on one, which showed up as a FAIL on a case this
@@ -92,3 +98,42 @@ IFS=' 0'; for f in $((708)); do printf '[%s]' "$f"; done; echo
 
 --- an empty expansion yields no field but quotes make one [xfail(legacy): legacy has no field splitting]
 a=; for f in x $a ''$a; do printf '[%s]' "$f"; done; echo
+
+--- an assignment value uses unquoted backslash rules [xfail(legacy): legacy applies no quote removal to an assignment value]
+x=\!; y=a\ b; printf '[%s][%s]\n' "$x" "$y"
+
+--- a redirection operand has its quotes removed [xfail(legacy): legacy ignores redirect nodes entirely]
+echo body > /tmp/lesh_spec_in0; cat </tmp/lesh_spec_i'n'"0"
+
+--- a here-document body keeps its quotes [xfail(legacy): legacy has no here-documents]
+cat <<END
+it's a"b" c
+END
+
+--- a here-document body escapes only dollar, backquote and backslash [xfail(legacy): legacy has no here-documents]
+cat <<END
+\$ \\ \` \" \z
+END
+
+--- an expansion error in a here-document body fails the redirection [xfail(legacy): legacy has no here-documents]
+echo not printed <<END
+${nope?}
+END
+
+--- an unquoted dollar-at in an assignment joins rather than keeping the last field [xfail(legacy): legacy has no positional parameters]
+set a b c; x=$@; y="$@"; printf '[%s][%s]\n' "$x" "$y"
+
+--- a default argument is expanded in the context of the expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+for f in ${u-\!a b} "${u-\!a b}"; do printf '[%s]' "$f"; done; echo
+
+--- a single quote in a default is a quote outside double quotes [xfail(legacy): legacy has no parameter expansion beyond $name]
+for f in ${u-a'b c'd}; do printf '[%s]' "$f"; done; echo
+
+--- assign-default removes quotes before assigning and splits the value after [xfail(legacy): legacy has no parameter expansion beyond $name]
+for f in ${a=\ x}; do printf '[%s]' "$f"; done; echo; printf '[%s]\n' "$a"
+
+--- only hash and percent have a doubled form [xfail(legacy): legacy has no parameter expansion beyond $name]
+printf '[%s][%s]\n' "${u--x}" "${u-=x}"
+
+--- a command substitution result is glob-eligible [xfail(legacy): legacy has no command substitution]
+mkdir -p /tmp/lesh_spec_glob && : > /tmp/lesh_spec_glob/dummyfile && cd /tmp/lesh_spec_glob && for f in $(echo 'dumm*ile'); do printf '[%s]' "$f"; done; echo

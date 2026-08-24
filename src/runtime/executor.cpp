@@ -201,7 +201,8 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	arena_array<std::string_view> fields{_pool, 2};
 	{
 		// Reparse the target as a standalone word so the expander sees it whole.
-		const std::string_view expanded = ex.expand_assignment_value(target_text);
+		const std::string_view expanded =
+			ex.expand_value(target_text, value_context::redirection_operand);
 		fields.push(expanded);
 	}
 	// `set -u` in a redirection target is as fatal as anywhere else: dash exits 2
@@ -350,8 +351,22 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 	// - the body is one blob of text, not a word list.
 	std::string expanded;
 	if (body.expand) {
-		expander ex{_pool, _state, &_runner, false, &_state, &_state};
-		const std::string_view result = ex.expand_assignment_value(text);
+		// make_expander, not a hand-built one: `set -u` was recorded and inert here
+		// while every other expansion site honoured it, which is exactly the reason
+		// there is one factory (see the comment on it).
+		expander ex = make_expander();
+		const std::string_view result =
+			ex.expand_value(text, value_context::here_document_body);
+		// A fatal expansion error in the BODY fails the redirection rather than the
+		// shell. `${a?}` in a body was reported and then ignored, so
+		// `echo not printed <<END` printed it (redir-p.tst:436) - the site #35 left
+		// out of the fatal-error wiring. Deliberately not expansion_failed(), which
+		// also arranges for a non-interactive shell to exit: dash prints the
+		// diagnostic, skips the command, and carries on to the next one, and it is a
+		// REDIRECTION error, which POSIX 2.8.1 does not make fatal for a command
+		// other than a special builtin.
+		if (ex.fatal_error())
+			return false;
 		expanded.assign(result);
 		text = expanded;
 	}
@@ -1225,7 +1240,8 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 				// shell over it anyway.
 				if (eq != std::string_view::npos)
 					std::ignore = _state.set_exported(
-						a.substr(0, eq), child_ex.expand_assignment_value(a.substr(eq + 1)));
+						a.substr(0, eq),
+						child_ex.expand_value(a.substr(eq + 1), value_context::assignment));
 			}
 		}
 
@@ -1251,7 +1267,8 @@ std::string_view tree_walking_executor::expand_assignment(std::string_view text)
 	if (eq == std::string_view::npos)
 		return text;
 	expander ex = make_expander();
-	const std::string_view value = ex.expand_assignment_value(text.substr(eq + 1));
+	const std::string_view value =
+		ex.expand_value(text.substr(eq + 1), value_context::assignment);
 	(void)expansion_failed(ex);
 	const std::string_view name = text.substr(0, eq);
 	char* joined = nullptr;
@@ -1310,7 +1327,7 @@ void tree_walking_executor::trace_command(const arena_array<std::string_view>& p
 		// A separate expander with NO runner: a command substitution in PS4 would
 		// otherwise recurse into tracing itself.
 		expander ex{_pool, _state, nullptr, false, &_state, &_state};
-		expanded_ps4.assign(ex.expand_assignment_value(raw));
+		expanded_ps4.assign(ex.expand_value(raw, value_context::assignment));
 		ps4 = expanded_ps4;
 	}
 	std::string line{ps4};
@@ -1406,7 +1423,8 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 			if (eq == std::string_view::npos)
 				continue;
 			const std::string_view name = a.substr(0, eq);
-			if (!_state.set_exported(name, ex.expand_assignment_value(a.substr(eq + 1)))) {
+			if (!_state.set_exported(
+					name, ex.expand_value(a.substr(eq + 1), value_context::assignment))) {
 				shell_state::report_readonly({}, name);
 				return assignment_error();
 			}

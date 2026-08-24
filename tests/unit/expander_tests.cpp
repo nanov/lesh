@@ -85,7 +85,7 @@ protected:
 	//
 	// `fatal_out` reports expander::fatal_error(), which is a SEPARATE channel from
 	// the returned status and the only one a defect inside a parameter default can
-	// travel on: expand_assignment_value returns a value, so it has no status to
+	// travel on: expand_value returns a value, so it has no status to
 	// hand back to expand_text. It is also the channel the executor acts on.
 	std::vector<std::string> expand(std::string_view src, command_runner* runner = nullptr,
 	                                expansion_status* status_out = nullptr,
@@ -113,6 +113,14 @@ protected:
 		for (const auto& f : fields)
 			out.emplace_back(f);
 		return out;
+	}
+
+	// Expands text into a single VALUE in one of the three value contexts. The
+	// three differ in their quoting rules, which is the whole reason
+	// value_context exists (#42).
+	std::string value(std::string_view text, value_context context) {
+		expander ex{pool, params};
+		return std::string(ex.expand_value(text, context));
 	}
 };
 
@@ -285,6 +293,100 @@ TEST_F(ExpanderTest, BackslashEscapesAreRemoved) {
 	EXPECT_EQ(expand("echo a\\ b"), (std::vector<std::string>{"echo", "a b"}));
 }
 
+// The three value contexts, which one `quoted` flag could not tell apart. It meant
+// "no field splitting" and "double-quoted backslash rules" at once, so suppressing
+// the first switched the second (#42).
+TEST_F(ExpanderTest, AnAssignmentValueUsesUNQUOTEDBackslashRules) {
+	// `x=\!` assigned `\!`, because the flag that turned field splitting off also
+	// said "inside double quotes", where a backslash before `!` is literal.
+	EXPECT_EQ(value("\\!", value_context::assignment), "!");
+	EXPECT_EQ(value("a\\ b", value_context::assignment), "a b") << "and still one value";
+}
+
+TEST_F(ExpanderTest, ARedirectionOperandUsesUNQUOTEDBackslashRulesToo) {
+	// `cat <\i'n'"0"` looked for a file called `\in0` - redir-p.tst:73.
+	EXPECT_EQ(value("\\i'n'\"0\"", value_context::redirection_operand), "in0");
+}
+
+TEST_F(ExpanderTest, AHereDocumentBodyKeepsItsQuotes) {
+	// POSIX 2.7.4: the body behaves as if double-quoted EXCEPT that `"` is not
+	// special - so neither quote character is. Lexed as a word interior instead,
+	// `it's` came out as `its` and `a"b` as `ab`: quote removal on text that never
+	// had quotes.
+	EXPECT_EQ(value("it's", value_context::here_document_body), "it's");
+	EXPECT_EQ(value("a\"b\"c", value_context::here_document_body), "a\"b\"c");
+	// The escapes that DO apply there, and the one that does not.
+	EXPECT_EQ(value("\\$ \\\\ \\\" \\z", value_context::here_document_body), "$ \\ \\\" \\z");
+}
+
+TEST_F(ExpanderTest, AnUnquotedDollarAtInAValueJoinsRatherThanLosingEveryFieldButTheLast) {
+	// `x=$@` assigned `c` for `set a b c`: the branch produced a field list into an
+	// array the value path discards. dash joins on IFS, and so does `x="$@"`.
+	params.args = {"a", "b", "c"};
+	EXPECT_EQ(value("$@", value_context::assignment), "a b c");
+	EXPECT_EQ(value("\"$@\"", value_context::assignment), "a b c");
+	params.separators = ":";
+	EXPECT_EQ(value("$@", value_context::assignment), "a:b:c");
+}
+
+TEST_F(ExpanderTest, AQuotedDollarAtInACommandWordStillMakesOneFieldPerParameter) {
+	// The other half of the same distinction: inside double quotes in a command's
+	// argument, field splitting is off while `"$@"` still yields a field each.
+	params.args = {"a b", "c"};
+	EXPECT_EQ(expand("echo \"$@\""), (std::vector<std::string>{"echo", "a b", "c"}));
+}
+
+// The argument of a ${...} operator is part of the WORD, so it is expanded in the
+// context of the expansion rather than flattened to a value and appended.
+TEST_F(ExpanderTest, ADefaultsArgumentIsExpandedInContext) {
+	// Unquoted, so the backslash escapes anything and the escaped blank does not
+	// separate while the bare one does. quote-p.tst's eleven 'backslashes in
+	// substitution of expansion' cases are this.
+	EXPECT_EQ(expand("echo ${u-\\!a b}"),
+	          (std::vector<std::string>{"echo", "!a", "b"}));
+	// Inside double quotes, the double-quote rules and no splitting at all.
+	EXPECT_EQ(expand("echo \"${u-\\!a b}\""),
+	          (std::vector<std::string>{"echo", "\\!a b"}));
+}
+
+TEST_F(ExpanderTest, ASingleQuoteInADefaultIsAQuoteOutsideDoubleQuotesAndAByteInside) {
+	EXPECT_EQ(expand("echo ${u-a'b c'd}"),
+	          (std::vector<std::string>{"echo", "ab cd"}));
+	EXPECT_EQ(expand("echo \"${u-a'b}\""),
+	          (std::vector<std::string>{"echo", "a'b"}));
+}
+
+TEST_F(ExpanderTest, AssignDefaultRemovesQuotesBeforeAssigningAndThenSplitsTheValue) {
+	// The one operator that needs a value AND a substitution, and they are not the
+	// same string: quote removal happens before the assignment, so the value holds
+	// a literal blank where the word held `\ ` - and the substitution then splits
+	// the VALUE, leading blank and all. quote-p.tst's 'quotes in substitution of
+	// expansion ${a=b}': `${a=\ x}` substitutes `[x]` while `${a+\ x}` gives `[ x]`.
+	FakeAssigner assigner;
+	const tree t = parse(pool, "echo ${a=\\ x}");
+	const node_index cmd = t.child_of(t[t.root()], 0);
+	expander ex{pool, params, nullptr, true, nullptr, &assigner};
+	lesh::arena_array<std::string_view> fields{pool, 4};
+	ex.expand_word(t, t.child_of(t[cmd], 1), fields);
+	ASSERT_EQ(fields.size(), 1u);
+	EXPECT_EQ(std::string(fields[0]), "x") << "the substitution is split, so the blank goes";
+	EXPECT_EQ(assigner.assigned["a"], " x") << "the value keeps it, quotes removed";
+}
+
+TEST_F(ExpanderTest, OnlyHashAndPercentHaveADoubledForm) {
+	// `${u--x}` is the default `-x`, not a `--` operator. Testing every operator
+	// for a repeated character ate the first byte of the argument and substituted
+	// `x`, which is three of fsplit-p.tst's cases - their defaults all begin with a
+	// hyphen.
+	EXPECT_EQ(expand("echo ${u--x}"), (std::vector<std::string>{"echo", "-x"}));
+	EXPECT_EQ(expand("echo ${u-=x}"), (std::vector<std::string>{"echo", "=x"}));
+	params.vars["v"] = "aab";
+	EXPECT_EQ(expand("echo ${v##a*}"), (std::vector<std::string>{"echo"}))
+		<< "and ## is still the longest-prefix form: it consumes everything, and an "
+		   "unquoted expansion that yields one empty field yields no field at all";
+	EXPECT_EQ(expand("echo ${v#a*}"), (std::vector<std::string>{"echo", "ab"}));
+}
+
 TEST_F(ExpanderTest, TildeExpandsToHome) {
 	EXPECT_EQ(expand("echo ~"), (std::vector<std::string>{"echo", "/home/tester"}));
 }
@@ -336,7 +438,7 @@ TEST_F(ExpanderTest, UnterminatedArithmeticInsideAParameterDefaultIsRefused) {
 	// scan counts braces, the `}` closes the parameter expansion - so no defect
 	// reaches the parser and the damage is entirely inside the expansion. The
 	// arithmetic case then strips `$((` and `))` from a segment too short to hold
-	// them, so expand_text and expand_assignment_value re-expanded the same four
+	// them, so expand_text and expand_to_value re-expanded the same four
 	// bytes until the stack ran out. Before the check below this test did not fail,
 	// it CRASHED: ASan reported a stack overflow alternating between the two.
 	bool fatal = false;
@@ -406,21 +508,24 @@ TEST_F(ExpanderTest, UnterminatedCommandSubstitutionInsideADefaultIsRefused) {
 TEST_F(ExpanderTest, UnterminatedQuoteInsideADefaultIsNotRefused) {
 	// The DELIBERATE edge of the check, asserted so it cannot be widened by
 	// accident. Whether a quote inside `${x-...}` is a quote at all depends on the
-	// double-quote context POSIX 2.6.2 gives it - `dash -c 'echo "${x-'"'"'}"'`
-	// prints a single quote and exits 0 - and expand_assignment_value does not
-	// carry that context yet (#42). Refusing here would trade a crash for a
-	// diagnostic on input dash accepts, so only the constructs whose delimiters
-	// the expander STRIPS are refused.
+	// double-quote context POSIX 2.6.2 gives it: inside double quotes it is an
+	// ordinary byte, and dash prints it - `dash -c 'echo "${x-'"'"'}"'` writes one
+	// single quote at status zero. Only the constructs whose delimiters the
+	// expander STRIPS are refused.
+	//
+	// The expected value used to be the empty string, because the default was
+	// re-lexed without the enclosing context and the quote ate the rest (#42). The
+	// default is now expanded in place, so the byte survives.
 	bool fatal = false;
 	EXPECT_EQ(expand("echo \"${x-'}\"", nullptr, nullptr, &fatal),
-	          (std::vector<std::string>{"echo", ""}));
+	          (std::vector<std::string>{"echo", "'"}));
 	EXPECT_FALSE(fatal);
 }
 
 TEST(ExpanderDepthTest, DeeplyNestedExpansionIsRefusedRatherThanExhaustingTheStack) {
 	// Well formed, and still unbounded. Refusing an unterminated construct bounds
 	// the recursion by the length of the input, which is not a bound: every level
-	// of `${x-...}` re-enters expand_text through expand_assignment_value, so
+	// of `${x-...}` re-enters expand_text, so
 	// nesting in the input is nesting on the C++ stack. Measured on the debug build
 	// before the limit: 1500 levels expanded, 2000 overflowed the stack. dash gets
 	// further on the same input and then does the same thing - `hi` at 16000,
@@ -438,6 +543,6 @@ TEST(ExpanderDepthTest, DeeplyNestedExpansionIsRefusedRatherThanExhaustingTheSta
 	text += "hi";
 	text.append(5000, '}');
 
-	EXPECT_TRUE(ex.expand_assignment_value(text).empty());
+	EXPECT_TRUE(ex.expand_value(text, value_context::assignment).empty());
 	EXPECT_TRUE(ex.fatal_error());
 }
