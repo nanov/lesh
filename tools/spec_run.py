@@ -48,6 +48,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -171,27 +172,39 @@ def run_shell(shell: str, testee: str, code: str, timeout: float, on_stdin: bool
     `[stdin]` case is instead spawned with NO arguments and the body written to fd
     0, which is what a script really looks like to a shell and is the path that
     hid #31.
+
+    EVERY CASE RUNS IN ITS OWN EMPTY DIRECTORY. Not for isolation between cases -
+    they use absolute paths - but because a case is also run against `legacy`, which
+    has no command substitution and no compound commands, so it reads a one-line
+    case as a single command with every later word as an operand. One `mkdir` case
+    therefore created twelve directories named `for`, `in`, `do`, `;`, `[%s]` and
+    friends. They were EMPTY, so `git status` could not see them, and they sat in the
+    repo root until someone listed it by hand. A runner that litters the tree it is
+    testing is a runner nobody trusts.
     """
-    proc = subprocess.Popen(
-        [shell] if on_stdin else [shell, "-c", code],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.PIPE if on_stdin else subprocess.DEVNULL,
-        text=True,
-        env=child_env(testee),
-        start_new_session=True,  # own process group, so killpg reaches grandchildren
-    )
-    try:
-        # A script ends in a newline; parse_spec strips the body, so put it back.
-        out, err = proc.communicate(code + "\n" if on_stdin else None, timeout=timeout)
-        return Run(out, err, proc.returncode, False)
-    except subprocess.TimeoutExpired:
+    with tempfile.TemporaryDirectory(prefix="spec.") as work:
+        proc = subprocess.Popen(
+            [shell] if on_stdin else [shell, "-c", code],
+            cwd=work,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if on_stdin else subprocess.DEVNULL,
+            text=True,
+            env=child_env(testee),
+            start_new_session=True,  # own group, so killpg reaches grandchildren
+        )
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
-        out, err = proc.communicate()
-        return Run(out, err, -1, True)
+            # A script ends in a newline; parse_spec strips the body, so put it back.
+            out, err = proc.communicate(code + "\n" if on_stdin else None,
+                                        timeout=timeout)
+            return Run(out, err, proc.returncode, False)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            out, err = proc.communicate()
+            return Run(out, err, -1, True)
 
 
 def diff(label: str, got: str, want: str) -> list[str]:
@@ -224,6 +237,11 @@ def main() -> int:
     passed = xfailed = failed = xpassed = 0
     ref_testee = testee_path(args.ref)
     shell_testee = testee_path(args.shell)
+    # The shells themselves are addressed absolutely for the same reason $TESTEE is:
+    # each case now runs in its own empty directory, so `--shell ./build/debug/lesh`
+    # would resolve against that and vanish. testee_path already does the work.
+    args.ref = ref_testee
+    args.shell = shell_testee
 
     if args.frontend:
         print(f"front end under test: {args.frontend}")
