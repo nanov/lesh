@@ -90,6 +90,23 @@ private:
 		const size_t at = _position + ahead;
 		return at < _source.size() ? _source[at] : '\0';
 	}
+	[[nodiscard]] constexpr char char_at(uint32_t at) const noexcept {
+		return at < _source.size() ? _source[at] : '\0';
+	}
+	// The first position at or after `at` that does not begin a line continuation.
+	//
+	// POSIX 2.2.1 removes `\<newline>` BEFORE the input is tokenised, so every
+	// lookahead has to look PAST one: `>\<newline>>` is the operator `>>`,
+	// `c\<newline>ase` is the reserved word `case`, and `$\<newline>{f}` is a
+	// parameter expansion. Treated as removal here rather than by rewriting the
+	// input, because the lexer owns no memory (#9) and a rewritten buffer would
+	// break every offset the line editor and `node_at` depend on. A TRAILING
+	// backslash is left alone: it is incomplete input, not a continuation yet.
+	[[nodiscard]] constexpr uint32_t past_continuations(uint32_t at) const noexcept {
+		while (at + 1 < _source.size() && _source[at] == '\\' && _source[at + 1] == '\n')
+			at += 2;
+		return at;
+	}
 
 	bool skip_blanks_and_comments() noexcept;  // returns whether anything was skipped
 	token lex_operator() noexcept;

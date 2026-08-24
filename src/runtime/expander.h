@@ -228,6 +228,8 @@ private:
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
 	void push_byte(char c) noexcept;
+	// A segment body with its line continuations removed. See the definition.
+	[[nodiscard]] std::string_view without_continuations(std::string_view body) noexcept;
 	// Bytes that arrived QUOTED: escaped in a pattern context, verbatim otherwise.
 	void append_quoted(std::string_view bytes, expand_context ctx) noexcept;
 	// Bytes that came out of an EXPANSION: escaped only when the expansion itself

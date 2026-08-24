@@ -117,15 +117,25 @@ bool is_assignable_name(std::string_view name) noexcept {
 	return true;
 }
 
+// Past any line continuations at `at`.
+constexpr size_t past_continuations(std::string_view text, size_t at) noexcept {
+	while (at + 1 < text.size() && text[at] == '\\' && text[at + 1] == '\n')
+		at += 2;
+	return at;
+}
+
 // The body of a parameter segment: what sits between `${` and `}`, or after `$`.
 std::string_view parameter_body(std::string_view segment) noexcept {
-	if (segment.size() >= 2 && segment[1] == '{') {
+	// Past the line continuations after the `$`, which POSIX removed before the
+	// input was tokenised: `$\<newline>{f}` is `${f}`.
+	const size_t at = past_continuations(segment, 1);
+	if (at < segment.size() && segment[at] == '{') {
 		const size_t close = segment.rfind('}');
-		if (close == std::string_view::npos || close < 2)
-			return segment.substr(2);
-		return segment.substr(2, close - 2);
+		if (close == std::string_view::npos || close < at + 1)
+			return segment.substr(at + 1);
+		return segment.substr(at + 1, close - at - 1);
 	}
-	return segment.substr(1);
+	return segment.substr(at);
 }
 
 // How a ${...} form modifies the value. POSIX's set, with the colon variants
@@ -315,6 +325,39 @@ void expander::append_value(std::string_view bytes, expand_context ctx) noexcept
 	// PATTERN, which is what makes `${w#${a}b}` and `${w#"${a}b"}` differ when a
 	// holds an asterisk - param-p.tst's 'parameter expansion in embedded pattern'.
 	append_quoted(bytes, ctx.double_quoted ? ctx : expand_context{.pattern = false});
+}
+
+// The interior of an expansion with its LINE CONTINUATIONS removed - except inside
+// SINGLE quotes, where a backslash-newline is two literal bytes and nothing else.
+//
+// POSIX 2.2.1 removes them before the input is tokenised, but the lexer records
+// the extent a segment SPANS rather than the text it means, so the expander is
+// where `${\<newline>f\<newline>}` has to become `${f}`. It cannot be done by the
+// lexer without rewriting the input, and it cannot be left to the literal-segment
+// handler either: by then the NAME and the OPERATOR have already been read off the
+// raw bytes, and `${f\<newline>#\<newline>f}` had a name of `f\<newline>` and no
+// operator at all (quote-p.tst's 'line continuation in parameter expansion').
+//
+// Returns the body unchanged when there is nothing to remove, which is almost
+// always, and costs no allocation then.
+std::string_view expander::without_continuations(std::string_view body) noexcept {
+	if (body.find('\\') == std::string_view::npos)
+		return body;
+	char* block = nullptr;
+	_pool.allocate(body.empty() ? 1 : body.size(), block, 1);
+	size_t written = 0;
+	bool in_single_quotes = false;
+	for (size_t i = 0; i < body.size(); ++i) {
+		if (body[i] == '\'')
+			in_single_quotes = !in_single_quotes;
+		if (!in_single_quotes && body[i] == '\\' && i + 1 < body.size() &&
+		    body[i + 1] == '\n') {
+			++i;
+			continue;
+		}
+		block[written++] = body[i];
+	}
+	return {block, written};
 }
 
 // One byte of ordinary text. Ends any separator run in progress, which is what
@@ -575,7 +618,8 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 			} break;
 
 			case token_kind::seg_parameter: {
-				const std::string_view pbody = parameter_body(body);
+				const std::string_view pbody =
+					parameter_body(without_continuations(body));
 				const parsed_parameter p = parse_parameter(pbody);
 
 				// $@ and $* are the only expansions whose FIELD COUNT depends on
@@ -848,7 +892,8 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 					break;
 				}
 				arena_array<char> captured{_pool, 256};
-				if (_runner->run_and_capture(substitution_body(body), captured)) {
+				if (_runner->run_and_capture(
+				        substitution_body(without_continuations(body)), captured)) {
 					std::string_view result{captured.data(), captured.size()};
 					// POSIX: trailing newlines are removed from the result.
 					while (!result.empty() && result.back() == '\n')
@@ -868,8 +913,11 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 			} break;
 
 			case token_kind::seg_arithmetic: {
-				// The lexer spans `$((...))`; strip the delimiters and evaluate.
-				std::string_view inner = body;
+				// The lexer spans `$((...))`; strip the delimiters and evaluate. The
+				// delimiters are at fixed offsets only once the line continuations
+				// between their characters are gone - `$\<newline>(\<newline>(1+2))`
+				// has a five-byte opener.
+				std::string_view inner = without_continuations(body);
 				if (inner.size() >= 5)
 					inner = inner.substr(3, inner.size() - 5);
 

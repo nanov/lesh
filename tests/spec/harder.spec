@@ -282,3 +282,103 @@ set -v
 echo one
 # a comment
 echo two
+
+--- a line continuation splits an operator [xfail(legacy): legacy's lexer treats a backslash-newline as an escape]
+: > /tmp/lesh_spec_lc; echo one >\
+> /tmp/lesh_spec_lc && cat /tmp/lesh_spec_lc
+
+--- a line continuation splits a reserved word [xfail(legacy): legacy has no compound commands]
+i\
+f true; th\
+en echo yes; f\
+i
+
+--- a line continuation splits a brace group and its operator [xfail(legacy): legacy has no compound commands]
+\
+{\
+ echo 1
+\
+}\
+||
+\
+{\
+ echo 2
+\
+}
+
+--- a line continuation splits a for loop [xfail(legacy): legacy has no compound commands]
+f\
+o\
+r i\
+ i\
+n 1 2
+d\
+o
+ echo $i
+d\
+one
+
+--- a line continuation splits an io number from its operator [xfail(legacy): legacy ignores redirect nodes entirely]
+: > /tmp/lesh_spec_lc2; echo two 3\
+>\
+> /tmp/lesh_spec_lc2 >\
+&\
+3; cat /tmp/lesh_spec_lc2
+
+--- a line continuation splits an assignment [xfail(legacy): legacy has no assignments]
+fo\
+o\
+=\
+b\
+ar
+echo $foo
+
+--- a line continuation splits a function definition [xfail(legacy): legacy has no function definitions]
+f\
+un\
+c \
+ ( \
+ )  \
+ # comment
+ \
+ ( echo ok )
+func
+
+--- a line continuation splits a parameter expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+f=foo
+echo $\
+f ${\
+f} ${#\
+f} ${f#\
+f} ${f:\
++x}
+
+--- a line continuation splits an arithmetic expansion [xfail(legacy): legacy has no arithmetic expansion]
+echo $\
+(\
+(\
+1 + 2\
+)\
+)
+
+--- a line continuation splits a command substitution [xfail(legacy): legacy has no command substitution]
+echo $\
+(\
+echo 1\
+)
+
+--- a line continuation splits a here-document operator and its delimiter [xfail(legacy): legacy has no here-documents]
+cat \
+<\
+<\
+\
+E\
+N\
+D\
+
+foo
+END
+
+--- but a backslash-newline inside single quotes is two literal bytes [xfail(legacy): legacy has no parameter expansion beyond $name]
+printf '[%s]\n' "${x-'a\
+b'}"

@@ -223,6 +223,62 @@ TEST(Lexer, TrailingBackslashIsIncompleteWithoutBeingAnError) {
 	EXPECT_TRUE(lx.incomplete());
 }
 
+// POSIX 2.2.1 removes `\<newline>` BEFORE the input is tokenised, so every
+// lookahead has to look past one. Read literally, an operator split across a
+// continuation was two operators, a reserved word was an ordinary word, and `(`
+// terminated the word it was supposed to open - fifteen of quote-p.tst's cases.
+TEST(Lexer, AnOperatorMayBeSplitByLineContinuations) {
+	const std::vector<std::pair<std::string, token_kind>> cases = {
+		{">\\\n>", token_kind::dgreat},
+		{"<\\\n<", token_kind::dless},
+		{"<\\\n<\\\n-", token_kind::dless_dash},
+		{">\\\n|", token_kind::clobber},
+		{">\\\n&", token_kind::great_and},
+		{"<\\\n&", token_kind::less_and},
+		{"<\\\n>", token_kind::less_great},
+		{"&\\\n&", token_kind::and_if},
+		{"|\\\n|", token_kind::or_if},
+		{";\\\n;", token_kind::dsemi},
+	};
+	for (const auto& [src, kind] : cases) {
+		lexer lx{src};
+		const token t = lx.next();
+		EXPECT_EQ(t.kind, kind) << src;
+		EXPECT_EQ(t.length, src.size()) << src << ": the token SPANS the continuation";
+	}
+}
+
+TEST(Lexer, ALineContinuationBetweenTokensIsNothingAtAll) {
+	// Left in place it began a WORD, so `\<newline>{` lexed as one word rather than
+	// as the reserved `{` and the shell looked for a command called `{`.
+	const auto tokens = lex_all("\\\n{\\\n echo 1\\\n;\\\n}");
+	ASSERT_GE(tokens.size(), 1u);
+	EXPECT_EQ(tokens[0].kind, token_kind::word);
+	EXPECT_EQ(tokens[0].text, "{\\\n") << "the word is `{` once the continuation goes";
+}
+
+TEST(Lexer, AnIoNumberSurvivesAContinuationBeforeItsOperator) {
+	// `3\<newline>>\<newline>>redir` is `3>>redir`. Read as a word the `3` became
+	// an ARGUMENT and the redirection landed on stdout, so a later `>&3` reported
+	// "not open for output".
+	lexer lx{"3\\\n>\\\n>redir"};
+	const token t = lx.next();
+	EXPECT_EQ(t.kind, token_kind::io_number);
+	const token op = lx.next();
+	EXPECT_EQ(op.kind, token_kind::dgreat);
+}
+
+TEST(Lexer, ADollarLooksPastAContinuationForItsBrace) {
+	// `(` is a word TERMINATOR, so this one is not cosmetic: `$\<newline>((1+2))`
+	// ended the word at the paren and parsed as a subshell.
+	for (const std::string src : {"$\\\n{f}", "$\\\n(echo 1)", "$\\\n(\\\n(1+2))"}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].kind, token_kind::word) << src;
+		EXPECT_EQ(tokens[0].text, src) << src << ": one word, not a word and an operator";
+	}
+}
+
 TEST(Lexer, LexingNeverFailsOnHalfTypedInput) {
 	// A highlighter sees every prefix of what the user types. None may throw, hang,
 	// or fail to terminate.

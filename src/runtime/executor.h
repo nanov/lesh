@@ -186,6 +186,8 @@ private:
 	bool save_fd(int fd, arena_array<saved_fd>* restore);
 	bool apply_redirection(const syntax::tree& t, syntax::node_index n,
 	                       arena_array<saved_fd>* restore);
+	// A token's text with its line continuations removed. See the definition.
+	[[nodiscard]] std::string_view joined_text(std::string_view text);
 	bool apply_here_doc(const syntax::tree& t, syntax::node_index n,
 	                    arena_array<saved_fd>* restore);
 	bool apply_redirections(const syntax::tree& t, syntax::node_index command,

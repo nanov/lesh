@@ -319,6 +319,30 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	return true;
 }
 
+// A token's text with its LINE CONTINUATIONS removed, in arena storage.
+//
+// POSIX 2.2.1 removes `\<newline>` before the input is tokenised, but the lexer
+// records the extent a token SPANS rather than the text it means - it owns no
+// memory and cannot rewrite the input (#9) - so every reader of a token's text as
+// a NAME has to do the removal itself. Returns the original view when there is
+// nothing to remove, which is almost always, and costs nothing then.
+std::string_view tree_walking_executor::joined_text(std::string_view text) {
+	size_t at = text.find('\\');
+	if (at == std::string_view::npos)
+		return text;
+	char* block = nullptr;
+	_pool.allocate(text.size() == 0 ? 1 : text.size(), block, 1);
+	size_t written = 0;
+	for (size_t i = 0; i < text.size(); ++i) {
+		if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\n') {
+			++i;
+			continue;
+		}
+		block[written++] = text[i];
+	}
+	return {block, written};
+}
+
 // Applies every redirection on a command, LEFT TO RIGHT. The order is
 // observable: `>a >b` leaves the fd pointing at b while creating both files.
 // Feeds a here-document body to stdin.
@@ -891,7 +915,10 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 	(void)name;
 	const bool has_in = (self.aux & 0x80000000u) != 0;
 	const uint32_t name_token = self.aux & 0x7FFFFFFFu;
-	const std::string_view var = t.text_of_token(t.token_at(name_token));
+	// Line continuations removed: `fo\<newline>r i\<newline>x in ...` names the
+	// variable `ix`, and the raw text created one whose name held a backslash and a
+	// newline, so the body saw nothing (quote-p.tst's `for in do done` case).
+	const std::string_view var = joined_text(t.text_of_token(t.token_at(name_token)));
 
 	// Every child but the last is a word to iterate; the last is the body.
 	const uint32_t word_count = self.children_count - 1;
@@ -1031,7 +1058,11 @@ int tree_walking_executor::run_function_definition(const tree& t, node_index n) 
 	if (self.children_count == 0)
 		return 0;
 	const token& name_token = t.token_at(self.aux);
-	const std::string name{t.text_of_token(name_token)};
+	// Line continuations removed, like every other name: `f\<newline>unc () { ... }`
+	// defines `func`, and the raw text registered a function whose name held a
+	// backslash and a newline, so calling `func` reported "No such file or
+	// directory" (quote-p.tst's 'line continuation in function definition').
+	const std::string name{joined_text(t.text_of_token(name_token))};
 	// A redefinition replaces the previous body, which is what POSIX requires and
 	// what makes reloading an rc file work.
 	_functions[name] = {&t, t.child_of(self, 0)};
@@ -1270,10 +1301,22 @@ std::string_view tree_walking_executor::expand_assignment(std::string_view text)
 	const std::string_view value =
 		ex.expand_value(text.substr(eq + 1), value_context::assignment);
 	(void)expansion_failed(ex);
-	const std::string_view name = text.substr(0, eq);
+	// The NAME's line continuations are removed too, and here rather than in the
+	// expander: the expander is handed the value alone. `fo\<newline>o=bar` assigns
+	// to `foo`, and copying the name verbatim created a variable whose name held a
+	// backslash and a newline (quote-p.tst's 'line continuation in assignment').
+	const std::string_view raw_name = text.substr(0, eq);
 	char* joined = nullptr;
-	_pool.allocate(name.size() + 1 + value.size(), joined, 1);
-	std::memcpy(joined, name.data(), name.size());
+	_pool.allocate(raw_name.size() + 1 + value.size(), joined, 1);
+	size_t written = 0;
+	for (size_t i = 0; i < raw_name.size(); ++i) {
+		if (raw_name[i] == '\\' && i + 1 < raw_name.size() && raw_name[i + 1] == '\n') {
+			++i;
+			continue;
+		}
+		joined[written++] = raw_name[i];
+	}
+	const std::string_view name{joined, written};
 	joined[name.size()] = '=';
 	std::memcpy(joined + name.size() + 1, value.data(), value.size());
 	return {joined, name.size() + 1 + value.size()};

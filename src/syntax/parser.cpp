@@ -18,6 +18,14 @@ bool looks_like_assignment(std::string_view text) noexcept {
 	                        static_cast<unsigned char>(text[0])))
 		return false;
 	for (size_t i = 1; i < text.size(); ++i) {
+		// A line continuation inside the NAME is removed before the input is
+		// tokenised, so `fo\<newline>o=bar` is an assignment to `foo`. Read as a
+		// backslash it was not an assignment at all and `foo=bar` ran as a command
+		// (quote-p.tst's 'line continuation in assignment').
+		if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\n') {
+			++i;
+			continue;
+		}
 		if (text[i] == '=')
 			return i > 0;
 		if (!lesh::string_utils::is_valid_var_name_non_first_char(
@@ -39,10 +47,34 @@ bool looks_like_assignment(std::string_view text) noexcept {
 //
 // This compares rather than unquoting into a buffer, because the parser has no
 // business allocating for a comparison it makes once per line.
+// True when a here-document delimiter carries quoting that suppresses expansion
+// in the body. A line continuation is not quoting, which flag_literal cannot say.
+bool delimiter_is_quoted(std::string_view raw) noexcept {
+	for (size_t i = 0; i < raw.size(); ++i) {
+		if (raw[i] == '\\') {
+			if (i + 1 < raw.size() && raw[i + 1] == '\n') {
+				++i;
+				continue;  // a continuation, not an escape
+			}
+			return true;
+		}
+		if (raw[i] == '\'' || raw[i] == '"')
+			return true;
+	}
+	return false;
+}
+
 bool delimiter_matches(std::string_view raw, std::string_view line) noexcept {
 	size_t r = 0, l = 0;
 	while (r < raw.size()) {
 		const char c = raw[r];
+		// A line continuation in the delimiter contributes nothing: `<<E\<newline>ND`
+		// is terminated by `END`. Read as an escape it tried to match a newline
+		// inside the line and never matched at all.
+		if (c == '\\' && r + 1 < raw.size() && raw[r + 1] == '\n') {
+			r += 2;
+			continue;
+		}
 		if (c == '\'') {
 			// Single quotes: everything up to the next one is literal, backslash
 			// included. An unterminated quote cannot match anything.
@@ -251,6 +283,36 @@ private:
 		return _tree.add_node(async);
 	}
 
+	// The reserved word a token spells once its LINE CONTINUATIONS are removed.
+	//
+	// False unless the joined text could BE one: only lower-case letters, `{`, `}`
+	// and `!` are accepted, so a quote, a `$`, or a backslash before anything but a
+	// newline refuses rather than being guessed at. False too when nothing was
+	// joined, which means the word is quoted some other way - `\case` is not a
+	// keyword and must not become one.
+	[[nodiscard]] static bool reserved_across_line_continuations(
+		std::string_view text, char* buffer, size_t capacity,
+		std::string_view& out) noexcept {
+		size_t at = 0;
+		bool joined_any = false;
+		for (size_t i = 0; i < text.size(); ++i) {
+			if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == '\n') {
+				++i;
+				joined_any = true;
+				continue;
+			}
+			const char c = text[i];
+			const bool allowed = (c >= 'a' && c <= 'z') || c == '{' || c == '}' || c == '!';
+			if (!allowed || at == capacity)
+				return false;
+			buffer[at++] = c;
+		}
+		if (!joined_any)
+			return false;
+		out = std::string_view{buffer, at};
+		return true;
+	}
+
 	[[nodiscard]] reserved peek_reserved() const noexcept {
 		const token& t = peek();
 		if (t.kind != token_kind::word || t.is_error())
@@ -258,9 +320,20 @@ private:
 		// A quoted or expanded word is never a keyword: `"if"` and `$x` are
 		// arguments however they spell out. flag_literal is exactly that test, and
 		// the lexer already computed it.
-		if ((t.flags & syntax::flag_literal) == 0)
+		if ((t.flags & syntax::flag_literal) != 0)
+			return reserved_of(text_of_token(_index));
+		// With ONE exception: a line continuation quotes nothing, so
+		// `c\<newline>ase` is the reserved word `case`. flag_literal is cleared by
+		// any backslash, which made every one of these an ordinary word - so
+		// `\<newline>{\<newline> echo 1` ran a command called `{`. The join accepts
+		// only the bytes a reserved word is spelled with, so anything else quoted
+		// still refuses.
+		char joined[8];
+		std::string_view text;
+		if (!reserved_across_line_continuations(text_of_token(_index), joined,
+		                                        sizeof joined, text))
 			return reserved::none;
-		return reserved_of(text_of_token(_index));
+		return reserved_of(text);
 	}
 
 	// True for words that close or continue a construct, so a command list stops
@@ -892,10 +965,13 @@ private:
 			const std::string_view raw = text_of_token(pending.delimiter_token);
 
 			// A quoted delimiter suppresses expansion in the body: <<'EOF' is
-			// literal, <<EOF is expanded. The lexer already recorded whether the
-			// word was literal, so this needs no re-scanning.
+			// literal, <<EOF is expanded. flag_literal is nearly that test, but it is
+			// cleared by a LINE CONTINUATION too, which quotes nothing - so
+			// `<<E\<newline>ND` would have suppressed expansion in a body dash
+			// expands. Re-scanned for the real thing.
 			const bool quoted = (_tree.token_at(pending.delimiter_token).flags &
-			                     syntax::flag_literal) == 0;
+			                     syntax::flag_literal) == 0 &&
+			                    delimiter_is_quoted(text_of_token(pending.delimiter_token));
 			// The delimiter is compared with quote removal applied on the fly - see
 			// delimiter_matches. `raw` is the word exactly as it was typed.
 
@@ -1049,8 +1125,16 @@ private:
 		if (peek().kind == token_kind::io_number) {
 			const std::string_view digits = text_of_token(_index);
 			fd = 0;
-			for (const char c : digits)
-				fd = fd * 10 + static_cast<uint32_t>(c - '0');
+			for (size_t i = 0; i < digits.size(); ++i) {
+				// The token spans any line continuations between the digits, because
+				// the lexer records the extent it consumed rather than the text it
+				// means. `1\<newline>2>file` is fd 12.
+				if (digits[i] == '\\' && i + 1 < digits.size() && digits[i + 1] == '\n') {
+					++i;
+					continue;
+				}
+				fd = fd * 10 + static_cast<uint32_t>(digits[i] - '0');
+			}
 			advance();
 		}
 

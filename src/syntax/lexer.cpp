@@ -28,6 +28,14 @@ bool lexer::skip_blanks_and_comments() noexcept {
 	for (;;) {
 		while (!at_end() && is_blank(peek()))
 			++_position;
+		// A line continuation between tokens is nothing at all, so it is skipped
+		// here with the blanks. Left in place it began a WORD - `\<newline>{` lexed
+		// as one word rather than as the reserved `{` - which is eleven of
+		// quote-p.tst's cases (#42).
+		if (const uint32_t after = past_continuations(_position); after != _position) {
+			_position = after;
+			continue;
+		}
 		// POSIX: '#' opens a comment only where a word could begin. Inside a word
 		// it is an ordinary character, which is why this runs before lex_word and
 		// never inside it.
@@ -43,40 +51,48 @@ bool lexer::skip_blanks_and_comments() noexcept {
 
 token lexer::lex_operator() noexcept {
 	const uint32_t start = _position;
-	const char c = peek();
-	const char c1 = peek(1);
-	const char c2 = peek(2);
+	// The characters of an operator may be separated by line continuations, which
+	// POSIX removes before the input is tokenised: `>\<newline>>` is `>>` and
+	// `<\<newline><\<newline>-` is `<<-`. So each character is looked up past
+	// them and `emit` takes the END position rather than a length - the token still
+	// SPANS the continuation bytes, because nothing reads an operator's text.
+	const uint32_t at1 = past_continuations(start + 1);
+	const uint32_t at2 = past_continuations(at1 + 1);
+	const uint32_t at3 = past_continuations(at2 + 1);
+	const char c = char_at(start);
+	const char c1 = char_at(at1);
+	const char c2 = char_at(at2);
 
-	auto emit = [&](token_kind kind, uint32_t length) {
-		_position += length;
+	auto emit = [&](token_kind kind, uint32_t end) {
+		_position = end;
 		token t;
 		t.kind = kind;
 		t.offset = start;
-		t.length = length;
+		t.length = end - start;
 		return t;
 	};
 
 	switch (c) {
-		case '|': return c1 == '|' ? emit(token_kind::or_if, 2) : emit(token_kind::pipe, 1);
-		case '&': return c1 == '&' ? emit(token_kind::and_if, 2) : emit(token_kind::amp, 1);
-		case ';': return c1 == ';' ? emit(token_kind::dsemi, 2) : emit(token_kind::semi, 1);
-		case '(': return emit(token_kind::lparen, 1);
-		case ')': return emit(token_kind::rparen, 1);
+		case '|': return c1 == '|' ? emit(token_kind::or_if, at2) : emit(token_kind::pipe, at1);
+		case '&': return c1 == '&' ? emit(token_kind::and_if, at2) : emit(token_kind::amp, at1);
+		case ';': return c1 == ';' ? emit(token_kind::dsemi, at2) : emit(token_kind::semi, at1);
+		case '(': return emit(token_kind::lparen, at1);
+		case ')': return emit(token_kind::rparen, at1);
 		case '<':
-			if (c1 == '<' && c2 == '-') return emit(token_kind::dless_dash, 3);
-			if (c1 == '<') return emit(token_kind::dless, 2);
-			if (c1 == '&') return emit(token_kind::less_and, 2);
-			if (c1 == '>') return emit(token_kind::less_great, 2);
-			return emit(token_kind::less, 1);
+			if (c1 == '<' && c2 == '-') return emit(token_kind::dless_dash, at3);
+			if (c1 == '<') return emit(token_kind::dless, at2);
+			if (c1 == '&') return emit(token_kind::less_and, at2);
+			if (c1 == '>') return emit(token_kind::less_great, at2);
+			return emit(token_kind::less, at1);
 		case '>':
-			if (c1 == '>') return emit(token_kind::dgreat, 2);
-			if (c1 == '&') return emit(token_kind::great_and, 2);
-			if (c1 == '|') return emit(token_kind::clobber, 2);
-			return emit(token_kind::great, 1);
+			if (c1 == '>') return emit(token_kind::dgreat, at2);
+			if (c1 == '&') return emit(token_kind::great_and, at2);
+			if (c1 == '|') return emit(token_kind::clobber, at2);
+			return emit(token_kind::great, at1);
 		default: {
 			// Unreachable for callers that check is_word_terminator first, but a
 			// lexer that never fails cannot have an unreachable path that traps.
-			token t = emit(token_kind::word, 1);
+			token t = emit(token_kind::word, at1);
 			t.error = token_error::unexpected_byte;
 			t.error_offset = start;
 			return t;
@@ -185,10 +201,13 @@ token lexer::lex_word(lex_mode mode) noexcept {
 		// `${...}` is part of the word even when it contains blanks, which
 		// `${x:?some message}` and `${x:-a default}` both do. Without this the word
 		// split at the space and the closing brace leaked into the next word.
-		if (c == '$' && peek(1) == '{') {
+		// Past line continuations, for the same reason the segment scan is: `(` is a
+		// word TERMINATOR, so `echo $\<newline>(\<newline>(1+2))` ended the word at
+		// the paren and parsed as a subshell.
+		if (c == '$' && char_at(past_continuations(_position + 1)) == '{') {
 			literal = false;
 			const uint32_t opened_at = _position;
-			_position += 2;
+			_position = past_continuations(_position + 1) + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
 				if (peek() == '{') ++depth;
@@ -205,14 +224,15 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			continue;
 		}
 
-		if (c == '$' && peek(1) == '(') {
+		if (c == '$' && char_at(past_continuations(_position + 1)) == '(') {
 			literal = false;
 			const uint32_t opened_at = _position;
+			const uint32_t at_paren = past_continuations(_position + 1);
 			// `$((` is arithmetic, and counting parens closes it correctly either way -
 			// but the two are worth telling apart in a diagnostic, which is the only
 			// reason this is looked at here rather than by counting alone.
-			const bool arithmetic = peek(2) == '(';
-			_position += 2;
+			const bool arithmetic = char_at(past_continuations(at_paren + 1)) == '(';
+			_position = at_paren + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
 				if (peek() == '(') ++depth;
@@ -377,21 +397,33 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 	}
 
 	if (c == '$') {
-		const char next = peek(1);
+		// Past the line continuations POSIX removes before tokenising, in BOTH
+		// lookaheads: `$\<newline>{f}` is a parameter expansion and
+		// `$\<newline>(\<newline>(1+2))` an arithmetic one. Read literally, the `$`
+		// was "a lone dollar" and the `(` went on to terminate the word, which is
+		// three of quote-p.tst's cases.
+		const uint32_t at_next = past_continuations(_position + 1);
+		const uint32_t at_next2 = past_continuations(at_next + 1);
+		const char next = char_at(at_next);
 		// The three expansions below report the same defect the command-mode scan
 		// reports, on the same construct. Saying it in only one of the two scans is
 		// what let `echo $(` through: the word carried no error, so the tree the
 		// executor refused to run was not the tree it was given (#47).
-		if (next == '(' && peek(2) == '(') {
-			_position += 3;
+		if (next == '(' && char_at(at_next2) == '(') {
+			_position = at_next2 + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
 				if (peek() == '(') ++depth;
 				else if (peek() == ')') --depth;
 				++_position;
 			}
-			if (!at_end() && peek() == ')')
-				++_position;
+			// The second `)` of `))` may be separated from the first by a line
+			// continuation, so it is looked for past them: `$((1)\<newline>)` closes.
+			// Without this the paren count ended at the first `)` and the second was
+			// left in the word as literal text, which printed a stray `)`.
+			const uint32_t at_close = past_continuations(_position);
+			if (char_at(at_close) == ')')
+				_position = at_close + 1;
 			else if (at_end()) {
 				_incomplete = true;
 				return finish(token_kind::seg_arithmetic,
@@ -400,7 +432,7 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 			return finish(token_kind::seg_arithmetic);
 		}
 		if (next == '(') {
-			_position += 2;
+			_position = at_next + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
 				if (peek() == '(') ++depth;
@@ -417,7 +449,7 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		if (next == '{') {
 			// Braces are COUNTED: `${x:-${y:-z}}` nests, and stopping at the first
 			// `}` left the outer brace as literal text.
-			_position += 2;
+			_position = at_next + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
 				if (peek() == '{') ++depth;
@@ -432,11 +464,15 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 			return finish(token_kind::seg_parameter);
 		}
 		if (lesh::string_utils::is_valid_var_name_first_char(static_cast<unsigned char>(next))) {
-			_position += 2;
-			while (!at_end() &&
-			       lesh::string_utils::is_valid_var_name_non_first_char(
-			           static_cast<unsigned char>(peek())))
-				++_position;
+			_position = at_next + 1;
+			for (;;) {
+				const uint32_t at = past_continuations(_position);
+				if (at >= _source.size() ||
+				    !lesh::string_utils::is_valid_var_name_non_first_char(
+				        static_cast<unsigned char>(_source[at])))
+					break;
+				_position = at + 1;
+			}
 			return finish(token_kind::seg_parameter);
 		}
 		// The special parameters. Each is exactly one character and none is a valid
@@ -444,14 +480,14 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		// widened name predicate - `$?x` is `$?` followed by a literal `x`.
 		if (next == '?' || next == '#' || next == '$' || next == '!' ||
 		    next == '@' || next == '*' || next == '-') {
-			_position += 2;
+			_position = at_next + 1;
 			return finish(token_kind::seg_parameter);
 		}
 		// A positional parameter: $0 through $9. Multi-digit needs braces
 		// (`${10}`), which POSIX requires and which the ${...} path already
 		// handles.
 		if (next >= '0' && next <= '9') {
-			_position += 2;
+			_position = at_next + 1;
 			return finish(token_kind::seg_parameter);
 		}
 		// A lone '$' is an ordinary character.
@@ -525,9 +561,13 @@ token lexer::next(lex_mode mode) noexcept {
 	// passes 2 as an argument. The lexer can see this without the parser's help,
 	// which is why it is one of the few things it decides alone.
 	if (mode == lex_mode::command && is_digit(c)) {
-		uint32_t ahead = _position;
+		// Across line continuations, both between the digits and before the
+		// operator: `3\<newline>>\<newline>>redir` is `3>>redir`, and read as a word
+		// the `3` became an ARGUMENT and the redirection landed on stdout - which is
+		// how quote-p.tst's operator case came to report `3: not open for output`.
+		uint32_t ahead = past_continuations(_position);
 		while (ahead < _source.size() && is_digit(_source[ahead]))
-			++ahead;
+			ahead = past_continuations(ahead + 1);
 		if (ahead < _source.size() && (_source[ahead] == '<' || _source[ahead] == '>')) {
 			token t;
 			t.kind = token_kind::io_number;
