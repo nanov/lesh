@@ -10,6 +10,25 @@ namespace {
 
 // Recursive-descent with precedence climbing. The grammar is C's, which POSIX
 // requires, so the levels below are C's precedence table read bottom-up.
+//
+// SHORT-CIRCUITING IS A PARSE WITH ITS EFFECTS OFF, not a subtree left unvisited
+// (issue #56). This evaluator computes AS IT PARSES - there is no tree standing
+// between the two for `&&` to decline to descend into - so an operand it must
+// skip is parsed anyway, with `_live` false: reads answer 0, writes do not
+// happen, and a division by zero is not an error.
+//
+// Building the tree instead was the alternative, and it buys nothing the flag
+// does not. The skipped operand has to be PARSED either way, because `$((0 && +))`
+// is still a malformed expression - dash, bash and zsh all say so - and the parse
+// is the only pass that can find that out. What a tree would cost is an arena in
+// evaluate()'s signature; #30 deliberately gave the arithmetic port exactly two
+// things, an expression and a variables interface, and every caller would have to
+// find an allocator to hand it a node representation nobody reads twice.
+//
+// What the flag must not do is silence a SYNTAX error, and it does not: only the
+// three effect sites consult it - reading a variable, writing one, and dividing
+// by zero. `_live` also only ever goes off, never on, so an operand skipped from
+// outside stays skipped however its own conditions come out.
 class evaluator {
 public:
 	evaluator(std::string_view text, arithmetic_variables& vars) noexcept
@@ -31,12 +50,21 @@ private:
 	size_t _at = 0;
 	bool _failed = false;
 	bool _refused = false;
+	// False while parsing an operand a short-circuit skipped. See the note above
+	// the class: the text is still read, nothing it describes is done.
+	bool _live = true;
 	const char* _error = nullptr;
 	// The first name read that the caller had never set. Only the first, because
 	// that is the one `set -u` reports and the evaluation stops mattering after it.
 	std::string_view _unset_name;
 
 	[[nodiscard]] int64_t read_variable(std::string_view name) noexcept {
+		// An operand that was not evaluated read nothing, so it owes the caller no
+		// unset name either: `set -u; echo $((0 && y))` is not a nounset error. zsh,
+		// which applies nounset inside arithmetic as lesh does, agrees; dash prints
+		// the same 0 for the simpler reason that it never applies nounset there.
+		if (!_live)
+			return 0;
 		if (_unset_name.empty() && !_vars.defined(name))
 			_unset_name = name;
 		return _vars.get(name);
@@ -47,6 +75,17 @@ private:
 			_failed = true;
 			_error = why;
 		}
+	}
+
+	// Dividing by zero is an evaluation error, not a syntax one, so an operand
+	// that is only being parsed does not commit it: `$((0 && 1/0))` is 0 in dash
+	// and in zsh. bash reports the error there; dash is the POSIX oracle. True
+	// when the caller must abandon what it was computing.
+	bool divide_by_zero() noexcept {
+		if (!_live)
+			return false;
+		fail("division by zero");
+		return true;
 	}
 
 	void skip_blanks() noexcept {
@@ -115,8 +154,10 @@ private:
 					const int64_t result = apply_compound(op, lhs, rhs);
 					// A readonly variable refuses the write. Failing the whole expression
 					// is the only honest answer: `$((x+=1))` that reports a value it did
-					// not store would be a lie the caller cannot see through.
-					if (!_vars.set(name, result)) {
+					// not store would be a lie the caller cannot see through. An
+					// assignment that never happened cannot be refused, so a skipped one
+					// does not ask.
+					if (_live && !_vars.set(name, result)) {
 						_refused = true;
 						fail("readonly variable");
 					}
@@ -127,7 +168,7 @@ private:
 			    (after + 1 >= _text.size() || _text[after + 1] != '=')) {
 				_at = after + 1;
 				const int64_t rhs = parse_assignment();
-				if (!_vars.set(name, rhs)) {
+				if (_live && !_vars.set(name, rhs)) {
 					_refused = true;
 					fail("readonly variable");
 				}
@@ -142,8 +183,8 @@ private:
 		if (op == "+=") return a + b;
 		if (op == "-=") return a - b;
 		if (op == "*=") return a * b;
-		if (op == "/=") { if (b == 0) { fail("division by zero"); return 0; } return a / b; }
-		if (op == "%=") { if (b == 0) { fail("division by zero"); return 0; } return a % b; }
+		if (op == "/=") { if (b == 0) { divide_by_zero(); return 0; } return a / b; }
+		if (op == "%=") { if (b == 0) { divide_by_zero(); return 0; } return a % b; }
 		if (op == "<<=") return static_cast<int64_t>(static_cast<uint64_t>(a) << (b & 63));
 		if (op == ">>=") return a >> (b & 63);
 		if (op == "&=") return a & b;
@@ -156,19 +197,34 @@ private:
 		const int64_t condition = parse_logical_or();
 		if (!consume("?"))
 			return condition;
+		// Exactly one branch runs. Both are parsed, because a malformed branch is a
+		// malformed expression whichever way the condition went.
+		const bool live = _live;
+		if (condition == 0)
+			_live = false;
 		const int64_t when_true = parse_assignment();
+		_live = live;
 		if (!consume(":")) {
 			fail("expected ':'");
 			return 0;
 		}
+		if (condition != 0)
+			_live = false;
 		const int64_t when_false = parse_conditional();
+		_live = live;
 		return condition != 0 ? when_true : when_false;
 	}
 
 	int64_t parse_logical_or() noexcept {
 		int64_t value = parse_logical_and();
 		while (consume("||")) {
+			// A true left operand settles the answer, so the right one is skipped -
+			// `$((1 || (x=1)))` must not assign.
+			const bool live = _live;
+			if (value != 0)
+				_live = false;
 			const int64_t rhs = parse_logical_and();
+			_live = live;
 			value = (value != 0 || rhs != 0) ? 1 : 0;
 		}
 		return value;
@@ -176,7 +232,12 @@ private:
 	int64_t parse_logical_and() noexcept {
 		int64_t value = parse_bit_or();
 		while (consume("&&")) {
+			// Mirror of `||`: a false left operand settles the answer.
+			const bool live = _live;
+			if (value == 0)
+				_live = false;
 			const int64_t rhs = parse_bit_or();
+			_live = live;
 			value = (value != 0 && rhs != 0) ? 1 : 0;
 		}
 		return value;
@@ -239,12 +300,24 @@ private:
 				value *= parse_unary();
 			} else if (consume("/")) {
 				const int64_t divisor = parse_unary();
-				if (divisor == 0) { fail("division by zero"); return 0; }
-				value /= divisor;
+				if (divisor == 0) {
+					if (divide_by_zero())
+						return 0;
+					// Returning would abandon the rest of a skipped operand mid-text, and
+					// what was left of it would fail the expression that skipped it.
+					value = 0;
+				} else {
+					value /= divisor;
+				}
 			} else if (consume("%")) {
 				const int64_t divisor = parse_unary();
-				if (divisor == 0) { fail("division by zero"); return 0; }
-				value %= divisor;
+				if (divisor == 0) {
+					if (divide_by_zero())
+						return 0;
+					value = 0;
+				} else {
+					value %= divisor;
+				}
 			} else {
 				return value;
 			}

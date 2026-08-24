@@ -48,6 +48,11 @@ struct arithmetic_result {
 
 // POSIX specifies signed long arithmetic. Division by zero is an error rather
 // than undefined behaviour, and integer bases follow C: 0x hex, 0 octal.
+//
+// `&&`, `||` and `?:` SHORT-CIRCUIT, which is observable because arithmetic can
+// assign: `$((0 && (x=1)))` leaves x alone. The skipped operand is still parsed,
+// so a malformed one still fails, but nothing it describes is done - no write, no
+// read for the caller's `set -u` to act on, and no division by zero. See #56.
 [[nodiscard]] arithmetic_result evaluate(std::string_view expression,
                                          arithmetic_variables& vars) noexcept;
 

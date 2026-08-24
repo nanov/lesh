@@ -16,6 +16,15 @@
 # operand looked for a file called `\in0`, and a here-document body had its quotes
 # REMOVED because it was lexed as the interior of a word.
 #
+# The arithmetic cases at the very end are #56. `&&`, `||` and `?:` answered the
+# right VALUE while still running the operand they should have skipped, because
+# the mini-parser computes as it parses. Each one therefore prints the variable
+# afterwards: the value alone never showed the bug. The last two are what the fix
+# must not overreach into - a skipped `1/0` is not a division error and a skipped
+# unset variable is not a nounset error, because neither operand was evaluated -
+# and the one before them is what it must not under-reach: `0 && (x=1) || (x=2)`
+# does reach the second assignment, and dash, bash and zsh all agree it does.
+#
 # Prose lives HERE and not between cases: a case body runs to the next `---`, so a
 # comment block in the middle of the file becomes part of the PRECEDING case - and
 # the legacy front end aborts on one, which showed up as a FAIL on a case this
@@ -223,3 +232,28 @@ echo "$(echo ")")" $(echo ')')
 echo $(
 echo a # ) comment
 )
+
+--- a short-circuited && operand is not evaluated [xfail(legacy): legacy has no arithmetic expansion]
+x=0; echo $(( 0 && (x=1) )); echo "x=$x"
+
+--- a short-circuited || operand is not evaluated [xfail(legacy): legacy has no arithmetic expansion]
+x=0; echo $(( 1 || (x=1) )); echo "x=$x"
+
+--- a conditional evaluates only the branch it takes [xfail(legacy): legacy has no arithmetic expansion]
+a=0; b=0; echo $(( 1 ? (a=5) : (b=-5) )); echo "$a $b"
+a=0; b=0; echo $(( 0 ? (a=-5) : (b=5) )); echo "$a $b"
+
+--- an operand that is reached still assigns [xfail(legacy): legacy has no arithmetic expansion]
+x=0; echo $(( 1 && (x=1) )); echo "x=$x"; echo $(( x = 7 )) $(( x += 3 )); echo "x=$x"
+
+--- skipping stops where the skipped operand does [xfail(legacy): legacy has no arithmetic expansion]
+x=0; echo $(( 0 && (x=1) || (x=2) )); echo "x=$x"
+
+--- and it does not resume inside the operand it skipped [xfail(legacy): legacy has no arithmetic expansion]
+x=0; y=0; echo $(( 0 && (0 || (x=1)) )); echo $(( 1 || (x=1) && (y=1) )); echo "$x $y"
+
+--- a division by zero in a skipped operand is not an error [xfail(legacy): legacy has no arithmetic expansion]
+echo $(( 0 && 1/0 )) $(( 1 || 1%0 )) $(( 1 ? 2 : 1/0 ))
+
+--- nor is an unset variable one, with nounset on [xfail(legacy): legacy has no arithmetic expansion]
+set -u; echo $(( 0 && y )); echo after
