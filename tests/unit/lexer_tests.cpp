@@ -317,6 +317,30 @@ TEST(Lexer, ASingleQuoteInsideBracesInsideDoubleQuotesIsAnOrdinaryByte) {
 		<< "outside double quotes the same bytes never close";
 }
 
+TEST(Lexer, AParenInsideQuotesOrACommentDoesNotCloseASubstitution) {
+	// Counted parens alone ended `$(echo ')')` inside the quotes and left the real
+	// closing paren to open a new word, so lesh reported an unterminated quoted
+	// string on input dash runs. A `#` where a word could begin opens a comment
+	// there, and the paren inside it is text.
+	for (const std::string src : {"$(echo ')')", "$(echo \")\")",
+	                             "$(\necho a # ) comment\n)", "$(echo $(echo n))"}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+TEST(Lexer, AnUnterminatedSubstitutionIsStillReportedAsOne) {
+	// The edge the `terminated` flag exists for: the scan's END POSITION cannot say
+	// whether the construct closed, and guessing from it would report an
+	// unterminated `$(` as a complete word.
+	lexer lx{"echo $(echo x"};
+	std::ignore = lx.next();
+	const token t = lx.next();
+	EXPECT_EQ(t.error, token_error::unterminated_command_sub);
+	EXPECT_TRUE(lx.incomplete());
+}
+
 TEST(Lexer, NestingDeeperThanTheScanFollowsIsReportedRatherThanMisScanned) {
 	// A stack that has lost its closers would leave the scan somewhere arbitrary
 	// and hand the expander a word nobody wrote, so past the limit the construct is

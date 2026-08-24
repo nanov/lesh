@@ -49,8 +49,23 @@ bool lexer::skip_blanks_and_comments() noexcept {
 	return _position != start;
 }
 
-uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
-                                         bool inside_double_quotes) const noexcept {
+// True when a byte at `p` sits where a WORD could begin, which is the only place
+// POSIX lets a `#` open a comment. `begin` is where the region being scanned
+// started, so its first byte counts as word-initial.
+bool lexer::starts_a_word(uint32_t p, uint32_t begin) const noexcept {
+	if (p <= begin)
+		return true;
+	switch (_source[p - 1]) {
+		case ' ': case '\t': case '\n':
+		case ';': case '&': case '|': case '(': case ')':
+			return true;
+		default:
+			return false;
+	}
+}
+
+uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
+                                         bool* terminated) const noexcept {
 	char expect[kMaxScanNesting];
 	// Whether a single quote is an ordinary byte at each level. `${...}` INHERITS
 	// the context it was opened in, while `$(...)` and a backquote start the shell
@@ -72,6 +87,9 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
 		p += width;
 	};
 
+	if (terminated != nullptr)
+		*terminated = false;
+
 	const char first = char_at(p);
 	if (first == '\'' && !inside_double_quotes) {
 		// Nothing inside single quotes is ever special, so there is no stack to
@@ -79,18 +97,35 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
 		++p;
 		while (p < _source.size() && _source[p] != '\'')
 			++p;
-		return p < _source.size() ? p + 1 : p;
+		if (p < _source.size()) {
+			if (terminated != nullptr)
+				*terminated = true;
+			return p + 1;
+		}
+		return p;
 	}
-	if (first == '"')
+	if (first == '"') {
 		open('"', 1, /*single_is_ordinary=*/true);
-	else if (first == '`')
+	} else if (first == '`') {
 		open('`', 1, false);
-	else if (first == '$' && char_at(p + 1) == '{')
-		open('}', 2, inside_double_quotes);
-	else if (first == '$' && char_at(p + 1) == '(')
-		open(')', 2, false);
-	else
+	} else if (first == '$') {
+		// The brace or paren may be separated from the `$` by line continuations,
+		// which POSIX removed before tokenising. Missing that returned `at`
+		// unchanged, and a caller that assigns the result to its own cursor then
+		// makes no progress at all - which is a hang, not a wrong answer.
+		const uint32_t after_dollar = past_continuations(p + 1);
+		if (char_at(after_dollar) == '{') {
+			p = after_dollar;
+			open('}', 1, inside_double_quotes);
+		} else if (char_at(after_dollar) == '(') {
+			p = after_dollar;
+			open(')', 1, false);
+		} else {
+			return at;
+		}
+	} else {
 		return at;
+	}
 
 	while (depth > 0 && p < _source.size()) {
 		const char c = _source[p];
@@ -126,12 +161,28 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
 			open('`', 1, false);
 			continue;
 		}
-		if (c == '$' && char_at(p + 1) == '{') {
-			open('}', 2, ordinary_single[depth - 1]);
+		if (c == '$') {
+			const uint32_t after_dollar = past_continuations(p + 1);
+			if (char_at(after_dollar) == '{') {
+				p = after_dollar;
+				open('}', 1, ordinary_single[depth - 1]);
+				continue;
+			}
+			if (char_at(after_dollar) == '(') {
+				p = after_dollar;
+				open(')', 1, false);
+				continue;
+			}
+			++p;
 			continue;
 		}
-		if (c == '$' && char_at(p + 1) == '(') {
-			open(')', 2, false);
+		// Inside a command substitution a `#` where a word could begin opens a
+		// COMMENT, and everything to the newline - a closing paren included - is
+		// text. `$(\n echo a # ) comment \n)` closed at the paren in the comment and
+		// ran `echo a #` (cmdsub-p.tst's 'comment in command substitution').
+		if (c == '#' && expect[depth - 1] == ')' && starts_a_word(p, at)) {
+			while (p < _source.size() && _source[p] != '\n')
+				++p;
 			continue;
 		}
 		// A bare paren or brace nests the construct it belongs to, which is how
@@ -146,6 +197,8 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
 		}
 		++p;
 	}
+	if (terminated != nullptr)
+		*terminated = depth == 0 && !too_deep;
 	// Nested deeper than the scan will follow: report it as running to the end of
 	// the input, which the callers already treat as unterminated. Continuing with a
 	// stack that lost its closers would put `p` somewhere arbitrary and hand the
@@ -351,14 +404,13 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			// but the two are worth telling apart in a diagnostic, which is the only
 			// reason this is looked at here rather than by counting alone.
 			const bool arithmetic = char_at(past_continuations(at_paren + 1)) == '(';
-			_position = at_paren + 1;
-			int depth = 1;
-			while (!at_end() && depth > 0) {
-				if (peek() == '(') ++depth;
-				else if (peek() == ')') --depth;
-				++_position;
-			}
-			if (depth > 0) {
+			// The whole construct at once, so a paren inside quotes or inside a
+			// comment closes nothing: `echo $(echo ')')` reported an unterminated
+			// quoted string, because counting parens alone ended the substitution
+			// inside the quotes and left the closing one to open a new word.
+			bool closed = false;
+			_position = skip_quoted_or_expansion(opened_at, false, &closed);
+			if (!closed) {
 				_incomplete = true;
 				return finish(arithmetic ? token_error::unterminated_arithmetic
 				                         : token_error::unterminated_command_sub,
@@ -550,14 +602,11 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 			return finish(token_kind::seg_arithmetic);
 		}
 		if (next == '(') {
-			_position = at_next + 1;
-			int depth = 1;
-			while (!at_end() && depth > 0) {
-				if (peek() == '(') ++depth;
-				else if (peek() == ')') --depth;
-				++_position;
-			}
-			if (depth > 0) {
+			// The whole construct at once, for the same reason the command-mode scan
+			// does it: a paren inside quotes or inside a comment closes nothing.
+			bool closed = false;
+			_position = skip_quoted_or_expansion(start, false, &closed);
+			if (!closed) {
 				_incomplete = true;
 				return finish(token_kind::seg_command_sub,
 				              token_error::unterminated_command_sub, start);

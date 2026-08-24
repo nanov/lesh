@@ -213,3 +213,11 @@ echoraw() { printf '%s\n' "$*"; }
 echoraw "`echoraw \"1\"`"
 echoraw `echoraw \" "\"" '\"'`
 echoraw "`echoraw \'2\'`"
+
+--- a paren inside quotes does not close a command substitution [xfail(legacy): legacy has no command substitution]
+echo "$(echo ")")" $(echo ')')
+
+--- a paren inside a comment does not close one either [xfail(legacy): legacy has no command substitution]
+echo $(
+echo a # ) comment
+)

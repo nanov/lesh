@@ -123,8 +123,14 @@ private:
 	// single quote at status zero in dash, because inside double quotes the `${...}`
 	// body inherits the context, while `"$(echo 'x')"` really does quote - a
 	// substitution starts the shell language over.
+	// `terminated`, when given, reports whether the construct actually closed - the
+	// caller needs it to say `unterminated command substitution` rather than
+	// guessing from the returned position.
 	[[nodiscard]] uint32_t skip_quoted_or_expansion(
-		uint32_t at, bool inside_double_quotes = false) const noexcept;
+		uint32_t at, bool inside_double_quotes = false,
+		bool* terminated = nullptr) const noexcept;
+	// True where a word could begin, which is where a `#` opens a comment.
+	[[nodiscard]] bool starts_a_word(uint32_t p, uint32_t begin) const noexcept;
 	// How deep the scan will follow nesting. 256 matches the expander's own
 	// kMaxExpansionDepth, which is the layer that refuses well-formed input nested
 	// deeper than that anyway. PAST it the construct is reported as UNTERMINATED
