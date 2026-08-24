@@ -878,3 +878,38 @@ case "$(command -v echo)" in (/*) echo pathname;; (*) echo name;; esac
 
 --- a command name containing a slash is described by an absolute pathname [xfail: divergence - dash writes the operand back exactly as typed and fails command-p.tst's 'output of describing external command (-v, with slash)'; POSIX XCU requires an absolute pathname for a command_name containing a slash]
 : >foo; chmod a+x foo; case "$(command -v ./foo)" in (/*/foo) echo absolute;; (*) echo relative;; esac
+
+# Assignment prefixes that never reached their command (#31). The prefix was
+# applied by four different paths and two of them dropped it: `x=1 eval 'echo $x'`
+# printed a blank line, and an external command's values were expanded in the
+# CHILD, by an expander built with no command runner, so a command substitution in
+# one of them had nothing to run it.
+#
+# The three rules the cases below separate, all POSIX 2.9.1 and all confirmed
+# against dash: a prefix on a SPECIAL builtin persists, a prefix on anything else
+# is restored, and `command` demotes a special builtin so its prefix is restored
+# too.
+
+--- a command substitution in an assignment prefix reaches the command [xfail(legacy): legacy has no command substitution]
+x=$(echo z) "$TESTEE" -c 'echo "[$x]"'
+
+--- a prefix on eval is visible to the code it reads and persists after it [xfail(legacy): legacy has no eval]
+x=1 eval 'echo "in=[$x]"'; echo "after=[$x]"
+
+--- a prefix on dot persists too, and unexported [xfail(legacy): legacy has no dot builtin]
+x=1 . /dev/null; echo "after=[$x]"; x=2 eval 'env' | grep '^x=' ; echo "env=$?"
+
+--- command demotes a special builtin, so its prefix is restored [xfail(legacy): legacy has no command builtin]
+a=a; a=b command :; echo "colon=[$a]"; x=1 command eval 'echo "in=[$x]"'; echo "eval=[$x]"; x=1 command . /dev/null; echo "dot=[$x]"
+
+--- a prefix on exec with no command persists, and not under command [xfail(legacy): legacy has no exec builtin]
+x=1 exec; echo "exec=[$x]"; y=1 command exec; echo "demoted=[$y]"
+
+--- a prefix on wait is restored, wait being a regular builtin [xfail(legacy): legacy has no wait builtin]
+x=1 wait; echo "after=[$x]"
+
+--- a prefix on an external command is exported to it and not to the shell [xfail(legacy): legacy has no command substitution]
+x=$(echo z) env | grep '^x='; echo "after=[$x]"
+
+--- a prefix in a pipeline stage is expanded in the stage [xfail(legacy): legacy has no command substitution]
+echo body | x=$(cat) "$TESTEE" -c 'echo "[$x]"'

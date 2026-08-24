@@ -29,6 +29,24 @@ protected:
 		tree_walking_executor ex{pool, state};
 		return ex.run(t);
 	}
+
+	// The standard output of `src`, taken through a FILE rather than a pipe: an
+	// external command in the source writes to fd 1 directly, so intercepting
+	// stdio would not see it.
+	std::string capture(std::string_view src) {
+		const std::string path = ::testing::TempDir() + "lesh_executor_capture.txt";
+		std::remove(path.c_str());
+		std::string wrapped{"{ "};
+		wrapped.append(src);
+		wrapped += "; } > ";
+		wrapped += path;
+		(void)run(wrapped);
+		std::ifstream in{path};
+		const std::string out{std::istreambuf_iterator<char>{in},
+		                      std::istreambuf_iterator<char>{}};
+		std::remove(path.c_str());
+		return out;
+	}
 };
 
 } // namespace
@@ -596,4 +614,56 @@ TEST_F(PipelineStdinTest, ASubstitutionInsideArithmeticInAStageReadsThePipe) {
 	feed_stdin("TERMINAL\n");
 	EXPECT_EQ(output_of("echo 3 | echo $(( $(cat) + 1 ))"), "4\n");
 	EXPECT_EQ(unread_stdin(), "TERMINAL\n");
+}
+
+// Assignment prefixes (#31). Four paths apply a prefix - a function call, a
+// builtin in the table, one of the executor's own, and `exec` - and two of them
+// did not apply it at all, while a fifth expanded it in the wrong process.
+TEST_F(ExecutorTest, ACommandSubstitutionInAPrefixReachesTheCommand) {
+	// The child expanded the prefix itself, with an expander built with NO command
+	// runner, so a substitution in a prefix value had nothing to run it and the
+	// variable was exported empty. It is the shell that read the command which owes
+	// the expansion, POSIX 2.9.1.
+	EXPECT_EQ(capture("x=$(echo z) /bin/sh -c 'echo [$x]'"), "[z]\n");
+	EXPECT_EQ(capture("echo body | x=$(cat) /bin/sh -c 'echo [$x]'"), "[body]\n");
+}
+
+TEST_F(ExecutorTest, APrefixOnEvalAndDotIsVisibleAndPersists) {
+	// try_run_executor_builtin was handed the assignments and passed them on to
+	// `exec` alone, so neither `eval` nor `.` could see its own prefix.
+	EXPECT_EQ(capture("x=1 eval 'echo in=[$x]'"), "in=[1]\n");
+	std::string_view value;
+	// Both are SPECIAL builtins, so POSIX makes the prefix persist rather than be
+	// restored. dash prints 1 for `x=1 . /dev/null; echo $x`.
+	EXPECT_EQ(run("kept=yes eval ':'"), 0);
+	ASSERT_TRUE(state.lookup("kept", value));
+	EXPECT_EQ(value, "yes");
+	EXPECT_EQ(run("dotted=yes . /dev/null"), 0);
+	ASSERT_TRUE(state.lookup("dotted", value));
+	EXPECT_EQ(value, "yes");
+}
+
+TEST_F(ExecutorTest, CommandDemotesASpecialBuiltinSoItsPrefixIsRestored) {
+	// `command` makes a special builtin behave like a regular one, and the
+	// assignment follows the demotion: command-p.tst's 'assignment on special
+	// built-in is temporary' is `a=a; a=b command :; echo $a` expecting `a`.
+	std::ignore = state.set("a", "a");
+	EXPECT_EQ(run("a=b command :"), 0);
+	std::string_view value;
+	ASSERT_TRUE(state.lookup("a", value));
+	EXPECT_EQ(value, "a") << "the prefix outlived a builtin `command` had demoted";
+	EXPECT_EQ(capture("x=1 command eval 'echo in=[$x]'"), "in=[1]\n")
+		<< "demoted or not, the builtin still has to SEE its prefix";
+	EXPECT_FALSE(state.lookup("x", value));
+	// `exec` with no command is the same rule: it persists, unless demoted.
+	EXPECT_EQ(run("gone=yes command exec"), 0);
+	EXPECT_FALSE(state.lookup("gone", value));
+}
+
+TEST_F(ExecutorTest, APrefixOnARegularExecutorBuiltinIsRestored) {
+	// `wait` is regular, so its prefix lasts only for the command - the same rule
+	// as `cd`, reached through a different dispatch.
+	EXPECT_EQ(run("temp=yes wait"), 0);
+	std::string_view value;
+	EXPECT_FALSE(state.lookup("temp", value));
 }

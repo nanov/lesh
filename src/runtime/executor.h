@@ -257,6 +257,36 @@ private:
 	                arena_array<std::string_view>* assignments = nullptr);
 	[[nodiscard]] bool apply_assignment(std::string_view text);
 
+	// Applies an assignment PREFIX, remembering what to put back.
+	//
+	// POSIX 2.9.1: a prefix on a SPECIAL builtin persists after the command - which
+	// is why `x=1 . /dev/null; echo $x` prints 1 in dash - and a prefix on anything
+	// else lasts only for its duration. `command` DEMOTES a special builtin to a
+	// regular one, and then the prefix is restored too: `a=b command :; echo $a`
+	// prints `a`.
+	//
+	// `restore` is left EMPTY when the prefix persists, so one call site can serve
+	// both rules. Returns false when a name was refused as readonly, having
+	// reported it - and the caller must still run the restores, or a redirection it
+	// applied would leak into the shell's own fds.
+	//
+	// One function because four call sites apply a prefix - a function call, a
+	// builtin in the table, one of the executor's own, and `exec` - and two of them
+	// simply forgot to. `x=1 eval 'echo $x'` printed a blank line for that reason.
+	[[nodiscard]] bool apply_prefix(const arena_array<std::string_view>& assignments,
+	                                bool persist, std::vector<saved_variable>& restore);
+	// Puts back what apply_prefix displaced.
+	void restore_prefix(const std::vector<saved_variable>& restore);
+	// Expands the values of an assignment prefix, leaving the names alone, so the
+	// child of a fork is handed text it only has to split and set.
+	//
+	// The expansion belongs to the shell that READ the command, and doing it in the
+	// child was a bug rather than an optimisation: the child built its expander with
+	// no command runner, so a substitution in a prefix value had nothing to run it
+	// and `x=$(echo z) sh -c 'echo $x'` exported x empty (#31).
+	[[nodiscard]] bool expand_prefix(const arena_array<std::string_view>& assignments,
+	                                 arena_array<std::string_view>& expanded);
+
 	// forks, execs, and returns the child's pid. Never returns in the child.
 	[[nodiscard]] pid_t spawn(arena_array<char*>& argv, const spawn_context& ctx,
 	                          const arena_array<std::string_view>* assignments = nullptr,
@@ -269,6 +299,10 @@ private:
 	// Split out of `spawn`, which is now this with a fork in front of it, so a
 	// pipeline stage - already running in the process forked for it - can exec
 	// without forking a second time.
+	//
+	// `assignments` are ALREADY EXPANDED - see expand_prefix. There is no expander
+	// here on purpose: the one that used to be built here had no command runner, so
+	// a command substitution in a prefix value expanded to nothing.
 	// `standard_path` is what `command -p` asks for: the search uses the path POSIX
 	// guarantees finds the standard utilities rather than $PATH, so
 	// `PATH= command -p cat` still runs cat.

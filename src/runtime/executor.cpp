@@ -1310,17 +1310,20 @@ void tree_walking_executor::become_command(arena_array<char*>& argv,
 	// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
 	// out of the shell - the parent's state is untouched by construction rather
 	// than by remembering to undo it.
+	//
+	// The VALUES were expanded by the caller, before the fork. Expanding them here
+	// meant building an expander with no command runner, and a command substitution
+	// in a prefix value therefore had nothing to run it: `x=$(echo z) sh -c 'echo
+	// $x'` exported x empty (#31). POSIX 2.9.1 performs every expansion before the
+	// command runs, so the shell that read the command is the one that owes them.
 	if (assignments != nullptr) {
-		expander child_ex{_pool, _state, nullptr, true, &_state, &_state};
 		for (const auto& a : *assignments) {
 			const size_t eq = a.find('=');
 			// A readonly name was refused before the fork - see run_simple_command -
 			// so the refusal cannot happen here, and a child could not exit the
 			// shell over it anyway.
 			if (eq != std::string_view::npos)
-				std::ignore = _state.set_exported(
-					a.substr(0, eq),
-					child_ex.expand_value(a.substr(eq + 1), value_context::assignment));
+				std::ignore = _state.set_exported(a.substr(0, eq), a.substr(eq + 1));
 		}
 	}
 
@@ -1386,6 +1389,58 @@ bool tree_walking_executor::apply_expanded_assignment(std::string_view expanded)
 // Splits NAME=value, expands the value, and applies it.
 bool tree_walking_executor::apply_assignment(std::string_view text) {
 	return apply_expanded_assignment(expand_assignment(text));
+}
+
+bool tree_walking_executor::apply_prefix(const arena_array<std::string_view>& assignments,
+                                         bool persist,
+                                         std::vector<saved_variable>& restore) {
+	if (!persist)
+		restore.reserve(assignments.size());
+	for (const auto& a : assignments) {
+		const size_t eq = a.find('=');
+		if (eq == std::string_view::npos)
+			continue;
+		// The old value is read BEFORE the new one lands, and only when it will be
+		// needed: a persisting prefix has nothing to put back by definition.
+		if (!persist) {
+			saved_variable sv;
+			sv.name.assign(a.substr(0, eq));
+			std::string_view previous;
+			sv.was_set = _state.lookup(sv.name, previous);
+			if (sv.was_set)
+				sv.value.assign(previous);
+			restore.push_back(std::move(sv));
+		}
+		// Applied one at a time, in order, because `a=1 b=$a cmd` must see a's new
+		// value - dash does the same.
+		if (!apply_assignment(a))
+			return false;
+	}
+	return true;
+}
+
+void tree_walking_executor::restore_prefix(const std::vector<saved_variable>& restore) {
+	for (const auto& sv : restore) {
+		// A name the command itself made readonly cannot be put back, and POSIX says
+		// a readonly variable stays readonly - so the refusal is the correct outcome
+		// here rather than an error to report twice.
+		if (sv.was_set)
+			std::ignore = _state.set(sv.name, sv.value);
+		else
+			std::ignore = _state.unset(sv.name);
+	}
+}
+
+bool tree_walking_executor::expand_prefix(const arena_array<std::string_view>& assignments,
+                                          arena_array<std::string_view>& expanded) {
+	for (const auto& a : assignments) {
+		expanded.push(expand_assignment(a));
+		// A fatal expansion error - `set -u` on an unset parameter, or `${x?}` - stops
+		// the command rather than exporting the empty string it could not expand.
+		if (_expansion_error)
+			return false;
+	}
+	return true;
 }
 
 // A variable assignment error, applied where POSIX 2.8.1 puts it: the shell exits
@@ -1490,10 +1545,14 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 		// No command: the redirections were the whole point. The assignments persist
 		// because exec is a special builtin, and they persist UNEXPORTED - dash
 		// leaves `FOO=bar exec` visible to the shell but absent from `env`.
-		for (const auto& a : assignments)
-			if (!apply_assignment(a))
-				return assignment_error();
-		return 0;
+		//
+		// Unless `command exec` demoted it, and then they are restored like any
+		// regular builtin's: `x=1 command exec; echo $x` prints nothing in dash
+		// where `x=1 exec; echo $x` prints 1.
+		std::vector<saved_variable> restore_vars;
+		const bool refused = !apply_prefix(assignments, !demoted, restore_vars);
+		restore_prefix(restore_vars);
+		return refused ? assignment_error() : 0;
 	}
 
 	// Drop `exec` and any `--` by shifting the rest down; the arena owns the
@@ -1830,9 +1889,22 @@ bool tree_walking_executor::try_run_executor_builtin(
 	// so `x=1 eval 'echo $x'` can read x, and `command -v foo >out` writes to the
 	// file. Shared by all four rather than written out per builtin, which is how
 	// `wait` came to perform no redirections at all.
+	//
+	// THE PREFIX REACHED NONE OF THEM. try_run_executor_builtin was handed the
+	// assignments and passed them on to `exec` alone, so `x=1 eval 'echo $x'`
+	// printed a blank line and `x=1 . /dev/null` left x unset - dash prints 1 for
+	// both. `eval` and `.` are SPECIAL builtins, so their prefix PERSISTS rather
+	// than being restored, which is the difference from the regular-builtin path
+	// and from a function call; `command eval ...` demotes them and the prefix is
+	// restored after all.
+	const bool special = classify_builtin(name) == builtin_kind::special;
 	arena_array<saved_fd> saved{_pool, 4};
 	std::fflush(nullptr);
 	const bool ok = apply_redirections(t, n, &saved);
+	std::vector<saved_variable> restore_vars;
+	bool refused = false;
+	if (ok)
+		refused = !apply_prefix(assignments, special && !cmd.present, restore_vars);
 	if (!ok) {
 		// POSIX 2.8.1 makes a redirection error on a SPECIAL builtin fatal to a
 		// non-interactive shell. dash agrees: `dash -c 'eval : </missing; echo
@@ -1840,9 +1912,11 @@ bool tree_walking_executor::try_run_executor_builtin(
 		// the same position reports 2 and carries on. `command eval ...` demotes it,
 		// which is what cmd.present records.
 		status = kRedirectionError;
-		if (classify_builtin(name) == builtin_kind::special && !cmd.present &&
-		    !_state.interactive())
+		if (special && !cmd.present && !_state.interactive())
 			_exit_requested = true;
+	} else if (refused) {
+		// Reported by apply_prefix; the status and the shell's fate are decided
+		// after the restores below, so a refusal cannot skip them.
 	} else if (name == "eval") {
 		// `eval` and `.` re-enter the FRONT END from inside execution, which is why
 		// they live here at all - giving every builtin a back-reference to the
@@ -1881,6 +1955,9 @@ bool tree_walking_executor::try_run_executor_builtin(
 	}
 	std::fflush(nullptr);
 	restore_fds(saved);
+	restore_prefix(restore_vars);
+	if (refused)
+		status = assignment_error();
 	return true;
 }
 
@@ -2062,37 +2139,12 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// The pre-check above makes this unreachable; leaving the path correct is
 		// cheaper than relying on that.
 		bool refused = false;
-		if (ok) {
-			restore_vars.reserve(assignments.size());
-			for (const auto& a : assignments) {
-				const size_t eq = a.find('=');
-				if (eq == std::string_view::npos)
-					continue;
-				saved_variable sv;
-				sv.name.assign(a.substr(0, eq));
-				std::string_view previous;
-				sv.was_set = _state.lookup(sv.name, previous);
-				if (sv.was_set)
-					sv.value.assign(previous);
-				restore_vars.push_back(std::move(sv));
-				if (!apply_assignment(a)) {
-					refused = true;
-					break;
-				}
-			}
-		}
+		if (ok)
+			refused = !apply_prefix(assignments, /*persist=*/false, restore_vars);
 		bool ran = false;
 		if (ok && !refused)
 			ran = try_run_function(t, argv, status);
-		for (const auto& sv : restore_vars) {
-			// A name the function made readonly cannot be put back, and POSIX says a
-			// readonly variable stays readonly - so the refusal is the correct
-			// outcome here rather than an error to report twice.
-			if (sv.was_set)
-				std::ignore = _state.set(sv.name, sv.value);
-			else
-				std::ignore = _state.unset(sv.name);
-		}
+		restore_prefix(restore_vars);
 		std::fflush(nullptr);
 		restore_fds(saved);
 		if (!ok)
@@ -2135,7 +2187,13 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// POSIX: assignments preceding a SPECIAL builtin persist afterwards; before a
 		// regular one they apply only for its duration. Not cosmetic - it is why
 		// `x=1 export y` leaves x set and `x=1 cd /tmp` does not.
-		const bool persist = classify_builtin(argv[0]) == builtin_kind::special;
+		//
+		// A `command` prefix DEMOTES the special builtin to a regular one, and the
+		// assignment follows the demotion: `a=a; a=b command :; echo $a` prints `a`
+		// in dash and printed `b` here, which is command-p.tst's 'assignment on
+		// special built-in is temporary'.
+		const bool persist =
+			classify_builtin(argv[0]) == builtin_kind::special && !cmd.present;
 		// POSIX 2.9.1 performs the assignments AFTER the redirections and BEFORE the
 		// command, so the builtin can READ them. They used to be applied after the
 		// call, and only in the persisting case, under a note saying no builtin read a
@@ -2147,28 +2205,8 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// flag rather than an early return. The readonly pre-check above makes it
 		// unreachable; leaving the path correct is cheaper than relying on that.
 		bool refused = false;
-		if (ok) {
-			if (!persist)
-				restore_vars.reserve(assignments.size());
-			for (const auto& a : assignments) {
-				const size_t eq = a.find('=');
-				if (eq == std::string_view::npos)
-					continue;
-				if (!persist) {
-					saved_variable sv;
-					sv.name.assign(a.substr(0, eq));
-					std::string_view previous;
-					sv.was_set = _state.lookup(sv.name, previous);
-					if (sv.was_set)
-						sv.value.assign(previous);
-					restore_vars.push_back(std::move(sv));
-				}
-				if (!apply_assignment(a)) {
-					refused = true;
-					break;
-				}
-			}
-		}
+		if (ok)
+			refused = !apply_prefix(assignments, persist, restore_vars);
 		if (ok && !refused) {
 			// `unset -f` removes a FUNCTION, and the function table lives here rather
 			// than in shell state. Only this FORM is intercepted - the variable form
@@ -2202,15 +2240,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		if (ok && drop_unwritable_output(argv[0]))
 			result.status = 1;
 		restore_fds(saved);
-		for (const auto& sv : restore_vars) {
-			// A name the builtin itself made readonly cannot be put back, and POSIX
-			// says a readonly variable stays readonly - so the refusal is the correct
-			// outcome here rather than an error to report twice.
-			if (sv.was_set)
-				std::ignore = _state.set(sv.name, sv.value);
-			else
-				std::ignore = _state.unset(sv.name);
-		}
+		restore_prefix(restore_vars);
 		if (refused)
 			result.status = assignment_error();
 
@@ -2224,7 +2254,16 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return result.status;
 	}
 
-	const pid_t pid = spawn(argv, {}, &assignments, &t, n, cmd.standard_path);
+	// The prefix values are expanded HERE, in the shell that read the command, and
+	// not in the child that will be replaced by it. POSIX 2.9.1 performs every
+	// expansion before the command runs, and the child had no command runner to
+	// reach - so a command substitution in a prefix value expanded to nothing and
+	// `x=$(echo z) sh -c 'echo $x'` exported x empty (#31).
+	arena_array<std::string_view> expanded{_pool, 4};
+	if (!expand_prefix(assignments, expanded))
+		return kExpansionError;
+
+	const pid_t pid = spawn(argv, {}, &expanded, &t, n, cmd.standard_path);
 	if (pid == -1)
 		return 1;
 
@@ -2326,8 +2365,12 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 
 	// An external command: this process becomes it. No second fork - the stage was
 	// forked before its words were expanded, so the process that expanded them is
-	// the one that execs.
-	become_command(argv, &assignments, &t, stage, cmd.standard_path);
+	// the one that execs - and the prefix is expanded here for the same reason the
+	// words are, beside them rather than inside become_command.
+	arena_array<std::string_view> expanded{_pool, 4};
+	if (!expand_prefix(assignments, expanded))
+		return kExpansionError;
+	become_command(argv, &expanded, &t, stage, cmd.standard_path);
 }
 
 int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
