@@ -91,5 +91,7 @@ d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -c 'echo "$0"'
 --- a word after -c's command string is an operand, not another option [xfail: #44 - lesh keeps parsing options past the command string, so the word after the command string is read as options instead of as $0]
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -- -x
 
---- a command_file that cannot be opened exits 127 [xfail: divergence - dash reports 2; startup-p.tst's 'reading non-existing file' requires 127 and bash agrees]
+--- a command_file that cannot be opened exits 127 [divergence: dash reports 2; startup-p.tst's 'reading non-existing file' requires 127 and bash agrees]
 d=$(mktemp -d); "$TESTEE" $d/no_such_file 2>/dev/null; echo "status=$?"
+=== expect
+status=127

@@ -38,8 +38,10 @@ kill -s URG $$; echo survived
 --- trap takes SIGURG in each of its three forms [xfail(legacy): legacy has no trap builtin and runs /bin/trap, which does not exist]
 trap '' URG; trap - URG; trap : URG; echo $?
 
---- the SIG prefix is accepted on a signal name [xfail: divergence - dash recognises only the unprefixed spellings POSIX lists and rejects SIGURG outright; bash, ksh, yash and zsh all accept the prefix, and no case in the conformance suite asserts rejection]
+--- the SIG prefix is accepted on a signal name [divergence: dash recognises only the unprefixed spellings POSIX lists and rejects SIGURG outright; bash, ksh, yash and zsh all accept the prefix, and no case in the conformance suite asserts rejection]
 trap : SIGURG; kill -s SIGURG $$; echo ok
+=== expect
+ok
 
 --- a trap on SIGURG runs between commands, not during one [xfail(legacy): legacy has neither trap nor a kill builtin]
 trap 'echo trapped' URG; kill -s URG $$; echo after
@@ -110,8 +112,10 @@ trap '' URG; "$TESTEE" -c 'trap "echo trapped" USR1; kill -s USR1 $$; echo after
 --- an EXIT trap is unaffected, since EXIT has no inherited disposition [xfail(legacy): same quote-expansion defect]
 trap '' INT; "$TESTEE" -c 'trap "echo bye" EXIT; echo hi'
 
---- trap lists nothing for a signal it cannot trap [xfail: divergence - dash and zsh accept the trap command, list it back, and then never run it; bash lists nothing and lesh follows bash, because a listing that names an action the shell will not take is the same defect as a builtin that succeeds without doing anything. See ADR-0001.]
+--- trap lists nothing for a signal it cannot trap [divergence: dash and zsh accept the trap command, list it back, and then never run it; bash lists nothing and lesh follows bash, because a listing that names an action the shell will not take is the same defect as a builtin that succeeds without doing anything. See ADR-0001.]
 trap '' URG; "$TESTEE" -c 'trap "echo x" URG; trap; echo end'
+=== expect
+end
 
 # ISSUE #52. POSIX XCU 2.11's third rule: an INTERACTIVE shell ignores SIGQUIT and
 # SIGTERM and catches SIGINT, so a keyboard interrupt or a stray `kill` abandons the
@@ -165,31 +169,40 @@ echo after"
 trap
 echo end'
 
---- a subshell of an interactive shell takes the default action back [xfail: divergence - dash and bash both keep sparing the subshell, and the conformance suite says both are wrong: sigterm5-p.tst requires `( "$TESTEE" -c "kill -s TERM \$PPID" )` under `sh -i +m` to be killed, because a subshell is not the process that reads commands and has a prompt to return to]
+--- a subshell of an interactive shell takes the default action back [divergence: dash and bash both keep sparing the subshell, and the conformance suite says both are wrong: sigterm5-p.tst requires `( "$TESTEE" -c "kill -s TERM \$PPID" )` under `sh -i +m` to be killed, because a subshell is not the process that reads commands and has a prompt to return to]
 "$TESTEE" -i +m -c 'trap - TERM
 ( "$TESTEE" -c '\''kill -s TERM $PPID'\''
 echo not printed )' 2>/dev/null; kill -l $?
+=== expect
+TERM
 
---- a command the interactive shell runs is not handed an unkillable SIGTERM [xfail: divergence - dash hands its interactive SIG_IGN straight to the child and the child then survives a SIGTERM aimed at itself; bash kills it, lesh follows bash, and sigterm5-p.tst's `target=child` cases require it. dash is inconsistent with its own `exec`, which DOES drop the ignore - the case below passes against it]
+--- a command the interactive shell runs is not handed an unkillable SIGTERM [divergence: dash hands its interactive SIG_IGN straight to the child and the child then survives a SIGTERM aimed at itself; bash kills it, lesh follows bash, and sigterm5-p.tst's `target=child` cases require it. dash is inconsistent with its own `exec`, which DOES drop the ignore - the case below passes against it]
 "$TESTEE" -i +m -c 'trap - TERM
 "$TESTEE" -c '\''kill -s TERM $$
 echo not printed'\''' 2>/dev/null; kill -l $?
+=== expect
+TERM
 
 --- exec hands over a killable SIGTERM, since SIG_IGN would survive execve [xfail(legacy): same quote-expansion defect]
 "$TESTEE" -i +m -c 'trap - TERM
 exec "$TESTEE" -c '\''kill -s TERM $$
 echo not printed'\''' 2>/dev/null; kill -l $?
 
---- an interactive shell catches SIGINT and carries on to the next command [xfail: divergence - dash dies with status 130 here: its top-level unwind exits when the input is not a terminal instead of reading on. bash prints `spared` and lesh follows bash, which is also what sigint5-p.tst requires of the 5 assertions dash fails in it]
+--- an interactive shell catches SIGINT and carries on to the next command [divergence: dash dies with status 130 here: its top-level unwind exits when the input is not a terminal instead of reading on. bash prints `spared` and lesh follows bash, which is also what sigint5-p.tst requires of the 5 assertions dash fails in it]
 "$TESTEE" -i +m -c 'trap - INT
 kill -s INT $$
 echo spared'; echo "status=$?"
+=== expect
+spared
+status=0
 
---- catching SIGINT means ABANDONING the command, not merely surviving it [xfail: divergence - dash dies, as above. bash abandons the loop and prints the command after it, and a shell that only stayed alive would run every iteration - which is the stub this case exists to fail]
+--- catching SIGINT means ABANDONING the command, not merely surviving it [divergence: dash dies, as above. bash abandons the loop and prints the command after it, and a shell that only stayed alive would run every iteration - which is the stub this case exists to fail]
 "$TESTEE" -i +m -c 'trap - INT
 n=0
 while [ "$n" -lt 5 ]; do n=$((n+1)); kill -s INT $$; done
 echo abandoned after $n'
+=== expect
+abandoned after 1
 
 # `exit` inside a trap action. The whole body runs even when the shell is already
 # on its way out, an explicit status REPLACES the one the shell was leaving with,
@@ -224,5 +237,7 @@ trap 'echo A; exit 4; echo B' USR1; kill -s USR1 $$; echo after
 --- an exit in a subshell's EXIT trap is the subshell's status [xfail(legacy): legacy has no trap builtin]
 ( trap 'exit 7' EXIT; exit 1 ); echo "sub=$?"
 
---- return with no operand in a trap reports the status the trap interrupted [xfail: divergence from dash - ADR-0001. POSIX makes "the last command" the one before the trap action for `return` as much as for `exit`, which is what return-p.tst's 'default exit status in function in trap' requires (19, not 0). dash applies the rule to `exit` only; bash and zsh to neither]
+--- return with no operand in a trap reports the status the trap interrupted [divergence: ADR-0001. POSIX makes "the last command" the one before the trap action for `return` as much as for `exit`, which is what return-p.tst's 'default exit status in function in trap' requires (19, not 0). dash applies the rule to `exit` only; bash and zsh to neither]
 fn() { true; return; }; trap 'fn; echo trapped $?' EXIT; (exit 19); exit
+=== expect [status: 19]
+trapped 19

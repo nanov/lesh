@@ -162,8 +162,10 @@ set --; for f in "$@"; do printf '[%s]' "$f"; done; echo END
 --- but an empty variable in those quotes still starts one [xfail(legacy): legacy has no positional parameters]
 set --; n=; for f in "$n""$@" "=$@=" ""; do printf '[%s]' "$f"; done; echo END
 
---- two absent dollar-ats in one quoted region [xfail: divergence - dash prints one empty field here where bash, zsh and macOS /bin/sh all print none. POSIX makes `"$@"` with no positional parameters zero fields, quotes and all, and lesh applies that to a quoted region holding nothing else; dash's own `"$@""$@"` prints none, so it is inconsistent with itself]
+--- two absent dollar-ats in one quoted region [divergence: dash prints one empty field here where bash, zsh and macOS /bin/sh all print none. POSIX makes `"$@"` with no positional parameters zero fields, quotes and all, and lesh applies that to a quoted region holding nothing else; dash's own `"$@""$@"` prints none, so it is inconsistent with itself]
 set --; for f in "$@$@"; do printf '[%s]' "$f"; done; echo END
+=== expect
+END
 
 --- assigning to a positional parameter is refused [xfail(legacy): legacy has no parameter expansion beyond $name]
 echo ${1:=x}

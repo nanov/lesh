@@ -271,6 +271,15 @@ zsh-inspired features admitted on top by explicit decision.
 The shell a differential test compares against. dash is authoritative for the floor;
 zsh only for the curated layer.
 
+**Divergence** _[lesh]_:
+A place lesh deliberately answers differently from the reference shell. Written down
+in ADR-0001, excluded from the differential comparison — dash cannot be the
+expectation of a case that exists because lesh differs — and carried as a
+`[divergence: ...]` case that states its own expected output. Counted in its own
+tally, so **known-fail** means only a gap not yet implemented.
+_Avoid_: "known failure" and "xfail" for one, which is what conflating the two cost:
+a score that could not tell "we chose this" from "we have not built this".
+
 **Shell under test** _[lesh]_:
 Whichever shell a differential case is currently running in — lesh in one half of a
 comparison, the reference shell in the other. Named `$TESTEE` in a case's

@@ -32,8 +32,31 @@ on top, admitted one feature at a time by explicit decision.
 ## Recorded divergences from dash
 
 dash is the reference, not the specification. Where lesh deliberately differs, the
-difference is written down here and carried as an `[xfail: divergence ...]` case in
-`tests/spec`, so it stays a decision rather than becoming a drift.
+difference is written down and carried as a `[divergence: ...]` case in `tests/spec`,
+so it stays a decision rather than becoming a drift.
+
+Such a case is **not compared against dash**. dash cannot be the expectation of a
+case whose whole content is that lesh answers differently, so the case states its own
+expected output instead:
+
+```
+--- name [divergence: why, and what dash does instead]
+code
+=== expect [status: 127] [stderr]
+the exact stdout lesh is expected to produce
+```
+
+`tools/spec_run.py` reports these in their own tally - neither a pass nor a
+known-fail, so `known-fail` counts only gaps that are not yet implemented - and
+FAILs if a recorded expectation stops holding. There are 29 such cases today.
+
+The entries below are the divergences argued in this ADR. The rest are argued where
+the cases are, in the block comments of `tests/spec/posix_gaps.spec` and
+`tests/spec/invocation.spec` - 21 of the 29, chiefly the `getopts` state rules, the
+POSIX `--` separator on the operand-only special builtins, the file-descriptor access
+mode checks, `pipefail`, and how `command -v` writes a pathname. **They belong here
+and are not here yet**; the marker text of each case carries its reason and the yash
+assertion that settles it, which is the source to write them up from.
 
 - **`kill -l` lists what the PLATFORM has, not what dash has** (issue #38). dash
   carries a fixed table of 32 signals; on glibc that omits `SIGRTMIN..SIGRTMAX`,

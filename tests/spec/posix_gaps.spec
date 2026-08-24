@@ -767,49 +767,94 @@ echo a | x=$(exit 3); echo "rc=$?"
 
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
-# assertion dash itself fails in the yash suite, so the xfail marker here means
-# "lesh is ahead", and an XPASS would mean dash had changed.
+# assertion dash itself fails in the yash suite, so each is a place lesh is ahead.
+# dash is NOT RUN for these: it cannot be the expectation of a case that exists
+# because lesh answers differently, so each carries its own `=== expect` block.
 #
 # The `set -o` listing is the one entry that is not a standards question: POSIX
 # leaves the format unspecified, dash lists four options of its own that lesh does
 # not have, and printing a name for a switch that does not exist would be the lie
 # `set -o` is meant to expose.
 
---- redirection operands with no command name are expanded in a subshell [xfail: divergence - dash expands them in the current environment; POSIX 2.9.1 requires a subshell]
+--- redirection operands with no command name are expanded in a subshell [divergence: dash expands them in the current environment; POSIX 2.9.1 requires a subshell]
 unset x; < ${x=no/such/file}; ${x+echo leaked}; echo done
+=== expect [stderr]
+done
 
---- duplicating a read-only descriptor onto an output fd is an error [xfail: divergence - dash does not check the access mode; POSIX 2.7.6 requires it]
+--- duplicating a read-only descriptor onto an output fd is an error [divergence: dash does not check the access mode; POSIX 2.7.6 requires it]
 3</dev/null >&3; echo "status=$?"
+=== expect [stderr]
+status=2
 
---- duplicating a write-only descriptor onto an input fd is an error [xfail: divergence - dash does not check the access mode; POSIX 2.7.5 requires it]
+--- duplicating a write-only descriptor onto an input fd is an error [divergence: dash does not check the access mode; POSIX 2.7.5 requires it]
 cat 3>/dev/null <&3; echo "status=$?"
+=== expect [stderr]
+status=2
 
---- nounset applies inside arithmetic [xfail: divergence - dash expands $((x)) on an unset x to zero; POSIX requires the error, and dash fails option-p.tst for it]
+--- nounset applies inside arithmetic [divergence: dash expands $((x)) on an unset x to zero; POSIX requires the error, and dash fails option-p.tst for it]
 set -u; echo "[$((x))]"; echo after
+=== expect [status: 2] [stderr]
 
---- pipefail makes a pipeline report its rightmost failing stage [xfail: divergence - dash has no pipefail and fails both of pipeline-p.tst's cases for it; POSIX Issue 8 defines it]
+--- pipefail makes a pipeline report its rightmost failing stage [divergence: dash has no pipefail and fails both of pipeline-p.tst's cases for it; POSIX Issue 8 defines it]
 set -o pipefail; exit 1 | exit 2 | exit 0; echo "b $?"; exit 3 | exit 0 | exit 0; echo "c $?"
+=== expect
+b 2
+c 3
 
---- set -o lists only the options the shell has [xfail: divergence - dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
+--- set -o lists only the options the shell has [divergence: dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
 set -o
+=== expect
+Current option settings
+allexport       off
+notify          off
+noclobber       off
+errexit         off
+noglob          off
+monitor         off
+noexec          off
+nounset         off
+verbose         off
+xtrace          off
+ignoreeof       off
+nolog           off
+pipefail        off
+vi              off
 
---- an incomplete test expression is an error rather than a crash [xfail: divergence - dash SEGFAULTS on `test x -a` and reports 139; POSIX leaves the two-argument case unspecified, and 2 with a diagnostic is the only answer that is not a crash]
+--- an incomplete test expression is an error rather than a crash [divergence: dash SEGFAULTS on `test x -a` and reports 139; POSIX leaves the two-argument case unspecified, and 2 with a diagnostic is the only answer that is not a crash]
 test x -a 2>/dev/null; echo $?
+=== expect
+2
 
---- OPTIND names the argument still being parsed rather than the next one [xfail: divergence - dash advances OPTIND on entering a word, so a mid-word `shift $((OPTIND-1))` discards letters nobody examined; bash, ksh and zsh all report it as lesh does]
+--- OPTIND names the argument still being parsed rather than the next one [divergence: dash advances OPTIND on entering a word, so a mid-word `shift $((OPTIND-1))` discards letters nobody examined; bash, ksh and zsh all report it as lesh does]
 set -- -abc; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"; getopts abc o; echo "$OPTIND"
+=== expect
+1
+1
+2
 
---- OPTARG is unset when the option takes no argument [xfail: divergence - dash leaves the previous OPTARG as an empty string and fails both of getopts-p.tst's assertions about it; POSIX requires unset]
+--- OPTARG is unset when the option takes no argument [divergence: dash leaves the previous OPTARG as an empty string and fails both of getopts-p.tst's assertions about it; POSIX requires unset]
 getopts a:b o -a foo -b; getopts a:b o -a foo -b; echo "${OPTARG-unset}"; OPTIND=1; getopts a x -a; getopts a x -a; echo "${OPTARG-unset}"
+=== expect
+unset
+unset
 
---- getopts state is per-shell, so a function continues the shell's parse [xfail: divergence - dash resets its internal index on function entry while leaving the OPTIND variable alone, so the two disagree inside a function; bash and ksh share it as lesh does]
+--- getopts state is per-shell, so a function continues the shell's parse [divergence: dash resets its internal index on function entry while leaving the OPTIND variable alone, so the two disagree inside a function; bash and ksh share it as lesh does]
 f() { getopts ab o; echo "f[$o]"; }; set -- -a -b; getopts ab o; echo "main[$o]"; f -a -b; echo "$OPTIND"
+=== expect
+main[a]
+f[b]
+3
 
---- an OPTIND past the last argument is the end of the options [xfail: divergence - dash silently restarts the parse from word 1, re-reporting options the script has already acted on; POSIX calls a modified OPTIND unspecified and bash clamps as lesh does]
+--- an OPTIND past the last argument is the end of the options [divergence: dash silently restarts the parse from word 1, re-reporting options the script has already acted on; POSIX calls a modified OPTIND unspecified and bash clamps as lesh does]
 set -- -a -b; OPTIND=99; getopts ab o; echo "st=$? [$o] [$OPTIND]"
+=== expect
+st=1 [?] [3]
 
---- a non-numeric or unset OPTIND restarts the parse [xfail: divergence - dash routes the value through its numeric parser inside the assignment hook and aborts the shell with "Illegal number"; POSIX specifies only the value 1]
+--- a non-numeric or unset OPTIND restarts the parse [divergence: dash routes the value through its numeric parser inside the assignment hook and aborts the shell with "Illegal number"; POSIX specifies only the value 1]
 set -- -abc; getopts abc o; unset OPTIND; getopts abc o; echo "[$o]"; OPTIND=junk; getopts abc o; echo "[$o]"
+=== expect
+[a]
+[a]
 
 # The `command` builtin (#31). It was once implemented for `-v` alone and let every
 # other use silently succeed, which regressed command-p.tst from 38/49 to 19/49 -
@@ -873,11 +918,15 @@ cat() { echo FUNCTION; }; echo hi | command cat
 --- command -v describes an external command by its absolute pathname [xfail(legacy): legacy has no command builtin]
 case "$(command -v cat)" in (/*cat) echo pathname;; (*) echo "[$(command -v cat)]";; esac
 
---- a regular built-in utility is described by a pathname [xfail: divergence - dash writes the bare name for `command -v echo` and fails command-p.tst's 'output of describing non-special built-in (-v)'; POSIX XCU writes a REGULAR built-in utility, one that also exists on PATH, as an absolute pathname and reserves the bare name for the built-ins that must be built in]
+--- a regular built-in utility is described by a pathname [divergence: dash writes the bare name for `command -v echo` and fails command-p.tst's 'output of describing non-special built-in (-v)'; POSIX XCU writes a REGULAR built-in utility, one that also exists on PATH, as an absolute pathname and reserves the bare name for the built-ins that must be built in]
 case "$(command -v echo)" in (/*) echo pathname;; (*) echo name;; esac
+=== expect
+pathname
 
---- a command name containing a slash is described by an absolute pathname [xfail: divergence - dash writes the operand back exactly as typed and fails command-p.tst's 'output of describing external command (-v, with slash)'; POSIX XCU requires an absolute pathname for a command_name containing a slash]
+--- a command name containing a slash is described by an absolute pathname [divergence: dash writes the operand back exactly as typed and fails command-p.tst's 'output of describing external command (-v, with slash)'; POSIX XCU requires an absolute pathname for a command_name containing a slash]
 : >foo; chmod a+x foo; case "$(command -v ./foo)" in (/*/foo) echo absolute;; (*) echo relative;; esac
+=== expect
+absolute
 
 # Assignment prefixes that never reached their command (#31). The prefix was
 # applied by four different paths and two of them dropped it: `x=1 eval 'echo $x'`
@@ -921,20 +970,27 @@ echo body | x=$(cat) "$TESTEE" -c 'echo "[$x]"'
 # return-p.tst, exit-p.tst and eval-p.tst; `. --` is the one it accepts, so that
 # case is not marked. The same divergence already stands for `exec --`.
 
---- the separator precedes the operand of exit [xfail: divergence - dash reports `exit: Illegal number: --` and fails exit-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+--- the separator precedes the operand of exit [divergence: dash reports `exit: Illegal number: --` and fails exit-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
 exit -- 56
+=== expect [status: 56]
 
---- the separator precedes the operand of return [xfail: divergence - dash reports `return: Illegal number: --` and fails return-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+--- the separator precedes the operand of return [divergence: dash reports `return: Illegal number: --` and fails return-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
 f() { return -- 56; }; f; echo "st=$?"
+=== expect
+st=56
 
---- the separator precedes the operand of eval [xfail: divergence - dash looks for a command named -- and fails eval-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+--- the separator precedes the operand of eval [divergence: dash looks for a command named -- and fails eval-p.tst's 'separator preceding operand'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
 eval -- 'echo foo'; echo "st=$?"
+=== expect
+foo
+st=0
 
 --- the separator precedes the operand of dot [xfail(legacy): legacy has no dot builtin]
 printf 'echo sourced\n(exit 3)\n' >script; . -- ./script; echo "st=$?"
 
---- a separator with no operand after it leaves the default [xfail: divergence - dash rejects the separator itself; POSIX XCU 1.4 discards it and `exit --` is then `exit`]
+--- a separator with no operand after it leaves the default [divergence: dash rejects the separator itself; POSIX XCU 1.4 discards it and `exit --` is then `exit`]
 (exit 41); exit --
+=== expect [status: 41]
 
 # Control flow unwinds PAST the operator that follows it. `break`, `continue` and
 # a bare `return` all report 0, and 0 is what `&&` continues on, so an and-or list
@@ -1105,11 +1161,15 @@ set -v
 eval 'echo hi'
 echo done
 
---- test -ot against a file that does not exist [xfail: divergence from dash - ADR-0001. A file that is not there has no modification time, so an existing file is newer than it: test-p.tst and bash both say so, while dash, zsh and macOS test(1) report false the moment either stat fails]
+--- test -ot against a file that does not exist [divergence: ADR-0001. A file that is not there has no modification time, so an existing file is newer than it: test-p.tst and bash both say so, while dash, zsh and macOS test(1) report false the moment either stat fails]
 : >newer; test XXXXX -ot newer; echo "ot=$?"
+=== expect
+ot=0
 
---- test -nt against a file that does not exist [xfail: divergence from dash - ADR-0001, the same rule read the other way round]
+--- test -nt against a file that does not exist [divergence: ADR-0001, the same rule read the other way round]
 : >newer; test newer -nt XXXXX; echo "nt=$?"
+=== expect
+nt=0
 
 --- test -nt and -ot with both operands missing are false, which dash agrees with [xfail(legacy): legacy mis-splits the line - `test: YYYYY;: unexpected operator` - so the second command's operand lands in the first]
 test XXXXX -nt YYYYY; printf 'nt=%s ' $?; test XXXXX -ot YYYYY; echo "ot=$?"
