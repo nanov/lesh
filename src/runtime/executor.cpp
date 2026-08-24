@@ -172,6 +172,11 @@ int search_and_exec(char** argv, char** env, std::string_view path_value,
 constexpr int kRedirectionError = 2;
 // The status dash reports for `set -u` on an unset parameter and for `${x?}`.
 constexpr int kExpansionError = 2;
+// The status `.` reports when the script cannot be found or read. dash answers 2,
+// and the operand of `.` is not a command name - so 127, which lesh answered
+// before, was the status of a command search that never happened. dot-p.tst only
+// requires non-zero, so this follows the reference shell.
+constexpr int kDotNotFound = 2;
 
 // A redirection's default fd when none was written: `>` means 1, `<` means 0.
 int default_fd_for(token_kind op) noexcept {
@@ -1145,12 +1150,70 @@ int tree_walking_executor::run_source(std::string_view source) {
 	return status;
 }
 
-int tree_walking_executor::run_file(std::string_view path) {
-	std::string name{path};
-	std::FILE* f = std::fopen(name.c_str(), "rb");
+// The pathname $PATH gives for a dot script, or false when no directory on it
+// holds a READABLE regular file of that name.
+//
+// Separate from search_path_for, which tests X_OK: POSIX says a dot script need
+// not be executable, and dash sources a mode-644 file happily. Sharing the
+// executable test would make `. lib.sh` fail on every library anyone ever wrote.
+//
+// A directory of the right name is SKIPPED rather than opened - dash reports
+// `not found` for it - and the search does NOT fall back to the working
+// directory when the path runs out. POSIX allows that fallback as an extension;
+// dash does not do it, and doing it silently would make `. config` source a
+// different file than the reference shell.
+bool tree_walking_executor::search_path_for_dot(std::string_view name,
+                                                std::string& out) const {
+	std::string_view path_value;
+	if (!_state.lookup("PATH", path_value))
+		path_value = "/usr/bin:/bin";
+	size_t at = 0;
+	while (at <= path_value.size()) {
+		const size_t colon = path_value.find(':', at);
+		const std::string_view dir = path_value.substr(
+			at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
+		// An EMPTY entry means the current directory, the same rule the command
+		// search itself follows.
+		std::string candidate{dir.empty() ? std::string_view{"."} : dir};
+		candidate += '/';
+		candidate.append(name);
+		struct stat info {};
+		if (stat(candidate.c_str(), &info) == 0 && S_ISREG(info.st_mode) &&
+		    access(candidate.c_str(), R_OK) == 0) {
+			out = std::move(candidate);
+			return true;
+		}
+		if (colon == std::string_view::npos)
+			break;
+		at = colon + 1;
+	}
+	return false;
+}
+
+// Finds and runs a dot script. False when it could not be found or read, having
+// reported it - the caller owns what that costs a non-interactive shell.
+//
+// POSIX XCU `.`: an operand CONTAINING A SLASH names the file directly, and one
+// without a slash is searched for on $PATH. This simply fopen()ed the operand,
+// which searched the working directory instead. dot-p.tst's 'dot script in $PATH'
+// passed anyway, because the case sets `PATH=$PWD` and the two answers coincide
+// there - a false pass, and with any other PATH lesh sourced a file dash refuses
+// to find.
+bool tree_walking_executor::run_dot_script(std::string_view operand, int& status) {
+	std::string path;
+	if (operand.find('/') != std::string_view::npos) {
+		path.assign(operand);
+	} else if (!search_path_for_dot(operand, path)) {
+		std::fprintf(stderr, "lesh: .: %.*s: not found\n",
+		             static_cast<int>(operand.size()), operand.data());
+		status = kDotNotFound;
+		return false;
+	}
+	std::FILE* f = std::fopen(path.c_str(), "rb");
 	if (f == nullptr) {
-		std::fprintf(stderr, "lesh: %s: %s\n", name.c_str(), std::strerror(errno));
-		return 127;
+		std::fprintf(stderr, "lesh: .: %s: %s\n", path.c_str(), std::strerror(errno));
+		status = kDotNotFound;
+		return false;
 	}
 	std::string source;
 	char buffer[4096];
@@ -1158,7 +1221,8 @@ int tree_walking_executor::run_file(std::string_view path) {
 	while ((got = std::fread(buffer, 1, sizeof(buffer), f)) > 0)
 		source.append(buffer, got);
 	std::fclose(f);
-	return run_source(source);
+	status = run_source(source);
+	return true;
 }
 
 int tree_walking_executor::run_function_definition(const tree& t, node_index n) {
@@ -2024,9 +2088,18 @@ bool tree_walking_executor::try_run_executor_builtin(
 		const size_t operand = first_operand(argv.data());
 		if (argv[operand] == nullptr) {
 			std::fprintf(stderr, "lesh: .: filename argument required\n");
-			status = 2;
-		} else {
-			status = run_file(argv[operand]);
+			status = kDotNotFound;
+			if (!cmd.present && !_state.interactive())
+				_exit_requested = true;
+		} else if (!run_dot_script(argv[operand], status)) {
+			// `.` is a SPECIAL builtin, so failing to FIND or READ the script is fatal
+			// to a non-interactive shell - the rule #34 established for a redirection
+			// failure and #35 extended to `readonly`. `. _no_such_file_; echo not
+			// reached` printed `not reached`. Only the search failure, never a non-zero
+			// status the script itself reported: `. ./exits3` answering 3 must leave
+			// the caller running. `command .` demotes it, which cmd.present records.
+			if (!cmd.present && !_state.interactive())
+				_exit_requested = true;
 		}
 	} else if (name == "command") {
 		// Reported HERE and not where the prefix was read, so it goes through the

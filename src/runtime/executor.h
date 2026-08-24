@@ -224,7 +224,14 @@ private:
 	};
 	void run_pending_traps();
 	void run_exit_trap();
-	int run_file(std::string_view path);
+	// Finds and runs a dot script, `.`'s whole job. False when the script could not
+	// be found or read, having reported it: the caller decides what that costs, the
+	// answer being different for an interactive shell and for `command .`.
+	bool run_dot_script(std::string_view operand, int& status);
+	// The pathname $PATH gives for a dot script. Separate from search_path_for
+	// because a dot script need only be READABLE - see the definition.
+	[[nodiscard]] bool search_path_for_dot(std::string_view name,
+	                                       std::string& out) const;
 	// Records what fd `n` holds before a redirection displaces it. Returns false
 	// only when the copy could not be made for a reason other than "it was not
 	// open", which is recorded rather than treated as an error.

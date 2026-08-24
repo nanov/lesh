@@ -983,3 +983,29 @@ for i in 1; do break x; echo reached; done 2>/dev/null; echo "st=$?"
 
 --- a dot script still sees the caller's exit status [xfail(legacy): legacy has no dot builtin]
 printf 'echo $?\n' >script; (exit 5); . ./script
+
+# `.` searches $PATH for an operand with no slash, and its failure to find the
+# script is FATAL to a non-interactive shell - `.` being a special builtin, the
+# rule #34 established for a redirection failure. It fopen()ed the operand
+# instead, which searches the working directory, and reported 127 and carried on.
+
+--- dot searches PATH for an operand with no slash [xfail(legacy): legacy has no dot builtin]
+mkdir p; printf 'exit 11\n' >p/sourced; PATH=./p; . sourced
+
+--- dot does not fall back to the working directory [xfail(legacy): legacy has no dot builtin]
+printf 'echo sourced\n' >here; PATH=/nonexistent; . here 2>/dev/null; echo "st=$?"
+
+--- a dot script need only be readable, not executable [xfail(legacy): legacy has no dot builtin]
+mkdir p; printf 'echo sourced\n' >p/readable; chmod 444 p/readable; PATH=./p; . readable
+
+--- dot failing to find its script exits a non-interactive shell [xfail(legacy): legacy has no dot builtin]
+. ./_no_such_file_ 2>/dev/null; echo not reached
+
+--- dot failing to find its script on PATH exits a non-interactive shell too [xfail(legacy): legacy has no dot builtin]
+. _no_such_file_ 2>/dev/null; echo not reached
+
+--- a dot failure in a subshell leaves the shell that forked it running [xfail(legacy): legacy has no dot builtin]
+(. ./_no_such_file_ 2>/dev/null); echo "reached st=$?"
+
+--- a status the dot script itself reported is not a search failure [xfail(legacy): legacy has no dot builtin]
+printf '(exit 3)\n' >script; . ./script; echo "reached st=$?"

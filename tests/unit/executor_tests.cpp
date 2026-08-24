@@ -793,3 +793,61 @@ TEST_F(ExecutorTest, DottingAFileWithNoCommandsReportsZero) {
 	EXPECT_EQ(capture("(exit 5); . " + script), "5\n");
 	std::remove(script.c_str());
 }
+
+// --- `.` searches $PATH, and its failure is fatal (dot-p.tst) ------------------
+
+TEST_F(ExecutorTest, DotSearchesPathForAnOperandWithNoSlash) {
+	// run_file fopen()ed the operand, which searches the WORKING DIRECTORY.
+	// dot-p.tst's 'dot script in $PATH' passed anyway because the case sets
+	// `PATH=$PWD` and the two answers coincide there.
+	const std::string dir = ::testing::TempDir() + "lesh_dot_path";
+	ASSERT_EQ(run("mkdir -p " + dir), 0);
+	const std::string script = dir + "/on_the_path";
+	{
+		std::ofstream out{script};
+		out << "exit 11\n";
+	}
+	std::ignore = state.set("PATH", dir);
+	EXPECT_EQ(run(". on_the_path"), 11);
+	// A dot script need only be READABLE, never executable: sharing the command
+	// search's X_OK test would break `. lib.sh` on every library ever written.
+	EXPECT_EQ(run("chmod 444 " + script + "; . on_the_path"), 11);
+	// And the search does NOT fall back to the working directory, which is what
+	// dash does. `.` with a PATH that does not name it must not find the file.
+	std::ignore = state.set("PATH", "/nonexistent");
+	EXPECT_NE(run(". on_the_path 2>/dev/null"), 0);
+	std::remove(script.c_str());
+}
+
+TEST_F(ExecutorTest, DotFailingToFindItsScriptExitsANonInteractiveShell) {
+	// `.` is a SPECIAL builtin, so the rule #34 established for a redirection
+	// failure applies: `. _no_such_file_; echo not reached` printed `not reached`.
+	// dot-p.tst's 'dot script not found' cases, in $PATH and relative.
+	EXPECT_EQ(capture(". _no_such_file_ 2>/dev/null; echo not reached"), "");
+	EXPECT_EQ(capture(". ./_no_such_file_ 2>/dev/null; echo not reached"), "");
+	EXPECT_EQ(capture(". 2>/dev/null; echo not reached"), "");
+	// 2, which is what dash answers; the operand of `.` is not a command name, so
+	// the 127 lesh reported was the status of a search that never happened.
+	EXPECT_EQ(run(". ./_no_such_file_ 2>/dev/null"), 2);
+	// A SUBSHELL exits and the shell that forked it carries on.
+	EXPECT_EQ(capture("(. ./_no_such_file_ 2>/dev/null); echo reached"), "reached\n");
+	// A status the SCRIPT reported is not a search failure and must not be fatal.
+	const std::string script = ::testing::TempDir() + "lesh_dot_fatal.sh";
+	{
+		std::ofstream out{script};
+		out << "(exit 3)\n";
+	}
+	EXPECT_EQ(capture(". " + script + "; echo reached=$?"), "reached=3\n");
+	std::remove(script.c_str());
+}
+
+TEST_F(ExecutorTest, DotFailingIsSurvivableInAnInteractiveShellAndUnderCommand) {
+	// An interactive shell reports and carries on - dot-p.tst asserts both halves
+	// separately - and `command .` demotes the special builtin, which is the same
+	// distinction the redirection-failure path makes.
+	EXPECT_EQ(capture("command . ./_no_such_file_ 2>/dev/null; echo reached"),
+	          "reached\n");
+	const lesh::testing::interactive_disposition_guard dispositions;
+	state.set_interactive(true);
+	EXPECT_EQ(capture(". ./_no_such_file_ 2>/dev/null; echo reached"), "reached\n");
+}
