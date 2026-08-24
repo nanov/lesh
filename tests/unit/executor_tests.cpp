@@ -922,3 +922,67 @@ TEST_F(ExecutorTest, ReturnInsideAFunctionStillReturnsFromTheFunction) {
 	EXPECT_EQ(capture("f() { return 5; }; f; echo after=$?"), "after=5\n");
 	EXPECT_EQ(capture("f() { return; echo not reached; }; f; echo after"), "after\n");
 }
+
+// --- break and continue outside a loop ---------------------------------------
+
+TEST_F(ExecutorTest, ABreakWithNoEnclosingLoopDoesNothing) {
+	// POSIX leaves it unspecified and dash makes it a silent no-op. lesh unwound,
+	// which was invisible at the top level - `break; echo x` printed x either way -
+	// and visible one construct in: `{ break; echo x; }` printed NOTHING, because
+	// the brace group ended for an unwind no loop was waiting behind.
+	EXPECT_EQ(capture("break; echo x"), "x\n");
+	EXPECT_EQ(capture("{ break; echo x; }"), "x\n");
+	EXPECT_EQ(capture("continue; echo x"), "x\n");
+	EXPECT_EQ(capture("{ continue; echo x; }"), "x\n");
+	EXPECT_EQ(capture("if :; then break; echo x; fi"), "x\n");
+	// The operand is still checked: `break 0` is an error whether or not there is
+	// a loop to break, which is the rule the previous fix in this area established.
+	EXPECT_EQ(run("break 0 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, AFunctionCallIsABoundaryForBreakAndContinue) {
+	// dash: the loops the CALLER is inside are not loops the body is inside, so a
+	// break in a function called from a loop does not break that loop. lesh broke
+	// it, which is zsh's dynamic answer rather than the POSIX floor's (ADR-0001).
+	EXPECT_EQ(capture("f() { break; }; for i in 1 2; do f; echo in; done; echo out"),
+	          "in\nin\nout\n");
+	EXPECT_EQ(capture("f() { continue; }; for i in 1 2; do f; echo in; done; echo out"),
+	          "in\nin\nout\n");
+	// Nor does a LEVEL travel out with it: `break 3` inside one loop in the body
+	// stops at that loop and leaves the caller's alone.
+	EXPECT_EQ(capture("f() { for i in 1 2; do break 3; done; echo in f; }; "
+	                  "for j in 1 2; do f; echo body; done; echo out"),
+	          "in f\nbody\nin f\nbody\nout\n");
+	// A loop INSIDE the function is a loop the body is inside, so break works there.
+	EXPECT_EQ(capture("f() { for i in 1 2; do break; echo no; done; echo in f; }; f"),
+	          "in f\n");
+}
+
+TEST_F(ExecutorTest, BreakStopsAtTheOutermostLoopRatherThanEscapingIt) {
+	// break-p.tst's 'breaking one more than actual nest level two': the echo
+	// between the two loops must not run, and the shell carries on afterwards.
+	EXPECT_EQ(capture("for i in 1; do for j in a; do break 3; echo n1; done; "
+	                  "echo n2; done; echo after"),
+	          "after\n");
+	EXPECT_EQ(capture("for i in 1; do break 2; done; echo x"), "x\n");
+	EXPECT_EQ(capture("for i in 1; do break 100; echo no; done; echo x"), "x\n");
+}
+
+TEST_F(ExecutorTest, DotAndEvalAreTransparentToBreak) {
+	// dash keeps the count across both: a break in a dot script breaks the
+	// CALLER's loop, and so does one inside an eval (break-p.tst's 'breaking out
+	// of eval'). Only a function call is a boundary.
+	EXPECT_EQ(capture("for i in 1 2; do eval break; echo body; done; echo after"),
+	          "after\n");
+	const std::string script = ::testing::TempDir() + "lesh_break_dot.sh";
+	{
+		std::ofstream out{script};
+		out << "echo lib\nbreak\necho not reached\n";
+	}
+	EXPECT_EQ(capture("for i in 1 2; do . " + script + "; echo body; done; echo after"),
+	          "lib\nafter\n");
+	// And with no loop anywhere it is a no-op inside the script too, so the script
+	// runs to its last line.
+	EXPECT_EQ(capture(". " + script + "; echo caller"), "lib\nnot reached\ncaller\n");
+	std::remove(script.c_str());
+}

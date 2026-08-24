@@ -736,6 +736,16 @@ int tree_walking_executor::run_parsed(const tree& t) {
 			_input_ended = true;
 			break;
 		}
+		// A `break` or `continue` cannot reach here in the shell's own process: with
+		// no loop around it the builtin does nothing, and the outermost loop consumes
+		// whatever level is left. It reaches here in a SUBSHELL, whose enclosing loop
+		// is in the parent - and then it unwinds out of the subshell, which is what
+		// dash does: `for i in 1; do echo "[$(break; echo insub)]"; done` prints `[]`.
+		if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop) {
+			_flow = control_flow::normal;
+			_input_ended = true;
+			break;
+		}
 		if (errexit_fires(status)) {
 			_exit_requested = true;
 			break;
@@ -969,7 +979,13 @@ int tree_walking_executor::run_if(const tree& t, node_index n) {
 bool tree_walking_executor::consume_loop_flow(bool& should_break) {
 	if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop) {
 		should_break = _flow == control_flow::break_loop;
-		if (--_flow_level <= 0) {
+		// The OUTERMOST loop of this process consumes the unwind whatever level is
+		// left on it: POSIX says `break n` breaks the n-th enclosing loop or, when
+		// there are fewer than n, the outermost one. Leaving the flow standing here
+		// handed the commands AFTER the loop an unwind nothing would consume - which
+		// is break-p.tst's 'breaking one more than actual nest level two', where the
+		// echo between the two loops must not run and the shell must go on afterwards.
+		if (--_flow_level <= 0 || _loop_depth <= 1) {
 			_flow = control_flow::normal;
 			return true;  // handled here
 		}
@@ -983,6 +999,9 @@ int tree_walking_executor::run_loop(const tree& t, node_index n, bool until) {
 	if (self.children_count < 2)
 		return 0;
 
+	// Raised for the CONDITION too, not only the body: `while break; do ...; done`
+	// leaves the loop in dash, so the condition is inside it.
+	const loop_scope inside{*this};
 	int status = 0;
 	// A guard against a runaway loop taking the machine down, which is exactly
 	// what an unbounded `while true` in a test harness would do.
@@ -1064,6 +1083,10 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 			ex.expand_word(t, t.child_of(self, i), items);
 	}
 
+	// After the word list is expanded, not before: the words are evaluated once,
+	// ahead of the first iteration, so a `break` in a command substitution there is
+	// not inside this loop.
+	const loop_scope inside{*this};
 	int status = 0;
 	for (const auto& item : items) {
 		// A readonly loop variable stops the loop: dash exits the shell over
@@ -1298,12 +1321,30 @@ bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& ar
 	_state.set_positional(std::move(arguments));
 
 	++_function_depth;
+	// A function call is a BOUNDARY for `break` and `continue`: the loops the
+	// CALLER is inside are not loops this body is inside. dash says so twice over -
+	// `while true; do f() { break; }; f; echo in; break; done` prints `in`, so the
+	// callee's break does not break the caller's loop, and `f() { for i in 1 2; do
+	// break 3; done; }` called from a loop does not either, so the level does not
+	// travel out with it. lesh broke the caller's loop in both, which is zsh's
+	// dynamic answer rather than the POSIX floor's (ADR-0001).
+	//
+	// Saved and restored rather than just zeroed: a function called FROM a loop
+	// body must leave the caller's own count intact, or the loop it returns into
+	// would think it was outermost.
+	const int caller_loops = _loop_depth;
+	_loop_depth = 0;
 	status = run_node(*it->second.tree, it->second.body);
+	_loop_depth = caller_loops;
 	--_function_depth;
 
 	// `return` unwinds to here and no further. The control_flow machinery has been
 	// wired since #24 with nothing to unwind; this is what it was waiting for.
 	if (_flow == control_flow::return_from)
+		_flow = control_flow::normal;
+	// And so does a `break n` whose level outlived the loops inside the body: with
+	// no loop here to consume it, it would break the CALLER's loop.
+	if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop)
 		_flow = control_flow::normal;
 
 	_state.set_positional(std::move(saved));
@@ -2444,6 +2485,25 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 
 		if (result.flow == control_flow::exit_shell) {
 			_exit_requested = true;
+		} else if ((result.flow == control_flow::break_loop ||
+		            result.flow == control_flow::continue_loop) &&
+		           _loop_depth == 0) {
+			// A `break` or `continue` with NO ENCLOSING LOOP. POSIX leaves it
+			// unspecified, and dash makes it a silent no-op that the commands after it
+			// carry on from: `break; echo x` prints x, and so does `{ break; echo x; }`
+			// - where lesh printed nothing at all, having unwound a brace group that
+			// no loop was waiting behind. zsh diagnoses it and stops the input
+			// instead; ADR-0001 makes dash authoritative for the POSIX floor, and
+			// nothing in the conformance suite asserts either answer.
+			//
+			// Deliberately silent, and that is worth stating because this project's
+			// repeated lesson is the opposite - `command`, `test`, `set -o pipefail`,
+			// `kill -l EXITSTATUS`, `kill` with no operand and `unalias -a` each
+			// silently succeeded and each cost a debugging session. The difference is
+			// that those did nothing where POSIX required something; this one does
+			// nothing where POSIX requires nothing and the reference shell does
+			// nothing either, and a diagnostic here would be lesh inventing an error
+			// the floor does not have.
 		} else if (result.flow != control_flow::normal) {
 			// break, continue and return unwind through the enclosing construct.
 			_flow = result.flow;

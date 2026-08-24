@@ -222,6 +222,21 @@ private:
 	private:
 		tree_walking_executor& _owner;
 	};
+	// Raises the loop depth for as long as one loop is running, condition
+	// included: `while break; do ...; done` leaves the loop in dash, so the
+	// condition counts as inside it. RAII for the same reason errexit_suppression
+	// is - run_loop returns from six places, and a depth left raised would make
+	// every later `break` at the top level unwind instead of doing nothing.
+	class loop_scope {
+	public:
+		explicit loop_scope(tree_walking_executor& owner) noexcept
+			: _owner(owner) { ++_owner._loop_depth; }
+		~loop_scope() { --_owner._loop_depth; }
+		loop_scope(const loop_scope&) = delete;
+		loop_scope& operator=(const loop_scope&) = delete;
+	private:
+		tree_walking_executor& _owner;
+	};
 	void run_pending_traps();
 	void run_exit_trap();
 	// Finds and runs a dot script, `.`'s whole job. False when the script could not
@@ -379,6 +394,22 @@ private:
 	// function. _flow_level implements `break 2`.
 	control_flow _flow = control_flow::normal;
 	int _flow_level = 0;
+	// How many loops THIS PROCESS is currently inside. `break` and `continue` are
+	// defined only inside a loop, and POSIX leaves them unspecified outside one;
+	// dash makes them a silent no-op and carries on, which is what lesh follows
+	// (ADR-0001: dash is authoritative for the POSIX floor).
+	//
+	// A counter and not a bool, because it also answers "is this the OUTERMOST
+	// loop", which is where `break 2` with one loop around it has to stop rather
+	// than leaving an unwind nothing will ever consume.
+	//
+	// Per PROCESS: a subshell inherits the count, so a `break` inside `(...)` in a
+	// loop unwinds out of the subshell rather than doing nothing, and the loop the
+	// parent is running is untouched because the parent never sees the flow.
+	//
+	// A FUNCTION CALL resets it - see try_run_function - and `.` and `eval` do
+	// not, which is dash's answer for all three.
+	int _loop_depth = 0;
 
 	// Defined functions, by name.
 	//

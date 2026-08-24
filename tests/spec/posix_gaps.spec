@@ -1049,3 +1049,44 @@ echo two
 
 --- a return still returns from a function [xfail(legacy): legacy has no functions]
 f() { return 5; }; f; echo "after $?"
+
+# `break` and `continue` with no enclosing loop. POSIX leaves it unspecified;
+# dash makes it a silent no-op and a FUNCTION CALL is a boundary, so the loops
+# the caller is inside are not loops the body is inside. `.` and `eval` are
+# transparent, which is dash's answer for all three.
+
+--- a break with no enclosing loop does nothing [xfail(legacy): legacy has no break builtin and runs /bin/break, which does not exist]
+break; echo x
+
+--- a break with no enclosing loop does nothing inside a brace group [xfail(legacy): legacy has no compound commands]
+{ break; echo x; }; echo y
+
+--- a continue with no enclosing loop does nothing [xfail(legacy): legacy has no continue builtin and runs /bin/continue, which does not exist]
+continue; echo x
+
+--- a break in a function does not break the caller's loop [xfail(legacy): legacy has no functions]
+f() { break; }; for i in 1 2; do f; echo in; done; echo out
+
+--- a continue in a function does not continue the caller's loop [xfail(legacy): legacy has no functions]
+f() { continue; }; for i in 1 2; do f; echo in; done; echo out
+
+--- a break level does not travel out of a function either [xfail(legacy): legacy has no functions]
+f() { for i in 1 2; do break 3; done; echo in f; }; for j in 1 2; do f; echo body; done; echo out
+
+--- a break past the nesting depth stops at the outermost loop [xfail(legacy): legacy has no compound commands]
+for i in 1; do for j in a; do break 3; echo n1; done; echo n2; done; echo after
+
+--- a break in a command substitution unwinds only the substitution [xfail(legacy): legacy has no compound commands]
+for i in 1; do echo "[$(break; echo insub)]"; done
+
+--- a break in a subshell unwinds only the subshell [xfail(legacy): legacy has no compound commands]
+for i in 1; do (break; echo insub); echo body; done; echo after
+
+--- a break in a dot script breaks the caller's loop [xfail(legacy): legacy has no dot builtin]
+printf 'echo lib\nbreak\necho not reached\n' >lib; for i in 1 2; do . ./lib; echo body; done; echo after
+
+--- a break in a dot script with no loop around it does nothing [xfail(legacy): legacy has no dot builtin]
+printf 'echo lib\nbreak\necho lib end\n' >lib; . ./lib; echo "caller $?"
+
+--- a break in the condition of a while loop leaves the loop [xfail(legacy): legacy has no compound commands]
+while break; do echo body; done; echo after
