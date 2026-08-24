@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <pwd.h>
 #include <unistd.h>
 
 #if defined(__APPLE__)
@@ -172,6 +173,30 @@ std::string_view shell_state::home_directory() const {
 	if (lookup("HOME", home))
 		return home;
 	return "/";
+}
+
+// `~user`. getpwnam is libc, so ADR-0005's one-self-contained-binary rule is not
+// at issue: there is no runtime shared-library dependency a static build would not
+// already have. A miss is cached as an empty string, so `~nosuchuser` in a loop
+// does not hit the password database every iteration.
+bool shell_state::home_directory_of(std::string_view user, std::string_view& out) const {
+	if (user.empty())
+		return false;
+	if (const auto it = _user_homes.find(user); it != _user_homes.end()) {
+		if (it->second.empty())
+			return false;
+		out = it->second;
+		return true;
+	}
+	// getpwnam wants a NUL-terminated name, and a string_view is not one.
+	const std::string name{user};
+	const struct passwd* entry = ::getpwnam(name.c_str());
+	const auto [it, _] = _user_homes.emplace(
+		name, entry != nullptr && entry->pw_dir != nullptr ? entry->pw_dir : "");
+	if (it->second.empty())
+		return false;
+	out = it->second;
+	return true;
 }
 
 std::string_view shell_state::ifs() const {

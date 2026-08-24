@@ -666,11 +666,22 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 			} break;
 
 			case token_kind::seg_tilde: {
-				// Only a bare ~ or ~/... for now; ~user needs the password database
-				// and belongs with shell state.
-				if (body == "~")
+				// The prefix arrives whole and unquoted: the lexer declines to claim a
+				// tilde-prefix that contains quoting, so this is `~` or `~name` and
+				// nothing else. It is appended rather than split - POSIX 2.6.1 puts
+				// tilde expansion before field splitting, but the RESULT is not split
+				// (tilde-p.tst's 'result of tilde expansion is not subject to field
+				// splitting'), and a `*` in a home directory is not a pattern either.
+				if (body == "~") {
 					append(_params.home_directory());
+					break;
+				}
+				std::string_view home;
+				if (_params.home_directory_of(body.substr(1), home))
+					append(home);
 				else
+					// No such user. dash leaves the word alone at status zero rather
+					// than reporting anything, and POSIX leaves it unspecified.
 					append(body);
 			} break;
 
@@ -770,11 +781,18 @@ std::string_view expander::expand_value(std::string_view text,
 	ctx.fields = false;  // and so `"$@"` joins rather than making fields nobody reads
 	switch (context) {
 		case value_context::assignment:
+			// Unquoted backslash rules, plus the one lexical difference an
+			// assignment has: a tilde after an unquoted colon is eligible, so
+			// `PATH=~/bin:~/sbin` expands both.
+			ctx.double_quoted = false;
+			ctx.mode = lex_mode::assignment_interior;
+			break;
 		case value_context::redirection_operand:
 			// UNQUOTED backslash rules. This is the half the old single flag got
 			// wrong: `x=\!` assigned `\!` and `cat <\i'n'"0"` looked for a file
 			// called `\in0`, because suppressing field splitting also switched the
-			// backslash rules to the double-quoted ones (#42).
+			// backslash rules to the double-quoted ones (#42). No after-colon tilde:
+			// POSIX confines that to assignments, and dash does not do it here.
 			ctx.double_quoted = false;
 			ctx.mode = lex_mode::word_interior;
 			break;

@@ -52,6 +52,8 @@ public:
 
 	[[nodiscard]] bool lookup(std::string_view name, std::string_view& value) const override;
 	[[nodiscard]] std::string_view home_directory() const override;
+	[[nodiscard]] bool home_directory_of(std::string_view user,
+	                                     std::string_view& out) const override;
 	[[nodiscard]] std::string_view ifs() const override;
 	[[nodiscard]] int last_status_value() const override { return _last_status; }
 	[[nodiscard]] int process_id_value() const override { return _pid; }
@@ -293,6 +295,13 @@ private:
 
 	std::unordered_map<std::string, variable, lesh::transparent_string_hash, std::equal_to<>> _vars;
 	std::string _ifs_default = " \t\n";
+	// `~user` lookups, cached. getpwnam returns a pointer into storage the NEXT
+	// call may reuse, and the expander is handed a string_view that has to outlive
+	// the call, so the answer is copied. Cached because a word can hold several
+	// (`PATH=~a/bin:~a/sbin`) and because a failed lookup is worth not repeating.
+	// `mutable`: this is a cache behind a const query, not state the shell has.
+	mutable std::unordered_map<std::string, std::string, lesh::transparent_string_hash,
+	                           std::equal_to<>> _user_homes;
 	std::unordered_map<std::string, std::string, lesh::transparent_string_hash, std::equal_to<>> _aliases;
 	std::vector<std::string> _positional;
 	std::string _script_name = "lesh";

@@ -20,6 +20,12 @@ namespace lesh::syntax {
 enum class lex_mode : uint8_t {
 	command,             // operators are operators, words are words
 	word_interior,       // inside a word: quoting and expansion boundaries
+	// Inside an ASSIGNMENT's value. Quoting reads exactly as in word_interior; the
+	// one difference is that a tilde after an unquoted colon is eligible for tilde
+	// expansion, which POSIX 2.6.1 confines to assignments so `PATH=~/bin:~/sbin`
+	// works. A separate mode rather than a flag on the expander, because it is the
+	// LEXER that decides where a tilde segment begins.
+	assignment_interior,
 	// Inside DOUBLE quotes. A single quote is an ordinary character there, and a
 	// leading tilde is not special. Lexing the interior in word_interior mode
 	// instead made `echo "it's"` print `it`, because `'s"` was taken for the start

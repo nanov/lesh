@@ -330,13 +330,35 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		return finish(token_kind::seg_double_quoted);
 	}
 
-	if (c == '~' && start == 0 && mode == lex_mode::word_interior) {
-		// Only a leading tilde is eligible. POSIX confines tilde expansion to the
-		// start of a word (and after ':' in assignments, which is #12's problem).
-		++_position;
-		while (!at_end() && peek() != '/' && !is_blank(peek()))
-			++_position;
-		return finish(token_kind::seg_tilde);
+	// Where a tilde is eligible: the start of a word, and - in an assignment's
+	// value only - after an unquoted colon, so `PATH=~/bin:~/sbin` expands both.
+	const bool in_assignment = mode == lex_mode::assignment_interior;
+	if (c == '~' && (mode == lex_mode::word_interior || in_assignment) &&
+	    (start == 0 || (in_assignment && start > 0 && _source[start - 1] == ':'))) {
+		// POSIX 2.6.1: the tilde-prefix runs to the first unquoted `/` - or, in an
+		// assignment, `:` - or to the end of the word, and if ANY character in it is
+		// quoted then NONE of them is a login name. So the prefix is inspected
+		// before the segment is claimed, and one that holds quoting is left to the
+		// literal scan, which removes those quotes: dash prints `~root` for
+		// `~"root"` and for `~roo\t`, quotes gone and tilde intact. `$` and a
+		// backquote disqualify it too - `echo ~$USER` prints `~dimitarnanov`.
+		uint32_t look = _position + 1;
+		bool quoted = false;
+		while (look < _source.size()) {
+			const char b = _source[look];
+			if (b == '/' || is_blank(b) || (in_assignment && b == ':'))
+				break;
+			if (b == '\'' || b == '"' || b == '\\' || b == '$' || b == '`') {
+				quoted = true;
+				break;
+			}
+			++look;
+		}
+		if (!quoted) {
+			_position = look;
+			return finish(token_kind::seg_tilde);
+		}
+		// Fall through: the `~` is ordinary text and the quotes still come off.
 	}
 
 	if (c == '`') {
@@ -440,6 +462,12 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 	// A literal run: everything up to the next byte that starts a segment.
 	while (!at_end()) {
 		const char ch = peek();
+		// A tilde after an unquoted colon starts a new segment in an assignment,
+		// so the run has to stop before it: `x=a:~` expands the tilde. Guarded on
+		// having consumed something, or a `~` the tilde branch above declined would
+		// end a zero-length run forever.
+		if (in_assignment && ch == '~' && _position > start && _source[_position - 1] == ':')
+			break;
 		if (ch == '\\' && peek(1) == '\n') {
 			_position += 2;  // line continuation
 			continue;
@@ -459,8 +487,8 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 token lexer::next(lex_mode mode) noexcept {
 	_incomplete = false;
 
-	if (mode == lex_mode::word_interior || mode == lex_mode::double_quote_interior ||
-	    mode == lex_mode::here_doc_body) {
+	if (mode == lex_mode::word_interior || mode == lex_mode::assignment_interior ||
+	    mode == lex_mode::double_quote_interior || mode == lex_mode::here_doc_body) {
 		if (at_end()) {
 			token t;
 			t.kind = token_kind::end;

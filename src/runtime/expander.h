@@ -33,6 +33,13 @@ public:
 	// whether that is an error under `set -u` is the caller's policy, not ours.
 	[[nodiscard]] virtual bool lookup(std::string_view name, std::string_view& value) const = 0;
 	[[nodiscard]] virtual std::string_view home_directory() const = 0;
+	// A NAMED user's home directory, for `~user`. False when there is no such user,
+	// which POSIX leaves unspecified and dash answers by leaving the word alone -
+	// `echo ~nosuchuser` prints `~nosuchuser` at status zero. On the port rather
+	// than in the expander so the password database stays out of a pure function of
+	// (word, shell state), and so a test can name a user that exists nowhere.
+	[[nodiscard]] virtual bool home_directory_of(std::string_view user,
+	                                             std::string_view& out) const = 0;
 	// Field separators. POSIX defaults to space, tab, newline when IFS is unset.
 	[[nodiscard]] virtual std::string_view ifs() const = 0;
 

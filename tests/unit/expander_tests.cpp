@@ -30,6 +30,18 @@ public:
 		return true;
 	}
 	std::string_view home_directory() const override { return home; }
+
+	// `~user`. A fake table, so a test can name a user that exists on no machine -
+	// which is the only way to assert what a MISS does without depending on the
+	// password database of whoever runs the suite.
+	std::map<std::string, std::string> user_homes;
+	bool home_directory_of(std::string_view user, std::string_view& out) const override {
+		const auto it = user_homes.find(std::string(user));
+		if (it == user_homes.end())
+			return false;
+		out = it->second;
+		return true;
+	}
 	std::string_view ifs() const override { return separators; }
 
 	// Special and positional parameters.
@@ -389,6 +401,52 @@ TEST_F(ExpanderTest, OnlyHashAndPercentHaveADoubledForm) {
 
 TEST_F(ExpanderTest, TildeExpandsToHome) {
 	EXPECT_EQ(expand("echo ~"), (std::vector<std::string>{"echo", "/home/tester"}));
+}
+
+TEST_F(ExpanderTest, ANamedTildeExpandsToThatUsersHome) {
+	params.user_homes["known"] = "/home/known";
+	EXPECT_EQ(expand("echo ~known"), (std::vector<std::string>{"echo", "/home/known"}));
+	EXPECT_EQ(expand("echo ~known/sub"),
+	          (std::vector<std::string>{"echo", "/home/known/sub"}));
+}
+
+TEST_F(ExpanderTest, AnUnknownUserLeavesTheWordAlone) {
+	// dash prints `~nosuchuser` at status zero rather than reporting anything, and
+	// POSIX leaves the case unspecified. Reporting would break `mkdir ~tmp` on a
+	// machine where the shell is right and the user is not.
+	EXPECT_EQ(expand("echo ~nobodyhere"),
+	          (std::vector<std::string>{"echo", "~nobodyhere"}));
+}
+
+TEST_F(ExpanderTest, AQuotedNameIsNotALoginNameButItsQuotesStillCome0ff) {
+	// POSIX 2.6.1: if ANY character of the tilde-prefix is quoted, none of them is
+	// part of a login name - so the tilde stays and quote removal still runs. dash
+	// prints `~known` for all three, and lesh printed `~"known"` with the quotes.
+	params.user_homes["known"] = "/home/known";
+	EXPECT_EQ(expand("echo ~\"known\""), (std::vector<std::string>{"echo", "~known"}));
+	EXPECT_EQ(expand("echo ~'known'"), (std::vector<std::string>{"echo", "~known"}));
+	EXPECT_EQ(expand("echo ~kno\\wn"), (std::vector<std::string>{"echo", "~known"}));
+	EXPECT_EQ(expand("echo ~\\/"), (std::vector<std::string>{"echo", "~/"}))
+		<< "tilde-p.tst's `~\\/`, which kept its backslash";
+}
+
+TEST_F(ExpanderTest, ATildeIsEligibleAfterAnUnquotedColonInAnAssignmentValueOnly) {
+	// POSIX confines the after-colon rule to assignments, which is why it is a lex
+	// MODE rather than a property of the word: `PATH=~/bin:~/sbin` expands both,
+	// and `echo ~:~` expands only the first.
+	params.user_homes["known"] = "/home/known";
+	EXPECT_EQ(value("a:~:~known", value_context::assignment),
+	          "a:/home/tester:/home/known");
+	EXPECT_EQ(value("a:~", value_context::redirection_operand), "a:~")
+		<< "not in a redirection operand: dash does not do it there either";
+	EXPECT_EQ(expand("echo a:~"), (std::vector<std::string>{"echo", "a:~"}))
+		<< "and not in an ordinary word";
+}
+
+TEST_F(ExpanderTest, AQuotedColonDoesNotMakeTheFollowingTildeEligible) {
+	// `x=':'~` assigns `:~` in dash: the colon has to be UNQUOTED for the tilde
+	// after it to be a tilde-prefix.
+	EXPECT_EQ(value("':'~", value_context::assignment), ":~");
 }
 
 // --- the port that breaks the cycle ------------------------------------------

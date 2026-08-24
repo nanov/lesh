@@ -137,3 +137,21 @@ printf '[%s][%s]\n' "${u--x}" "${u-=x}"
 
 --- a command substitution result is glob-eligible [xfail(legacy): legacy has no command substitution]
 mkdir -p /tmp/lesh_spec_glob && : > /tmp/lesh_spec_glob/dummyfile && cd /tmp/lesh_spec_glob && for f in $(echo 'dumm*ile'); do printf '[%s]' "$f"; done; echo
+
+--- a named tilde expands to that user's home [xfail(legacy): legacy has no tilde expansion]
+printf '[%s][%s]\n' ~root ~root/sub
+
+--- an unknown user leaves the word alone
+printf '[%s]\n' ~nosuchuser12345 ~nosuchuser12345/x
+
+--- a quoted tilde name is not a login name but its quotes come off [xfail(legacy): legacy has no tilde expansion]
+printf '[%s][%s][%s][%s]\n' ~"root" ~'root' ~ro\ot ~\/
+
+--- a tilde is eligible after an unquoted colon in an assignment [xfail(legacy): legacy has no tilde expansion]
+a=x:~root:~root; b=x:~; c=':'~root; printf '[%s][%s][%s]\n' "$a" "$b" "$c"
+
+--- a tilde after a colon is not eligible outside an assignment
+printf '[%s]\n' x:~ ~:~
+
+--- a tilde prefix holding an expansion is not a login name [xfail(legacy): legacy has no tilde expansion]
+u=root; printf '[%s]\n' ~$u
