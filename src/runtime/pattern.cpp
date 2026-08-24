@@ -6,12 +6,105 @@ namespace lesh::runtime {
 
 namespace {
 
+// One of POSIX's twelve character classes.
+//
+// Spelled out rather than delegated to <ctype.h>, because those functions read
+// the process locale and this matcher must not: it is a pure function of two
+// strings, and the same pattern has to mean the same thing in `case`, in a glob
+// and in `${x#pat}` whichever locale the caller happens to be running under. The
+// C locale is the only one lesh has, so the two agree today - and this way they
+// still agree the day lesh grows a locale.
+//
+// An unknown name matches NOTHING rather than being an error. POSIX leaves it
+// undefined; dash matches nothing, including the bytes the construct is spelled
+// with, so `[[:nosuch:]]` matches neither `a` nor `[` nor `:`.
+bool in_class(std::string_view name, unsigned char c) {
+	const bool lower = c >= 'a' && c <= 'z';
+	const bool upper = c >= 'A' && c <= 'Z';
+	const bool digit = c >= '0' && c <= '9';
+	if (name == "lower")  return lower;
+	if (name == "upper")  return upper;
+	if (name == "alpha")  return lower || upper;
+	if (name == "digit")  return digit;
+	if (name == "alnum")  return lower || upper || digit;
+	if (name == "xdigit") return digit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+	if (name == "blank")  return c == ' ' || c == '\t';
+	if (name == "space")
+		return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+	if (name == "cntrl")  return c < 0x20 || c == 0x7f;
+	if (name == "print")  return c >= 0x20 && c < 0x7f;
+	if (name == "graph")  return c > 0x20 && c < 0x7f;
+	if (name == "punct")  return c > 0x20 && c < 0x7f && !(lower || upper || digit);
+	return false;
+}
+
+// One element of a bracket expression, which is not always one character.
+//
+// POSIX admits three bracketed forms inside the brackets - `[:class:]`,
+// `[.symbol.]` and `[=equivalent=]` - and they do not behave alike: a class is a
+// SET and so can never bound a range, while the other two name a single
+// character and can. Reading an element is therefore its own step, and the range
+// lookahead runs on what it produced rather than on raw bytes: `[[.0.]-[.2.]]`
+// is the range `0` to `2` written the long way, and stepping over the endpoints
+// a character at a time cannot see that.
+struct bracket_element {
+	bool well_formed = true;
+	bool is_class = false;  // a set, so not a range endpoint
+	bool matched = false;   // is_class only: the class holds the subject byte
+	char value = 0;         // otherwise: the one character it denotes
+};
+
+// Reads the element at `at` and advances past it.
+bracket_element read_element(std::string_view pattern, size_t& at, unsigned char c) {
+	bracket_element e;
+
+	if (pattern[at] == '[' && at + 1 < pattern.size() &&
+	    (pattern[at + 1] == ':' || pattern[at + 1] == '.' || pattern[at + 1] == '=')) {
+		const char delimiter = pattern[at + 1];
+		const size_t body = at + 2;
+		const char closing[3] = {delimiter, ']', '\0'};
+		const size_t close = pattern.find(closing, body);
+		if (close == std::string_view::npos) {
+			e.well_formed = false;  // `[[:` that never closes: the '[' opens nothing
+			return e;
+		}
+		const std::string_view name = pattern.substr(body, close - body);
+		if (delimiter == ':') {
+			e.is_class = true;
+			e.matched = in_class(name, c);
+		} else if (name.size() == 1) {
+			// A collating symbol and an equivalence class both name exactly one
+			// character in the C locale, and in the C locale a character is
+			// equivalent to itself and nothing else.
+			e.value = name[0];
+		} else {
+			e.well_formed = false;  // no multi-character collating element in C
+			return e;
+		}
+		at = close + 2;
+		return e;
+	}
+
+	// A backslash escapes the next byte, including a `]` that would otherwise
+	// close the expression. POSIX leaves a backslash inside brackets to the
+	// locale, but the SHELL has already put this one there deliberately: quoting
+	// a metacharacter is translated into `\` on its way to the matcher, so
+	// `["*"]` has to be the set holding an asterisk rather than the set holding a
+	// backslash as well.
+	if (pattern[at] == '\\' && at + 1 < pattern.size())
+		++at;
+	e.value = pattern[at];
+	++at;
+	return e;
+}
+
 // Matches a bracket expression starting at pattern[0] == '['.
 //
 // Returns whether it matched, and advances `pattern_at` past the closing ']'.
 // An unterminated '[' is a literal '[' - POSIX's rule, and the reason this
 // returns a separate "well formed" flag rather than just failing.
 bool match_bracket(std::string_view pattern, size_t& pattern_at, char c, bool& well_formed) {
+	const unsigned char subject = static_cast<unsigned char>(c);
 	size_t at = pattern_at + 1;
 	bool negated = false;
 	if (at < pattern.size() && (pattern[at] == '!' || pattern[at] == '^')) {
@@ -31,17 +124,36 @@ bool match_bracket(std::string_view pattern, size_t& pattern_at, char c, bool& w
 			break;
 		first = false;
 
-		const char low = pattern[at];
-		if (at + 2 < pattern.size() && pattern[at + 1] == '-' && pattern[at + 2] != ']') {
-			const char high = pattern[at + 2];
-			if (c >= low && c <= high)
-				matched = true;
-			at += 3;
-		} else {
-			if (c == low)
-				matched = true;
-			++at;
+		const bracket_element low = read_element(pattern, at, subject);
+		if (!low.well_formed) {
+			well_formed = false;
+			return false;
 		}
+		if (low.is_class) {
+			// A class is a set, so it never bounds a range: a `-` after one is an
+			// ordinary character, which is the reading POSIX's "undefined" leaves
+			// open and the only one that does not need a second kind of endpoint.
+			matched = matched || low.matched;
+			continue;
+		}
+
+		// `a-z`. A `-` immediately before the closing `]` is an ordinary character
+		// instead - `[a-]` is the two-character set - which is what the second half
+		// of this lookahead is for.
+		if (at + 1 < pattern.size() && pattern[at] == '-' && pattern[at + 1] != ']') {
+			size_t after = at + 1;
+			const bracket_element high = read_element(pattern, after, subject);
+			if (!high.well_formed || high.is_class) {
+				well_formed = false;
+				return false;
+			}
+			at = after;
+			if (c >= low.value && c <= high.value)
+				matched = true;
+			continue;
+		}
+		if (c == low.value)
+			matched = true;
 	}
 
 	well_formed = true;

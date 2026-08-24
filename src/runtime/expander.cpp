@@ -313,7 +313,7 @@ void expander::append_quoted(std::string_view bytes, expand_context ctx) noexcep
 		return;
 	}
 	for (const char c : bytes) {
-		if (c == '\\' || c == '*' || c == '?' || c == '[')
+		if (is_pattern_syntax(c))
 			_current->push('\\');
 		push_byte(c);
 	}

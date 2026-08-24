@@ -31,6 +31,26 @@ namespace lesh::runtime {
 // the overwhelming majority of words.
 [[nodiscard]] bool has_pattern_characters(std::string_view text) noexcept;
 
+// Every byte this matcher reads as SYNTAX rather than as data, and therefore
+// every byte that has to be escaped when it arrives QUOTED. Lives here because
+// the matcher is what decides it: an expander that kept its own list of them
+// would be a second opinion about one grammar, which is the thing #23 exists to
+// prevent.
+//
+// Wider than the three metacharacters, because a bracket expression has a syntax
+// of its own: `]` closes it, `-` makes a range, and `!` or `^` negates it. The
+// expander cannot consult POSITION to decide which of those are live - whether a
+// byte lands inside brackets depends on text that may have come from a different
+// segment of the word entirely - so a quoted one is escaped wherever it goes.
+// That costs nothing: the matcher reads `\x` as `x` for every x, so an escape
+// that turns out to be unnecessary is merely unnecessary. `case '-' in [a\-c]`
+// is the two-character set, and dropping the backslash from a quoted `-` put the
+// range back.
+[[nodiscard]] constexpr bool is_pattern_syntax(char c) noexcept {
+	return c == '\\' || c == '*' || c == '?' || c == '[' || c == ']' || c == '-' ||
+	       c == '!' || c == '^';
+}
+
 // Longest or shortest match anchored at one end, for ${x#pat} and friends.
 // Returns the number of bytes matched, or npos when nothing matched - zero is a
 // legitimate result, since `*` matches the empty string.

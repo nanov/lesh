@@ -309,3 +309,36 @@ n=; case '' in $n) echo one;; esac; case $n in $n) echo two;; esac; case $(true)
 
 --- a case pattern is not field-split however IFS reads [xfail(legacy): legacy has no case clause]
 IFS=:; p='a:b'; case 'a:b' in $p) echo joined;; esac; case a in $p) echo no;; esac
+
+# A bracket expression is not just a list of bytes. POSIX admits `[:class:]`,
+# `[.symbol.]` and `[=equivalent=]` inside the brackets, and the shell's own
+# quoting arrives here as a backslash - so what looks like one loop over
+# characters is three kinds of element and a range that may be written the long
+# way. fnmatch-p.tst's 'brackets' is the whole of it in eighteen lines.
+
+--- a bracket expression holds character classes [xfail(legacy): legacy has no case clause]
+for c in a Z 7 ' ' '!' '	'; do
+  for k in lower upper alpha digit alnum punct graph print cntrl blank space xdigit; do
+    eval "case \"\$c\" in [[:\$k:]]) printf '%s ' \"\$k\";; esac"
+  done
+  echo
+done
+
+--- a class is one member of a set like any other [xfail(legacy): legacy has no case clause]
+for c in a 7 b; do case $c in [a[:digit:]]) echo "$c in";; *) echo "$c out";; esac; done
+for c in a 7; do case $c in [![:digit:]]) echo "$c in";; *) echo "$c out";; esac; done
+
+--- collating symbols and equivalence classes name one character each [xfail(legacy): legacy has no case clause]
+case a in [[.a.]]) echo dot;; esac
+case a in [[=a=]]) echo equiv;; esac
+case 1 in [[.0.]-[.2.]]) echo range;; esac
+case 3 in [[.0.]-[.2.]]) echo notreached;; esac
+
+--- a quoted metacharacter inside a bracket expression is one member of it [xfail(legacy): legacy has no case clause]
+case '*' in ["*"]) echo star;; esac
+case '\' in ["*"]) echo notreached;; esac
+case '-' in [a\-c]) echo dash;; esac
+case b in [a\-c]) echo notreached;; esac
+
+--- an unknown class name matches nothing at all [xfail(legacy): legacy has no case clause]
+for c in a '[' ':'; do case $c in [[:nosuch:]]) echo "$c in";; *) echo "$c out";; esac; done
