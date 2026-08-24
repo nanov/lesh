@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <string_view>
@@ -1744,16 +1745,67 @@ builtin_result builtin_shift(shell_state& state, char** argv) {
 	return {0};
 }
 
-builtin_result builtin_break(shell_state&, char** argv) {
+// How many levels `break` or `continue` unwinds. False when the operand was not a
+// positive decimal integer, having reported it.
+//
+// POSIX XCU: n "shall be a positive decimal integer". `break 0` went through
+// std::atoi and asked to unwind ZERO levels, which consume_loop_flow reads as
+// "already arrived" - so the break VANISHED and the loop carried on to the
+// commands after it. A break that silently does nothing is the
+// stub-that-succeeds failure #24's resolution warned about, and break-p.tst's
+// 'zero operand' is the assertion for it. dash writes `Illegal number: 0` and
+// exits 2; being a special builtin, so does this.
+//
+// The digits are checked before the value rather than after: `break -1` and
+// `break x` both reach atoi as something <= 0, and a NEGATIVE level would make
+// consume_loop_flow's `--_flow_level <= 0` true at the first loop and leave the
+// operand indistinguishable from 1.
+bool read_flow_level(std::string_view name, char* const* argv, int& level) {
 	const size_t operand = first_operand(argv);
-	return {0, control_flow::break_loop,
-	        argv[operand] != nullptr ? std::atoi(argv[operand]) : 1};
+	if (argv[operand] == nullptr)
+		return true;  // no operand: the default of one stands
+	const std::string_view text{argv[operand]};
+	unsigned long long value = 0;
+	if (!text.empty() &&
+	    text.find_first_not_of("0123456789") == std::string_view::npos) {
+		for (const char c : text) {
+			value = value * 10 + static_cast<unsigned long long>(c - '0');
+			// Clamped rather than wrapped: `break 99999999999999` means out of every
+			// loop there is, which is what any level past the nesting depth already
+			// means ('breaking much more than actual nest level'). Wrapping could land
+			// on zero and turn the break back into the no-op this function exists to
+			// refuse.
+			if (value > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+				value = static_cast<unsigned long long>(std::numeric_limits<int>::max());
+				break;
+			}
+		}
+	}
+	if (value == 0) {
+		std::fprintf(stderr, "lesh: %.*s: %.*s: not a positive integer\n",
+		             static_cast<int>(name.size()), name.data(),
+		             static_cast<int>(text.size()), text.data());
+		return false;
+	}
+	level = static_cast<int>(value);
+	return true;
+}
+
+builtin_result builtin_break(shell_state&, char** argv) {
+	int level = 1;
+	// 2, as for any other builtin's usage error, and what dash answers. `break` is
+	// SPECIAL, so try_run_builtin turns the non-zero status into an exit for a
+	// non-interactive shell - which is what dash does too.
+	if (!read_flow_level("break", argv, level))
+		return {2};
+	return {0, control_flow::break_loop, level};
 }
 
 builtin_result builtin_continue(shell_state&, char** argv) {
-	const size_t operand = first_operand(argv);
-	return {0, control_flow::continue_loop,
-	        argv[operand] != nullptr ? std::atoi(argv[operand]) : 1};
+	int level = 1;
+	if (!read_flow_level("continue", argv, level))
+		return {2};
+	return {0, control_flow::continue_loop, level};
 }
 
 builtin_result builtin_return(shell_state& state, char** argv) {

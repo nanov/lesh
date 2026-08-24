@@ -955,3 +955,16 @@ f() { return 7 && echo reached; }; f; echo "st=$?"
 
 --- an exit before && does not run the right-hand side [xfail(legacy): legacy has no exit builtin and runs /bin/exit, which does not exist]
 exit 5 && echo reached
+
+# `break 0` is an ERROR, not a no-op. POSIX XCU makes n a positive decimal
+# integer; zero levels is what the unwind counter reads as "already arrived", so
+# the break vanished and the loop carried on.
+
+--- a zero operand to break is an error [xfail(legacy): legacy has no compound commands]
+for i in 1; do break 0; echo reached; done 2>/dev/null; echo "st=$?"
+
+--- a zero operand to continue is an error [xfail(legacy): legacy has no compound commands]
+for i in 1; do continue 0; echo reached; done 2>/dev/null; echo "st=$?"
+
+--- a non-numeric operand to break is an error [xfail(legacy): legacy has no compound commands]
+for i in 1; do break x; echo reached; done 2>/dev/null; echo "st=$?"

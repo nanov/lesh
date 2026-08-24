@@ -735,3 +735,32 @@ TEST_F(ExecutorTest, AnUnwindBeforeAndKeepsTheStatusTheBuiltinReported) {
 	EXPECT_EQ(run("f() { return 7 && echo reached; }; f"), 7);
 	EXPECT_EQ(capture("f() { return 7 && echo reached; }; f; echo st=$?"), "st=7\n");
 }
+
+// --- `break 0` is an error, not a no-op ---------------------------------------
+
+TEST_F(ExecutorTest, AZeroOperandToBreakIsAnError) {
+	// Zero levels is what consume_loop_flow reads as "already arrived", so the
+	// break vanished and the loop ran on into `echo reached`. break-p.tst's
+	// 'zero operand' wants a diagnostic and a non-zero status; dash exits 2.
+	EXPECT_EQ(run("for i in 1; do break 0; done 2>/dev/null"), 2);
+	EXPECT_EQ(run("for i in 1; do continue 0; done 2>/dev/null"), 2);
+	EXPECT_EQ(capture("for i in 1; do break 0; echo reached; done 2>/dev/null"), "");
+	// A special builtin's failure exits a non-interactive shell, so nothing after
+	// the loop runs either.
+	EXPECT_EQ(capture("for i in 1; do break 0; done 2>/dev/null; echo after"), "");
+}
+
+TEST_F(ExecutorTest, ANonNumericOrNegativeOperandToBreakIsAnError) {
+	// atoi answered 0 for `x` and -1 for `-1`, and a negative level would make
+	// `--_flow_level <= 0` true at the first loop - indistinguishable from 1.
+	EXPECT_EQ(run("for i in 1; do break x; done 2>/dev/null"), 2);
+	EXPECT_EQ(run("for i in 1; do break -1; done 2>/dev/null"), 2);
+	EXPECT_EQ(run("for i in 1; do continue 1x; done 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, ALevelPastTheNestingDepthStillBreaksOutOfTheLoop) {
+	// The clamp must not turn a huge operand back into the zero this refuses.
+	// break-p.tst's 'breaking much more than actual nest level one'.
+	EXPECT_EQ(capture("for i in 1; do break 100; echo reached; done"), "");
+	EXPECT_EQ(capture("for i in 1; do break 99999999999999; echo reached; done"), "");
+}
