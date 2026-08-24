@@ -4,6 +4,8 @@
 #include "runtime/glob.h"
 #include "runtime/pattern.h"
 
+#include "substrate/char_utils.h"
+
 #include "syntax/lexer.h"
 
 #include <cstdio>
@@ -60,6 +62,59 @@ constexpr bool is_unterminated_substitution(token_error error) noexcept {
 			return false;
 	}
 	return false;
+}
+
+// True for a name the LENGTH form can be taken of: a variable name, `*`, `@`, or
+// a positional number. What decides whether `${#...}` is a length at all.
+//
+// POSIX 2.6.2 disambiguates `${#-word}` this way and dash agrees: `#` followed by
+// something that cannot be a name is the parameter `#` with an operator, not the
+// length of a parameter with a peculiar name. Read as a length, `${#+y}` gave the
+// length of an unset parameter called `+y` - zero - where dash prints `y`.
+bool is_length_target(std::string_view name) noexcept {
+	if (name.empty())
+		return false;
+	// A SPECIAL parameter, but only when it is the whole rest of the body. `${#?}`
+	// is the length of `$?` and `${#?X}` is the count with an error-if-unset
+	// message, which is the distinction param-p.tst asserts in two directions at
+	// once - :236 wants the first and :268 the second.
+	if (name.size() == 1) {
+		switch (name[0]) {
+			case '*': case '@': case '?': case '$': case '!': case '-': case '#':
+				return true;
+			default:
+				break;
+		}
+	}
+	bool all_digits = true;
+	for (const char c : name)
+		all_digits = all_digits && c >= '0' && c <= '9';
+	if (all_digits)
+		return true;
+	if (!lesh::string_utils::is_valid_var_name_first_char(
+	        static_cast<unsigned char>(name[0])))
+		return false;
+	for (const char c : name.substr(1)) {
+		if (!lesh::string_utils::is_valid_var_name_non_first_char(
+		        static_cast<unsigned char>(c)))
+			return false;
+	}
+	return true;
+}
+
+// True for a name `${x=...}` may assign to: a variable, and nothing else. A
+// positional or special parameter is not assignable, which is a diagnostic rather
+// than a silent substitution.
+bool is_assignable_name(std::string_view name) noexcept {
+	if (name.empty() || !lesh::string_utils::is_valid_var_name_first_char(
+	                        static_cast<unsigned char>(name[0])))
+		return false;
+	for (const char c : name.substr(1)) {
+		if (!lesh::string_utils::is_valid_var_name_non_first_char(
+		        static_cast<unsigned char>(c)))
+			return false;
+	}
+	return true;
 }
 
 // The body of a parameter segment: what sits between `${` and `}`, or after `$`.
@@ -119,16 +174,20 @@ parsed_parameter parse_parameter(std::string_view body) noexcept {
 		}
 	}
 
-	if (body[0] == '#' && body.size() > 1) {
+	if (body[0] == '#' && body.size() > 1 && is_length_target(body.substr(1))) {
 		// ${#x} is length - but `$#` alone is the positional count, which reaches
-		// here as a bare name rather than through this branch.
+		// here as a bare name rather than through this branch, and `${#-y}` is that
+		// count with a default rather than the length of a parameter called `-y`.
 		out.op = param_op::length;
 		out.name = body.substr(1);
 		return out;
 	}
 
-	// Scan for the operator, which starts after the name.
-	size_t at = 0;
+	// Scan for the operator, which starts after the name. It starts at 1 for `#`
+	// because `#` is itself a parameter name and every operator character can
+	// follow it: `${#-y}`, `${#+y}`, `${#=y}`. Starting at 0 read the `#` AS the
+	// operator and left the name empty.
+	size_t at = body[0] == '#' ? 1 : 0;
 	while (at < body.size() && body[at] != ':' && body[at] != '-' && body[at] != '=' &&
 	       body[at] != '?' && body[at] != '+' && body[at] != '#' && body[at] != '%')
 		++at;
@@ -235,6 +294,29 @@ void expander::append_split(std::string_view bytes,
 	}
 }
 
+// Bytes a pattern matcher must read as DATA. Escaping rather than removing the
+// quotes is how the quoting survives expansion: `\*` is the only channel there is
+// for telling the matcher that an asterisk is an asterisk.
+void expander::append_quoted(std::string_view bytes, expand_context ctx) noexcept {
+	if (!ctx.pattern) {
+		append(bytes);
+		return;
+	}
+	for (const char c : bytes) {
+		if (c == '\\' || c == '*' || c == '?' || c == '[')
+			_current->push('\\');
+		push_byte(c);
+	}
+	_field_started = true;
+}
+
+void expander::append_value(std::string_view bytes, expand_context ctx) noexcept {
+	// Only a value that was inside double quotes is data. An unquoted one is a
+	// PATTERN, which is what makes `${w#${a}b}` and `${w#"${a}b"}` differ when a
+	// holds an asterisk - param-p.tst's 'parameter expansion in embedded pattern'.
+	append_quoted(bytes, ctx.double_quoted ? ctx : expand_context{.pattern = false});
+}
+
 // One byte of ordinary text. Ends any separator run in progress, which is what
 // makes a separator's trailing white space belong to the separator rather than
 // to the field after it.
@@ -293,6 +375,30 @@ bool expander::lookup_parameter(std::string_view name, std::string_view& out) no
 	}
 	if (name == "-") {
 		out = _params.option_flags();
+		return true;
+	}
+	if (name == "@" || name == "*") {
+		// ALWAYS set, even with no positional parameters: `${@-unset}` is empty in
+		// dash rather than `unset`, and only the colon forms treat it as absent.
+		// Reported unset, `${@=x}` took the assignment path and reported a bad
+		// variable name where dash substitutes nothing at status zero.
+		arena_array<char> joined{_pool, 32};
+		const std::string_view sep = _params.ifs();
+		const size_t count = _params.positional_count();
+		for (size_t i = 1; i <= count; ++i) {
+			std::string_view arg;
+			if (!_params.positional_at(i, arg))
+				continue;
+			if (i > 1 && !sep.empty())
+				joined.push(sep[0]);
+			for (const char c : arg)
+				joined.push(c);
+		}
+		char* block = nullptr;
+		_pool.allocate(joined.size() == 0 ? 1 : joined.size(), block, 1);
+		if (joined.size() > 0)
+			std::memcpy(block, joined.data(), joined.size());
+		out = std::string_view(block, joined.size());
 		return true;
 	}
 	if (name[0] >= '1' && name[0] <= '9') {
@@ -377,6 +483,8 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 			break;
 		}
 		const std::string_view body = text.substr(seg.offset, seg.length);
+		// Content unless proven otherwise, which only the empty `"$@"` below does.
+		bool segment_is_content = true;
 
 		switch (seg.kind) {
 			case token_kind::seg_literal: {
@@ -400,13 +508,17 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						const char next = body[i + 1];
 						if (ctx.escapes(next)) {
 							// An escaped byte is quoted, so it never separates fields even
-							// where the unescaped one would: `${a+\ x}` is one field.
-							push_byte(next);
+							// where the unescaped one would: `${a+\ x}` is one field - and
+							// in a pattern it stays escaped rather than turning back into a
+							// metacharacter.
+							append_quoted(body.substr(i + 1, 1), ctx);
 							++i;
 							continue;
 						}
 					}
-					if (ctx.split && ctx.substituted)
+					if (ctx.pattern && ctx.double_quoted)
+						append_quoted(body.substr(i, 1), ctx);
+					else if (ctx.split && ctx.substituted)
 						append_split(body.substr(i, 1), out);
 					else
 						push_byte(body[i]);
@@ -415,9 +527,10 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 
 			case token_kind::seg_single_quoted: {
 				// Nothing inside single quotes is ever special, and the quotes
-				// themselves are removed. An empty '' still starts a field.
+				// themselves are removed. An empty '' still starts a field. In a
+				// pattern the quoting becomes escapes rather than nothing.
 				if (body.size() >= 2)
-					append(body.substr(1, body.size() - 2));
+					append_quoted(body.substr(1, body.size() - 2), ctx);
 				_field_started = true;
 			} break;
 
@@ -426,7 +539,17 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				// FIELD LIST is being built is the enclosing context's business, so
 				// `"$@"` in a command argument still gives one field per parameter
 				// while `x="$@"` joins.
-				_field_started = true;
+				//
+				// The quotes start a field, EXCEPT when all they contain is a `"$@"`
+				// with no positional parameters: POSIX makes that zero fields, quotes
+				// and all, so `set --; bracket "$@"` prints nothing. Forcing the field
+				// here unconditionally printed one empty one (param-p.tst:560), while
+				// `bracket "$null$@"` must still print it - an empty variable is
+				// content and an absent `$@` is not.
+				const bool outer_empty_at = _saw_empty_at;
+				const bool outer_other = _saw_other_content;
+				_saw_empty_at = false;
+				_saw_other_content = false;
 				if (body.size() >= 2) {
 					// The interior is lexed as the inside of double quotes: a single
 					// quote there is an ordinary byte, not the start of a quoted run.
@@ -435,11 +558,20 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						            expand_context{.split = false,
 						                           .fields = ctx.fields,
 						                           .double_quoted = true,
+						                           .pattern = ctx.pattern,
 						                           .mode = lex_mode::double_quote_interior},
 						            out);
 					if (inner != expansion_status::ok)
 						status = inner;
 				}
+				const bool quotes_hold_only_an_absent_at =
+					_saw_empty_at && !_saw_other_content;
+				_saw_empty_at = outer_empty_at;
+				_saw_other_content = outer_other;
+				if (!quotes_hold_only_an_absent_at)
+					_field_started = true;
+				else
+					segment_is_content = false;
 			} break;
 
 			case token_kind::seg_parameter: {
@@ -453,6 +585,13 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				// written, which is why it is handled before anything else.
 				if (p.op == param_op::none && (p.name == "@" || p.name == "*")) {
 					const size_t count = _params.positional_count();
+					if (ctx.double_quoted && ctx.fields && p.name == "@" && count == 0) {
+						// Nothing at all - not even the field the quotes would start.
+						// The enclosing seg_double_quoted reads this.
+						segment_is_content = false;
+						_saw_empty_at = true;
+						break;
+					}
 					if (ctx.double_quoted && ctx.fields && p.name == "@") {
 						for (size_t i = 1; i <= count; ++i) {
 							std::string_view arg;
@@ -542,6 +681,24 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						goto substitute_value;
 
 					case param_op::assign_default:
+						if (absent && !is_assignable_name(p.name)) {
+							// POSIX: only a VARIABLE can be assigned to. `${1:=x}` and
+							// `${*:=x}` reported nothing and quietly substituted the
+							// default - a stub that succeeded, which param-p.tst:198 and
+							// :202 both assert against. dash says `1: bad variable name`
+							// and exits 2.
+							//
+							// Checked only when the assignment would actually HAPPEN,
+							// which is dash's rule and not an approximation of it:
+							// `set a; echo ${1=x}` substitutes `a` at status zero, and
+							// `${#=y}` substitutes the count, because neither needs to
+							// assign anything.
+							std::fprintf(stderr, "lesh: %.*s: bad variable name\n",
+							             static_cast<int>(p.name.size()), p.name.data());
+							status = expansion_status::unsupported_construct;
+							_fatal_error = true;
+							break;
+						}
 						if (absent) {
 							// `=` is the one that needs a value as well as a substitution,
 							// and the two are NOT the same string: quote removal happens
@@ -608,25 +765,24 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						// The pattern is expanded but NOT globbed - it is a pattern,
 						// not a filename. The matcher is #23's, shared with `case`.
 						//
-						// Expanded with the DOUBLE-QUOTED rules whatever the enclosing
-						// context, which is deliberate and still wrong: a backslash has to
-						// survive expansion for the matcher to see `\*` as a literal
-						// asterisk, so quote removal cannot run here, and a QUOTED `*`
-						// (`${a#"*"}`) is therefore still treated as a metacharacter.
+						// `pattern` rather than `double_quoted`, which is what this used
+						// to say. Both keep a backslash through expansion, but only
+						// `pattern` also keeps the quoting that had no backslash:
+						// `${s#'*'}` on `***` must trim ONE asterisk, and reading those
+						// quotes as nothing left the matcher a bare `*` that swallowed all
+						// three. Not double-quoted, because the outer quotes of
+						// `"${a#*1}"` do not quote the pattern - it still wildcards.
+						//
 						// Lexed as a WORD interior whatever the enclosing mode, because a
 						// quote inside `${...}` is a quote even where the surrounding text
-						// has none: `cat <<END` holding `${foo%"oo"}` trims `oo`, and a
+						// has none: `cat <<END` holding `${foo%"oo"}` trims `oo`, while a
 						// here-document body's own `"` is an ordinary byte (redir-p.tst's
 						// 'parameter expansion with unquoted here-document delimiter').
-						//
-						// Doing it properly wants the expansion to carry which bytes came
-						// out quoted, which is param-p.tst's four trim cases and
-						// quote-p.tst's 'quotes in pattern of expansions'; left as it was
-						// rather than regressed toward removing the backslashes too.
 						const std::string_view pat = expand_to_value(
 							p.argument, expand_context{.split = false,
 							                           .fields = false,
-							                           .double_quoted = true,
+							                           .double_quoted = false,
+							                           .pattern = true,
 							                           .mode = lex_mode::word_interior});
 						std::string_view result = value;
 						const bool prefix = p.op == param_op::trim_prefix_short ||
@@ -639,7 +795,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							result = prefix ? value.substr(n)
 							                : value.substr(0, value.size() - n);
 						}
-						if (ctx.split) append_split(result, out); else append(result);
+						if (ctx.split) append_split(result, out); else append_value(result, ctx);
 						break;
 					}
 
@@ -655,7 +811,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 									_field_globbable = true;
 								append_split(value, out);
 							} else {
-								append(value);
+								append_value(value, ctx);
 							}
 						}
 						break;
@@ -706,7 +862,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							_field_globbable = true;
 						append_split(result, out);
 					} else {
-						append(result);
+						append_value(result, ctx);
 					}
 				}
 			} break;
@@ -761,13 +917,15 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				// results of expansions' sets `IFS=' 0'` and requires `$((708))` to
 				// become two fields.
 				const std::string_view text{digits, n > 0 ? static_cast<size_t>(n) : 0};
-				if (ctx.split) append_split(text, out); else append(text);
+				if (ctx.split) append_split(text, out); else append_value(text, ctx);
 			} break;
 
 			default:
 				append(body);
 				break;
 		}
+		if (segment_is_content)
+			_saw_other_content = true;
 	}
 	--_depth;
 	return status;

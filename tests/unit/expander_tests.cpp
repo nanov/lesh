@@ -399,6 +399,105 @@ TEST_F(ExpanderTest, OnlyHashAndPercentHaveADoubledForm) {
 	EXPECT_EQ(expand("echo ${v#a*}"), (std::vector<std::string>{"echo", "ab"}));
 }
 
+// `"$@"` with no positional parameters is ZERO fields, quotes and all.
+TEST_F(ExpanderTest, AnAbsentDollarAtInDoubleQuotesDoesNotEvenStartAField) {
+	// The quotes normally start a field, which is why `echo ""` passes one empty
+	// argument. POSIX exempts an absent `"$@"`, and forcing the field here printed
+	// one empty one where dash, bash and zsh all print nothing (param-p.tst:560).
+	EXPECT_EQ(expand("echo \"$@\""), (std::vector<std::string>{"echo"}));
+	EXPECT_EQ(expand("echo \"$@\"\"$@\""), (std::vector<std::string>{"echo"}));
+}
+
+TEST_F(ExpanderTest, ButAnythingElseInThoseQuotesStillStartsIt) {
+	// The line either side of the exemption. An empty VARIABLE is content and an
+	// absent `$@` is not, so `"$null$@"` is one empty field and `"$@"` is none -
+	// which is why this takes two flags rather than one.
+	params.vars["null"] = "";
+	EXPECT_EQ(expand("echo \"$null\"\"$@\""), (std::vector<std::string>{"echo", ""}));
+	EXPECT_EQ(expand("echo \"=$@=\""), (std::vector<std::string>{"echo", "=="}));
+	EXPECT_EQ(expand("echo \"\""), (std::vector<std::string>{"echo", ""}));
+}
+
+TEST_F(ExpanderTest, AssigningToAPositionalOrSpecialParameterIsRefusedNotIgnored) {
+	// A stub that succeeded: `${1:=}` reported nothing and quietly substituted the
+	// default. dash says `1: bad variable name` and exits 2 (param-p.tst:198, :202).
+	FakeAssigner assigner;
+	for (const std::string_view form : {"${1:=x}", "${*:=x}", "${@:=x}", "${1=x}"}) {
+		const std::string src = std::string("echo ") + std::string(form);
+		const tree t = parse(pool, src);
+		const node_index cmd = t.child_of(t[t.root()], 0);
+		expander ex{pool, params, nullptr, true, nullptr, &assigner};
+		lesh::arena_array<std::string_view> fields{pool, 4};
+		ex.expand_word(t, t.child_of(t[cmd], 1), fields);
+		EXPECT_TRUE(ex.fatal_error()) << form;
+	}
+	EXPECT_TRUE(assigner.assigned.empty()) << "and nothing was assigned";
+}
+
+TEST_F(ExpanderTest, ButOnlyWhenTheAssignmentWouldActuallyHappen) {
+	// dash's rule rather than an approximation of it: `set a; echo ${1=x}`
+	// substitutes `a` at status zero, because a set parameter needs no assignment.
+	params.args = {"a"};
+	bool fatal = false;
+	EXPECT_EQ(expand("echo ${1=x}", nullptr, nullptr, &fatal),
+	          (std::vector<std::string>{"echo", "a"}));
+	EXPECT_FALSE(fatal);
+}
+
+TEST_F(ExpanderTest, DollarAtAndDollarStarAreAlwaysSet) {
+	// `${@-unset}` is EMPTY in dash, not `unset`: only the colon forms treat an
+	// empty `$@` as absent. Reported unset, `${@=x}` took the assignment path and
+	// refused a name dash accepts.
+	EXPECT_EQ(expand("echo \"${@-unset}\""), (std::vector<std::string>{"echo", ""}));
+	EXPECT_EQ(expand("echo \"${@:-unset}\""),
+	          (std::vector<std::string>{"echo", "unset"}));
+}
+
+TEST_F(ExpanderTest, TheLengthFormNeedsAnAmeAfterTheHash) {
+	// POSIX 2.6.2's disambiguation. `${#+y}` read as a length gave the length of an
+	// unset parameter called `+y` - zero - where dash prints `y`, and `${#?}` read
+	// as an operator gave the count where dash gives the length of `$?`.
+	params.args = {"a", "b"};
+	EXPECT_EQ(expand("echo ${#+y}"), (std::vector<std::string>{"echo", "y"}));
+	EXPECT_EQ(expand("echo ${#-y}"), (std::vector<std::string>{"echo", "2"}));
+	EXPECT_EQ(expand("echo ${#?}"), (std::vector<std::string>{"echo", "1"}))
+		<< "the length of $?, which is one digit";
+	EXPECT_EQ(expand("echo ${#?X}"), (std::vector<std::string>{"echo", "2"}))
+		<< "but with a message it is the count again";
+	params.vars["v"] = "hello";
+	EXPECT_EQ(expand("echo ${#v}"), (std::vector<std::string>{"echo", "5"}));
+}
+
+// A pattern keeps its quoting, as escapes. Removing the quotes made every quoted
+// metacharacter a metacharacter again.
+TEST_F(ExpanderTest, AQuotedMetacharacterInATrimPatternIsData) {
+	params.vars["s"] = "***";
+	EXPECT_EQ(expand("echo ${s#'*'}"), (std::vector<std::string>{"echo", "**"}))
+		<< "one literal asterisk, not all three";
+	EXPECT_EQ(expand("echo ${s##'*'}"), (std::vector<std::string>{"echo", "**"}));
+	EXPECT_EQ(expand("echo ${s#\\*}"), (std::vector<std::string>{"echo", "**"}));
+}
+
+TEST_F(ExpanderTest, AnUnquotedMetacharacterInATrimPatternStillWildcards) {
+	// The other half: `pattern` must not turn the pattern into a literal string.
+	params.vars["a"] = "1-2-3-4";
+	EXPECT_EQ(expand("echo ${a#*-}"), (std::vector<std::string>{"echo", "2-3-4"}));
+	EXPECT_EQ(expand("echo ${a##*-}"), (std::vector<std::string>{"echo", "4"}));
+	EXPECT_EQ(expand("echo \"${a#*1}\""), (std::vector<std::string>{"echo", "-2-3-4"}))
+		<< "and the outer double quotes do not quote the pattern";
+}
+
+TEST_F(ExpanderTest, AnExpansionInAPatternIsAPatternUnlessItWasQuoted) {
+	// param-p.tst's 'parameter expansion in embedded pattern': the value of `a` is
+	// an asterisk, so unquoted it wildcards and quoted it is one literal asterisk
+	// that `ab\bc` does not contain.
+	params.vars["w"] = "ab\\bc";
+	params.vars["a"] = "*";
+	EXPECT_EQ(expand("echo ${w#${a}b}"), (std::vector<std::string>{"echo", "\\bc"}));
+	EXPECT_EQ(expand("echo ${w#\"${a}b\"}"),
+	          (std::vector<std::string>{"echo", "ab\\bc"}));
+}
+
 TEST_F(ExpanderTest, TildeExpandsToHome) {
 	EXPECT_EQ(expand("echo ~"), (std::vector<std::string>{"echo", "/home/tester"}));
 }

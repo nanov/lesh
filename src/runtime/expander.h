@@ -189,6 +189,13 @@ private:
 		// But `${a+ x}` really does substitute a leading blank that then separates,
 		// which is why the two cannot share one flag.
 		bool substituted = false;
+		// The text is a PATTERN - the argument of `${x#word}` and friends. Quoting
+		// inside it is TRANSLATED into backslash escapes rather than removed,
+		// because a matcher's only channel for "this asterisk is data" is a
+		// backslash: `${s#'*'}` trims one literal asterisk, while `${a#*1}` still
+		// wildcards. Removing the quotes lost the distinction and made every quoted
+		// metacharacter a metacharacter again.
+		bool pattern = false;
 		// How the text is LEXED, which is a third thing again: a single quote is an
 		// ordinary byte inside double quotes and in a here-document body, and a
 		// tilde is eligible only where a word begins.
@@ -221,6 +228,12 @@ private:
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
 	void push_byte(char c) noexcept;
+	// Bytes that arrived QUOTED: escaped in a pattern context, verbatim otherwise.
+	void append_quoted(std::string_view bytes, expand_context ctx) noexcept;
+	// Bytes that came out of an EXPANSION: escaped only when the expansion itself
+	// was inside double quotes, because an unquoted `${a}` in a pattern is a
+	// pattern - `w='ab\bc' a='*'; ${w#${a}b}` matches while `${w#"${a}b"}` does not.
+	void append_value(std::string_view bytes, expand_context ctx) noexcept;
 	bool finish_field(arena_array<std::string_view>& out, bool even_if_empty = false) noexcept;
 
 	// Where a run of IFS separators stands. Held across segments because ONE
@@ -289,6 +302,15 @@ private:
 	// Set when a glob metacharacter arrived from unquoted text. Quoted ones are
 	// literal, so `echo "*.txt"` must not touch the filesystem.
 	bool _field_globbable = false;
+
+	// Whether the text just expanded held a `"$@"` with no positional parameters,
+	// and whether it held anything else. POSIX: `"$@"` with nothing to expand
+	// yields ZERO fields even inside double quotes, so the quotes do not start one
+	// either - `set --; bracket "$@"` prints nothing while `bracket "$null$@"`
+	// prints one empty field, because the empty VARIABLE is content and the `$@` is
+	// not. Two flags rather than one, because `""` must still start a field.
+	bool _saw_empty_at = false;
+	bool _saw_other_content = false;
 };
 
 } // namespace lesh::runtime

@@ -155,3 +155,36 @@ printf '[%s]\n' x:~ ~:~
 
 --- a tilde prefix holding an expansion is not a login name [xfail(legacy): legacy has no tilde expansion]
 u=root; printf '[%s]\n' ~$u
+
+--- an absent dollar-at in double quotes yields no field at all [xfail(legacy): legacy has no positional parameters]
+set --; for f in "$@"; do printf '[%s]' "$f"; done; echo END
+
+--- but an empty variable in those quotes still starts one [xfail(legacy): legacy has no positional parameters]
+set --; n=; for f in "$n""$@" "=$@=" ""; do printf '[%s]' "$f"; done; echo END
+
+--- two absent dollar-ats in one quoted region [xfail: divergence - dash prints one empty field here where bash, zsh and macOS /bin/sh all print none. POSIX makes `"$@"` with no positional parameters zero fields, quotes and all, and lesh applies that to a quoted region holding nothing else; dash's own `"$@""$@"` prints none, so it is inconsistent with itself]
+set --; for f in "$@$@"; do printf '[%s]' "$f"; done; echo END
+
+--- assigning to a positional parameter is refused [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo ${1:=x}
+
+--- assigning to a special parameter is refused [xfail(legacy): legacy has no parameter expansion beyond $name]
+echo ${*:=x}
+
+--- but not when the parameter is already set [xfail(legacy): legacy has no parameter expansion beyond $name]
+set a; echo ${1=x}
+
+--- dollar-at and dollar-star are always set [xfail(legacy): legacy has no parameter expansion beyond $name]
+printf '[%s][%s][%s]\n' "${@-unset}" "${*-unset}" "${@:-unset}"
+
+--- the length form needs a name after the hash [xfail(legacy): legacy has no parameter expansion beyond $name]
+set a b; printf '[%s][%s][%s][%s][%s]\n' "${#+y}" "${#-y}" "${#=y}" "${#?}" "${#?X}"
+
+--- a quoted metacharacter in a trim pattern is data [xfail(legacy): legacy has no parameter expansion beyond $name]
+s='***'; h='###'; printf '[%s][%s][%s][%s]\n' "${s#'*'}" "${s##'*'}" "${s#\*}" "${h#'#'}"
+
+--- an unquoted metacharacter in a trim pattern still wildcards [xfail(legacy): legacy has no parameter expansion beyond $name]
+a=1-2-3-4; printf '[%s][%s][%s]\n' "${a#*-}" "${a##*-}" "${a#*1}"
+
+--- an expansion in a trim pattern is a pattern unless it was quoted [xfail(legacy): legacy has no parameter expansion beyond $name]
+w='ab\bc'; a='*'; printf '[%s]\n' "${w#${a}b}"
