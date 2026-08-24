@@ -637,7 +637,12 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		// trap free to run its whole body afterwards.
 		if (_flow == control_flow::interrupted)
 			_flow = control_flow::normal;
-		if (_exit_requested)
+		// `_input_ended` is a `return` outside any function or dot script, which
+		// dash and zsh both answer by ending the input. Not folded into
+		// `_exit_requested`: that flag is `exit`, and every construct that stops
+		// early for it would then stop for a `return` too, whose whole point is that
+		// the function or script it was in decides. Only THIS loop reads it.
+		if (_exit_requested || _input_ended)
 			break;
 	}
 	run_exit_trap();
@@ -714,6 +719,21 @@ int tree_walking_executor::run_parsed(const tree& t) {
 		// that failed, and 130 must not exit the shell of someone who ran `set -e`.
 		if (_flow == control_flow::interrupted) {
 			status = _state.last_status();
+			break;
+		}
+		// A `return` that reached HERE was inside no function and no dot script, and
+		// POSIX leaves that unspecified. dash and zsh both END THE INPUT with the
+		// status the return asked for - `return; echo x` prints nothing in either -
+		// and lesh went on to the next command, so `return 7` was a no-op that
+		// reported 7. Ending the input is also the only reading that keeps `.`
+		// consistent: a dot script's `return` ends the script, and the shell's own
+		// input is the outermost script there is.
+		//
+		// The flow is CLEARED here rather than left for run_input, so a `return` at
+		// the top of a script leaves the EXIT trap free to run its whole body.
+		if (_flow == control_flow::return_from) {
+			_flow = control_flow::normal;
+			_input_ended = true;
 			break;
 		}
 		if (errexit_fires(status)) {

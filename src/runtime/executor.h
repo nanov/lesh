@@ -348,6 +348,13 @@ private:
 	uint64_t _substitutions = 0;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
+	// Set by a `return` that reached the top level - outside any function and any
+	// dot script. POSIX leaves that unspecified; dash and zsh both END THE INPUT,
+	// so `return; echo x` prints nothing. Only run_input reads it, and it is
+	// deliberately NOT `_exit_requested`: that one is `exit`, and folding the two
+	// together would make every construct that stops early for an exit stop for a
+	// `return` as well.
+	bool _input_ended = false;
 	// POSIX suppresses `set -e` wherever a status is being TESTED rather than acted
 	// on: the condition of if/while/until, every operand of an and-or list but the
 	// last, and a pipeline negated with `!`. A depth counter, not a flag, because

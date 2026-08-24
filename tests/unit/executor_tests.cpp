@@ -896,3 +896,29 @@ TEST_F(ExecutorTest, EvalIsNotAReturnBoundary) {
 	EXPECT_EQ(capture("f() { eval return; echo not reached; }; f; echo after"),
 	          "after\n");
 }
+
+// --- a return outside a function ends the input -------------------------------
+
+TEST_F(ExecutorTest, ReturnOutsideAFunctionEndsTheInput) {
+	// POSIX leaves `return` with no function and no dot script around it
+	// unspecified. dash and zsh both END THE INPUT with the status it asked for -
+	// `return; echo x` prints nothing in either - and lesh ran the next command,
+	// so the `return` reported a status and did nothing else.
+	EXPECT_EQ(capture("return; echo x"), "");
+	EXPECT_EQ(capture("return 7; echo x"), "");
+	EXPECT_EQ(run("return 7; echo x"), 7);
+	// Through a brace group and through a loop, both of which already let the
+	// unwind out - what was missing was anything to stop at the top.
+	EXPECT_EQ(capture("{ return 7; echo x; }; echo y"), "");
+	EXPECT_EQ(capture("while :; do return 4; done; echo x"), "");
+	EXPECT_EQ(run("while :; do return 4; done; echo x"), 4);
+	// `eval` is not a boundary, so a return inside one ends the input too.
+	EXPECT_EQ(capture("eval return 4; echo x"), "");
+}
+
+TEST_F(ExecutorTest, ReturnInsideAFunctionStillReturnsFromTheFunction) {
+	// The guard on the rule above: the boundary that already existed must still
+	// win, or every `return` would end the script.
+	EXPECT_EQ(capture("f() { return 5; }; f; echo after=$?"), "after=5\n");
+	EXPECT_EQ(capture("f() { return; echo not reached; }; f; echo after"), "after\n");
+}

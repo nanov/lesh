@@ -1025,3 +1025,27 @@ printf '(exit 1)\nreturn 17\n' >script; . ./script; echo "st=$?"
 
 --- return out of an eval returns from the enclosing function [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
 f() { eval return; echo not reached; }; f; echo "after st=$?"
+
+# A `return` outside any function and any dot script. POSIX leaves it
+# unspecified; dash and zsh both end the current input with the status it asked
+# for, and lesh ran the next command instead.
+
+--- a return outside a function ends the input [xfail(legacy): legacy has no return builtin]
+return; echo x
+
+--- a return outside a function reports its operand [xfail(legacy): legacy has no return builtin]
+return 7; echo x
+
+--- a return inside a brace group ends the input [xfail(legacy): legacy has no compound commands]
+{ return 7; echo x; }; echo y
+
+--- a return inside a loop ends the input [xfail(legacy): legacy has no compound commands]
+while :; do return 4; done; echo x
+
+--- a return ends a script arriving on standard input [stdin] [xfail(legacy): legacy has no return builtin]
+echo one
+return 6
+echo two
+
+--- a return still returns from a function [xfail(legacy): legacy has no functions]
+f() { return 5; }; f; echo "after $?"
