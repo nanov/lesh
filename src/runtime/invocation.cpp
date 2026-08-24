@@ -107,6 +107,18 @@ invocation parse_invocation(int argc, char** argv) {
 		inv.command_name = argv[i];
 		++i;
 	}
+	// With no operand to name it, $0 is argv[0] exactly as it was spelled - symlink
+	// included - which is what dash, bash and zsh all report, and what
+	// startup-p.tst's '$0 with -s' asserts. The fallback belongs HERE rather than in
+	// main(): main() cannot be unit-tested, and leaving the answer to a literal
+	// default in shell_state is how $0 came to be the string "lesh" for every
+	// invocation that named no command_file (issue #43).
+	//
+	// This is $0 and nothing else. lesh's own diagnostics keep their hardcoded
+	// `lesh: ` prefix, because dash prints its own name there too rather than $0 -
+	// `dash: 0: -c requires an argument`, whatever it was invoked as.
+	if (inv.command_name == nullptr && argc > 0)
+		inv.command_name = argv[0];
 	inv.first_argument = i;
 	return inv;
 }

@@ -269,6 +269,10 @@ int main(int argc, char **argv, char **envp) {
 		next_state.opts() = inv.options;
 		// $0. With -c the operand after the command string is the command name, not
 		// the first positional parameter - which is why first_argument is past it.
+		// parse_invocation falls back to argv[0] when no operand names $0, so this
+		// is set for every real invocation and shell_state's literal default never
+		// reaches a running shell (issue #43). The guard is for an empty argv, not
+		// for an ordinary one.
 		if (inv.command_name != nullptr)
 			next_state.set_script_name(inv.command_name);
 		std::vector<std::string> args;

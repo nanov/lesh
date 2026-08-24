@@ -25,7 +25,9 @@ struct invocation {
 	// The command_file operand, when there is one and -c was not given.
 	const char* script_path = nullptr;
 	// $0. With -c this is the operand AFTER the command string, which is what
-	// POSIX calls command_name; otherwise it is the script's pathname.
+	// POSIX calls command_name; otherwise it is the script's pathname. When no
+	// operand names it, argv[0] - exactly as spelled, symlink included, which is
+	// what every reference shell reports. Never null for a real argv.
 	const char* command_name = nullptr;
 	// argv index of $1. Equal to argc when there are no positional parameters.
 	int first_argument = 0;

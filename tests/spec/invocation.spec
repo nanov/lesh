@@ -85,8 +85,13 @@ d=$(mktemp -d); cd $d && "$TESTEE" -cn 'echo hi > f'; echo "status=$? [$(ls $d)]
 --- exec replaces the shell with another shell [xfail(legacy): same quote-expansion defect]
 "$TESTEE" -c 'exec "$TESTEE" -c "echo inner"; echo not reached'
 
---- $0 is the pathname the shell was invoked as [xfail: #43 - lesh reports the literal string "lesh" for every invocation that names no command_file]
+--- $0 is the pathname the shell was invoked as [xfail(legacy): same quote-expansion defect]
 d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -c 'echo "$0"'
+
+--- $0 is argv[0] for a shell whose script arrives on standard input [xfail(legacy): same quote-expansion defect]
+d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -s X <<'EOF'
+printf '[%s]\n' "$0" "$@"
+EOF
 
 --- a word after -c's command string is an operand, not another option [xfail(legacy): same quote-expansion defect]
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -- -x

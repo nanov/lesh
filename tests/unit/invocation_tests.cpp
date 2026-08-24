@@ -199,3 +199,35 @@ TEST(Invocation, DashCWithNoOperandIsRefused) {
 	EXPECT_NE(inv.error, nullptr);
 	EXPECT_EQ(inv.command_string, nullptr);
 }
+
+// $0 follows argv[0] exactly, symlink included, whenever no operand names it.
+// It came from a literal `"lesh"` default in shell_state, so every invocation
+// without a command_file operand reported that string - including `sh -s`, which
+// startup-p.tst:79 asserts. The fallback lives in parse_invocation rather than in
+// main() so the rule is assertable at all (issue #43).
+TEST(Invocation, DollarZeroFallsBackToArgvZero) {
+	const invocation absolute = parse({"/tmp/d/sh", "-c", "echo hi"});
+	ASSERT_NE(absolute.command_name, nullptr);
+	EXPECT_STREQ(absolute.command_name, "/tmp/d/sh");
+
+	// startup-p.tst's '$0 with -s': the operand is $1, so argv[0] is still $0.
+	const invocation with_s = parse({"./sh", "-s", "X"});
+	ASSERT_NE(with_s.command_name, nullptr);
+	EXPECT_STREQ(with_s.command_name, "./sh");
+	EXPECT_EQ(with_s.first_argument, 2);
+
+	// No operands at all: the script arrives on standard input.
+	const invocation bare = parse({"lesh"});
+	ASSERT_NE(bare.command_name, nullptr);
+	EXPECT_STREQ(bare.command_name, "lesh");
+}
+
+TEST(Invocation, AnOperandNamingDollarZeroBeatsArgvZero) {
+	const invocation named = parse({"/bin/sh", "-c", "echo hi", "myname"});
+	ASSERT_NE(named.command_name, nullptr);
+	EXPECT_STREQ(named.command_name, "myname");
+
+	const invocation script = parse({"/bin/sh", "script.sh"});
+	ASSERT_NE(script.command_name, nullptr);
+	EXPECT_STREQ(script.command_name, "script.sh");
+}

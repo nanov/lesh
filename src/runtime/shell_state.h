@@ -341,6 +341,10 @@ private:
 	                           std::equal_to<>> _user_homes;
 	std::unordered_map<std::string, std::string, lesh::transparent_string_hash, std::equal_to<>> _aliases;
 	std::vector<std::string> _positional;
+	// $0 for a state nobody invoked - a unit test's, chiefly. A real shell always
+	// overrides it: parse_invocation names $0 from an operand or from argv[0], so
+	// this literal is never what a running shell reports. It WAS, for every
+	// invocation that named no command_file, which is issue #43.
 	std::string _script_name = "lesh";
 	int _pid = 0;
 	std::string _own_path;
