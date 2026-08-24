@@ -16,7 +16,7 @@
 # operand looked for a file called `\in0`, and a here-document body had its quotes
 # REMOVED because it was lexed as the interior of a word.
 #
-# The arithmetic cases at the very end are #56. `&&`, `||` and `?:` answered the
+# The arithmetic short-circuit cases near the end are #56. `&&`, `||` and `?:` answered the
 # right VALUE while still running the operand they should have skipped, because
 # the mini-parser computes as it parses. Each one therefore prints the variable
 # afterwards: the value alone never showed the bug. The last two are what the fix
@@ -24,6 +24,16 @@
 # unset variable is not a nounset error, because neither operand was evaluated -
 # and the one before them is what it must not under-reach: `0 && (x=1) || (x=2)`
 # does reach the second assignment, and dash, bash and zsh all agree it does.
+#
+# The overflow cases at the very end are #59, and they are ordinary differential
+# cases rather than divergences because lesh matches dash on every one: an
+# operator WRAPS, where all three reference shells agree, and a literal too large
+# to represent SATURATES, which is dash alone - bash wraps the literal too and zsh
+# diagnoses it. `$((-9223372036854775808))` is the case that tells saturation from
+# wrapping apart, there being no negative literal for it to be: dash answers
+# -9223372036854775807. The last case is the one #56's `_live` rule would have
+# constrained had overflow been made an error; it is not one, so a skipped operand
+# whose literal overflows still reports nothing and still assigns nothing.
 #
 # Prose lives HERE and not between cases: a case body runs to the next `---`, so a
 # comment block in the middle of the file becomes part of the PRECEDING case - and
@@ -257,3 +267,16 @@ echo $(( 0 && 1/0 )) $(( 1 || 1%0 )) $(( 1 ? 2 : 1/0 ))
 
 --- nor is an unset variable one, with nounset on [xfail(legacy): legacy has no arithmetic expansion]
 set -u; echo $(( 0 && y )); echo after
+
+--- an arithmetic operator wraps rather than overflowing [xfail(legacy): legacy has no arithmetic expansion]
+echo $(( 9223372036854775807 + 1 )) $(( -9223372036854775807 - 2 )) $(( 9223372036854775807 * 2 ))
+
+--- a literal too large to represent saturates, in every base [xfail(legacy): legacy has no arithmetic expansion]
+echo $(( 99999999999999999999 )) $(( 0xFFFFFFFFFFFFFFFFF )) $(( 077777777777777777777777 ))
+echo $(( 99999999999999999999 - 7 )) $(( -9223372036854775808 ))
+
+--- dividing the negative limit by -1 wraps [xfail(legacy): legacy has no arithmetic expansion]
+m=$(( -9223372036854775807 - 1 )); echo $(( m / -1 )) $(( m % -1 )) $(( -m ))
+
+--- overflow in a skipped operand is not reported [xfail(legacy): legacy has no arithmetic expansion]
+x=0; echo $(( 0 && 99999999999999999999 )) $(( 1 || 9223372036854775807 + 1 )); echo $(( 0 && (x=99999999999999999999) )); echo "x=$x"

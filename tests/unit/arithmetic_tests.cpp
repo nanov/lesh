@@ -262,3 +262,94 @@ TEST_F(ArithmeticTest, ASkippedAssignmentCannotBeRefused) {
 	EXPECT_FALSE(skipped.assignment_refused);
 	EXPECT_EQ(skipped.value, 0);
 }
+
+// Signed overflow was undefined behaviour at six sites, every one of them
+// reachable from a single line of input - `$((99999999999999999999))` was enough.
+// See issue #59. POSIX defers to C's signed-integer rules and so decides nothing,
+// so dash, bash and zsh were measured before choosing: an operator WRAPS, which
+// all three do, and a literal too large to represent SATURATES, which is dash's
+// answer and therefore the floor's.
+
+TEST_F(ArithmeticTest, ALiteralTooLargeToRepresentSaturates) {
+	// dash parses with strtoimax, which clamps at ERANGE. All three bases share the
+	// one accumulation loop, so all three clamp alike.
+	EXPECT_EQ(eval("99999999999999999999"), INT64_MAX);
+	EXPECT_EQ(eval("0xFFFFFFFFFFFFFFFFF"), INT64_MAX);
+	EXPECT_EQ(eval("077777777777777777777777"), INT64_MAX);
+	// Exactly representable, so untouched - the clamp must not be off by one.
+	EXPECT_EQ(eval("9223372036854775807"), INT64_MAX);
+	EXPECT_EQ(eval("0x7fffffffffffffff"), INT64_MAX);
+	EXPECT_EQ(eval("0777777777777777777777"), INT64_MAX);
+}
+
+TEST_F(ArithmeticTest, ASaturatedLiteralIsConsumedToItsEnd) {
+	// Stopping at the digit that overflowed would leave the rest of the literal
+	// behind to be parsed as operators, turning a representable answer into a
+	// syntax error.
+	EXPECT_EQ(eval("99999999999999999999 - 7"), INT64_MAX - 7);
+	EXPECT_TRUE(evaluate("99999999999999999999", vars).ok);
+	// There is no negative literal - `-` is unary - so this is a saturated
+	// INT64_MAX negated, which is why dash answers -9223372036854775807 and not
+	// INT64_MIN. Saturation is observable here and nowhere else.
+	EXPECT_EQ(eval("-9223372036854775808"), -INT64_MAX);
+}
+
+TEST_F(ArithmeticTest, AnOperatorWrapsRatherThanOverflowing) {
+	// dash, bash and zsh agree on each of these, all at status 0.
+	EXPECT_EQ(eval("9223372036854775807 + 1"), INT64_MIN);
+	EXPECT_EQ(eval("-9223372036854775807 - 2"), INT64_MAX);
+	EXPECT_EQ(eval("9223372036854775807 * 2"), -2);
+	EXPECT_TRUE(evaluate("9223372036854775807 + 1", vars).ok)
+		<< "overflow refuses no expression in any reference shell";
+}
+
+TEST_F(ArithmeticTest, UnaryMinusWrapsAtTheNegativeLimit) {
+	// INT64_MIN has no positive counterpart, so negating it overflows. Reached
+	// through a variable, because a literal that large saturates before it arrives.
+	vars.values["m"] = INT64_MIN;
+	EXPECT_EQ(eval("-m"), INT64_MIN);
+	EXPECT_EQ(eval("- -m"), INT64_MIN);
+}
+
+TEST_F(ArithmeticTest, DivisionAndModuloWrapAtTheNegativeLimit) {
+	// INT64_MIN / -1 is the one overflowing division - its true quotient is one
+	// past INT64_MAX - and it was a UB site the ticket had not counted. dash, bash
+	// and zsh all answer INT64_MIN.
+	vars.values["m"] = INT64_MIN;
+	EXPECT_EQ(eval("m / -1"), INT64_MIN);
+	EXPECT_EQ(eval("m % -1"), 0);
+	// The ordinary cases still divide, which the `b == -1` shortcut must not break.
+	EXPECT_EQ(eval("-7 / -1"), 7);
+	EXPECT_EQ(eval("7 % -1"), 0);
+	EXPECT_EQ(eval("7 / -2"), -3);
+}
+
+TEST_F(ArithmeticTest, CompoundAssignmentOverflowsThroughTheSameHelpers) {
+	// apply_compound held a second copy of `+`, `-`, `*`, `/` and `%`, which is
+	// precisely the N-sites-become-N-behaviours trap #35 and #49 both recorded.
+	vars.values["x"] = INT64_MAX;
+	EXPECT_EQ(eval("x += 1"), INT64_MIN);
+	EXPECT_EQ(vars.values["x"], INT64_MIN);
+	vars.values["y"] = INT64_MAX;
+	EXPECT_EQ(eval("y *= 2"), -2);
+	vars.values["z"] = INT64_MIN;
+	EXPECT_EQ(eval("z /= -1"), INT64_MIN);
+	vars.values["w"] = INT64_MIN;
+	EXPECT_EQ(eval("w -= 1"), INT64_MAX);
+	vars.values["v"] = INT64_MIN;
+	EXPECT_EQ(eval("v %= -1"), 0);
+}
+
+TEST_F(ArithmeticTest, OverflowInASkippedOperandIsNotReported) {
+	// The FOURTH effect site #56's `_live` rule would have had to gate, had
+	// overflow been made an error. It is not one, and this is the reason it is not
+	// one: a skipped operand is still PARSED, so its literal is still accumulated,
+	// and an error raised there could not have been suppressed by a flag that the
+	// accumulation does not consult.
+	EXPECT_EQ(eval("0 && 99999999999999999999"), 0);
+	EXPECT_EQ(eval("1 || 99999999999999999999"), 1);
+	EXPECT_EQ(eval("1 ? 2 : 99999999999999999999"), 2);
+	EXPECT_EQ(eval("0 && 9223372036854775807 + 1"), 0);
+	EXPECT_EQ(eval("0 && (x = 99999999999999999999)"), 0);
+	EXPECT_FALSE(vars.assigned("x")) << "a skipped operand still writes nothing";
+}

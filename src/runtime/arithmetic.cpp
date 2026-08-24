@@ -8,6 +8,87 @@ namespace lesh::runtime {
 
 namespace {
 
+// SIGNED OVERFLOW IS UNDEFINED BEHAVIOUR, so every operation below that can
+// overflow routes through one of these rather than being written out at its site.
+// There were SIX such sites - `value * base + digit` in parse_number, `+`, `-`,
+// `*`, unary minus, and `/` and `%` at INT64_MIN / -1 - and every one of them was
+// reachable from a single line of input: `$((99999999999999999999))` was enough
+// (#59). One place rather than six is the lesson #35 and #49 both taught, that N
+// sites fixed individually become N subtly different behaviours.
+//
+// WHAT THE REFERENCE SHELLS DO, measured before choosing, because POSIX defers to
+// C's signed-integer rules and so answers nothing:
+//
+//                                dash                  bash      zsh
+//   $((99999999999999999999))    INT64_MAX (clamped)    wrapped   diagnosed, 19 digits kept
+//   $((INT64_MAX + 1))           wrapped                wrapped   wrapped
+//   $((-INT64_MAX - 2))          wrapped                wrapped   wrapped
+//   $((INT64_MAX * 2))           wrapped                wrapped   wrapped
+//   $((INT64_MIN / -1))          wrapped                wrapped   wrapped
+//
+// All three at status 0, and none of them refusing the expression. So:
+//
+//   - AN OPERATOR WRAPS. All three agree on all four operators and on `/`, and
+//     unanimity among the reference shells is the best evidence available where
+//     the standard defers. It is also what arithmetic that relies on wrapping -
+//     hashing, mixing - is written against. Wrapping is only UB when it is done
+//     by overflowing a SIGNED int, which is what the code did; the builtins below
+//     produce the same two's-complement value with the overflow defined away.
+//   - A LITERAL SATURATES at INT64_MAX. That is dash's answer, in all three bases,
+//     and ADR-0001 makes dash the oracle for the floor - dash parses with
+//     strtoimax, which clamps and sets ERANGE. It is right on the merits too: an
+//     unrepresentable CONSTANT is not an operation that overflowed. It is visible
+//     in `$((-9223372036854775808))`, which has no negative literal in it and so
+//     is a saturated INT64_MAX negated - dash says -9223372036854775807.
+//
+// NOTHING HERE FAILS THE EXPRESSION, which is a decision and not an omission. A
+// diagnostic would be a FOURTH effect site to gate on `_live` (#56), and the gate
+// could not work: the overflow in `$((0 && 99999999999999999999))` happens while
+// the skipped operand is PARSED, and #56 requires it to be parsed. An answer that
+// cannot report is an answer that cannot report on an operand nobody evaluated.
+
+// True when the operation overflowed. `out` receives the two's-complement result
+// either way, so a caller that means to wrap discards the answer.
+[[nodiscard]] inline bool add_overflows(int64_t a, int64_t b, int64_t& out) noexcept {
+	return __builtin_add_overflow(a, b, &out);
+}
+[[nodiscard]] inline bool sub_overflows(int64_t a, int64_t b, int64_t& out) noexcept {
+	return __builtin_sub_overflow(a, b, &out);
+}
+[[nodiscard]] inline bool mul_overflows(int64_t a, int64_t b, int64_t& out) noexcept {
+	return __builtin_mul_overflow(a, b, &out);
+}
+
+// The wrapping forms the operators use: the same computation, answer discarded.
+[[nodiscard]] inline int64_t wrap_add(int64_t a, int64_t b) noexcept {
+	int64_t out = 0;
+	(void)add_overflows(a, b, out);
+	return out;
+}
+[[nodiscard]] inline int64_t wrap_sub(int64_t a, int64_t b) noexcept {
+	int64_t out = 0;
+	(void)sub_overflows(a, b, out);
+	return out;
+}
+[[nodiscard]] inline int64_t wrap_mul(int64_t a, int64_t b) noexcept {
+	int64_t out = 0;
+	(void)mul_overflows(a, b, out);
+	return out;
+}
+[[nodiscard]] inline int64_t wrap_neg(int64_t a) noexcept { return wrap_sub(0, a); }
+
+// `/` and `%` overflow in exactly one case, INT64_MIN / -1, whose true quotient is
+// one past INT64_MAX. Dividing by -1 IS negation, so the wrapped negation is the
+// answer for every operand and not just that one; `a % -1` is 0 for every a. A
+// ZERO divisor is not handled here - it is an evaluation error the caller gates on
+// `_live` - so these are only ever reached with b non-zero.
+[[nodiscard]] inline int64_t wrap_div(int64_t a, int64_t b) noexcept {
+	return b == -1 ? wrap_neg(a) : a / b;
+}
+[[nodiscard]] inline int64_t wrap_mod(int64_t a, int64_t b) noexcept {
+	return b == -1 ? 0 : a % b;
+}
+
 // Recursive-descent with precedence climbing. The grammar is C's, which POSIX
 // requires, so the levels below are C's precedence table read bottom-up.
 //
@@ -180,11 +261,11 @@ private:
 	}
 
 	int64_t apply_compound(std::string_view op, int64_t a, int64_t b) noexcept {
-		if (op == "+=") return a + b;
-		if (op == "-=") return a - b;
-		if (op == "*=") return a * b;
-		if (op == "/=") { if (b == 0) { divide_by_zero(); return 0; } return a / b; }
-		if (op == "%=") { if (b == 0) { divide_by_zero(); return 0; } return a % b; }
+		if (op == "+=") return wrap_add(a, b);
+		if (op == "-=") return wrap_sub(a, b);
+		if (op == "*=") return wrap_mul(a, b);
+		if (op == "/=") { if (b == 0) { divide_by_zero(); return 0; } return wrap_div(a, b); }
+		if (op == "%=") { if (b == 0) { divide_by_zero(); return 0; } return wrap_mod(a, b); }
 		if (op == "<<=") return static_cast<int64_t>(static_cast<uint64_t>(a) << (b & 63));
 		if (op == ">>=") return a >> (b & 63);
 		if (op == "&=") return a & b;
@@ -288,8 +369,8 @@ private:
 	int64_t parse_additive() noexcept {
 		int64_t value = parse_multiplicative();
 		for (;;) {
-			if (consume("+")) value += parse_multiplicative();
-			else if (consume("-")) value -= parse_multiplicative();
+			if (consume("+")) value = wrap_add(value, parse_multiplicative());
+			else if (consume("-")) value = wrap_sub(value, parse_multiplicative());
 			else return value;
 		}
 	}
@@ -297,7 +378,7 @@ private:
 		int64_t value = parse_unary();
 		for (;;) {
 			if (consume("*")) {
-				value *= parse_unary();
+				value = wrap_mul(value, parse_unary());
 			} else if (consume("/")) {
 				const int64_t divisor = parse_unary();
 				if (divisor == 0) {
@@ -307,7 +388,7 @@ private:
 					// what was left of it would fail the expression that skipped it.
 					value = 0;
 				} else {
-					value /= divisor;
+					value = wrap_div(value, divisor);
 				}
 			} else if (consume("%")) {
 				const int64_t divisor = parse_unary();
@@ -316,7 +397,7 @@ private:
 						return 0;
 					value = 0;
 				} else {
-					value %= divisor;
+					value = wrap_mod(value, divisor);
 				}
 			} else {
 				return value;
@@ -327,7 +408,7 @@ private:
 		skip_blanks();
 		if (consume("!")) return parse_unary() == 0 ? 1 : 0;
 		if (consume("~")) return ~parse_unary();
-		if (consume("-")) return -parse_unary();
+		if (consume("-")) return wrap_neg(parse_unary());
 		if (consume("+")) return parse_unary();
 		return parse_primary();
 	}
@@ -378,6 +459,7 @@ private:
 
 		int64_t value = 0;
 		bool any = base != 16;  // "0" alone is a valid decimal zero
+		bool saturated = false;
 		while (_at < _text.size()) {
 			const char c = _text[_at];
 			int digit;
@@ -386,10 +468,19 @@ private:
 			else if (base == 16 && c >= 'A' && c <= 'F') digit = c - 'A' + 10;
 			else break;
 			if (digit >= base) break;
-			value = value * base + digit;
+			// A literal too large to represent SATURATES at INT64_MAX, which is dash's
+			// answer in each of the three bases. The digits are consumed either way:
+			// the literal ends where it ends, and stopping at the one that overflowed
+			// would leave the rest of it behind to be parsed as though it were
+			// operators, turning a representable answer into a syntax error.
+			int64_t scaled = 0;
+			if (mul_overflows(value, base, scaled) || add_overflows(scaled, digit, value))
+				saturated = true;
 			any = true;
 			++_at;
 		}
+		if (saturated)
+			value = INT64_MAX;
 		if (!any)
 			fail("malformed number");
 		return value;

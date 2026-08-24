@@ -49,6 +49,15 @@ struct arithmetic_result {
 // POSIX specifies signed long arithmetic. Division by zero is an error rather
 // than undefined behaviour, and integer bases follow C: 0x hex, 0 octal.
 //
+// OVERFLOW NEVER FAILS THE EXPRESSION. An operator WRAPS - dash, bash and zsh all
+// do, on every one of `+`, `-`, `*`, `/` and the shifts - and a LITERAL too large
+// to represent SATURATES at INT64_MAX, which is dash's answer in all three bases.
+// Both are computed so that no signed overflow is ever executed, because that is
+// undefined behaviour whatever the shell then prints (#59). Returning a value
+// rather than an error is also what keeps overflow off the list of effect sites
+// `_live` has to gate: an overflowing literal in a SKIPPED operand still has to be
+// parsed, so an error there could not have been suppressed.
+//
 // `&&`, `||` and `?:` SHORT-CIRCUIT, which is observable because arithmetic can
 // assign: `$((0 && (x=1)))` leaves x alone. The skipped operand is still parsed,
 // so a malformed one still fails, but nothing it describes is done - no write, no

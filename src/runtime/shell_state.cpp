@@ -213,21 +213,44 @@ int64_t shell_state::get(std::string_view name) const {
 	std::string_view text;
 	if (!lookup(name, text))
 		return 0;  // unset is zero, not an error
-	int64_t value = 0;
 	bool negative = false;
 	size_t at = 0;
 	if (at < text.size() && (text[at] == '-' || text[at] == '+')) {
 		negative = text[at] == '-';
 		++at;
 	}
-	// A non-numeric value is zero too: POSIX leaves it unspecified, and dash
-	// treats it as zero rather than failing.
+	// THE SECOND PLACE A LITERAL IS BUILT, and it had the same undefined behaviour
+	// arithmetic.cpp's parse_number did (#59): `value * 10 + digit` in an int64_t
+	// overflows on any value past INT64_MAX, and `-value` overflows again at the
+	// negative limit. It could not even represent INT64_MIN, whose magnitude 2^63
+	// does not fit the signed accumulator it was being built in - so
+	// `m=$((-9223372036854775807 - 1)); echo $((m))` could not round-trip.
+	//
+	// The magnitude is therefore accumulated UNSIGNED, where wrapping is defined,
+	// clamped at the limit for its sign, and negated in the unsigned domain because
+	// -INT64_MIN has no int64_t to be. Clamping rather than wrapping matches what
+	// parse_number does with an over-large literal, so a number too large to
+	// represent means one thing here whether it was written in the expression or
+	// read out of a variable.
+	uint64_t magnitude = 0;
+	// 2^63 negated is INT64_MIN, so the negative limit is one past the positive one.
+	const uint64_t limit = negative ? (uint64_t{1} << 63) : (uint64_t{1} << 63) - 1;
+	bool saturated = false;
+	// A non-numeric value is zero too: POSIX leaves it unspecified, and lesh answers
+	// 0 rather than the `Illegal number` dash raises - which is what makes
+	// `i=$((i+1))` work without initialising i first.
 	for (; at < text.size(); ++at) {
 		if (text[at] < '0' || text[at] > '9')
 			return 0;
-		value = value * 10 + (text[at] - '0');
+		const uint64_t digit = static_cast<uint64_t>(text[at] - '0');
+		if (magnitude > (limit - digit) / 10)
+			saturated = true;
+		else
+			magnitude = magnitude * 10 + digit;
 	}
-	return negative ? -value : value;
+	if (saturated)
+		magnitude = limit;
+	return static_cast<int64_t>(negative ? uint64_t{0} - magnitude : magnitude);
 }
 
 bool shell_state::set(std::string_view name, int64_t value) {
