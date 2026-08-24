@@ -1049,3 +1049,36 @@ TEST_F(ExecutorTest, ReturnWithNoOperandInATrapReportsTheEntryStatus) {
 	EXPECT_EQ(capture("fn() { true; return; }; (exit 19); fn; echo plain $?"),
 	          "plain 0\n");
 }
+
+// --- set -v echoes a dot script as it reads it -------------------------------
+
+TEST_F(ExecutorTest, VerboseEchoesADotScriptAsItIsRead) {
+	// POSIX `-v`: the shell writes its input to standard error as it READS it, and
+	// a dot script is input. lesh echoed the `. ./script` line and then went silent
+	// for the script itself (dot-p.tst's 'with verbose option'), which is the one
+	// place the option had least to say and most to show.
+	const std::string script = ::testing::TempDir() + "lesh_verbose_dot.sh";
+	{
+		std::ofstream out{script};
+		out << ":\n";
+	}
+	EXPECT_EQ(capture("set -v; . " + script + " 2>&1"), ":\n");
+	// Per COMMAND, in the script's own bytes, the way run_input echoes a script.
+	{
+		std::ofstream out{script};
+		out << "# a comment\n:\n";
+	}
+	EXPECT_EQ(capture("set -v; . " + script + " 2>&1"), "# a comment\n:\n");
+	// And nothing is echoed without the option. `set +v` because the fixture keeps
+	// one shell state for the whole test, so the option above is still on.
+	EXPECT_EQ(capture("set +v; . " + script + " 2>&1"), "");
+	std::remove(script.c_str());
+}
+
+TEST_F(ExecutorTest, VerboseDoesNotEchoAnEvalOperandTwice) {
+	// dash echoes neither an `eval` operand nor a trap body: both have already been
+	// echoed once as part of the line that carried them, and only `.` brings in
+	// text the shell has not already read.
+	EXPECT_EQ(capture("set -v; eval ':' 2>&1"), "");
+	EXPECT_EQ(capture("set -v; trap ':' EXIT 2>&1"), "");
+}

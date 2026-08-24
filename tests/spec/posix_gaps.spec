@@ -1090,3 +1090,17 @@ printf 'echo lib\nbreak\necho lib end\n' >lib; . ./lib; echo "caller $?"
 
 --- a break in the condition of a while loop leaves the loop [xfail(legacy): legacy has no compound commands]
 while break; do echo body; done; echo after
+
+# `set -v` writes input to standard error AS IT IS READ, and a dot script is
+# input. Only `.` - an `eval` operand and a trap body have already been echoed
+# once, as part of the line that carried them.
+
+--- the verbose option echoes a dot script [stdin] [xfail(legacy): legacy has no dot builtin]
+set -v
+printf 'echo one\nexit 3\n' >script
+. ./script
+
+--- the verbose option does not echo an eval operand [stdin] [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+set -v
+eval 'echo hi'
+echo done

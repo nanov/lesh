@@ -147,8 +147,15 @@ private:
 	// Returns false when the name is not a function, so the caller execs instead.
 	bool try_run_function(const syntax::tree& t, arena_array<char*>& argv, int& status);
 	bool consume_loop_flow(bool& should_break);
-	// Parses and runs source in this environment. Used by `eval` and `.`.
-	int run_source(std::string_view source);
+	// Parses and runs source in this environment. Used by `eval`, `.` and a trap
+	// body.
+	//
+	// `echo_as_read` is `set -v`, and only `.` asks for it: POSIX makes the option
+	// write INPUT to standard error as it is read, and dash echoes a dot script's
+	// text (per command, as this reads it) while echoing neither an `eval` operand
+	// nor a trap body - both of which it has already echoed once as part of the
+	// line that carried them.
+	int run_source(std::string_view source, bool echo_as_read = false);
 	// `exec`. Returns only when there is no command to become, or the exec failed;
 	// on success this process IS the command. See the definition for why it is not
 	// a builtins.cpp builtin.

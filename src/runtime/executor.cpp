@@ -1196,7 +1196,7 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 // Parses and runs source in THIS environment. `eval` and `.` both need it, and
 // both must see the shell's own state rather than a copy - which is what makes
 // `. ./config` able to set variables the caller then reads.
-int tree_walking_executor::run_source(std::string_view source) {
+int tree_walking_executor::run_source(std::string_view source, bool echo_as_read) {
 	// A nested pool: the trees live only as long as this call. Functions defined
 	// here would not outlive it, which is the same limitation #25 recorded. A deque
 	// of them rather than one, because POSIX says `eval` and `.` READ their
@@ -1217,7 +1217,16 @@ int tree_walking_executor::run_source(std::string_view source) {
 	int status = 0;
 	size_t at = 0;
 	while (at < source.size()) {
+		const size_t from = at;
 		trees.push_back(syntax::parse_next_command(nested, source, at, &_state));
+		// `set -v` writes input to standard error AS IT IS READ, and a dot script is
+		// input: dash echoes each of its commands, in the script's own bytes, right
+		// where this reads them. lesh echoed the `. ./script` line and then nothing,
+		// so the option that exists to show what the shell is reading went silent
+		// exactly where the reading was least visible (dot-p.tst's 'with verbose
+		// option'). After the parse and not before it, so the unit echoed is the one
+		// about to run - the same order run_input uses.
+		echo_if_verbose(source.substr(from, at - from), echo_as_read);
 		const tree& parsed = trees.back();
 		if (parsed.has_errors() && !_state.interactive()) {
 			// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
@@ -1311,7 +1320,7 @@ bool tree_walking_executor::run_dot_script(std::string_view operand, int& status
 	while ((got = std::fread(buffer, 1, sizeof(buffer), f)) > 0)
 		source.append(buffer, got);
 	std::fclose(f);
-	status = run_source(source);
+	status = run_source(source, /*echo_as_read=*/true);
 	// A dot script is a RETURN BOUNDARY. POSIX XCU `return`: it returns from the
 	// function OR the dot script that invoked it, whichever is innermost - so the
 	// unwind stops at this one call and whatever invoked it carries on. dash and
