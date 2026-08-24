@@ -24,6 +24,15 @@ bool is_ifs(char c, std::string_view ifs) noexcept {
 	return ifs.find(c) != std::string_view::npos;
 }
 
+// "IFS white space" is the subset of IFS that is space, tab or newline. POSIX
+// treats it differently from the rest of IFS at both ends of the input and around
+// a non-white-space separator, which is the whole reason field splitting is a
+// state machine rather than a scan for separators. `read` already had to make this
+// distinction (builtins.cpp split_line); this is the same rule for expansions.
+bool is_ifs_whitespace(char c, std::string_view ifs) noexcept {
+	return (c == ' ' || c == '\t' || c == '\n') && is_ifs(c, ifs);
+}
+
 // True for an unterminated construct whose DELIMITERS this file strips off the
 // segment before working on what is left. An unterminated one means the bytes it
 // would strip are not there, and the arithmetic case then re-expands the segment
@@ -163,29 +172,85 @@ std::string_view substitution_body(std::string_view segment) noexcept {
 void expander::append(std::string_view bytes) noexcept {
 	for (const char c : bytes)
 		_current->push(c);
+	// Content, so any separator run is over even when `bytes` is empty: `''` after
+	// a separator starts a field, which is what makes `bracket ''$b''` two fields
+	// rather than one (fsplit-p.tst 'empty field removal').
+	_run = split_run::none;
+	_run_closed_a_field = false;
 	_field_started = true;
 }
 
 // Splits on IFS as it appends. Only the RESULT of an unquoted expansion is split;
 // literal text never is, which is why `a b` is one word and `$x` holding "a b" is
 // two fields. Getting that distinction wrong is the classic shell bug.
+//
+// POSIX 2.6.5 gives a separator a SHAPE rather than a set of bytes: IFS white
+// space, then at most one non-white-space IFS character, then more IFS white
+// space. Two consequences the previous "drop every IFS byte" loop got wrong, for
+// ten of fsplit-p.tst's twelve failures: `IFS=-; echo [$a]` on `a=1--2` has an
+// EMPTY field between the two separators, and a separator that has used its
+// non-white-space slot ends the run, so a second one starts a new separator.
+// White space at the very start of the word is not a separator at all, which is
+// why the two cases below differ.
 void expander::append_split(std::string_view bytes,
                             arena_array<std::string_view>& out) noexcept {
 	const std::string_view ifs = _params.ifs();
 	for (const char c : bytes) {
-		if (is_ifs(c, ifs)) {
-			if (_field_started)
-				finish_field(out);
-		} else {
-			_current->push(c);
-			_field_started = true;
+		if (!is_ifs(c, ifs)) {
+			push_byte(c);
+			continue;
 		}
+		const bool white = is_ifs_whitespace(c, ifs);
+		if (_run == split_run::none) {
+			// White space closes a field that EXISTS; before the word's first byte
+			// there is nothing to close, so `echo [$a]` on `a=' 1'` is one field
+			// while `echo [-$a]` is two. A non-white-space IFS character always ends
+			// a field, even an empty one: `IFS=-; echo [$a]` on `a=-1` yields an
+			// empty field and then `1`.
+			const bool closed = finish_field(out, /*even_if_empty=*/!white);
+			_run = white ? split_run::white : split_run::delimited;
+			_run_closed_a_field = closed;
+			continue;
+		}
+		if (white)
+			continue;  // trailing white space of the same separator
+		if (_run == split_run::white && _run_closed_a_field) {
+			// Fills this separator's one non-white-space slot, and the leading white
+			// space has already ended the field, so nothing more is owed:
+			// `IFS=' -'; a='1 -2'` is two fields, not three.
+			_run = split_run::delimited;
+			continue;
+		}
+		// Either the leading white space had no field to close - `IFS=' -'` on
+		// `'  --33'` - or the separator has already used its slot, so this byte
+		// begins a NEW one and the field between them is empty. Both owe one.
+		std::ignore = finish_field(out, /*even_if_empty=*/true);
+		_run = split_run::delimited;
+		_run_closed_a_field = true;
 	}
 }
 
-void expander::finish_field(arena_array<std::string_view>& out) noexcept {
-	if (!_field_started)
-		return;
+// One byte of ordinary text. Ends any separator run in progress, which is what
+// makes a separator's trailing white space belong to the separator rather than
+// to the field after it.
+void expander::push_byte(char c) noexcept {
+	_run = split_run::none;
+	_run_closed_a_field = false;
+	_current->push(c);
+	_field_started = true;
+}
+
+// Closes the field under construction. Returns whether a field was actually
+// emitted, which is what append_split needs to know whether a separator run still
+// owes one.
+bool expander::finish_field(arena_array<std::string_view>& out, bool even_if_empty) noexcept {
+	// A separator run is over the moment a field boundary is taken, so the next
+	// byte starts a fresh one. Cleared here rather than at every call site because
+	// "$@" takes boundaries too.
+	_run = split_run::none;
+	_run_closed_a_field = false;
+	if (!_field_started && !even_if_empty)
+		return false;
 	const size_t n = _current->size();
 	char* block = nullptr;
 	// Exact-size copy out of the accumulator: the accumulator relocates as it
@@ -196,6 +261,7 @@ void expander::finish_field(arena_array<std::string_view>& out) noexcept {
 	out.push(std::string_view(block, n));
 	_current->truncate(0);
 	_field_started = false;
+	return true;
 }
 
 // Resolves a parameter name, including the special ones. `$?`, `$#`, `$$` and
@@ -329,14 +395,12 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 					if (body[i] == '\\' && i + 1 < body.size()) {
 						const char next = body[i + 1];
 						if (!quoted || next == '"' || next == '\\' || next == '$' || next == '`') {
-							_current->push(next);
-							_field_started = true;
+							push_byte(next);
 							++i;
 							continue;
 						}
 					}
-					_current->push(body[i]);
-					_field_started = true;
+					push_byte(body[i]);
 				}
 			} break;
 
@@ -607,7 +671,12 @@ expansion_status expander::expand_text(std::string_view text, bool quoted,
 				char digits[24];
 				const int n = std::snprintf(digits, sizeof(digits), "%lld",
 				                            static_cast<long long>(r.value));
-				append(std::string_view(digits, n > 0 ? static_cast<size_t>(n) : 0));
+				// Split like any other expansion result. Digits look unsplittable
+				// until IFS holds one: fsplit-p.tst's 'field splitting applies to
+				// results of expansions' sets `IFS=' 0'` and requires `$((708))` to
+				// become two fields.
+				const std::string_view text{digits, n > 0 ? static_cast<size_t>(n) : 0};
+				if (quoted) append(text); else append_split(text, out);
 			} break;
 
 			default:
@@ -633,6 +702,10 @@ std::string_view expander::expand_assignment_value(std::string_view text) noexce
 	_current = &accumulator;
 	_field_started = false;
 	_field_globbable = false;
+	const split_run outer_run = _run;
+	const bool outer_run_closed = _run_closed_a_field;
+	_run = split_run::none;
+	_run_closed_a_field = false;
 
 	// quoted=true suppresses field splitting, which is the assignment rule: the
 	// value is one word however many blanks the expansion produced.
@@ -647,6 +720,8 @@ std::string_view expander::expand_assignment_value(std::string_view text) noexce
 	_current = outer_current;
 	_field_started = outer_started;
 	_field_globbable = outer_globbable;
+	_run = outer_run;
+	_run_closed_a_field = outer_run_closed;
 	return {block, n};
 }
 
@@ -672,6 +747,10 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	arena_array<char> accumulator{_pool, 64};
 	_current = &accumulator;
 	_field_started = false;
+	// One word, one separator state: a run left over from the previous word would
+	// swallow the first byte of this one.
+	_run = split_run::none;
+	_run_closed_a_field = false;
 
 	// Pathname expansion runs AFTER field splitting, on each resulting field, and
 	// only on unquoted text - which is why it happens here rather than inside

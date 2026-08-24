@@ -72,6 +72,38 @@ shell_state::shell_state() {
 	// parent's index. OPTARG is deliberately NOT initialised; POSIX says nothing
 	// about it, and dash passes an inherited one through.
 	_vars.insert_or_assign("OPTIND", variable{"1", false});
+
+	// The rest of the set POSIX XCU 2.5.3 makes the SHELL's job to set, enumerated
+	// once rather than discovered one conformance file at a time (#42). Every one
+	// of these OVERRIDES an inherited value, because POSIX says the shell sets it
+	// at invocation - `IFS=X dash -c 'printf "[%s]" "$IFS"'` prints the default,
+	// which fsplit-p.tst asserts as 'default IFS (overriding environment
+	// variable)'. None is exported, matching dash.
+	//
+	// IFS was the one that mattered: splitting read shell_state::ifs(), which falls
+	// back to the default, so the MECHANISM was right while `echo "[$IFS]"` printed
+	// nothing and `${IFS+set}` said unset. The variable and the mechanism disagreed.
+	_vars.insert_or_assign("IFS", variable{" \t\n", false});
+	// PS1, PS2 and PS4 have POSIX-specified defaults. PS4 is the one with a test:
+	// option-p.tst's '$PS4' assigns it and expects `set -x` to use the assigned
+	// value, and trace_command already reads the variable - it only lacked a
+	// default to be overridden.
+	_vars.insert_or_assign("PS1", variable{"$ ", false});
+	_vars.insert_or_assign("PS2", variable{"> ", false});
+	_vars.insert_or_assign("PS4", variable{"+ ", false});
+
+	// PWD is deliberately NOT here. It is inherited from the environment and
+	// rewritten by `cd`, which owns the logical-versus-physical question POSIX
+	// attaches to it (#46); seeding it here would put a second author on one
+	// variable. dash refreshes it from getcwd at startup and lesh does not - a
+	// divergence visible only as `env -u PWD lesh -c 'echo ${PWD-unset}'`.
+	//
+	// LINENO is deliberately NOT here. It is not a constant to seed but a variable
+	// the shell must keep current as it reads, and a token's offset can land in an
+	// alias text region rather than in the input (#47), so the mapping from offset
+	// to line number is entangled with alias substitution. Seeding it with 1 would
+	// be a stub that succeeds: `echo $LINENO` on line 9 would print 1 and look
+	// implemented. lineno-p.tst stays 0/3 and says why.
 }
 
 shell_state::~shell_state() = default;

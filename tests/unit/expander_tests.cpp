@@ -197,6 +197,68 @@ TEST_F(ExpanderTest, FieldSplittingHonoursIfs) {
 	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "a", "b", "c"}));
 }
 
+// POSIX 2.6.5 gives a separator a shape - IFS white space, then at most one
+// non-white-space IFS character, then more IFS white space - and the consequence
+// is EMPTY fields, which the previous "drop every IFS byte" loop could not
+// produce at all. Ten of fsplit-p.tst's twelve failures were this one rule (#42).
+TEST_F(ExpanderTest, SuccessiveNonWhitespaceSeparatorsLeaveAnEmptyFieldBetweenThem) {
+	params.separators = "-";
+	params.vars["P"] = "1--2";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "1", "", "2"}));
+}
+
+TEST_F(ExpanderTest, ALeadingNonWhitespaceSeparatorLeavesAnEmptyFieldBeforeIt) {
+	params.separators = "-";
+	params.vars["P"] = "-1";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "", "1"}));
+}
+
+TEST_F(ExpanderTest, ALeadingWhitespaceSeparatorDoesNot) {
+	// The asymmetry is the point: white space at the start of the input is not a
+	// separator, so there is no field for it to end.
+	params.separators = " ";
+	params.vars["P"] = " 1";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "1"}));
+}
+
+TEST_F(ExpanderTest, WhitespaceAroundANonWhitespaceSeparatorIsPartOfIt) {
+	// ` - ` is ONE separator, not three, so this is two fields rather than four.
+	params.separators = " -";
+	params.vars["P"] = "1 - 2";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "1", "2"}));
+}
+
+TEST_F(ExpanderTest, ASeparatorThatHasUsedItsSlotStartsANewOne) {
+	// fsplit-p.tst's 'complex field splitting with successive non-whitespace IFS':
+	// leading white space has no field to close, so the first `-` produces the
+	// empty field and the second produces another.
+	params.separators = " -";
+	params.vars["P"] = "  --33";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "", "", "33"}));
+}
+
+TEST_F(ExpanderTest, ATrailingSeparatorDoesNotAddAnEmptyLastField) {
+	// "empty last field is ignored": one separator at the end yields nothing extra,
+	// two yield one empty field. Achieved by never emitting a field until content
+	// arrives, so the end of the word simply drops what is owed.
+	params.separators = "-";
+	params.vars["P"] = "1-";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "1"}));
+	params.vars["P"] = "1--";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", "1", ""}));
+	params.vars["P"] = "-";
+	EXPECT_EQ(expand("echo $P"), (std::vector<std::string>{"echo", ""}));
+}
+
+TEST_F(ExpanderTest, OneSeparatorMaySpanTwoExpansions) {
+	// The separator state has to outlive a segment: `$a$b` is `1  2` here, which is
+	// ONE separator and two fields. Resetting per segment made it three.
+	params.separators = " ";
+	params.vars["A"] = "1 ";
+	params.vars["B"] = " 2";
+	EXPECT_EQ(expand("echo $A$B"), (std::vector<std::string>{"echo", "1", "2"}));
+}
+
 TEST_F(ExpanderTest, SingleQuotesSuppressEverything) {
 	params.vars["X"] = "value";
 	EXPECT_EQ(expand("echo '$X'"), (std::vector<std::string>{"echo", "$X"}));

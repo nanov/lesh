@@ -140,7 +140,22 @@ private:
 	                                 = syntax::lex_mode::word_interior) noexcept;
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
-	void finish_field(arena_array<std::string_view>& out) noexcept;
+	void push_byte(char c) noexcept;
+	bool finish_field(arena_array<std::string_view>& out, bool even_if_empty = false) noexcept;
+
+	// Where a run of IFS separators stands. Held across segments because ONE
+	// separator can be split between them: `$a$b` with a='1 ' and b=' 2' is two
+	// fields, not three, and the two spaces belong to one separator.
+	enum class split_run : uint8_t {
+		none,       // in a field, or before the word's first byte
+		white,      // inside a separator that has seen only IFS white space
+		delimited,  // inside a separator whose one non-white-space slot is used
+	};
+	split_run _run = split_run::none;
+	// Whether the separator in progress has already ended a field. A separator owes
+	// exactly one field boundary, and which byte of it pays depends on whether
+	// there was a field to close when the run began.
+	bool _run_closed_a_field = false;
 
 	buffer_pool& _pool;
 	const parameter_source& _params;

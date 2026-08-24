@@ -284,7 +284,10 @@ TEST_F(ReadTest, AnAssignmentPrefixIsVisibleToTheBuiltinAndDoesNotOutliveIt) {
 	EXPECT_EQ(run("IFS=' -' read a b"), 0);
 	EXPECT_EQ(value_of("a"), "A");
 	EXPECT_EQ(value_of("b"), "B");
-	EXPECT_EQ(value_of("IFS"), "<unset>") << "restored to what it was: unset";
+	// The default rather than unset: POSIX makes IFS a variable the shell SETS at
+	// startup, so there is a previous value to restore to (#42). Before that it was
+	// genuinely unset, and this line read "<unset>".
+	EXPECT_EQ(value_of("IFS"), " \t\n") << "restored to what it was: the default";
 
 	feed("A-B\n");
 	EXPECT_EQ(run("IFS=:; IFS=' -' read c d"), 0);
