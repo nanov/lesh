@@ -851,3 +851,48 @@ TEST_F(ExecutorTest, DotFailingIsSurvivableInAnInteractiveShellAndUnderCommand) 
 	state.set_interactive(true);
 	EXPECT_EQ(capture(". ./_no_such_file_ 2>/dev/null; echo reached"), "reached\n");
 }
+
+// --- a dot script is a return boundary ---------------------------------------
+
+TEST_F(ExecutorTest, ReturnFromADotScriptStopsAtThatScript) {
+	// POSIX XCU `return`: the unwind ends at the innermost function OR dot script.
+	// It ended at neither here - `return` in a sourced script unwound past every
+	// enclosing one, which is return-p.tst's 'returning from dot script, nested in
+	// another dot script' and 'nested in function'.
+	const std::string dir = ::testing::TempDir();
+	const std::string inner = dir + "lesh_return_inner.sh";
+	const std::string outer = dir + "lesh_return_outer.sh";
+	{
+		std::ofstream out{inner};
+		out << "echo in inner\nreturn\necho not reached\n";
+	}
+	{
+		std::ofstream out{outer};
+		out << "echo in outer\n. " << inner << "\necho out outer\n";
+	}
+	EXPECT_EQ(capture(". " + outer + "; echo after"),
+	          "in outer\nin inner\nout outer\nafter\n");
+	EXPECT_EQ(capture("f() { echo in f; . " + inner + "; echo out f; }; f; echo after"),
+	          "in f\nin inner\nout f\nafter\n");
+	std::remove(inner.c_str());
+	std::remove(outer.c_str());
+}
+
+TEST_F(ExecutorTest, ReturnFromADotScriptStillReportsItsOwnStatus) {
+	// The boundary consumes the UNWIND and not the status: return-p.tst's
+	// 'specifying exit status in returning from dot script' expects 17.
+	const std::string script = ::testing::TempDir() + "lesh_return_status.sh";
+	{
+		std::ofstream out{script};
+		out << "(exit 1)\nreturn 17\n";
+	}
+	EXPECT_EQ(run(". " + script), 17);
+	std::remove(script.c_str());
+}
+
+TEST_F(ExecutorTest, EvalIsNotAReturnBoundary) {
+	// `eval` shares run_source with `.` and must NOT stop the unwind:
+	// return-p.tst's 'returning out of eval' has the function return, not the eval.
+	EXPECT_EQ(capture("f() { eval return; echo not reached; }; f; echo after"),
+	          "after\n");
+}

@@ -1222,6 +1222,22 @@ bool tree_walking_executor::run_dot_script(std::string_view operand, int& status
 		source.append(buffer, got);
 	std::fclose(f);
 	status = run_source(source);
+	// A dot script is a RETURN BOUNDARY. POSIX XCU `return`: it returns from the
+	// function OR the dot script that invoked it, whichever is innermost - so the
+	// unwind stops at this one call and whatever invoked it carries on. dash and
+	// zsh agree, and the two cases that distinguish it are return-p.tst's
+	// 'returning from dot script, nested in another dot script' (the OUTER script
+	// must go on to its last line) and 'returning from dot script, nested in
+	// function' (the calling function must go on to its).
+	//
+	// Consumed HERE and not in run_source, which `eval` shares: `eval return`
+	// inside a function returns from the FUNCTION - return-p.tst's 'returning out
+	// of eval' - so eval must let the unwind through and only `.` may stop it.
+	//
+	// The status is left alone. `. ./script` where the script ends in `return 17`
+	// reports 17, which run_source already returned as the last command's status.
+	if (_flow == control_flow::return_from)
+		_flow = control_flow::normal;
 	return true;
 }
 

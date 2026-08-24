@@ -1009,3 +1009,19 @@ mkdir p; printf 'echo sourced\n' >p/readable; chmod 444 p/readable; PATH=./p; . 
 
 --- a status the dot script itself reported is not a search failure [xfail(legacy): legacy has no dot builtin]
 printf '(exit 3)\n' >script; . ./script; echo "reached st=$?"
+
+# A dot script is a RETURN BOUNDARY: `return` in a sourced script returns from
+# that script and no further, so whatever invoked it carries on. `eval` is NOT a
+# boundary - `eval return` inside a function returns from the function.
+
+--- return from a dot script nested in another dot script [xfail(legacy): legacy has no dot builtin]
+printf 'echo in inner\nreturn\necho not reached\n' >inner; printf 'echo in outer\n. ./inner\necho out outer\n' >outer; . ./outer; echo after
+
+--- return from a dot script nested in a function [xfail(legacy): legacy has no dot builtin]
+printf 'echo in inner\nreturn\necho not reached\n' >inner; f() { echo in f; . ./inner; echo out f; }; f; echo after
+
+--- return from a dot script reports the status it was given [xfail(legacy): legacy has no dot builtin]
+printf '(exit 1)\nreturn 17\n' >script; . ./script; echo "st=$?"
+
+--- return out of an eval returns from the enclosing function [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+f() { eval return; echo not reached; }; f; echo "after st=$?"
