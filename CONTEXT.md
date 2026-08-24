@@ -78,8 +78,13 @@ A unit produced by field splitting. One word yields zero, one, or many fields.
 _Avoid_: word, argument.
 
 **Field splitting** _[floor]_:
-Splitting the result of an unquoted expansion on the characters in `IFS`.
-_Avoid_: word splitting, tokenizing.
+Splitting the result of an unquoted expansion on the characters in `IFS`. A
+**separator** has a SHAPE rather than being one byte: IFS white space, then at most
+one non-white-space IFS character, then more IFS white space. Two separators in a
+row therefore leave an EMPTY field between them, which is the difference between
+this and dropping IFS bytes.
+_Avoid_: word splitting, tokenizing. Also avoid calling the run between two fields
+a "delimiter" when it may be several characters — separator is the POSIX word.
 
 **Parameter expansion** _[floor]_:
 The `${...}` family, including the bare `$name` form.
@@ -169,10 +174,27 @@ Turns tokens into a tree. Always returns a tree; invalid input yields error node
 
 **Expander** _[lesh]_:
 Turns one word plus the shell state into fields. Called by the executor per command,
-at execution time. Also the last line of defence against a **defect** the front end
-could not see: the word scan counts braces, so an unterminated construct inside
-`${x-...}` is only lexed when the default is expanded, and refusing it is the
-expander's job (#48). Re-entrant, and therefore depth-limited.
+at execution time. Re-entrant — a parameter default, an assignment value and
+arithmetic's inner text all re-enter it — and therefore depth-limited.
+
+Still the last line of defence against a **defect** the front end could not see,
+but a narrower one than #48 recorded: the word scan followed nothing but braces
+then, so an unterminated construct inside `${x-...}` was only lexed when the
+default was expanded. The scan now follows quoting and nesting (#42), so the word
+itself carries the defect and the parser refuses it. What is left to the expander is
+text no word scan ever saw: `eval`, `.`, an assignment value and arithmetic's inner
+text.
+
+**Expansion context** _[lesh]_:
+The properties that decide how a piece of text expands, held together rather than
+inferred from one flag. POSIX applies its treatments independently and one bool
+standing for several of them has been wrong three times: field splitting, the
+double-quote backslash rules, whether a FIELD LIST is being produced (so `"$@"` may
+make more than one), whether the text is itself the RESULT of an expansion (so its
+literal blanks separate), whether it is a PATTERN (so quoting becomes escapes rather
+than nothing), and whether it is the interior of `${...}` (so `\}` escapes). The
+lexing **mode** is a sixth, and separate again.
+_Avoid_: "quoted", which named two of these at once and then three.
 
 **Executor** _[lesh]_:
 Runs a tree. An interface, so the back end stays replaceable.
