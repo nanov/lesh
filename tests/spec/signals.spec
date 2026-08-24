@@ -292,3 +292,55 @@ sleep 0 & b=$!; { [ "$!" = "$b" ] && echo inherited; } | cat; wait
 trap 'echo TRAP' USR1; { trap; } | cat
 === expect
 trap -- 'echo TRAP' USR1
+
+# ISSUE #45. WHAT `kill` VALIDATES. Every form below reported success or signalled
+# something other than what it was given, because the pid operand went through
+# `atoi` - which answers 0 for `notanumber`, for `--` and for `%1`, and
+# `kill(0, sig)` signals THE WHOLE PROCESS GROUP. `kill -s TERM notanumber`
+# therefore killed the shell it was typed into. dash answers 2 for a line it
+# refused to run and 1 only for one the system refused, and lesh now agrees.
+
+--- kill with a signal and no pid is a usage error, not a silent success [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill, which answers its own way]
+kill -s TERM; echo "st=$?"
+
+--- kill with nothing at all is a usage error [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill; echo "st=$?"
+
+--- kill -s with no signal name names no signal [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s; echo "st=$?"
+
+--- a pid operand that is not a number is refused, rather than becoming the process group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s TERM notanumber; echo "st=$?"
+
+--- and so is one that only starts as a number [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s TERM 12abc; echo "st=$?"
+
+--- an empty pid operand is refused too [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s TERM ''; echo "st=$?"
+
+--- a job specification is refused rather than taken for the process group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill %1; echo "st=$?"
+
+--- a bare negative operand is an option, and an unknown one [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill, which reads it as a process group]
+kill -s 0 -1; echo "st=$?"
+
+--- `--` ends kill's options, which is how a POSIX process group is written [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s 0 -- $$; echo "st=$?"
+
+--- `--` with no operand after it is a usage error, not a signal to the whole group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s TERM --; echo "st=$?"
+
+--- an unknown option is refused by name [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -x 1; echo "st=$?"
+
+--- an unknown signal name is a usage error [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s NOSUCH $$; echo "st=$?"
+
+--- kill -l refuses an operand that names no signal with the same status [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -l 0; echo "st=$?"
+
+--- the forms that ARE valid still work, and the null signal still asks nothing [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s 0 $$; echo "s=$?"; kill -0 $$; echo "n=$?"; kill -s URG $$; echo "u=$?"
+
+--- EXIT is a trap condition and not a signal kill can send [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+kill -s EXIT $$; echo "st=$?"

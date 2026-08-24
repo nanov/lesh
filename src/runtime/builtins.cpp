@@ -1163,6 +1163,17 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 	return {status};
 }
 
+// 2, as for any other builtin's usage error, and what dash answers for every
+// malformed `kill` line. Distinct from 1, which this builtin keeps for a kill(2)
+// the SYSTEM refused: the command was well formed and the shell did ask.
+constexpr int kKillUsageError = 2;
+
+builtin_result kill_usage() {
+	std::fprintf(stderr, "lesh: kill: usage: kill -s signal_name pid... | "
+	                     "kill -signal_name pid... | kill -l [exit_status]\n");
+	return {kKillUsageError};
+}
+
 // `kill -l EXIT_STATUS`: POSIX's inverse of `kill -s`, and a gap here is not
 // local. The suite's own run-test.sh renders every signalled exit with
 // `kill -l "$actual_exit_status"`, and kill1-p.tst asserts both readings of the
@@ -1179,7 +1190,7 @@ builtin_result kill_list_one(const char* operand) {
 	if (!is_unsigned_integer(text)) {
 		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
 		             operand);
-		return {1};
+		return {kKillUsageError};
 	}
 	int value = 0;
 	for (const char c : text) {
@@ -1192,55 +1203,154 @@ builtin_result kill_list_one(const char* operand) {
 	if (signo <= 0 || name.empty()) {
 		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
 		             operand);
-		return {1};
+		return {kKillUsageError};
 	}
 	std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
 	return {0};
 }
 
-builtin_result builtin_kill(shell_state&, char** argv) {
-	int signo = SIGTERM;
-	size_t first = 1;
+// `0` leads the list because the null signal is a legal `kill -s` operand and has
+// no name of its own; printing `EXIT` there would be a category error - EXIT is a
+// `trap` condition, not something you can send. dash prints exactly this, one name
+// per line, in numeric order.
+builtin_result kill_list_all() {
+	std::puts("0");
+	for (int i = 1; i < kMaxSignal; ++i) {
+		const std::string_view name = signal_state::signal_name(i);
+		if (!name.empty())
+			std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
+	}
+	return {0};
+}
 
-	if (argv[1] != nullptr && std::strcmp(argv[1], "-l") == 0) {
-		if (argv[2] != nullptr)
-			return kill_list_one(argv[2]);  // dash reads only the first operand too
-		// `0` leads the list because the null signal is a legal `kill -s` operand
-		// and has no name of its own; printing `EXIT` there would be a category
-		// error - EXIT is a `trap` condition, not something you can send. dash
-		// prints exactly this, one name per line, in numeric order.
-		std::puts("0");
-		for (int i = 1; i < kMaxSignal; ++i) {
-			const std::string_view name = signal_state::signal_name(i);
-			if (!name.empty())
-				std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
-		}
-		return {0};
+// A pid operand, read strictly. This is what `std::atoi` was doing instead, and a
+// missing operand was only the QUIETEST member of the family it let through: atoi
+// answers 0 for `notanumber`, for `--`, for `%1` and for `0x10`, and kill(0, sig)
+// signals THE WHOLE PROCESS GROUP - so `kill -s TERM notanumber` killed the shell
+// and everything beside it, and `kill -s TERM -1` asked the kernel to signal every
+// process the user owns. Neither of those is a diagnostic being missed; they are
+// the wrong syscall being made (#45).
+//
+// dash's tolerances are copied deliberately rather than tightened: surrounding
+// blanks, a leading `+` and leading zeros are all accepted, because dash is the
+// POSIX floor and a script may already rely on `kill "$pid_with_spaces"`. The
+// range check is dash's too - it refuses a number it cannot hold rather than
+// wrapping onto some unrelated process.
+bool read_pid_operand(const char* operand, pid_t& out) {
+	std::string_view text{operand};
+	while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
+		text.remove_prefix(1);
+	while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
+		text.remove_suffix(1);
+	// A NEGATIVE pid names a process group, and POSIX writes it after `--` -
+	// `kill -s HUP -- -$pgid`, which is the form kill4-p.tst uses. A bare `-$pgid`
+	// is an option as far as the option scan is concerned, and is refused there.
+	bool negative = false;
+	if (!text.empty() && (text.front() == '+' || text.front() == '-')) {
+		negative = text.front() == '-';
+		text.remove_prefix(1);
 	}
+	if (!is_unsigned_integer(text))
+		return false;
+	long long value = 0;
+	for (const char c : text) {
+		value = value * 10 + (c - '0');
+		if (value > static_cast<long long>(std::numeric_limits<pid_t>::max()))
+			return false;
+	}
+	out = static_cast<pid_t>(negative ? -value : value);
+	return true;
+}
+
+// POSIX gives `kill` exactly two forms: a signal specification followed by AT
+// LEAST ONE pid, and `-l [exit_status]`. Every other spelling is a usage error,
+// and saying so is the whole point of this reading - `kill -s TERM` used to
+// signal nothing and report SUCCESS, the stub-that-succeeds shape that has now
+// cost this project five debugging sessions (`command`, `set -o pipefail`,
+// `test`, `kill -l EXITSTATUS`, and this).
+//
+// One scan over argv rather than a check bolted onto the front of the old one:
+// the old reading looked at argv[1] and argv[2] by hand and had no notion of
+// where the OPERANDS began, which is why `kill -s` took the `s` for a signal name
+// and `kill -s TERM --` sent SIGTERM to the shell's process group.
+builtin_result builtin_kill(shell_state&, char** argv) {
 	const char* signal_operand = nullptr;
-	if (argv[1] != nullptr && std::strcmp(argv[1], "-s") == 0 && argv[2] != nullptr) {
-		signal_operand = argv[2];
-		first = 3;
-	} else if (argv[1] != nullptr && argv[1][0] == '-' && argv[1][1] != '\0') {
-		signal_operand = argv[1] + 1;
-		first = 2;
+	bool list = false;
+	size_t i = 1;
+	for (; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		// POSIX XCU 1.4: `--` ends the options. first_operand cannot serve here -
+		// it answers for a utility whose `--` can only be argv[1], and `kill`'s
+		// comes after the signal option.
+		if (arg == "--") {
+			++i;
+			break;
+		}
+		if (arg.size() < 2 || arg.front() != '-')
+			break;  // the operands start here
+		if (arg == "-l") {
+			list = true;
+			continue;
+		}
+		if (arg == "-s") {
+			// `kill -s` with nothing after it names no signal. It used to fall
+			// through to the `-NAME` reading below, which took the `s` for the name
+			// and reported `s: bad signal` - a diagnostic about the wrong thing.
+			if (argv[i + 1] == nullptr)
+				return kill_usage();
+			signal_operand = argv[++i];
+			continue;
+		}
+		if (arg.substr(0, 2) == "-s") {
+			signal_operand = argv[i] + 2;  // `kill -sTERM`, which dash accepts too
+			continue;
+		}
+		// `-TERM`, `-15`. Validated below, so an option this reading does not know -
+		// `kill -x 1`, `kill -n 9 $$` - is refused by name rather than silently
+		// taken for a pid.
+		signal_operand = argv[i] + 1;
 	}
-	if (signal_operand != nullptr)
+
+	if (list) {
+		// dash reads only the first operand and ignores the rest.
+		return argv[i] != nullptr ? kill_list_one(argv[i]) : kill_list_all();
+	}
+
+	int signo = SIGTERM;
+	if (signal_operand != nullptr) {
 		signo = signal_state::signal_number(signal_operand);
-	if (signo < 0) {
-		// Naming the operand matters: the whole of issue #38 presented itself as
-		// this message with nothing in it to say WHICH signal the shell had never
-		// heard of.
-		std::fprintf(stderr, "lesh: kill: %s: bad signal\n", signal_operand);
-		return {1};
+		// `EXIT` is a `trap` CONDITION and not something you can send, so the name
+		// resolving to 0 is not the same answer as the number 0 - which is the null
+		// signal and a legal operand. `kill -s EXIT $$` reported success having sent
+		// nothing; the same category error `kill -l` refuses at the other end.
+		if (signo == kExitTrap && !is_unsigned_integer(signal_operand))
+			signo = -1;
+		if (signo < 0) {
+			// Naming the operand matters: the whole of issue #38 presented itself as
+			// this message with nothing in it to say WHICH signal the shell had never
+			// heard of.
+			std::fprintf(stderr, "lesh: kill: %s: bad signal\n", signal_operand);
+			return {kKillUsageError};
+		}
 	}
+	// The ticket's case, and the reason for all of the above: a signal with no pid.
+	if (argv[i] == nullptr)
+		return kill_usage();
 
 	int status = 0;
-	for (size_t i = first; argv[i] != nullptr; ++i) {
-		const pid_t pid = static_cast<pid_t>(std::atoi(argv[i]));
+	for (; argv[i] != nullptr; ++i) {
+		pid_t pid = 0;
+		if (!read_pid_operand(argv[i], pid)) {
+			std::fprintf(stderr, "lesh: kill: %s: not a process id\n", argv[i]);
+			status = kKillUsageError;
+			continue;
+		}
 		if (::kill(pid, signo) != 0) {
 			std::fprintf(stderr, "lesh: kill: %s: %s\n", argv[i], std::strerror(errno));
-			status = 1;
+			// A usage error already reported outranks this one: dash answers 2 for a
+			// line it refused to run and 1 only for one the system refused.
+			if (status == 0)
+				status = 1;
 		}
 	}
 	return {status};

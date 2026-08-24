@@ -222,3 +222,94 @@ TEST_F(BuiltinRegistryTest, CommandRunsAndBypassesFunctionsInAPipelineStage) {
 	EXPECT_EQ(capture("cat() { echo FUNCTION; }; echo hi | command cat"), "hi\n");
 	EXPECT_EQ(capture("echo hi | command -p cat"), "hi\n");
 }
+
+// --- what `kill` validates (issue #45) ---------------------------------------
+//
+// The same failure this file exists for, one builtin further in: a form the shell
+// did not handle reported SUCCESS. `kill -s TERM` signalled nothing and answered
+// 0, and every unrecognised PID operand went through `atoi` - which answers 0 for
+// `notanumber`, for `--`, for `%1` and for `0x10`. kill(0, sig) signals the whole
+// PROCESS GROUP, so those were not diagnostics being missed but the wrong syscall
+// being made.
+//
+// SIGURG throughout, and deliberately: it is discarded by default, so a case that
+// still reached the old code path would leave this binary alive to report the
+// failure. With TERM the pre-fix behaviour kills the test runner instead of
+// failing a test, which is the same reason the corpus cases for the dangerous
+// spelling live in a shell of their own.
+
+TEST_F(BuiltinRegistryTest, KillWithNoPidOperandIsAUsageError) {
+	// 2, which is what dash answers for every one of these and what this shell
+	// already answers for `break` and `continue`.
+	EXPECT_EQ(run("kill -s URG 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -URG 2>/dev/null"), 2);
+	// `--` ends the options, so this names no pid either. It used to reach
+	// atoi("--") - and signal the group.
+	EXPECT_EQ(run("kill -s URG -- 2>/dev/null"), 2);
+}
+
+TEST_F(BuiltinRegistryTest, KillWithNoSignalAfterDashSSaysSo) {
+	// The old reading fell through to the `-NAME` form and reported `s: bad
+	// signal`, a diagnostic about a letter the user did not type.
+	EXPECT_EQ(run("kill -s 2>/dev/null"), 2);
+}
+
+TEST_F(BuiltinRegistryTest, KillRefusesAnOperandThatIsNotAProcessId) {
+	EXPECT_EQ(run("kill -s URG notanumber 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -s URG 12abc 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -s URG '' 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -s URG 0x10 2>/dev/null"), 2);
+	// A job specification is not a pid and job control is out of scope (ADR-0001),
+	// so it is refused rather than quietly meaning "this process group".
+	EXPECT_EQ(run("kill -s URG %1 2>/dev/null"), 2);
+	// A bare negative operand is an OPTION as far as the scan is concerned, and an
+	// unknown one. POSIX writes a process group as `kill -s URG -- -$pgid`, which
+	// is the form kill4-p.tst uses; dash refuses the bare spelling the same way.
+	EXPECT_EQ(run("kill -s URG -1 2>/dev/null"), 2);
+}
+
+TEST_F(BuiltinRegistryTest, KillRefusesASignalItDoesNotKnow) {
+	EXPECT_EQ(run("kill -s NOSUCH $$ 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -x 1 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -n 9 $$ 2>/dev/null"), 2);
+}
+
+TEST_F(BuiltinRegistryTest, KillStillAcceptsEveryFormPOSIXDefines) {
+	// The null signal asks the kernel nothing and reports whether it could have,
+	// which makes it the one signal safe to send this process from its own tests.
+	EXPECT_EQ(run("kill -s 0 $$"), 0);
+	EXPECT_EQ(run("kill -0 $$"), 0);
+	EXPECT_EQ(run("kill -s 0 -- $$"), 0);
+	EXPECT_EQ(run("kill -s0 $$"), 0);
+	// dash's tolerances, copied rather than tightened: surrounding blanks, a
+	// leading `+`, and leading zeros are all a pid.
+	EXPECT_EQ(run("kill -s 0 \" $$ \""), 0);
+	EXPECT_EQ(run("kill -s 0 \"+$$\""), 0);
+	// Two operands, both signalled, and the status is still zero.
+	EXPECT_EQ(run("kill -s 0 $$ $$"), 0);
+	// -l is unaffected: it takes one operand, reads a 128+n exit status back, and
+	// refuses what names no signal - with the usage status, as dash does.
+	EXPECT_EQ(capture("kill -l 9"), "KILL\n");
+	EXPECT_EQ(capture("kill -l 137"), "KILL\n");
+	EXPECT_EQ(capture("kill -l -- 1"), "HUP\n");
+	EXPECT_EQ(run("kill -l 0 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -l 128 2>/dev/null"), 2);
+}
+
+TEST_F(BuiltinRegistryTest, AFailedKillIsOneAndNotAUsageError) {
+	// The two statuses mean different things: 2 for a line the shell refused to
+	// run, 1 for one the SYSTEM refused. Conflating them would have made the fix
+	// above unfalsifiable.
+	EXPECT_EQ(run("kill -s 0 99999999 2>/dev/null"), 1);
+}
+
+TEST_F(BuiltinRegistryTest, KillRefusesEXITBecauseItIsATrapConditionAndNotASignal) {
+	// The name resolves to 0 and the NUMBER 0 is the null signal, so this is not
+	// the same operand twice: `kill -s 0 $$` must work and `kill -s EXIT $$` must
+	// not. It reported success having sent nothing - the same category error
+	// `kill -l` refuses at the other end, and dash refuses this one too.
+	EXPECT_EQ(run("kill -s EXIT $$ 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -EXIT $$ 2>/dev/null"), 2);
+	EXPECT_EQ(run("kill -s 0 $$"), 0);
+}
