@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <csignal>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -1081,4 +1082,72 @@ TEST_F(ExecutorTest, VerboseDoesNotEchoAnEvalOperandTwice) {
 	// text the shell has not already read.
 	EXPECT_EQ(capture("set -v; eval ':' 2>&1"), "");
 	EXPECT_EQ(capture("set -v; trap ':' EXIT 2>&1"), "");
+}
+
+// --- a pipeline stage is a subshell environment (issue #53) -------------------
+//
+// Every case that must see THE STAGE take a signal has a grandchild send it
+// through $PPID. `$$` in a stage is the SHELL's pid, so `kill -s USR1 $$` from a
+// stage signals the shell, which then runs the trap perfectly correctly - which is
+// how a stage keeping its parent's handlers survived twenty conformance files and
+// two suites.
+
+TEST_F(ExecutorTest, APipelineStageDoesNotRunTheHandlerItInherited) {
+	// The disposition is restored because `trap` installs a real handler in this
+	// process, and the next shell state's constructor reads what it finds (#37).
+	const lesh::testing::saved_disposition guard{SIGUSR1};
+	// `done` is the point: the STAGE dies of SIGUSR1 - its default action, since a
+	// subshell resets the handler - and the SHELL carries on. Asserting emptiness
+	// alone would also pass if the whole pipeline had failed to run.
+	EXPECT_EQ(capture("trap 'echo TRAP' USR1; "
+	                  "{ /bin/sh -c 'kill -s USR1 $PPID'; echo body; } | cat; echo done"),
+	          "done\n")
+		<< "the stage kept the parent's handler, so it ran TRAP and carried on";
+}
+
+TEST_F(ExecutorTest, APipelineStageKeepsAnIgnore) {
+	// The asymmetry POSIX asks for and the reason the reset is not a clear-all: an
+	// IGNORE protects a whole subtree, a handler belongs to the shell that set it.
+	const lesh::testing::saved_disposition guard{SIGUSR1};
+	EXPECT_EQ(capture("trap '' USR1; "
+	                  "{ /bin/sh -c 'kill -s USR1 $PPID'; echo body; } | cat"),
+	          "body\n");
+}
+
+TEST_F(ExecutorTest, ATrapSetInsideAPipelineStageFiresThere) {
+	const lesh::testing::saved_disposition guard{SIGUSR1};
+	EXPECT_EQ(capture("{ trap 'echo INSIDE' USR1; /bin/sh -c 'kill -s USR1 $PPID'; "
+	                  "echo body; } | cat"),
+	          "INSIDE\nbody\n");
+}
+
+TEST_F(ExecutorTest, APipelineStageRunsItsOwnExitTrap) {
+	// The same answer run_subshell gave in 7a52868, because a stage is the same
+	// kind of environment. It printed only `body` before.
+	EXPECT_EQ(capture("{ trap 'echo S' EXIT; echo body; } | cat"), "body\nS\n");
+	// And on the way out of an `exit`, which is where a stage's cleanup matters.
+	EXPECT_EQ(capture("{ trap 'echo S' EXIT; exit 3; } | cat"), "S\n");
+	// The LAST stage too, which is the one that is not a writer to a pipe.
+	EXPECT_EQ(capture("echo a | { trap 'echo S' EXIT; cat; }"), "a\nS\n");
+}
+
+TEST_F(ExecutorTest, APipelineStageDoesNotRunTheExitTrapItInherited) {
+	// Both halves of the one reset, and they are separable: a stage that ran the
+	// inherited trap would print T twice, and a shell that reset its own would
+	// print it never. In a subshell because `capture` redirects a brace group and
+	// the SHELL's own EXIT trap runs after that redirection is undone.
+	EXPECT_EQ(capture("( trap 'echo T' EXIT; { echo body; } | cat; echo after )"),
+	          "body\nafter\nT\n");
+	EXPECT_EQ(capture("( trap 'echo T' EXIT; { trap 'echo S' EXIT; echo body; } | cat )"),
+	          "body\nS\nT\n");
+}
+
+TEST_F(ExecutorTest, APipelineStageInheritsTheShellsSpecialParameters) {
+	// The neighbouring "what does a stage inherit" question, and the answer is that
+	// these two are NOT reset: POSIX gives `$$` the pid of the invoking shell, and
+	// a subshell does not become a new invocation. Both shells agree, and nothing
+	// in either suite covers it.
+	EXPECT_EQ(capture("p=$$; { [ \"$$\" = \"$p\" ] && echo same; } | cat"), "same\n");
+	EXPECT_EQ(capture("sleep 0 & b=$!; { [ \"$!\" = \"$b\" ] && echo inherited; } | cat; wait"),
+	          "inherited\n");
 }

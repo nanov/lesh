@@ -2721,15 +2721,44 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 		const pid_t pid = fork();
 		if (pid == 0) {
 			setpgid(0, group);
+			// A stage is a SUBSHELL ENVIRONMENT, and this is the one place per stage
+			// that is already inside it - after the fork, before anything in the
+			// stage is evaluated. So the traps reset here, exactly as they do for
+			// `( ... )`, for `&` and for `$( ... )`: the handlers this shell set
+			// belong to it, and only an IGNORE carries in. Without it a stage RAN THE
+			// PARENT'S HANDLERS - `trap "echo TRAP" USR1; { "$TESTEE" -c 'kill -s
+			// USR1 $PPID'; echo body; } | cat` printed TRAP and carried on where dash
+			// and bash are killed by the signal (#53).
+			//
+			// enter_subshell rather than reset_for_subshell alone, because the trap
+			// action's entry status goes with it - see shell_state. It is also what
+			// drops #52's interactive defaults, which belong to the process that
+			// reads commands and has a prompt to return to and not to a stage; and it
+			// leaves #37's ignored-on-entry rule alone, which is why a signal the
+			// shell was invoked ignoring is still untrappable in a stage.
+			_state.enter_subshell();
+			// The stage gets its OWN EXIT trap, and the flag must be cleared for it -
+			// the same reason run_subshell clears it, for a stage forked from inside
+			// the parent's EXIT trap.
+			_exit_trap_ran = false;
 			if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
 			if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
 			// A stage may be a COMPOUND command - `echo x | { read v; ... }` and
 			// `... | while read l; do ...; done` are both ordinary shell. Only a
 			// simple command has words to expand and a name to dispatch on, which is
 			// all run_pipeline_stage adds over run_node.
-			const int status = t[stage].kind == node_kind::simple_command
-			                       ? run_pipeline_stage(t, stage)
-			                       : run_node(t, stage);
+			int status = t[stage].kind == node_kind::simple_command
+			                 ? run_pipeline_stage(t, stage)
+			                 : run_node(t, stage);
+			// And it RUNS that trap on the way out, which is the answer run_subshell
+			// gave in 7a52868 and the answer a stage has to match: `{ trap "echo S"
+			// EXIT; echo body; } | cat` prints body and then S in dash, and printed
+			// only body here. An EXTERNAL command never reaches this - the stage
+			// EXECS and the trap goes with the process it replaced, which is what
+			// POSIX says and what dash does.
+			int from_trap = 0;
+			if (run_exit_trap(from_trap))
+				status = from_trap;
 			std::fflush(nullptr);
 			_exit(status);
 		}

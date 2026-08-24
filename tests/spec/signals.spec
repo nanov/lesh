@@ -241,3 +241,54 @@ trap 'echo A; exit 4; echo B' USR1; kill -s USR1 $$; echo after
 fn() { true; return; }; trap 'fn; echo trapped $?' EXIT; (exit 19); exit
 === expect [status: 19]
 trapped 19
+
+# ISSUE #53. A PIPELINE STAGE IS A SUBSHELL ENVIRONMENT, so POSIX 2.9.2 resets its
+# traps to default and keeps only the ignores - the same asymmetry `( ... )`, `&`
+# and `$( ... )` already obeyed and the pipeline fork did not.
+#
+# The `2>/dev/null` on the first case is not hiding a trap result: dash writes a
+# "User defined signal 1"-style notification for a signal-killed child and lesh
+# writes nothing, which is a separate divergence and not this ticket's.
+#
+# Each case that must see the STAGE take the signal re-invokes "$TESTEE" and sends
+# to $PPID, because `$$` inside a subshell is the PARENT's pid - `kill -s SIG $$`
+# from a stage signals the shell, and the shell then runs the trap perfectly
+# correctly, which is how this bug survived twenty signal files.
+
+--- a pipeline stage does not run the trap handler it inherited [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+"$TESTEE" -c 'trap "echo TRAP" USR1; { "$TESTEE" -c "kill -s USR1 \$PPID"; echo body; } | cat; echo done' 2>/dev/null
+
+--- but an IGNORE does carry into a pipeline stage, which is the asymmetry [xfail(legacy): same quote-expansion defect]
+trap '' USR1; { "$TESTEE" -c 'kill -s USR1 $PPID'; echo body; } | cat
+
+--- a trap set INSIDE a stage still fires there [xfail(legacy): same quote-expansion defect]
+{ trap 'echo INSIDE' USR1; "$TESTEE" -c 'kill -s USR1 $PPID'; echo body; } | cat
+
+--- a stage of an ASYNC pipeline keeps the SIGINT ignore XCU 2.11 gave it [xfail(legacy): same quote-expansion defect]
+{ "$TESTEE" -c 'kill -s INT $PPID'; echo body; } | cat & wait
+
+--- a pipeline stage runs its OWN EXIT trap [xfail(legacy): legacy has no trap builtin]
+{ trap 'echo S' EXIT; echo body; } | cat
+
+--- and runs it when the stage exits early [xfail(legacy): legacy has no trap builtin]
+{ trap 'echo S' EXIT; exit 3; } | cat; echo "st=$?"
+
+--- the LAST stage runs its own EXIT trap too, and the shell still runs the one it kept [xfail(legacy): legacy has no trap builtin]
+trap 'echo T' EXIT; echo a | { trap 'echo S' EXIT; cat; }
+
+--- a stage does NOT run the EXIT trap it inherited [xfail(legacy): legacy has no trap builtin]
+trap 'echo T' EXIT; { echo body; } | cat; echo after
+
+--- both an inherited EXIT trap and the stage's own, each in its own process [xfail(legacy): legacy has no trap builtin]
+trap 'echo T' EXIT; { trap 'echo S' EXIT; echo body; } | cat
+
+--- $$ in a pipeline stage is still the shell's pid [xfail(legacy): legacy has no compound commands, so the brace group is not a stage it can run]
+p=$$; { [ "$$" = "$p" ] && echo same; } | cat
+
+--- $! in a pipeline stage is the one the shell recorded [xfail(legacy): legacy has no compound commands, so the brace group is not a stage it can run]
+sleep 0 & b=$!; { [ "$!" = "$b" ] && echo inherited; } | cat; wait
+
+--- trap still REPORTS what a stage inherited, though the action is gone [divergence: the #33 divergence reaching a pipeline stage - dash reports nothing in any subshell, which leaves `saved=$(trap)` with nothing to save, and POSIX.1-2024 requires the listing. bash reports the inherited traps, and lesh follows bash]
+trap 'echo TRAP' USR1; { trap; } | cat
+=== expect
+trap -- 'echo TRAP' USR1
