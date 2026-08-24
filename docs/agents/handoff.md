@@ -22,6 +22,14 @@ traps rather than a summary of them.
 - **Never run the conformance sweep alongside a build or the differential corpus.**
   The per-file timeout is real time. One overlapping run reported 37 timeouts,
   including `umask-p.tst`, which takes under a second on an idle machine.
+- **A loaded machine does not merely time files out - it makes the signal tests report
+  WRONG ANSWERS.** One after-sweep read 4763 where the same binary reads 5061, and
+  looked exactly like a 162-assertion regression. Nothing timed out. `sigint1-p.tst`
+  scored 65/180 in it and 180/180 alone minutes later. The suite self-signals, and its
+  own `macos_kill_workaround` calls the delivery timing "more likely" rather than
+  guaranteed, so a busy scheduler changes the ANSWER instead of the runtime. **A sweep
+  showing a large unexplained drop is a property of the measurement until it has been
+  re-run idle.**
 - **Build with `-j3`, not `-j8`.** `-O3 -flto=thin` across three presets pegs the
   machine, and the machine belongs to someone.
 - **Check for orphans before and after**:
