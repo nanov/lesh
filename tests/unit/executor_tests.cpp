@@ -4,6 +4,7 @@
 #include "syntax/parser.h"
 
 #include "interactive_signal_guard.h"
+#include "temp_path.h"
 
 #include <gtest/gtest.h>
 
@@ -26,6 +27,7 @@ class ExecutorTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
 		const tree t = parse(pool, src);
@@ -37,7 +39,7 @@ protected:
 	// external command in the source writes to fd 1 directly, so intercepting
 	// stdio would not see it.
 	std::string capture(std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_executor_capture.txt";
+		const std::string path = scratch.file("executor_capture.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);
@@ -315,7 +317,7 @@ TEST_F(ExecutorTest, ExecRedirectionOutlivesTheCommand) {
 	// `exec >file` is how a script redirects itself for good, and it is the one
 	// place where "apply without saving" is observable. Inside a subshell so the
 	// test binary's own stdout survives.
-	const std::string path = ::testing::TempDir() + "lesh_exec_redirect.txt";
+	const std::string path = scratch.file("exec_redirect.txt");
 	ASSERT_EQ(run("(exec >" + path + "; /bin/echo written)"), 0);
 	std::ifstream written{path};
 	std::string line;
@@ -416,7 +418,7 @@ TEST_F(ExecutorTest, ARedirectionOnABuiltinClosesTheFdItOpened) {
 TEST_F(ExecutorTest, ADisplacedFdThatWasOpenIsPutBackRatherThanClosed) {
 	// The other half of the sentinel: an fd that WAS open must come back, so
 	// distinguishing the two cases cannot be done by always closing either.
-	const std::string path = ::testing::TempDir() + "lesh_restore_fd.txt";
+	const std::string path = scratch.file("restore_fd.txt");
 	ASSERT_EQ(run("(exec 3>" + path + "; { /bin/echo inner >&3; } 3>&2; "
 	              "/bin/echo outer >&3)"), 0);
 	std::ifstream written{path};
@@ -430,7 +432,7 @@ TEST_F(ExecutorTest, TheSavedCopyIsOutOfReachOfALaterRedirection) {
 	// The copy is taken at fd 10 or above. dup(2) returns the LOWEST free fd,
 	// which `4>&3` in the same command then overwrote - so the restore put back
 	// whatever fd 4 had been aimed at instead of the original fd 3.
-	const std::string path = ::testing::TempDir() + "lesh_saved_copy.txt";
+	const std::string path = scratch.file("saved_copy.txt");
 	ASSERT_EQ(run("(exec 3>" + path + "; { :; } 3>&2 4>&3; "
 	              "/bin/echo outer >&3)"), 0);
 	std::ifstream written{path};
@@ -481,7 +483,7 @@ TEST_F(ExecutorTest, ClosingStdoutMakesABuiltinThatWritesFail) {
 TEST_F(ExecutorTest, ACommandThatIsOnlyRedirectionsStillPerformsThem) {
 	// POSIX 2.9.1: no command name does not mean no redirections. lesh dropped
 	// them entirely, so `>file` never created the file and `<missing` never failed.
-	const std::string path = ::testing::TempDir() + "lesh_bare_redirect.txt";
+	const std::string path = scratch.file("bare_redirect.txt");
 	std::remove(path.c_str());
 	EXPECT_EQ(run("> " + path), 0);
 	std::ifstream created{path};
@@ -549,6 +551,7 @@ class PipelineStdinTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 	int _original_stdin = -1;
 
 	void SetUp() override { _original_stdin = ::dup(STDIN_FILENO); }
@@ -583,7 +586,7 @@ protected:
 	// Runs `code` with its output in a file, because the shell writes to fd 1 and
 	// the test needs to read what it wrote.
 	std::string output_of(const std::string& code) {
-		const std::string path = ::testing::TempDir() + "lesh_pipeline_stage_stdin.txt";
+		const std::string path = scratch.file("pipeline_stage_stdin.txt");
 		std::remove(path.c_str());
 		// The source must OUTLIVE the tree: the nodes hold views into it, not copies.
 		const std::string source = "{ " + code + "; } > " + path;
@@ -700,7 +703,7 @@ TEST_F(ExecutorTest, TheSeparatorPrecedesTheOperandOfEvalAndDot) {
 	// `.` too: dot-p.tst's 'option-operand separator' is `. -- ./file1`. A real
 	// script rather than /dev/null, so the assertion is that the file after the
 	// separator was READ and not merely that nothing complained.
-	const std::string script = ::testing::TempDir() + "lesh_dot_separator.sh";
+	const std::string script = scratch.file("dot_separator.sh");
 	{
 		std::ofstream out{script};
 		out << "exit 23\n";
@@ -786,7 +789,7 @@ TEST_F(ExecutorTest, DottingAFileWithNoCommandsReportsZero) {
 	// And `$?` inside the script is still the caller's, which is what dot-p.tst's
 	// 'non-empty dot script' asserts - the initial status is the value RETURNED
 	// when nothing runs, not a write to `$?`.
-	const std::string script = ::testing::TempDir() + "lesh_dot_status.sh";
+	const std::string script = scratch.file("dot_status.sh");
 	{
 		std::ofstream out{script};
 		out << "echo $?\n";
@@ -801,7 +804,7 @@ TEST_F(ExecutorTest, DotSearchesPathForAnOperandWithNoSlash) {
 	// run_file fopen()ed the operand, which searches the WORKING DIRECTORY.
 	// dot-p.tst's 'dot script in $PATH' passed anyway because the case sets
 	// `PATH=$PWD` and the two answers coincide there.
-	const std::string dir = ::testing::TempDir() + "lesh_dot_path";
+	const std::string dir = scratch.file("dot_path");
 	ASSERT_EQ(run("mkdir -p " + dir), 0);
 	const std::string script = dir + "/on_the_path";
 	{
@@ -833,7 +836,7 @@ TEST_F(ExecutorTest, DotFailingToFindItsScriptExitsANonInteractiveShell) {
 	// A SUBSHELL exits and the shell that forked it carries on.
 	EXPECT_EQ(capture("(. ./_no_such_file_ 2>/dev/null); echo reached"), "reached\n");
 	// A status the SCRIPT reported is not a search failure and must not be fatal.
-	const std::string script = ::testing::TempDir() + "lesh_dot_fatal.sh";
+	const std::string script = scratch.file("dot_fatal.sh");
 	{
 		std::ofstream out{script};
 		out << "(exit 3)\n";
@@ -860,9 +863,8 @@ TEST_F(ExecutorTest, ReturnFromADotScriptStopsAtThatScript) {
 	// It ended at neither here - `return` in a sourced script unwound past every
 	// enclosing one, which is return-p.tst's 'returning from dot script, nested in
 	// another dot script' and 'nested in function'.
-	const std::string dir = ::testing::TempDir();
-	const std::string inner = dir + "lesh_return_inner.sh";
-	const std::string outer = dir + "lesh_return_outer.sh";
+	const std::string inner = scratch.file("return_inner.sh");
+	const std::string outer = scratch.file("return_outer.sh");
 	{
 		std::ofstream out{inner};
 		out << "echo in inner\nreturn\necho not reached\n";
@@ -882,7 +884,7 @@ TEST_F(ExecutorTest, ReturnFromADotScriptStopsAtThatScript) {
 TEST_F(ExecutorTest, ReturnFromADotScriptStillReportsItsOwnStatus) {
 	// The boundary consumes the UNWIND and not the status: return-p.tst's
 	// 'specifying exit status in returning from dot script' expects 17.
-	const std::string script = ::testing::TempDir() + "lesh_return_status.sh";
+	const std::string script = scratch.file("return_status.sh");
 	{
 		std::ofstream out{script};
 		out << "(exit 1)\nreturn 17\n";
@@ -975,7 +977,7 @@ TEST_F(ExecutorTest, DotAndEvalAreTransparentToBreak) {
 	// of eval'). Only a function call is a boundary.
 	EXPECT_EQ(capture("for i in 1 2; do eval break; echo body; done; echo after"),
 	          "after\n");
-	const std::string script = ::testing::TempDir() + "lesh_break_dot.sh";
+	const std::string script = scratch.file("break_dot.sh");
 	{
 		std::ofstream out{script};
 		out << "echo lib\nbreak\necho not reached\n";
@@ -1058,7 +1060,7 @@ TEST_F(ExecutorTest, VerboseEchoesADotScriptAsItIsRead) {
 	// a dot script is input. lesh echoed the `. ./script` line and then went silent
 	// for the script itself (dot-p.tst's 'with verbose option'), which is the one
 	// place the option had least to say and most to show.
-	const std::string script = ::testing::TempDir() + "lesh_verbose_dot.sh";
+	const std::string script = scratch.file("verbose_dot.sh");
 	{
 		std::ofstream out{script};
 		out << ":\n";

@@ -4,6 +4,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -34,6 +36,7 @@ class BuiltinRegistryTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
 		const tree t = parse(pool, src);
@@ -42,7 +45,7 @@ protected:
 	}
 
 	std::string capture(std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_registry_capture.txt";
+		const std::string path = scratch.file("registry_capture.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);

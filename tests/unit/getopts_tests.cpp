@@ -4,6 +4,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -31,6 +33,7 @@ protected:
 	// that is the entire builtin. A test that runs more than one snippet therefore
 	// says `OPTIND=1` to start a fresh parse, exactly as a script would.
 	shell_state state;
+	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
 		const tree t = parse(pool, src);
@@ -51,7 +54,7 @@ protected:
 	}
 
 	std::string capture_fd(std::string_view fd, std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_getopts_capture.txt";
+		const std::string path = scratch.file("getopts_capture.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);

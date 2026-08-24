@@ -4,6 +4,8 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -170,13 +172,13 @@ TEST_F(TestBuiltinTest, FreshnessComparisonsAgainstAMissingFile) {
 	// both (`XXXXX -ot newer` true, `newer -nt XXXXX` true) and bash answers the
 	// same; dash, zsh and macOS test(1) report false as soon as either stat fails,
 	// which is the divergence recorded in ADR-0001.
-	const std::string present = ::testing::TempDir() + "lesh_test_present";
+	const lesh::testing::temp_path scratch;
+	const std::string present = scratch.file("test_present");
 	{
 		std::ofstream out{present};
 		out << "x";
 	}
-	const std::string missing = ::testing::TempDir() + "lesh_test_missing_XXXXX";
-	std::remove(missing.c_str());
+	const std::string missing = scratch.file("test_missing");
 	EXPECT_EQ(run("test " + missing + " -ot " + present), 0) << "missing is older";
 	EXPECT_EQ(run("test " + present + " -nt " + missing), 0) << "present is newer";
 	EXPECT_EQ(run("test " + missing + " -nt " + present), 1);

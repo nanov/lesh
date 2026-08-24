@@ -4,10 +4,11 @@
 #include "runtime/shell_state.h"
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -33,17 +34,15 @@ class CdTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 	std::string root;   // the PHYSICAL pathname of the scratch tree
 
 	void SetUp() override {
 		_origin = std::filesystem::current_path();
-		std::string pattern = ::testing::TempDir() + "lesh_cd_XXXXXX";
-		ASSERT_NE(::mkdtemp(pattern.data()), nullptr);
-		// canonical(), because ::testing::TempDir() is itself reached through a
-		// symlink on macOS (/var -> /private/var). Comparing a -P result against the
-		// name the directory was CREATED under would then fail for a reason that has
-		// nothing to do with cd.
-		root = std::filesystem::canonical(pattern).string();
+		// scratch.dir() is already canonical (see temp_path.h) - comparing a -P
+		// result against the name the directory was CREATED under, before that
+		// resolution, would fail for a reason that has nothing to do with cd.
+		root = scratch.dir();
 		std::filesystem::create_directories(root + "/real/inner");
 		std::filesystem::create_directory_symlink(root + "/real", root + "/link");
 		std::ofstream{root + "/file"} << "not a directory\n";
@@ -60,10 +59,10 @@ protected:
 	void TearDown() override {
 		// The process's working directory is global, and a test that left it inside a
 		// deleted temporary directory would make every LATER test in the binary fail
-		// in getcwd rather than here.
+		// in getcwd rather than here. Restoring it BEFORE the fixture (and so
+		// `scratch`) is destroyed keeps that ordering; `scratch`'s destructor then
+		// removes the tree, tolerant of a test that already removed pieces of it.
 		std::filesystem::current_path(_origin);
-		std::error_code ec;
-		std::filesystem::remove_all(root, ec);
 	}
 
 	int run(std::string_view src) {

@@ -5,6 +5,7 @@
 #include "syntax/parser.h"
 
 #include "interactive_signal_guard.h"
+#include "temp_path.h"
 
 #include <gtest/gtest.h>
 
@@ -30,6 +31,7 @@ class ReadonlyTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
 		const tree t = parse(pool, src);
@@ -45,7 +47,7 @@ protected:
 	std::string capture_stderr(std::string_view src) { return capture_fd("2", src); }
 
 	std::string capture_fd(std::string_view fd, std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_readonly_capture.txt";
+		const std::string path = scratch.file("readonly_capture.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);

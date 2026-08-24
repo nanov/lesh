@@ -4,6 +4,7 @@
 #include "syntax/parser.h"
 
 #include "interactive_signal_guard.h"
+#include "temp_path.h"
 
 #include <gtest/gtest.h>
 
@@ -27,6 +28,7 @@ class OptionsTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
 	shell_state state;
+	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
 		const tree t = parse(pool, src);
@@ -38,7 +40,7 @@ protected:
 	// A redirection rather than freopen, because the shell's own stdio is what is
 	// under test and swapping it out from underneath would change the thing measured.
 	std::string capture(std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_options_capture.txt";
+		const std::string path = scratch.file("options_capture.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);
@@ -53,7 +55,7 @@ protected:
 	}
 
 	std::string capture_stderr(std::string_view src) {
-		const std::string path = ::testing::TempDir() + "lesh_options_stderr.txt";
+		const std::string path = scratch.file("options_stderr.txt");
 		std::remove(path.c_str());
 		std::string wrapped{"{ "};
 		wrapped.append(src);
@@ -166,7 +168,7 @@ TEST_F(OptionsTest, AnUnknownOptionIsAnErrorThatExitsANonInteractiveShell) {
 TEST_F(OptionsTest, NoExecReadsWithoutRunning) {
 	EXPECT_EQ(run("set -n; exit 42"), 0)
 		<< "`exit 42` must not run, so the status is the shell's own zero";
-	const std::string path = ::testing::TempDir() + "lesh_noexec_marker.txt";
+	const std::string path = scratch.file("noexec_marker.txt");
 	std::remove(path.c_str());
 	state.opts() = {};
 	EXPECT_EQ(run("set -n; > " + path), 0);
@@ -176,7 +178,7 @@ TEST_F(OptionsTest, NoExecReadsWithoutRunning) {
 }
 
 TEST_F(OptionsTest, NoClobberRefusesToTruncateAnExistingFile) {
-	const std::string path = ::testing::TempDir() + "lesh_noclobber.txt";
+	const std::string path = scratch.file("noclobber.txt");
 	std::remove(path.c_str());
 	EXPECT_EQ(run("set -C; echo first > " + path), 0)
 		<< "-C still creates a file that does not exist";
