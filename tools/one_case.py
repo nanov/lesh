@@ -41,7 +41,13 @@ except subprocess.TimeoutExpired:
 if trs.exists():
     print(trs.read_text(errors="replace"))
     text = trs.read_text(errors="replace")
-    print(f"=== {text.count('%%% OK[PASSED]')} passed, "
-          f"{text.count('%%% ERROR[FAILED]')} failed ===")
+    # PASSED_UNEXPECTEDLY counts as passing, for the reason tools/conformance.py
+    # spells out: the suite inverts a `-f` case, so satisfying one is the shell doing
+    # what the case describes. Counting only the two obvious markers dropped it from
+    # both halves of the ratio and made return-p.tst read 26/26 of 27.
+    unexpected = text.count("PASSED_UNEXPECTEDLY")
+    print(f"=== {text.count('%%% OK[PASSED]') + unexpected} passed, "
+          f"{text.count('%%% ERROR[FAILED]')} failed"
+          f"{f' ({unexpected} unexpectedly)' if unexpected else ''} ===")
 else:
     print("=== no .trs produced ===")

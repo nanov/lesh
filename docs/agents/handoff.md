@@ -40,10 +40,12 @@ traps rather than a summary of them.
   eight checked, which is precisely what makes it dangerous.
 - **Check for orphans before and after**:
   `ps -Ao pid=,command= | grep "yash-tests/tmp\."` and `ls -d third_party/yash-tests/tmp.*`
-- **Distrust the scoreboard.** `tools/conformance.py` has had five bugs: an exit
+- **Distrust the scoreboard.** `tools/conformance.py` has had six bugs: an exit
   status that is always zero, a guessed failure marker, an exclusion that removed
   mandatory POSIX, "errored" for files the suite itself skipped, and a ten-second
-  per-file timeout that made the score move with machine load.
+  per-file timeout that made the score move with machine load, and counting neither
+  half of a `-f` case the shell unexpectedly satisfied - which shrank the denominator
+  instead of reporting anything, and made `return-p.tst` read 26/26 of its 27 cases.
 - **When a proven fix moves nothing, look at what runs BEFORE the thing under
   test.** Three times on map #17 a correct fix scored nothing because something
   earlier aborted the file.

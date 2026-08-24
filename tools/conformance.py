@@ -69,7 +69,15 @@ def parse_results(trs: Path) -> tuple[int, int, int]:
     passed = text.count("%%% OK[PASSED]")
     failed = text.count("%%% ERROR[FAILED]")
     skipped = text.count("%%% SKIPPED:")
-    return passed, passed + failed, skipped
+    # A case the suite marks `-f` has its result INVERTED - the marker exists for
+    # features yash itself has not implemented. When our shell satisfies one anyway
+    # the suite calls it an error, PASSED_UNEXPECTEDLY, and counting only the two
+    # markers above dropped it from the numerator AND the denominator: `return-p.tst`
+    # holds 27 cases and the scoreboard said 26/26. A `-f` case that starts passing
+    # must not silently shrink the total - the shell did what the case describes, so
+    # it counts as passing, and the tally is reported so the reason stays visible.
+    unexpected = text.count("PASSED_UNEXPECTEDLY")
+    return passed + unexpected, passed + unexpected + failed, skipped
 
 
 def run_case(runner: Path, shell: str, case: Path,
