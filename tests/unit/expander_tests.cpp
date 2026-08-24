@@ -6,6 +6,7 @@
 
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace lesh::runtime;
@@ -156,6 +157,27 @@ protected:
 			*status_out = last;
 		if (fatal_out != nullptr)
 			*fatal_out = ex.fatal_error();
+
+		std::vector<std::string> out;
+		for (const auto& f : fields)
+			out.emplace_back(f);
+		return out;
+	}
+
+	// Expands the patterns of the first item of a `case` clause.
+	//
+	// Goes through the same expand_word() every other word takes, deliberately:
+	// what makes a case pattern a pattern is the ROLE the parser recorded on the
+	// node, so a helper that passed the property itself would assert nothing about
+	// the mechanism under test.
+	std::vector<std::string> patterns(std::string_view src) {
+		const tree t = parse(pool, src);
+		const node_index clause = t.child_of(t[t.root()], 0);
+		const node& item = t[t.child_of(t[clause], 1)];
+		expander ex{pool, params, nullptr, /*glob_enabled=*/true};
+		lesh::arena_array<std::string_view> fields{pool, 8};
+		for (uint32_t i = 0; i < item.aux; ++i)
+			std::ignore = ex.expand_word(t, t.child_of(item, i), fields);
 
 		std::vector<std::string> out;
 		for (const auto& f : fields)
@@ -532,6 +554,59 @@ TEST_F(ExpanderTest, AnExpansionInAPatternIsAPatternUnlessItWasQuoted) {
 	EXPECT_EQ(expand("echo ${w#${a}b}"), (std::vector<std::string>{"echo", "\\bc"}));
 	EXPECT_EQ(expand("echo ${w#\"${a}b\"}"),
 	          (std::vector<std::string>{"echo", "ab\\bc"}));
+}
+
+// A `case` pattern is the same PATTERN property, reached through the role the
+// parser recorded rather than through a `#` operator. It was not reached at all:
+// the pattern went through expand_word like a command argument, so quote removal
+// threw the quoting away and every quoted metacharacter became a metacharacter
+// again - `case '*ab' in '***')` matched.
+TEST_F(ExpanderTest, AQuotedMetacharacterInACasePatternIsData) {
+	EXPECT_EQ(patterns("case x in \\*\\*\\*|'***'|\"***\") :; esac"),
+	          (std::vector<std::string>{"\\*\\*\\*", "\\*\\*\\*", "\\*\\*\\*"}))
+		<< "all three quotings say the same thing to the matcher";
+	EXPECT_EQ(patterns("case x in \\?\\?) :; esac"), (std::vector<std::string>{"\\?\\?"}));
+	EXPECT_EQ(patterns("case x in '[['abc]) :; esac"),
+	          (std::vector<std::string>{"\\[\\[abc]"}));
+}
+
+TEST_F(ExpanderTest, AnUnquotedMetacharacterInACasePatternStillWildcards) {
+	// The other half, and the reason the escaping cannot simply be applied to the
+	// whole pattern: `*)` has to stay a wildcard.
+	EXPECT_EQ(patterns("case x in \\**) :; esac"), (std::vector<std::string>{"\\**"}));
+	EXPECT_EQ(patterns("case x in a?c|[ab]*) :; esac"),
+	          (std::vector<std::string>{"a?c", "[ab]*"}));
+}
+
+TEST_F(ExpanderTest, ABackslashArrivingFromAnExpansionInACasePatternIsSpecial) {
+	// XCU 2.9.4: an unquoted backslash in the pattern is special even when it came
+	// out of an expansion, so `$bs` wildcards nothing and escapes the `a`. Quoting
+	// the expansion makes both backslashes data. Same rule append_value already
+	// applies to `${w#${a}b}`.
+	params.vars["bs"] = "\\a\\z";
+	EXPECT_EQ(patterns("case x in $bs) :; esac"), (std::vector<std::string>{"\\a\\z"}));
+	EXPECT_EQ(patterns("case x in \"$bs\") :; esac"),
+	          (std::vector<std::string>{"\\\\a\\\\z"}));
+}
+
+TEST_F(ExpanderTest, ACasePatternIsOneFieldEvenWhenItExpandsToNothing) {
+	// A command argument that expands to nothing is NO argument; a pattern that
+	// expands to nothing is the EMPTY pattern, which matches an empty subject. The
+	// executor skipped an item whose pattern list came back empty, so
+	// `case $(true) in $(true))` never ran - case-p.tst's 'redirection on case
+	// command', which is not about redirection at all.
+	params.separators = " \t\n";
+	EXPECT_EQ(patterns("case x in $nope) :; esac"), (std::vector<std::string>{""}));
+	EXPECT_EQ(patterns("case x in \"\") :; esac"), (std::vector<std::string>{""}));
+}
+
+TEST_F(ExpanderTest, ACasePatternIsNotFieldSplit) {
+	// POSIX subjects a case pattern to the expansions but not to field splitting,
+	// so an IFS that appears in the value must not break the pattern in two - and
+	// the second field would have been read as the item's SECOND pattern.
+	params.vars["p"] = "a:b";
+	params.separators = ":";
+	EXPECT_EQ(patterns("case x in $p) :; esac"), (std::vector<std::string>{"a:b"}));
 }
 
 TEST_F(ExpanderTest, ABackslashEscapesABraceInsideBracesEvenInDoubleQuotes) {

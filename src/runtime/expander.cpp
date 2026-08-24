@@ -1174,10 +1174,27 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	// characters, so the field is a view into the source at no cost. The lexer
 	// already excludes glob characters from flag_literal, so this cannot skip
 	// pathname expansion.
+	//
+	// A case pattern may take it too: the same absence that makes the word its own
+	// field makes it its own pattern, since the bytes flag_literal rules out are
+	// exactly the quoting a pattern would have to escape and the metacharacters it
+	// would have to keep.
 	if ((tok.flags & syntax::flag_literal) != 0) {
 		out.push(text);
 		return expansion_status::ok;
 	}
+
+	// A `case` pattern, which the parser marked because only the parser can see it.
+	// Three properties, and each is one POSIX applies to `${x#word}` already:
+	// quoting becomes escapes rather than nothing, no field splitting and so no
+	// pathname expansion, and ONE result rather than a field list - so a pattern
+	// that expands to nothing is an empty pattern that matches an empty subject,
+	// where a command argument that expands to nothing is no argument at all.
+	const bool is_pattern = n.kind == syntax::node_kind::word &&
+	                        static_cast<syntax::word_role>(n.aux) == syntax::word_role::pattern;
+	const expand_context ctx = is_pattern
+		? expand_context{.split = false, .fields = false, .pattern = true}
+		: expand_context{};
 
 	arena_array<char> accumulator{_pool, 64};
 	_current = &accumulator;
@@ -1192,8 +1209,8 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	// expand_text, where quoting context is still being tracked.
 	const size_t before_fields = out.size();
 	_field_globbable = false;
-	const expansion_status status = expand_text(text, expand_context{}, out);
-	finish_field(out);
+	const expansion_status status = expand_text(text, ctx, out);
+	finish_field(out, /*even_if_empty=*/is_pattern);
 
 	if (_glob_enabled && _field_globbable) {
 		arena_array<std::string_view> globbed{_pool, out.size() - before_fields + 4};

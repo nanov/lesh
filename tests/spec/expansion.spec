@@ -280,3 +280,32 @@ m=$(( -9223372036854775807 - 1 )); echo $(( m / -1 )) $(( m % -1 )) $(( -m ))
 
 --- overflow in a skipped operand is not reported [xfail(legacy): legacy has no arithmetic expansion]
 x=0; echo $(( 0 && 99999999999999999999 )) $(( 1 || 9223372036854775807 + 1 )); echo $(( 0 && (x=99999999999999999999) )); echo "x=$x"
+
+# A `case` pattern is a PATTERN, which is the same property `${x#word}` already
+# carries: quoting inside it becomes a backslash escape rather than nothing,
+# because a matcher's only channel for "this asterisk is data" is `\*`. It is also
+# expanded as ONE value rather than a field list, so a pattern that expands to
+# nothing is an EMPTY pattern that matches an empty subject - not a pattern that
+# is skipped, which is what dropped the item in `case $(true) in $(true))`.
+
+--- a quoted metacharacter in a case pattern is data [xfail(legacy): legacy has no case clause]
+case '*ab' in \*\*\*) echo no1;; '***') echo no2;; "***") echo no3;; \**) echo matched;; esac
+
+--- and so is a quoted question mark or bracket [xfail(legacy): legacy has no case clause]
+case '?a' in \?\?) echo no1;; '??') echo no2;; \??) echo yes1;; esac
+case '[a' in \[\[abc]) echo no3;; '[['abc]) echo no4;; \[[abc]) echo yes2;; esac
+
+--- an unquoted metacharacter in a case pattern still wildcards [xfail(legacy): legacy has no case clause]
+case abc in a*) echo star;; esac; case abc in a?c) echo quest;; esac; case abc in [ab]bc) echo brack;; esac
+
+--- a backslash arriving from an expansion in a case pattern is special unless quoted [xfail(legacy): legacy has no case clause]
+bs='\a\z'; case az in $bs) echo bs1;; esac; case '\a\z' in "$bs") echo bs2;; esac
+
+--- quoting in a case subject comes off without leaving escapes behind [xfail(legacy): legacy has no case clause]
+bs='\a\z'; case $bs in '\a\z') echo bs1;; esac; case "$bs" in '\a\z') echo bs2;; esac
+
+--- a case pattern that expands to nothing is an empty pattern, not no pattern [xfail(legacy): legacy has no case clause]
+n=; case '' in $n) echo one;; esac; case $n in $n) echo two;; esac; case $(true) in $(true)) echo three;; esac
+
+--- a case pattern is not field-split however IFS reads [xfail(legacy): legacy has no case clause]
+IFS=:; p='a:b'; case 'a:b' in $p) echo joined;; esac; case a in $p) echo no;; esac

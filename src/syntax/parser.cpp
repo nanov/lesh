@@ -655,7 +655,10 @@ private:
 				advance();
 
 			while (peek().kind == token_kind::word) {
-				_scratch.push(word_node(advance(), node_kind::word));
+				// The one place a word's role is anything but ordinary. The SUBJECT
+				// above is an ordinary word - `case "$x"` has its quotes removed and
+				// nothing escaped - and these are patterns.
+				_scratch.push(word_node(advance(), node_kind::word, word_role::pattern));
 				++patterns;
 				if (peek().kind != token_kind::pipe)
 					break;
@@ -1365,11 +1368,13 @@ private:
 	//
 	// The kind is a parameter because an assignment prefix is the same token with
 	// the same defect: `x="abc` is as unterminated as `echo "abc`.
-	[[nodiscard]] node_index word_node(uint32_t at, node_kind kind) noexcept {
+	[[nodiscard]] node_index word_node(uint32_t at, node_kind kind,
+	                                   word_role role = word_role::ordinary) noexcept {
 		node w;
 		w.kind = kind;
 		w.first_token = at;
 		w.last_token = at;
+		w.aux = static_cast<uint32_t>(role);
 		if (_tree.token_at(at).is_error())
 			w.error = parse_error::unterminated_word;
 		return _tree.add_node(w);

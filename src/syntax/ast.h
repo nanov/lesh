@@ -34,7 +34,7 @@ enum class node_kind : uint16_t {
 	and_or,          // pipelines joined by && and ||
 	pipeline,        // commands joined by |
 	simple_command,  // a command name with arguments, assignments, redirections
-	word,            // one word of a command
+	word,            // one word of a command; `aux` is its word_role
 	assignment,      // NAME=value preceding a command
 	redirect,        // an operator with its target
 
@@ -69,6 +69,29 @@ enum class node_kind : uint16_t {
 	// flag on `pipeline`, because a negated single command is not wrapped in a
 	// pipeline node at all.
 	negation,
+};
+
+// What the GRAMMAR makes of a word, which decides how the expander treats it.
+//
+// A `case` pattern is a pattern and one value: quoting inside it becomes a
+// backslash escape rather than nothing - the matcher's only channel for "this
+// asterisk is data" - and it is neither field-split nor pathname-expanded, so a
+// pattern that expands to nothing is an EMPTY pattern rather than no pattern at
+// all. Nothing about the word itself says so: `*)` and the `*` in `echo *` are
+// the same token and the same node, and only the position the parser read them
+// in tells them apart.
+//
+// It therefore travels on the node, the way `for_loop` carries whether an `in`
+// clause was written, rather than as an argument every caller of expand_word has
+// to remember. Marking it at the one place that can know it beats spreading the
+// knowledge over the callers, and there is no way to expand a case pattern as
+// though it were a command argument by forgetting a flag.
+enum class word_role : uint32_t {
+	// A command argument, an assignment's left half, a `for` list word, a `case`
+	// SUBJECT: split, globbed, and quote-removed.
+	ordinary = 0,
+	// One of a `case` item's patterns.
+	pattern = 1,
 };
 
 enum class parse_error : uint16_t {

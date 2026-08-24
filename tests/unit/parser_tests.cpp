@@ -288,6 +288,35 @@ TEST_F(ParserTest, AWellFormedCompoundCommandCarriesNoDefect) {
 	}
 }
 
+TEST_F(ParserTest, OnlyACaseItemsPatternsCarryThePatternRole) {
+	// Which words are PATTERNS is knowledge only the parser has: `*)` and the `*`
+	// in `echo *` are the same token and the same node kind, and the expander sees
+	// no difference. Recorded on the node so the expander cannot be handed one and
+	// treat it as a command argument, which is what threw the quoting away.
+	const tree t = parse_it("case \"$x\" in a|b) echo *;; esac");
+	const node& clause = t[t.child_of(t[t.root()], 0)];
+	ASSERT_EQ(clause.kind, node_kind::case_clause);
+
+	const node& subject = t[t.child_of(clause, 0)];
+	EXPECT_EQ(static_cast<word_role>(subject.aux), word_role::ordinary)
+		<< "the subject is an ordinary word: its quotes come off and nothing escapes";
+
+	const node& item = t[t.child_of(clause, 1)];
+	ASSERT_EQ(item.aux, 2u) << "two alternative patterns";
+	for (uint32_t i = 0; i < item.aux; ++i)
+		EXPECT_EQ(static_cast<word_role>(t[t.child_of(item, i)].aux), word_role::pattern);
+
+	// The body's words are ordinary too, or `echo *` inside a case would stop
+	// globbing.
+	const node& body = t[t.child_of(item, item.aux)];
+	const node& command = t[t.child_of(body, 0)];
+	for (uint32_t i = 0; i < command.children_count; ++i) {
+		const node& w = t[t.child_of(command, i)];
+		if (w.kind == node_kind::word)
+			EXPECT_EQ(static_cast<word_role>(w.aux), word_role::ordinary);
+	}
+}
+
 TEST_F(ParserTest, AnUnterminatedCompoundCommandStillEndsTheReadUnit) {
 	// The progress guarantee, for the parser's channel this time: the incremental
 	// reader calls parse_next_command in a loop until the cursor reaches the end,
