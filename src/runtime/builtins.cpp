@@ -75,23 +75,68 @@ builtin_result builtin_pwd(shell_state& state, char**) {
 	return {0};
 }
 
-// Resolves `.` and `..` LEXICALLY, without touching the filesystem.
+// `cd`'s two modes, POSIX XCU `cd`. -L is the DEFAULT: `..` is resolved against
+// the LOGICAL working directory, so a symlink followed on the way in is unfollowed
+// on the way out. -P hands the path to chdir and reads the answer back, so PWD
+// holds a physical path. #24 chose the logical PWD deliberately and this does not
+// disturb it - -P is a second mode BESIDE it, not a rework of it.
+enum class cd_mode {
+	logical,
+	physical,
+};
+
+// POSIX `cd` step 10's canonicalization: a `.` component is deleted and a `..`
+// deletes the component before it, LEXICALLY - the filesystem is not consulted for
+// the resolution itself.
 //
-// POSIX cd maintains a LOGICAL working directory: symlinks are not resolved
+// That is what makes the working directory logical: symlinks are not resolved
 // unless -P is given, so `cd /tmp` on a system where /tmp links to /private/tmp
 // must still report /tmp. Using the real path here is a difference dash catches
 // immediately, and it matters because `cd ..` after following a symlink should
 // return where the user came from rather than where the link pointed.
-std::string canonicalize_logical(std::string_view path) {
+//
+// The ONE filesystem access is step 10(b)(i): the component preceding a `..` must
+// name a directory, or `cd` fails. Without it `cd ./file/../dev` succeeds by
+// cancelling `file/..` out of a path no resolution could ever walk - which is what
+// dash does, and what cd-p.tst's 'non-directory file in operand component (-L)'
+// and 'non-existing file in operand component (-L)' fail dash for. `offender` is
+// the prefix that failed so the diagnostic can name it, with errno as the stat
+// left it.
+bool canonicalize_logical(std::string_view path, std::string& out, std::string& offender) {
 	std::vector<std::string_view> parts;
+	// The check is only meaningful for an ABSOLUTE path, which is all cd hands over:
+	// curpath has PWD prepended before it gets here. A relative path would be
+	// stat()ed against the process's real directory, which under -L is not where the
+	// shell believes it is.
+	const bool absolute = !path.empty() && path[0] == '/';
 	size_t at = 0;
 	while (at <= path.size()) {
 		const size_t slash = path.find('/', at);
 		const std::string_view part = path.substr(
 			at, slash == std::string_view::npos ? std::string_view::npos : slash - at);
 		if (part == "..") {
-			if (!parts.empty())
+			if (!parts.empty()) {
+				if (absolute) {
+					std::string prefix;
+					for (const auto& kept : parts) {
+						prefix += '/';
+						prefix.append(kept);
+					}
+					struct stat info{};
+					if (::stat(prefix.c_str(), &info) != 0) {
+						offender = std::move(prefix);
+						return false;
+					}
+					if (!S_ISDIR(info.st_mode)) {
+						// stat SUCCEEDED, so errno still holds whatever the last failed call
+						// left there; the diagnostic has to name which of the two happened.
+						errno = ENOTDIR;
+						offender = std::move(prefix);
+						return false;
+					}
+				}
 				parts.pop_back();
+			}
 		} else if (!part.empty() && part != ".") {
 			parts.push_back(part);
 		}
@@ -99,75 +144,240 @@ std::string canonicalize_logical(std::string_view path) {
 			break;
 		at = slash + 1;
 	}
-	std::string out;
+	std::string joined;
 	for (const auto& part : parts) {
-		out += '/';
-		out.append(part);
+		joined += '/';
+		joined.append(part);
 	}
-	return out.empty() ? "/" : out;
+	out = joined.empty() ? "/" : std::move(joined);
+	return true;
+}
+
+// The logical working directory `cd` starts from: $PWD, or the real one when PWD
+// cannot be believed.
+//
+// PWD not being absolute is not a curiosity - `PWD=foo` is a plain assignment any
+// script may make - and joining a relative operand onto it would produce a path
+// with no relation to where the shell is. POSIX 2.5.3 describes PWD as an absolute
+// pathname, so anything else is treated as absent.
+std::string current_logical_pwd(const shell_state& state) {
+	std::string_view pwd;
+	if (state.lookup("PWD", pwd) && !pwd.empty() && pwd[0] == '/')
+		return std::string{pwd};
+	std::error_code ec;
+	return std::filesystem::current_path(ec).string();
+}
+
+// POSIX `cd` step 5: a relative operand whose first component is neither `.` nor
+// `..` is looked up in $CDPATH, left to right, and the FIRST entry under which it
+// names a directory wins.
+//
+// An EMPTY entry means the current directory, and it is the one match whose result
+// is NOT written to standard output - which is the half shells get wrong. A
+// literal `.` entry prints and an empty one does not; cd-p.tst asserts both
+// ('found in dot cd path' expects the line, 'found in empty cd path' expects no
+// line), and they differ in nothing else.
+//
+// Returns true when an entry matched: `out` is the concatenated path and
+// `announce` says whether the new directory must be printed.
+bool search_cdpath(const shell_state& state, std::string_view operand,
+                   std::string& out, bool& announce) {
+	// The FIRST COMPONENT, not the first character: `.hidden` is an ordinary name
+	// that CDPATH is searched for, while `./hidden` and `..` are not.
+	const size_t slash = operand.find('/');
+	const std::string_view first = operand.substr(
+		0, slash == std::string_view::npos ? std::string_view::npos : slash);
+	if (first == "." || first == "..")
+		return false;
+
+	std::string_view cdpath;
+	if (!state.lookup("CDPATH", cdpath) || cdpath.empty())
+		return false;
+
+	size_t at = 0;
+	while (at <= cdpath.size()) {
+		const size_t colon = cdpath.find(':', at);
+		const std::string_view entry = cdpath.substr(
+			at, colon == std::string_view::npos ? std::string_view::npos : colon - at);
+		std::string candidate{entry.empty() ? std::string_view{"."} : entry};
+		candidate += '/';
+		candidate.append(operand);
+		struct stat info{};
+		if (::stat(candidate.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+			out = std::move(candidate);
+			announce = !entry.empty();
+			return true;
+		}
+		if (colon == std::string_view::npos)
+			break;
+		at = colon + 1;
+	}
+	return false;
 }
 
 builtin_result builtin_cd(shell_state& state, char** argv) {
-	std::string target;
-	if (argv[1] == nullptr) {
+	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
+	bool require_pwd = false;          // -e
+	size_t at = 1;
+	for (; argv[at] != nullptr; ++at) {
+		const std::string_view arg{argv[at]};
+		if (arg == "--") {
+			++at;
+			break;
+		}
+		// A lone `-` is cd's OLDPWD OPERAND, not an option, so the scan stops at it
+		// rather than reading it as an empty option group.
+		if (arg.size() < 2 || arg[0] != '-')
+			break;
+		for (const char option : arg.substr(1)) {
+			// The LAST of -L and -P wins, inside a group as well as across them:
+			// cd-p.tst's 'the last option wins' is `cd -P -L -PL`, whose answer is -L.
+			if (option == 'L') {
+				mode = cd_mode::logical;
+			} else if (option == 'P') {
+				mode = cd_mode::physical;
+			} else if (option == 'e') {
+				// POSIX -e: with -P, say so when the new working directory cannot be
+				// determined. It has no meaning under -L, where PWD is COMPUTED rather
+				// than read back and therefore always known, and POSIX leaves that
+				// combination unspecified - so it is accepted and has no effect. dash
+				// rejects -e outright, which is what fails it cd-p.tst's 'exit status of
+				// success with -e'; the divergence is deliberate and recorded in #46.
+				require_pwd = true;
+			} else {
+				std::fprintf(stderr, "lesh: cd: Illegal option -%c\n", option);
+				return {2};
+			}
+		}
+	}
+
+	// At most ONE operand. dash takes the first and ignores the rest in silence,
+	// which turns `cd my dir` - an unquoted pathname with a space in it - into a
+	// successful cd to `my`. A wrong answer with no diagnostic is the failure mode
+	// this project keeps paying for, so this diverges from the reference
+	// deliberately (ADR-0001 wants the divergence in writing, and #46 carries it):
+	// POSIX's synopsis takes one operand, bash, ksh, yash and zsh all diagnose a
+	// second, dash is the outlier, and cd-p.tst asserts nothing either way.
+	if (argc_of(argv) - at > 1) {
+		std::fprintf(stderr, "lesh: cd: too many operands\n");
+		return {2};
+	}
+
+	std::string operand;       // what the user asked for, for the diagnostic
+	std::string curpath;       // POSIX's curpath, which may come from CDPATH
+	bool announce = false;     // POSIX: some forms WRITE the new directory
+	if (argv[at] == nullptr) {
 		std::string_view home;
 		if (!state.lookup("HOME", home) || home.empty()) {
 			std::fprintf(stderr, "lesh: cd: HOME not set\n");
-			return {1};
+			return {2};
 		}
-		target.assign(home);
-	} else if (std::strcmp(argv[1], "-") == 0) {
+		operand.assign(home);
+		curpath = operand;
+	} else if (std::strcmp(argv[at], "-") == 0) {
 		std::string_view previous;
 		if (!state.lookup("OLDPWD", previous) || previous.empty()) {
 			std::fprintf(stderr, "lesh: cd: OLDPWD not set\n");
-			return {1};
+			return {2};
 		}
-		target.assign(previous);
+		operand.assign(previous);
+		curpath = operand;
+		announce = true;   // POSIX: `cd -` prints where it went
 	} else {
-		target = argv[1];
+		operand = argv[at];
+		// chdir("") is ENOENT and POSIX gives cd no special case for an empty
+		// operand. Both of the paths below would answer wrongly: joining it onto PWD
+		// succeeds as a no-op, and searching CDPATH for it finds every entry, so
+		// `CDPATH=/x; cd ''` would land in /x. dash succeeds here; cd-p.tst's 'empty
+		// operand' asserts the failure, and #46 records the divergence.
+		if (operand.empty()) {
+			std::fprintf(stderr, "lesh: cd: : %s\n", std::strerror(ENOENT));
+			return {2};
+		}
+		curpath = operand;
+		if (operand[0] != '/') {
+			std::string found;
+			if (search_cdpath(state, operand, found, announce))
+				curpath = std::move(found);
+		}
 	}
 
-	// The logical path: relative targets extend PWD rather than the real path.
-	std::string_view current;
-	// A missing PWD is normal, not an error: the branch below handles it.
-	std::ignore = state.lookup("PWD", current);
-	std::string logical;
-	if (!target.empty() && target[0] == '/') {
-		logical = canonicalize_logical(target);
-	} else {
-		std::string joined{current};
-		if (joined.empty()) {
-			std::error_code ec;
-			joined = std::filesystem::current_path(ec).string();
-		}
+	// The PREVIOUS logical directory, copied out before anything is written back:
+	// it becomes OLDPWD, and it is what a relative curpath extends. Step 8 joins
+	// onto the LOGICAL PWD rather than onto the real path, which is what makes `cd
+	// link` then `cd ..` return where the user came from.
+	const std::string previous_pwd = current_logical_pwd(state);
+	if (curpath.empty() || curpath[0] != '/') {
+		std::string joined = previous_pwd;
 		joined += '/';
-		joined += target;
-		logical = canonicalize_logical(joined);
+		joined += curpath;
+		curpath = std::move(joined);
 	}
 
-	std::error_code ec;
-	std::filesystem::current_path(logical, ec);
-	if (ec) {
-		std::fprintf(stderr, "lesh: cd: %s: %s\n", target.c_str(), ec.message().c_str());
-		return {1};
+	std::string next_pwd;
+	bool pwd_unknown = false;
+	if (mode == cd_mode::physical) {
+		// -P: the kernel does the resolving, and PWD is read BACK from it. That is
+		// the whole difference - by the time getcwd answers, every symlink in curpath
+		// is gone. No lexical canonicalization runs, because POSIX's step 10 is -L's
+		// alone: `cd -P link/..` must land where the LINK's parent is, not where the
+		// text says.
+		std::error_code ec;
+		std::filesystem::current_path(curpath, ec);
+		if (ec) {
+			std::fprintf(stderr, "lesh: cd: %s: %s\n", operand.c_str(), ec.message().c_str());
+			return {2};
+		}
+		std::error_code where;
+		next_pwd = std::filesystem::current_path(where).string();
+		if (where || next_pwd.empty()) {
+			// The directory DID change and only its name is unknown, so this is not a
+			// failed cd: PWD gets the best answer available and the status is decided at
+			// the end, where -e is honoured.
+			next_pwd = curpath;
+			pwd_unknown = true;
+		}
+	} else {
+		std::string offender;
+		if (!canonicalize_logical(curpath, next_pwd, offender)) {
+			std::fprintf(stderr, "lesh: cd: %s: %s\n", offender.c_str(), std::strerror(errno));
+			return {2};
+		}
+		// The CANONICAL path is what gets chdir'd, not the operand: under -L the two
+		// name different directories whenever a symlink and a `..` meet, and PWD has
+		// to describe the one the shell actually moved to.
+		std::error_code ec;
+		std::filesystem::current_path(next_pwd, ec);
+		if (ec) {
+			std::fprintf(stderr, "lesh: cd: %s: %s\n", operand.c_str(), ec.message().c_str());
+			return {2};
+		}
 	}
 
-	if (argv[1] != nullptr && std::strcmp(argv[1], "-") == 0)
-		std::printf("%s\n", logical.c_str());  // POSIX: `cd -` prints where it went
+	// POSIX: `cd -`, and a cd resolved through a NON-EMPTY CDPATH entry, write the
+	// new working directory to standard output. `pwd` is not enough for a script to
+	// find out where a CDPATH search landed it - that is what the rule is for.
+	if (announce)
+		std::printf("%s\n", next_pwd.c_str());
 
 	// PWD and OLDPWD are part of cd's contract, not a nicety: scripts read them.
 	// A readonly PWD makes cd FAIL after the directory has already changed, which
 	// is what dash does too - the chdir is not undone, but the shell says that the
 	// variable no longer describes where it is.
 	int status = 0;
-	if (!current.empty() && !state.set_exported("OLDPWD", current)) {
+	if (!previous_pwd.empty() && !state.set_exported("OLDPWD", previous_pwd)) {
 		shell_state::report_readonly("cd", "OLDPWD");
 		status = 2;
 	}
-	if (!state.set_exported("PWD", logical)) {
+	if (!state.set_exported("PWD", next_pwd)) {
 		shell_state::report_readonly("cd", "PWD");
 		status = 2;
 	}
+	// POSIX -e, and the one cd failure that is not 2: the shell DID move and only
+	// cannot say where, which a script asks about precisely because it is not the
+	// same as not having moved.
+	if (status == 0 && pwd_unknown && require_pwd)
+		status = 1;
 	return {status};
 }
 

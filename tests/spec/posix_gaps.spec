@@ -83,6 +83,46 @@ cd /tmp && pwd
 --- cd .. is lexical, not physical [xfail(legacy): legacy resolves the physical path]
 cd /tmp && cd .. && pwd
 
+# `cd -L`, `cd -P`, $CDPATH and the failure status (#46). Every case starts with an
+# ABSOLUTE cd into a fresh directory of its own: the harness runs a case with the
+# repo as $PWD and a temporary directory as the real one, and an absolute cd is what
+# makes the two agree before anything relative is measured. Nothing prints an
+# absolute path either - the two shells get different temporary directories, so the
+# expectation is what is left after $d is trimmed off.
+
+--- cd -P resolves a symlink where -L keeps it [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p real/inner; ln -s real link; cd -L link/inner; echo "L=${PWD#$d}"; cd -L "$d"; cd -P link/inner; echo "P=${PWD#$d}"
+
+--- dot-dot follows the mode it was reached in [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p real/inner; ln -s real link; cd link/inner; cd ..; echo "L=${PWD#$d}"; cd -P "$d/link/inner"; cd -P ..; echo "P=${PWD#$d}"
+
+--- a CDPATH match is written to standard output [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p one/target; CDPATH=$d/one; cd target > "$d/printed"; read line < "$d/printed"; echo "printed=${line#$d} pwd=${PWD#$d}"
+
+--- an empty CDPATH entry means the current directory and prints nothing [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p one/target target; CDPATH=:$d/one; cd target > "$d/printed"; read line < "$d/printed"; echo "printed=[${line#$d}] pwd=${PWD#$d}"
+
+--- CDPATH is searched left to right [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p first/want second/want; CDPATH=$d/first:$d/second; cd want > /dev/null; echo "${PWD#$d}"
+
+--- CDPATH is not searched for a dot-prefixed operand [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p one/here here; CDPATH=$d/one; cd ./here > "$d/printed"; read line < "$d/printed"; echo "printed=[${line#$d}] pwd=${PWD#$d}"
+
+--- the last of cd -L and cd -P wins [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p real/inner; ln -s real link; cd -P -L -PL link/inner; echo "${PWD#$d}"; cd -L "$d"; cd -L -P -LP link/inner; echo "${PWD#$d}"
+
+--- a cd that did not happen is status 2 [xfail(legacy): legacy has no parameter expansion beyond $name]
+cd /nonexistent 2>/dev/null; echo "status=$?"
+
+--- an illegal cd option is status 2 [xfail(legacy): legacy has no parameter expansion beyond $name]
+cd -x 2>/dev/null; echo "status=$?"
+
+--- cd - prints where it went and swaps OLDPWD [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p a b; cd a; cd ../b; cd - > "$d/printed"; read line < "$d/printed"; echo "printed=${line#$d} pwd=${PWD#$d} oldpwd=${OLDPWD#$d}"
+
+--- cd -- ends the options [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -- -L; cd -- -L; echo "${PWD#$d}"
+
 --- export makes a variable visible to a child [xfail(legacy): legacy's export path is incomplete]
 export EXPORTED_VAR=visible; /usr/bin/env | /usr/bin/grep '^EXPORTED_VAR='
 

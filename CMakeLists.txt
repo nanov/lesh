@@ -213,6 +213,7 @@ add_executable(lesh_tests
 	tests/unit/allocation_tests.cpp
 	tests/unit/arithmetic_tests.cpp
 	tests/unit/builtin_registry_tests.cpp
+	tests/unit/cd_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
