@@ -32,6 +32,12 @@ traps rather than a summary of them.
   re-run idle.**
 - **Build with `-j3`, not `-j8`.** `-O3 -flto=thin` across three presets pegs the
   machine, and the machine belongs to someone.
+- **Measure against `third_party/yash-tests` itself, not a copy under `/tmp`.** Some
+  cases need file modes a temp filesystem refuses - `test-p.tst` does a setgid `chmod`
+  and reports `Operation not permitted` there, then skips all 241 of its own
+  assertions. A copy in the scratchpad reported 0/0 where the real directory reported
+  239/241, with byte-identical `.tst` and runner. Only that one file differed of the
+  eight checked, which is precisely what makes it dangerous.
 - **Check for orphans before and after**:
   `ps -Ao pid=,command= | grep "yash-tests/tmp\."` and `ls -d third_party/yash-tests/tmp.*`
 - **Distrust the scoreboard.** `tools/conformance.py` has had five bugs: an exit
