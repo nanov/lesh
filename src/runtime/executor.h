@@ -180,9 +180,19 @@ private:
 	// One place, so an option cannot be honoured by three of the four expansion
 	// sites and forgotten by the fourth. `set -u` was recorded and inert for
 	// exactly that kind of reason: nothing ever read the flag.
-	[[nodiscard]] expander make_expander() noexcept {
-		return expander{_pool, _state, &_runner, !_state.opts().no_glob, &_state,
+	// GLOBBING IS A PARAMETER, `set -u` IS NOT. The two are independent properties,
+	// and conflating them is what #39 cost: a case pattern must not be pathname-
+	// expanded, so run_case built its own expander to turn globbing off - and in
+	// doing so silently dropped error_on_unset, which is the only argument it was
+	// not passing. `sh -u -c 'case $nope in *) echo x;; esac'` could not even
+	// REPORT the unset parameter, let alone stop for it. A caller may choose
+	// whether a pattern globs; no caller chooses whether `set -u` applies.
+	[[nodiscard]] expander make_expander(bool glob_enabled) noexcept {
+		return expander{_pool, _state, &_runner, glob_enabled, &_state,
 		                &_state, _state.opts().error_on_unset};
+	}
+	[[nodiscard]] expander make_expander() noexcept {
+		return make_expander(!_state.opts().no_glob);
 	}
 	// True when `ex` reported an expansion error POSIX makes fatal, having arranged
 	// for a non-interactive shell to stop. `${x?}` and `set -u` on an unset

@@ -1244,3 +1244,21 @@ echo "[$(exit 7)]"; echo st=$?
 
 --- a command substitution running a missing command does not stop anything [xfail(legacy): legacy has no command substitution]
 echo "[$(_lesh_no_such_command_zz 2>/dev/null)]"; echo st=$?
+
+# `set -u` reaching the compound commands (#39). Both were the same cause: each
+# caller built its own expander and decided for itself, so a rule added in one
+# place was missing in the others. `for` reported and carried on; `case` turned
+# globbing off by constructing an expander directly and dropped error_on_unset
+# with it, so it could not even report.
+
+--- nounset in a for loop's word list stops the shell [xfail(legacy): legacy has no shell options]
+set -u; for i in $nope; do echo x; done; echo reached
+
+--- nounset in a case subject stops the shell [xfail(legacy): legacy has no shell options]
+set -u; case $nope in *) echo x;; esac; echo reached
+
+--- a case pattern is still not pathname-expanded [xfail(legacy): legacy has no case clause]
+case a in *) echo star;; esac
+
+--- nounset leaves a defaulted case subject alone [xfail(legacy): legacy has no case clause]
+set -u; case ${x-ok} in ok) echo defaulted;; esac

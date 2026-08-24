@@ -138,7 +138,7 @@ echo "${x-'}"
 --- a malformed expansion in a for list stops the shell [xfail(legacy): legacy has no compound commands]
 for i in ${x-$((1}; do echo $i; done
 
---- but a FATAL expansion error in a for list still does not [xfail: #39's remaining gap - `run_for` and `run_case` never consult expander::fatal_error(), so `${x?}` there is reported and then ignored while dash exits 2. Reached only by an error the WORD SCAN cannot see: a malformed nesting is now refused at parse time, and this is not malformed]
+--- and a FATAL expansion error in a for list stops it too [xfail(legacy): legacy has no compound commands]
 for i in ${x?}; do echo $i; done; echo after
 
 --- a default the operator never reaches is refused too [xfail(legacy): legacy has no parameter expansion beyond $name]

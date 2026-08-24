@@ -462,8 +462,22 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 	if (buffer_capacity <= 0)
 		buffer_capacity = 512;
 	if (text.size() <= static_cast<size_t>(buffer_capacity)) {
-		if (!text.empty())
-			(void)!write(pipe_fds[1], text.data(), text.size());
+		if (!text.empty()) {
+			// NO SHORT WRITE IS POSSIBLE HERE, and that is why the result was being
+			// discarded - but it was discarded without saying so, which is the same
+			// shape as the bugs #39 was opened for. POSIX XSH 2.9.1: a write of at
+			// most PIPE_BUF bytes to a pipe is atomic, and this branch is taken only
+			// when the body fits, so the call either transfers every byte or fails
+			// outright. What it can still do is FAIL - and a here-document whose body
+			// never reached the command is not something to carry on from silently.
+			const ssize_t written = write(pipe_fds[1], text.data(), text.size());
+			if (written != static_cast<ssize_t>(text.size())) {
+				std::fprintf(stderr, "lesh: here-document: %s\n", std::strerror(errno));
+				close(pipe_fds[0]);
+				close(pipe_fds[1]);
+				return false;
+			}
+		}
 		close(pipe_fds[1]);
 	} else {
 		std::fflush(nullptr);
@@ -1128,6 +1142,12 @@ int tree_walking_executor::run_for(const tree& t, node_index n) {
 	} else {
 		for (uint32_t i = 0; i < word_count; ++i)
 			ex.expand_word(t, t.child_of(self, i), items);
+		// The word list is the loop's whole input, so a fatal expansion here means
+		// there is nothing to iterate and nothing to decide from. It was REPORTED
+		// and then ignored: `sh -u -c 'for i in $nope; do echo x; done; echo reached'`
+		// printed the diagnostic and then `reached`, where dash stops at 2 (#39).
+		if (expansion_failed(ex))
+			return kExpansionError;
 	}
 
 	// After the word list is expanded, not before: the words are evaluated once,
@@ -1169,9 +1189,15 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 	// to field splitting or pathname expansion - otherwise `*)` expands to the
 	// files in the current directory and matches nothing, which is exactly what
 	// happened before this flag was passed.
-	expander ex{_pool, _state, &_runner, false, &_state, &_state};
+	expander ex = make_expander(false);
 	arena_array<std::string_view> subject{_pool, 2};
 	ex.expand_word(t, t.child_of(self, 0), subject);
+	// The subject is expanded before any pattern is looked at, so a `set -u`
+	// failure here stops the construct rather than matching against the empty
+	// string: dash exits 2 for `sh -u -c 'case $nope in *) echo x;; esac'` and
+	// lesh ran the `*)` item, printing `x` and reporting success.
+	if (expansion_failed(ex))
+		return kExpansionError;
 	const std::string_view text = subject.empty() ? std::string_view{} : subject[0];
 
 	for (uint32_t i = 1; i < self.children_count; ++i) {
@@ -2675,7 +2701,15 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 			return kRedirectionError;
 		if (cmd.present || !try_run_function(t, argv, status)) {
 			builtin_result r{};
-			(void)try_run_builtin(_state, argv.data(), r);
+			// The discard is safe HERE and nowhere by default, so the invariant is
+			// written down rather than left to be re-derived: this branch is reached
+			// only when `in_process` above found classify_builtin() != none, and #35
+			// made the registry static_assert both ways, so a classified name always
+			// has a handler. Discarding this same return where that did NOT hold is
+			// what made `test 1 = 2` return 0.
+			const bool handled = try_run_builtin(_state, argv.data(), r);
+			LESH_ASSERT(handled);
+			(void)handled;
 			status = r.status;
 		}
 		return status;
