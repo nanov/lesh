@@ -7,6 +7,22 @@ namespace lesh::runtime {
 invocation parse_invocation(int argc, char** argv) {
 	invocation inv;
 
+	// `-c` does NOT take the next word. POSIX writes the form as
+	// `sh -c [options] command_string [command_name [argument...]]`: the option list
+	// CONTINUES after -c, and the command string is the FIRST OPERAND. Measured,
+	// dash and bash agree on every corner of that - `-c -e code` sets errexit and
+	// runs `code`, and `-c - code` and `-c -- code` both run `code`, because POSIX
+	// says a single hyphen "shall be treated as the first operand and then ignored"
+	// (startup-p.tst:158 and :169).
+	//
+	// Reading the next word instead was one bug wearing two faces (issue #44). It
+	// walked ON past the command string, so `-c code -- -x` read `--` as the option
+	// terminator and then took `-x` for $0, losing a positional parameter that dash
+	// and bash both keep; and it ran the hyphen in `-c - code`. Both go away here,
+	// because the option list ends at the first operand by construction and the
+	// command string IS that operand.
+	bool want_command_string = false;
+
 	int i = 1;
 	for (; i < argc; ++i) {
 		const std::string_view arg{argv[i]};
@@ -32,16 +48,12 @@ invocation parse_invocation(int argc, char** argv) {
 						inv.error_operand = argv[i];
 						return inv;
 					}
-					if (++i >= argc) {
-						inv.error = "-c requires a command string";
-						return inv;
-					}
-					inv.command_string = argv[i];
-					// The command string is the NEXT WORD, so the rest of THIS word is
-					// still option letters. Ending the group here dropped them silently:
-					// `sh -cn 'for i in $(>f); do :; done'` ran the substitution and
-					// created the file, which is option-p.tst's 'noexec on: for command
-					// is not executed'. dash reads `-cn` the same way.
+					// The rest of THIS word is still option letters, and so is the rest
+					// of the command line up to the first operand. Ending the group here
+					// dropped the letters silently: `sh -cn 'for i in $(>f); do :; done'`
+					// ran the substitution and created the file, which is option-p.tst's
+					// 'noexec on: for command is not executed'.
+					want_command_string = true;
 					break;
 				case 'i':
 					inv.interactive = enable;
@@ -78,10 +90,16 @@ invocation parse_invocation(int argc, char** argv) {
 		}
 	}
 
-	// Operand handling, and the one part of POSIX's invocation grammar that lesh
-	// had wrong: with -c the first operand is $0 (command_name), NOT $1. Without
-	// -c it is the script to run, and a script's pathname is its own $0.
-	if (inv.command_string != nullptr) {
+	// Operand handling, and the part of POSIX's invocation grammar lesh had wrong:
+	// with -c the first operand is the command string and the SECOND is $0
+	// (command_name), NOT $1. Without -c the first operand is the script to run,
+	// and a script's pathname is its own $0.
+	if (want_command_string) {
+		if (i >= argc) {
+			inv.error = "-c requires a command string";
+			return inv;
+		}
+		inv.command_string = argv[i++];
 		if (i < argc)
 			inv.command_name = argv[i++];
 	} else if (!inv.read_stdin && i < argc) {

@@ -87,10 +87,10 @@ TEST(Invocation, DashCLastInAGroupStillTakesItsArgument) {
 	EXPECT_STREQ(inv.command_string, "echo hi");
 }
 
-// The command string is the NEXT WORD, so any letter after `c` in the same word
-// is still an option. lesh ended the group at `c` and dropped them: `sh -cn CMD`
-// executed CMD, which is option-p.tst's 'noexec on: for command is not executed'.
-// dash reads `-cn` the same way.
+// The command string is the first OPERAND, so any letter after `c` in the same
+// word is still an option. lesh ended the group at `c` and dropped them:
+// `sh -cn CMD` executed CMD, which is option-p.tst's 'noexec on: for command is
+// not executed'. dash reads `-cn` the same way.
 TEST(Invocation, LettersAfterDashCAreStillOptions) {
 	const invocation inv = parse({"sh", "-cn", "echo hi"});
 	ASSERT_NE(inv.command_string, nullptr);
@@ -127,4 +127,75 @@ TEST(Invocation, DashSReadsStandardInputEvenWithOperands) {
 	EXPECT_TRUE(inv.read_stdin);
 	EXPECT_EQ(inv.script_path, nullptr);
 	EXPECT_EQ(inv.first_argument, 2);
+}
+
+// POSIX: `sh [options] -c command_string [command_name [argument...]]`. Once the
+// command string has been consumed the option list is OVER, so a later word that
+// looks like an option is an operand. lesh kept walking argv, read `--` as the
+// option terminator and then took `-x` for $0 - losing a positional parameter.
+// dash and bash both report $0 as `--` and $1 as `-x` (issue #44).
+TEST(Invocation, TheOptionListEndsAtTheCommandString) {
+	const invocation inv = parse({"sh", "-c", "echo hi", "--", "-x"});
+	EXPECT_EQ(inv.error, nullptr);
+	ASSERT_NE(inv.command_name, nullptr);
+	EXPECT_STREQ(inv.command_name, "--");
+	EXPECT_EQ(inv.first_argument, 4);
+	EXPECT_FALSE(inv.interactive.has_value());
+}
+
+// Even a word that IS a valid option letter is an operand there: `-c code -s foo`
+// gives $0 = `-s` and $1 = `foo`, and does NOT read standard input.
+TEST(Invocation, AnOptionLetterAfterTheCommandStringIsAnOperand) {
+	const invocation inv = parse({"sh", "-c", "echo hi", "-s", "foo"});
+	EXPECT_EQ(inv.error, nullptr);
+	EXPECT_FALSE(inv.read_stdin);
+	ASSERT_NE(inv.command_name, nullptr);
+	EXPECT_STREQ(inv.command_name, "-s");
+	EXPECT_EQ(inv.first_argument, 4);
+}
+
+// The two halves of the rule in one case, because they pull against each other:
+// the rest of the `-cn` WORD is still option letters, and no later word is.
+TEST(Invocation, TheRestOfTheDashCWordIsOptionsButNoLaterWordIs) {
+	const invocation inv = parse({"sh", "-cn", "echo hi", "-x", "a"});
+	EXPECT_EQ(inv.error, nullptr);
+	EXPECT_TRUE(inv.options.no_exec);
+	EXPECT_FALSE(inv.options.trace);
+	ASSERT_NE(inv.command_name, nullptr);
+	EXPECT_STREQ(inv.command_name, "-x");
+	EXPECT_EQ(inv.first_argument, 4);
+}
+
+// The other face of the same bug. The option list CONTINUES after -c, because
+// POSIX's form is `sh -c [options] command_string ...` and the command string is
+// an operand. Taking the next word instead ran `-e` as the command.
+TEST(Invocation, AnOptionMaySitBetweenDashCAndTheCommandString) {
+	const invocation inv = parse({"sh", "-c", "-e", "echo hi"});
+	EXPECT_EQ(inv.error, nullptr);
+	EXPECT_TRUE(inv.options.exit_on_error);
+	ASSERT_NE(inv.command_string, nullptr);
+	EXPECT_STREQ(inv.command_string, "echo hi");
+}
+
+// POSIX: "A single hyphen shall be treated as the first operand and then
+// ignored." So it is not the command string - `sh -c - code` and `sh -c -- code`
+// both run `code`, which is startup-p.tst:158 and :169. lesh ran the hyphen.
+TEST(Invocation, AHyphenBeforeTheCommandStringIsIgnored) {
+	const invocation hyphen = parse({"sh", "-c", "-", "echo hi"});
+	EXPECT_EQ(hyphen.error, nullptr);
+	ASSERT_NE(hyphen.command_string, nullptr);
+	EXPECT_STREQ(hyphen.command_string, "echo hi");
+
+	const invocation double_hyphen = parse({"sh", "-c", "--", "echo hi"});
+	EXPECT_EQ(double_hyphen.error, nullptr);
+	ASSERT_NE(double_hyphen.command_string, nullptr);
+	EXPECT_STREQ(double_hyphen.command_string, "echo hi");
+}
+
+// -c with options but no operand has no command string, and a shell that cannot
+// parse its own command line must not guess.
+TEST(Invocation, DashCWithNoOperandIsRefused) {
+	const invocation inv = parse({"sh", "-c", "-e"});
+	EXPECT_NE(inv.error, nullptr);
+	EXPECT_EQ(inv.command_string, nullptr);
 }

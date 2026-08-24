@@ -73,7 +73,7 @@ d=$(mktemp -d); printf 'printed text\n' > $d/in; "$TESTEE" -c cat < $d/in
 --- a script's pathname is its own $0 [xfail(legacy): same quote-expansion defect]
 d=$(mktemp -d); printf 'echo "$0"\n' > $d/s; cd $d && "$TESTEE" ./s
 
---- -cn takes the command string from the next word and still honours noexec [xfail(legacy): same quote-expansion defect]
+--- -cn reads the n as an option and still honours noexec [xfail(legacy): same quote-expansion defect]
 d=$(mktemp -d); cd $d && "$TESTEE" -cn 'echo hi > f'; echo "status=$? [$(ls $d)]"
 
 --- -e on the command line makes a failing command exit the shell [xfail(legacy): same quote-expansion defect]
@@ -88,8 +88,17 @@ d=$(mktemp -d); cd $d && "$TESTEE" -cn 'echo hi > f'; echo "status=$? [$(ls $d)]
 --- $0 is the pathname the shell was invoked as [xfail: #43 - lesh reports the literal string "lesh" for every invocation that names no command_file]
 d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -c 'echo "$0"'
 
---- a word after -c's command string is an operand, not another option [xfail: #44 - lesh keeps parsing options past the command string, so the word after the command string is read as options instead of as $0]
+--- a word after -c's command string is an operand, not another option [xfail(legacy): same quote-expansion defect]
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -- -x
+
+--- a word after -c's command string is an operand even when it is a valid option letter [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -s foo
+
+--- the command string is the first OPERAND, so an option may sit between -c and it [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -c -e 'false; echo not reached'; echo "status=$?"
+
+--- a single hyphen before the command string is an operand and then ignored [xfail(legacy): same quote-expansion defect]
+"$TESTEE" -c - 'echo OK'; "$TESTEE" -c -- 'echo OK'
 
 --- a command_file that cannot be opened exits 127 [divergence: dash reports 2; startup-p.tst's 'reading non-existing file' requires 127 and bash agrees]
 d=$(mktemp -d); "$TESTEE" $d/no_such_file 2>/dev/null; echo "status=$?"
