@@ -7,8 +7,12 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <tuple>
+
+#include <unistd.h>
 
 using namespace lesh::runtime;
 using namespace lesh::syntax;
@@ -497,4 +501,99 @@ TEST_F(ExecutorTest, DuplicatingADescriptorChecksItsAccessMode) {
 	EXPECT_EQ(run("{ :; } 3>/dev/null <&3"), 2);
 	EXPECT_EQ(run("{ :; } 3</dev/null <&3"), 0);
 	EXPECT_EQ(run("{ :; } 3>/dev/null >&3"), 0);
+}
+
+namespace {
+
+// The hang in issue #50, asserted without a terminal.
+//
+// A pipeline stage's words were expanded in the SHELL, before the stage's child
+// had the pipe on fd 0, so a command substitution in them read the shell's own
+// standard input. Every runner in this project passes /dev/null there - probe.py
+// and spec_run.py both do, deliberately - and against /dev/null the bug is a
+// wrong answer: an empty string instead of the piped data. On a TERMINAL the same
+// read blocks and the shell hangs, which is how the bug was found and what it
+// cost two sessions on the #17 map.
+//
+// The differential corpus cannot express that, so this asserts the CAUSE instead
+// of the symptom: fd 0 carries bytes the stage must never see, and they must
+// still be unread afterwards. An fd 0 that no stage reads is exactly the property
+// that makes the terminal case terminate.
+class PipelineStdinTest : public ::testing::Test {
+protected:
+	lesh::buffer_pool pool{1024 * 64};
+	shell_state state;
+	int _original_stdin = -1;
+
+	void SetUp() override { _original_stdin = ::dup(STDIN_FILENO); }
+
+	void TearDown() override {
+		if (_original_stdin >= 0) {
+			::dup2(_original_stdin, STDIN_FILENO);
+			::close(_original_stdin);
+		}
+	}
+
+	// Puts bytes on fd 0 that no pipeline stage is allowed to read. The write end
+	// is CLOSED: a stage that reads them anyway then sees EOF rather than blocking,
+	// because a test that hangs when it fails is the same failure mode it is here
+	// to prevent. What is left on fd 0 is the verdict.
+	void feed_stdin(std::string_view text) {
+		int fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(fds), 0);
+		ASSERT_EQ(::write(fds[1], text.data(), text.size()),
+		          static_cast<ssize_t>(text.size()));
+		::close(fds[1]);
+		ASSERT_EQ(::dup2(fds[0], STDIN_FILENO), STDIN_FILENO);
+		::close(fds[0]);
+	}
+
+	std::string unread_stdin() {
+		char buffer[64] = {};
+		const ssize_t got = ::read(STDIN_FILENO, buffer, sizeof(buffer));
+		return got > 0 ? std::string{buffer, static_cast<size_t>(got)} : std::string{};
+	}
+
+	// Runs `code` with its output in a file, because the shell writes to fd 1 and
+	// the test needs to read what it wrote.
+	std::string output_of(const std::string& code) {
+		const std::string path = ::testing::TempDir() + "lesh_pipeline_stage_stdin.txt";
+		std::remove(path.c_str());
+		// The source must OUTLIVE the tree: the nodes hold views into it, not copies.
+		const std::string source = "{ " + code + "; } > " + path;
+		const tree t = parse(pool, source);
+		tree_walking_executor ex{pool, state};
+		std::ignore = ex.run(t);
+		std::ifstream in{path};
+		std::string out{std::istreambuf_iterator<char>{in},
+		                std::istreambuf_iterator<char>{}};
+		std::remove(path.c_str());
+		return out;
+	}
+};
+
+} // namespace
+
+TEST_F(PipelineStdinTest, ACommandSubstitutionInAStageReadsThePipeNotTheShellsStdin) {
+	feed_stdin("TERMINAL\n");
+	EXPECT_EQ(output_of("echo a | echo $(cat)"), "a\n");
+	EXPECT_EQ(unread_stdin(), "TERMINAL\n")
+		<< "the substitution read the shell's fd 0 - on a terminal that is the hang";
+}
+
+TEST_F(PipelineStdinTest, AnExternalStagesSubstitutionReadsThePipeNotTheShellsStdin) {
+	// The external path forks and execs; the builtin path stays in the stage's own
+	// process. Both expanded in the parent, so both have to be asserted.
+	feed_stdin("TERMINAL\n");
+	EXPECT_EQ(output_of("echo a | /bin/echo $(cat)"), "a\n");
+	EXPECT_EQ(unread_stdin(), "TERMINAL\n");
+}
+
+TEST_F(PipelineStdinTest, ASubstitutionInsideArithmeticInAStageReadsThePipe) {
+	// `$(( $(cat) + 1 ))` reached the same expander from a different entry point,
+	// and answered 1 - arithmetic on the empty string - rather than hanging only
+	// once the terminal case was tried.
+	feed_stdin("TERMINAL\n");
+	EXPECT_EQ(output_of("echo 3 | echo $(( $(cat) + 1 ))"), "4\n");
+	EXPECT_EQ(unread_stdin(), "TERMINAL\n");
 }

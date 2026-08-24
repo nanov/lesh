@@ -1253,38 +1253,44 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 			close(ctx.output_fd);
 		}
 
-		// Redirections are applied AFTER the pipeline's fds, so an explicit
-		// `> file` on a pipeline stage overrides the pipe - which is what POSIX
-		// requires and what `a | b > out` means.
-		if (t != nullptr && !apply_redirections(*t, command, nullptr))
-			_exit(kRedirectionError);
-
-		// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
-		// out of the shell - the parent's state is untouched by construction rather
-		// than by remembering to undo it.
-		if (assignments != nullptr) {
-			expander child_ex{_pool, _state, nullptr, true, &_state, &_state};
-			for (const auto& a : *assignments) {
-				const size_t eq = a.find('=');
-				// A readonly name was refused before the fork - see run_simple_command -
-				// so the refusal cannot happen here, and a child could not exit the
-				// shell over it anyway.
-				if (eq != std::string_view::npos)
-					std::ignore = _state.set_exported(
-						a.substr(0, eq),
-						child_ex.expand_value(a.substr(eq + 1), value_context::assignment));
-			}
-		}
-
-		std::string_view path_value;
-		if (!_state.lookup("PATH", path_value))
-			path_value = "/usr/bin:/bin";
-		exec_or_die(argv.data(), _state.environment_block(), path_value,
-		            _state.own_path());
+		become_command(argv, assignments, t, command);
 	}
 
 	setpgid(pid, ctx.group == 0 ? pid : ctx.group);
 	return pid;
+}
+
+void tree_walking_executor::become_command(arena_array<char*>& argv,
+                                           const arena_array<std::string_view>* assignments,
+                                           const tree* t, node_index command) {
+	// Redirections are applied AFTER the pipeline's fds, so an explicit
+	// `> file` on a pipeline stage overrides the pipe - which is what POSIX
+	// requires and what `a | b > out` means.
+	if (t != nullptr && !apply_redirections(*t, command, nullptr))
+		_exit(kRedirectionError);
+
+	// `x=1 cmd` exports x to cmd only. Applying it in the CHILD is what keeps it
+	// out of the shell - the parent's state is untouched by construction rather
+	// than by remembering to undo it.
+	if (assignments != nullptr) {
+		expander child_ex{_pool, _state, nullptr, true, &_state, &_state};
+		for (const auto& a : *assignments) {
+			const size_t eq = a.find('=');
+			// A readonly name was refused before the fork - see run_simple_command -
+			// so the refusal cannot happen here, and a child could not exit the
+			// shell over it anyway.
+			if (eq != std::string_view::npos)
+				std::ignore = _state.set_exported(
+					a.substr(0, eq),
+					child_ex.expand_value(a.substr(eq + 1), value_context::assignment));
+		}
+	}
+
+	std::string_view path_value;
+	if (!_state.lookup("PATH", path_value))
+		path_value = "/usr/bin:/bin";
+	exec_or_die(argv.data(), _state.environment_block(), path_value,
+	            _state.own_path());
 }
 
 // Expands the value of a NAME=value assignment, returning the whole thing with
@@ -1943,6 +1949,90 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	return status_from_wait(wait_status);
 }
 
+// One simple-command pipeline stage, in the process forked for it, with the pipe
+// already on its fds.
+//
+// The words are expanded HERE and not in the shell before the fork, which is the
+// whole point: `echo a | echo $(cat)` expanded in the shell ran `cat` on the
+// SHELL's fd 0, so it printed nothing under /dev/null and hung outright on a
+// terminal (#50). POSIX 2.9.1 then performs the redirections, so `echo $(cat)
+// <file` still substitutes from the pipe and only afterwards moves fd 0.
+int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
+	// A stage with NO WORDS AT ALL - what is left when an alias substituted to
+	// blanks - is not a command, and POSIX leaves `$?` alone for it. Same rule as
+	// run_simple_command; `echo foo | e` with `alias e=' '` is the shape that
+	// stalled a probe on #40.
+	if (t[stage].children_count == 0)
+		return _state.last_status();
+
+	// POSIX 2.9.1: a command with no command name completes with the status of the
+	// LAST command substitution it performed, and zero when it performed none.
+	const uint64_t substitutions_before = _substitutions;
+
+	arena_array<char*> argv{_pool, 8};
+	arena_array<std::string_view> assignments{_pool, 4};
+	_expansion_error = false;
+	const bool has_command = build_argv(t, stage, argv, &assignments);
+	// A fatal expansion error - `${x?}`, or `set -u` on an unset parameter - stops
+	// the shell it happens in, and that shell is THIS one: the stage's subshell.
+	// Expanding in the parent made `echo a | echo ${x?bad}` exit the whole shell,
+	// so the command after the pipeline never ran; dash reports 2 for the stage and
+	// carries on.
+	if (_expansion_error)
+		return kExpansionError;
+
+	if (!has_command) {
+		// No command name still performs the redirections and the assignments, in a
+		// subshell - which this process already is, so they are applied directly
+		// rather than through run_redirections_only, which forks one of its own.
+		// The stage used to be skipped entirely, so `echo a | >out` created no file.
+		if (has_redirections(t, stage) && !apply_redirections(t, stage, nullptr))
+			return kRedirectionError;
+		for (const auto& a : assignments) {
+			const std::string_view expanded = expand_assignment(a);
+			if (_expansion_error)
+				return kExpansionError;
+			if (!apply_expanded_assignment(expanded))
+				return assignment_error();
+		}
+		return _substitutions != substitutions_before ? _state.last_status() : 0;
+	}
+
+	// A function or builtin in a pipeline stage runs in ITS OWN process - this one -
+	// so its effects do not reach the shell. POSIX allows either, and running it in
+	// a subshell is what dash does, which is why `f | cat` cannot set a variable in
+	// the parent and `echo a | read x` cannot either.
+	const bool in_process = _functions.contains(argv[0]) ||
+	                        classify_builtin(argv[0]) != builtin_kind::none;
+	if (in_process) {
+		// The executor's own builtins are dispatched here rather than through
+		// try_run_builtin, which has no entry for any of them: `exec echo foo | cat`
+		// printed nothing, and so did `echo hi | eval cat`. They come before the
+		// apply_redirections below because each applies the stage's redirections
+		// itself where it needs them.
+		int status = 0;
+		if (try_run_executor_builtin(t, stage, argv, assignments, false, status))
+			return status;
+		// nullptr for `restore`: this process exists only for this stage, so there
+		// is nothing to put the fds back for. Its status matters though - a failed
+		// redirection has to make the STAGE fail, and discarding the result ran the
+		// builtin anyway, on the unredirected fds.
+		if (!apply_redirections(t, stage, nullptr))
+			return kRedirectionError;
+		if (!try_run_function(t, argv, status)) {
+			builtin_result r{};
+			(void)try_run_builtin(_state, argv.data(), r);
+			status = r.status;
+		}
+		return status;
+	}
+
+	// An external command: this process becomes it. No second fork - the stage was
+	// forked before its words were expanded, so the process that expanded them is
+	// the one that execs.
+	become_command(argv, &assignments, &t, stage);
+}
+
 int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 	const node& self = t[n];
 	LESH_ASSERT(self.children_count >= 2);
@@ -1962,97 +2052,36 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 
 		const node_index stage = t.child_of(self, i);
 
-		// A stage may be a COMPOUND command - `echo x | { read v; ... }` and
-		// `... | while read l; do ...; done` are both ordinary shell. build_argv
-		// only understands simple commands, so a compound stage found no words and
-		// was silently skipped, producing no output at all.
-		if (t[stage].kind != node_kind::simple_command) {
+		// The fork comes FIRST, before anything in the stage is evaluated. POSIX
+		// 2.9.2 puts each stage in a subshell environment with its input already
+		// connected, and expanding the words is part of running the command - so a
+		// command substitution in them must see the PIPE on fd 0. Expanding in the
+		// shell first, which is what this did, made `echo a | echo $(cat)` read the
+		// shell's own stdin: empty against /dev/null and a HANG on a terminal. See
+		// issue #50.
+		std::fflush(nullptr);
+		const pid_t pid = fork();
+		if (pid == 0) {
+			setpgid(0, group);
+			if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
+			if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
+			// A stage may be a COMPOUND command - `echo x | { read v; ... }` and
+			// `... | while read l; do ...; done` are both ordinary shell. Only a
+			// simple command has words to expand and a name to dispatch on, which is
+			// all run_pipeline_stage adds over run_node.
+			const int status = t[stage].kind == node_kind::simple_command
+			                       ? run_pipeline_stage(t, stage)
+			                       : run_node(t, stage);
 			std::fflush(nullptr);
-			const pid_t pid = fork();
-			if (pid == 0) {
-				setpgid(0, group);
-				if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
-				if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
-				const int status = run_node(t, stage);
-				std::fflush(nullptr);
-				_exit(status);
-			}
-			if (pid > 0) {
-				setpgid(pid, group == 0 ? pid : group);
-				pids.push(pid);
-				if (group == 0)
-					group = pid;
-			}
-			if (input_fd != STDIN_FILENO) close(input_fd);
-			if (!is_last) { close(pipe_fds[1]); input_fd = pipe_fds[0]; }
-			continue;
+			_exit(status);
 		}
-
-		arena_array<char*> argv{_pool, 8};
-		arena_array<std::string_view> assignments{_pool, 4};
-		if (build_argv(t, stage, argv, &assignments)) {
-			// A function or builtin in a pipeline stage runs in ITS OWN process, so
-			// it forks like anything else and its effects do not reach the shell.
-			// POSIX allows either, and running it in a subshell is what dash does -
-			// which is why `f | cat` cannot set a variable in the parent.
-			const bool in_process = _functions.contains(argv[0]) ||
-			                        classify_builtin(argv[0]) != builtin_kind::none;
-			if (in_process) {
-				std::fflush(nullptr);
-				const pid_t pid = fork();
-				if (pid == 0) {
-					setpgid(0, group);
-					if (input_fd != STDIN_FILENO) { dup2(input_fd, STDIN_FILENO); close(input_fd); }
-					if (!is_last) { dup2(pipe_fds[1], STDOUT_FILENO); close(pipe_fds[1]); }
-					// The executor's own builtins are dispatched here rather than through
-					// try_run_builtin, which has no entry for any of them: `exec echo foo |
-					// cat` printed nothing, and so did `echo hi | eval cat`. They come
-					// before the apply_redirections below because each applies the stage's
-					// redirections itself where it needs them.
-					int status = 0;
-					if (try_run_executor_builtin(t, stage, argv, assignments, false, status)) {
-						std::fflush(nullptr);
-						_exit(status);
-					}
-					// nullptr for `restore`: this process exists only for this stage, so
-					// there is nothing to put the fds back for. Its status matters
-					// though - a failed redirection has to make the STAGE fail, and
-					// discarding the result ran the builtin anyway, on the unredirected
-					// fds.
-					if (!apply_redirections(t, stage, nullptr)) {
-						std::fflush(nullptr);
-						_exit(kRedirectionError);
-					}
-					if (!try_run_function(t, argv, status)) {
-						builtin_result r{};
-						(void)try_run_builtin(_state, argv.data(), r);
-						status = r.status;
-					}
-					std::fflush(nullptr);
-					_exit(status);
-				}
-				if (pid > 0) {
-					setpgid(pid, group == 0 ? pid : group);
-					pids.push(pid);
-					if (group == 0)
-						group = pid;
-				}
-				if (input_fd != STDIN_FILENO) close(input_fd);
-				if (!is_last) { close(pipe_fds[1]); input_fd = pipe_fds[0]; }
-				continue;
-			}
-
-			// Every stage runs in its own process, so a builtin in a pipeline stage
-			// affects only that process - which is why dispatch here would be wrong
-			// and `echo a | read x` cannot set x in the shell. That is POSIX's
-			// behaviour, not a limitation.
-			const pid_t pid = spawn(argv, {input_fd, is_last ? STDOUT_FILENO : pipe_fds[1], group},
-			                        &assignments, &t, stage);
-			if (pid > 0) {
-				pids.push(pid);
-				if (group == 0)
-					group = pid;
-			}
+		if (pid == -1)
+			std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		if (pid > 0) {
+			setpgid(pid, group == 0 ? pid : group);
+			pids.push(pid);
+			if (group == 0)
+				group = pid;
 		}
 
 		// Close our copies. Every stage must close the ends it does not use, or a

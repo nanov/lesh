@@ -688,6 +688,43 @@ readonly v; echo hi | { read v 2>/dev/null; echo "st=$?"; }; echo reached
 --- getopts fails rather than ignore a readonly OPTIND [xfail(legacy): legacy has no getopts and no readonly]
 readonly OPTIND; getopts a o -a 2>/dev/null; echo "st=$?"; echo reached
 
+# Issue #50: a pipeline stage is FORKED before anything in it is evaluated, so a
+# command substitution in its WORDS runs with the pipe on fd 0 and not the shell's
+# own stdin. Expanding first, in the shell, made every case below read the wrong
+# descriptor - empty here, because this runner gives each case /dev/null, and a
+# HANG on a terminal. The terminal half is asserted in tests/unit/executor_tests.cpp,
+# which is the only place that can: stdin=DEVNULL here is by design.
+
+--- a command substitution in a pipeline stage reads the pipe
+echo a | echo $(cat)
+
+--- a command substitution in an EXTERNAL stage reads the pipe [xfail(legacy): beyond legacy's single-pass parser]
+echo a | /bin/echo $(cat)
+
+--- a command substitution in a FUNCTION stage's arguments reads the pipe [xfail(legacy): beyond legacy's single-pass parser]
+f() { echo "[$1]"; }; echo a | f $(cat)
+
+--- a command substitution inside arithmetic in a stage reads the pipe [xfail(legacy): beyond legacy's single-pass parser]
+echo 3 | echo $(( $(cat) + 1 ))
+
+--- a command substitution in a MIDDLE stage reads its own pipe [xfail(legacy): beyond legacy's single-pass parser]
+printf 'm\n' | echo $(cat) | tr m M
+
+--- a command substitution in a stage may be a pipeline itself [xfail(legacy): beyond legacy's single-pass parser]
+echo a | echo $(cat | tr a-z A-Z)
+
+--- a stage's words are expanded BEFORE its redirections are performed [xfail(legacy): beyond legacy's single-pass parser]
+F=/tmp/lesh_spec_p50_f; echo FILE > $F; echo PIPE | echo $(cat) < $F; rm -f $F
+
+--- a fatal expansion error in a stage ends the stage, not the shell [xfail(legacy): beyond legacy's single-pass parser]
+echo a | echo ${x?bad}; echo "rc=$?"
+
+--- a stage with no command name still performs its redirections [xfail(legacy): legacy ignores redirect nodes entirely]
+F=/tmp/lesh_spec_p50_out; rm -f $F; echo a | > $F; echo "rc=$?"; ls $F; rm -f $F
+
+--- a stage with no command name reports its last command substitution [xfail(legacy): beyond legacy's single-pass parser]
+echo a | x=$(exit 3); echo "rc=$?"
+
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
 # assertion dash itself fails in the yash suite, so the xfail marker here means

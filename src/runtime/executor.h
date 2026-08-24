@@ -218,6 +218,20 @@ private:
 	                          const syntax::tree* t = nullptr,
 	                          syntax::node_index command = 0);
 
+	// Applies a command's redirections and its assignment prefix and BECOMES it.
+	//
+	// Split out of `spawn`, which is now this with a fork in front of it, so a
+	// pipeline stage - already running in the process forked for it - can exec
+	// without forking a second time.
+	[[noreturn]] void become_command(arena_array<char*>& argv,
+	                                 const arena_array<std::string_view>* assignments,
+	                                 const syntax::tree* t, syntax::node_index command);
+
+	// Runs one SIMPLE-COMMAND pipeline stage, in the process forked for it and
+	// after its pipe is on its fds. Returns the status to _exit with, or never
+	// returns because the stage became an external command.
+	int run_pipeline_stage(const syntax::tree& t, syntax::node_index stage);
+
 	// Runs a whole tree with stdout captured. Used by command substitution.
 	[[nodiscard]] bool capture(std::string_view code, arena_array<char>& out);
 
