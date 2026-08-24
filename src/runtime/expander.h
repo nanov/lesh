@@ -196,6 +196,11 @@ private:
 		// wildcards. Removing the quotes lost the distinction and made every quoted
 		// metacharacter a metacharacter again.
 		bool pattern = false;
+		// The text is the interior of a `${...}`, where a `}` would END the expansion
+		// - so a backslash escapes one even inside double quotes, which is the only
+		// way to write a literal brace there. `"${a+a\}b}"` is `a}b` in dash and was
+		// `a\}b` here, the whole of quote-p.tst's remaining three cases.
+		bool in_braces = false;
 		// How the text is LEXED, which is a third thing again: a single quote is an
 		// ordinary byte inside double quotes and in a here-document body, and a
 		// tilde is eligible only where a word begins.
@@ -213,6 +218,8 @@ private:
 				return true;  // outside quotes a backslash escapes anything
 			if (c == '$' || c == '`' || c == '\\' || c == '\n')
 				return true;
+			if (c == '}' && in_braces)
+				return true;
 			return c == '"' && mode != syntax::lex_mode::here_doc_body;
 		}
 	};
@@ -228,8 +235,13 @@ private:
 	void append(std::string_view bytes) noexcept;
 	void append_split(std::string_view bytes, arena_array<std::string_view>& out) noexcept;
 	void push_byte(char c) noexcept;
+	// The same context, marked as the interior of a `${...}`.
+	[[nodiscard]] static expand_context brace_ctx(expand_context ctx) noexcept;
 	// A segment body with its line continuations removed. See the definition.
 	[[nodiscard]] std::string_view without_continuations(std::string_view body) noexcept;
+	// The code inside backquotes, with the escapes POSIX 2.6.3 removes.
+	[[nodiscard]] std::string_view unescape_backquotes(std::string_view code,
+	                                                   bool in_double_quotes) noexcept;
 	// Bytes that arrived QUOTED: escaped in a pattern context, verbatim otherwise.
 	void append_quoted(std::string_view bytes, expand_context ctx) noexcept;
 	// Bytes that came out of an EXPANSION: escaped only when the expansion itself

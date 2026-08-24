@@ -108,6 +108,31 @@ private:
 		return at;
 	}
 
+	// Advances past ONE quoted run or expansion beginning at `at`, returning the
+	// position just after it - or `at` when nothing starts there.
+	//
+	// Four scans needed this and all four had the same defect: a loop looking for
+	// one delimiter walked straight through a nested construct that could contain
+	// it. `"outer $(echo "inner") end"` is ONE quoted string, `"`echo "x"`"` is one
+	// too, and `${e=a"b"c}` ends at the brace AFTER the quotes rather than at
+	// whichever `"` or `}` came first. Iterative, with an explicit stack of the
+	// closers each open construct wants, because the nesting depth is the INPUT's
+	// and recursion here would be a stack overflow waiting for a test case.
+	// `inside_double_quotes` says whether a single quote at `at` is a QUOTE or an
+	// ordinary byte. It is not derivable from the bytes: `"${x-'}"` prints one
+	// single quote at status zero in dash, because inside double quotes the `${...}`
+	// body inherits the context, while `"$(echo 'x')"` really does quote - a
+	// substitution starts the shell language over.
+	[[nodiscard]] uint32_t skip_quoted_or_expansion(
+		uint32_t at, bool inside_double_quotes = false) const noexcept;
+	// How deep the scan will follow nesting. 256 matches the expander's own
+	// kMaxExpansionDepth, which is the layer that refuses well-formed input nested
+	// deeper than that anyway. PAST it the construct is reported as UNTERMINATED
+	// rather than mis-scanned: an unmatched closer would otherwise leave the scan
+	// somewhere arbitrary and produce a silently wrong word, and a diagnostic at
+	// status 2 is the answer this project gives to input it will not follow.
+	static constexpr int kMaxScanNesting = 256;
+
 	bool skip_blanks_and_comments() noexcept;  // returns whether anything was skipped
 	token lex_operator() noexcept;
 	token lex_word(lex_mode mode) noexcept;

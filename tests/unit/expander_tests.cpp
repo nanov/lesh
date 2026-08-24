@@ -498,6 +498,48 @@ TEST_F(ExpanderTest, AnExpansionInAPatternIsAPatternUnlessItWasQuoted) {
 	          (std::vector<std::string>{"echo", "ab\\bc"}));
 }
 
+TEST_F(ExpanderTest, ABackslashEscapesABraceInsideBracesEvenInDoubleQuotes) {
+	// The one byte double-quote rules do NOT cover, and they cannot: a `}` would end
+	// the expansion, so `\}` is the only way to write a literal one there. dash
+	// prints `a}b` for `"${a+a\}b}"` and lesh printed `a\}b` - the whole of
+	// quote-p.tst's remaining three cases, one character each.
+	params.vars["a"] = "set";
+	EXPECT_EQ(expand("echo \"${a+a\\}b}\""),
+	          (std::vector<std::string>{"echo", "a}b"}));
+	EXPECT_EQ(expand("echo \"${a+\\{}\""), (std::vector<std::string>{"echo", "\\{"}))
+		<< "and an opening brace is NOT special, so its backslash stays";
+}
+
+TEST_F(ExpanderTest, ABackquotedSubstitutionHasItsEscapesRemovedFirst) {
+	// POSIX 2.6.3: a backslash inside backquotes keeps its literal meaning except
+	// before `$`, a backquote or another backslash - so the body handed to the
+	// parser is not the body as written. Unconditionally, not quote-aware:
+	// `` `echoraw '\$y'` `` prints `$y`, so the escape inside SINGLE quotes was
+	// removed too, before the body was ever parsed.
+	FakeRunner runner;
+	runner.reply = "out\n";
+	expand("echo `a \\` b \\$c \\\\ \\z`", &runner);
+	ASSERT_EQ(runner.asked.size(), 1u);
+	EXPECT_EQ(runner.asked[0], "a ` b $c \\ \\z");
+}
+
+TEST_F(ExpanderTest, AndDoubleQuotesAddTheQuoteToThatSet) {
+	// `"`echoraw \"1\"`"` prints `1`: the `\"` is in the source only to stop the
+	// quoted string ending, so it comes off. Outside double quotes it does not -
+	// `` `echoraw \"1\"` `` prints `"1"` there.
+	FakeRunner runner;
+	runner.reply = "out\n";
+	expand("echo \"`a \\\"1\\\"`\"", &runner);
+	ASSERT_EQ(runner.asked.size(), 1u);
+	EXPECT_EQ(runner.asked[0], "a \"1\"");
+
+	FakeRunner bare;
+	bare.reply = "out\n";
+	expand("echo `a \\\"1\\\"`", &bare);
+	ASSERT_EQ(bare.asked.size(), 1u);
+	EXPECT_EQ(bare.asked[0], "a \\\"1\\\"") << "outside quotes the backslash stays";
+}
+
 TEST_F(ExpanderTest, TildeExpandsToHome) {
 	EXPECT_EQ(expand("echo ~"), (std::vector<std::string>{"echo", "/home/tester"}));
 }
@@ -638,18 +680,18 @@ TEST_F(ExpanderTest, EveryParameterOperatorRefusesAnUnterminatedArithmetic) {
 	}
 }
 
-TEST_F(ExpanderTest, AnArgumentTheOperatorNeverReachesIsNeverRefused) {
-	// The measured cost of decision 2, pinned rather than left to be discovered.
-	// dash reports `${x-$((1}` at PARSE time, so it refuses the command whether or
-	// not x is set. lesh's word scan cannot see inside `${...}` - it counts braces,
-	// which is #42's territory to change - so the defect is found when the default
-	// is expanded, and a default that is not needed is not expanded. Recorded as a
-	// divergence in tests/spec/syntax_errors.spec too.
+TEST_F(ExpanderTest, AnArgumentTheOperatorNeverReachesIsRefusedTOO) {
+	// #48 recorded this as a divergence: dash reports `${x-$((1}` at PARSE time and
+	// so refuses it whether or not x is set, while lesh's word scan counted braces,
+	// could not see inside `${...}`, and only found the defect when the default was
+	// expanded - which a set x never does. The scan now follows the nesting, so the
+	// word itself carries the defect and the command is refused before anything
+	// runs. Kept as a test because it is the case that closes the divergence.
 	params.vars["x"] = "value";
 	bool fatal = false;
 	EXPECT_EQ(expand("echo ${x-$((1}", nullptr, nullptr, &fatal),
-	          (std::vector<std::string>{"echo", "value"}));
-	EXPECT_FALSE(fatal);
+	          (std::vector<std::string>{"echo"}));
+	EXPECT_TRUE(fatal);
 }
 
 TEST_F(ExpanderTest, UnterminatedCommandSubstitutionInsideADefaultIsRefused) {

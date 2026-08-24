@@ -129,16 +129,19 @@ echo ${x-$((1+2))}
 --- a TERMINATED command substitution inside a parameter default still expands [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
 echo ${x-`echo hi`}
 
---- an unterminated quote inside a parameter default is not refused [xfail: divergence - dash refuses this at PARSE time, scanning the `${...}` body for quotes; lesh's word scan counts braces and cannot see inside, so the defect is only found when the default is expanded, and an unterminated quote there is not one of the constructs whose delimiters the expander strips. Same shape as the two cases below, and the reason it is not simply refused is the case that follows it]
+--- an unterminated quote inside a parameter default is refused [xfail(legacy): legacy has no parameter expansion beyond $name, so it echoes the braces]
 echo ${x-'a}
 
 --- a single quote inside a double-quoted parameter default is a byte, not a quote [xfail(legacy): legacy has no parameter expansion beyond $name, so it echoes the braces]
 echo "${x-'}"
 
---- a malformed expansion in a for list diagnoses but does not stop the shell [xfail: #47's remaining gap - the for list and the case subject are the two expansion sites that never consult expander::fatal_error(), so a fatal expansion error there is reported and then ignored. `for i in ${x?}` behaves the same way and predates this fix, which only made the gap visible on a second kind of input: before it, this input aborted the shell on a stack overflow. dash exits 2]
+--- a malformed expansion in a for list stops the shell [xfail(legacy): legacy has no compound commands]
 for i in ${x-$((1}; do echo $i; done
 
---- a default the operator never reaches is never refused [xfail: divergence - dash refuses this at PARSE time, so it refuses it whether or not x is set. lesh's word scan counts braces and cannot see inside `${...}`, which is #42's to change, so the defect is found when the default is expanded - and a default that is not needed is not expanded. The crash this replaces was in the same position]
+--- but a FATAL expansion error in a for list still does not [xfail: #39's remaining gap - `run_for` and `run_case` never consult expander::fatal_error(), so `${x?}` there is reported and then ignored while dash exits 2. Reached only by an error the WORD SCAN cannot see: a malformed nesting is now refused at parse time, and this is not malformed]
+for i in ${x?}; do echo $i; done; echo after
+
+--- a default the operator never reaches is refused too [xfail(legacy): legacy has no parameter expansion beyond $name]
 x=1; echo ${x-$((1}
 
 --- a trailing backslash is incomplete without being an error

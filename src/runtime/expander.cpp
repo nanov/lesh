@@ -360,6 +360,48 @@ std::string_view expander::without_continuations(std::string_view body) noexcept
 	return {block, written};
 }
 
+// The code inside backquotes, with the escapes POSIX 2.6.3 removes.
+//
+// A backslash there retains its literal meaning EXCEPT before `$`, a backquote or
+// another backslash - and, inside double quotes, before a `"`, which is only in
+// the source to stop the quoted string ending. Removing them is unconditional
+// rather than quote-aware, which is the standard's rule and observably so:
+// `` `echoraw '\$y'` `` prints `$y`, so the `\$` inside SINGLE quotes was still
+// unescaped before the body was ever parsed.
+//
+// Without this the body was handed to the parser exactly as written, so
+// `` `echo \`echo x\`` `` was a syntax error rather than a nested substitution and
+// `"`echo \"1\"`"` printed `"1"` - four of cmdsub-p.tst's cases.
+std::string_view expander::unescape_backquotes(std::string_view code,
+                                               bool in_double_quotes) noexcept {
+	if (code.find('\\') == std::string_view::npos)
+		return code;
+	char* block = nullptr;
+	_pool.allocate(code.empty() ? 1 : code.size(), block, 1);
+	size_t written = 0;
+	for (size_t i = 0; i < code.size(); ++i) {
+		if (code[i] == '\\' && i + 1 < code.size()) {
+			const char next = code[i + 1];
+			if (next == '$' || next == '`' || next == '\\' ||
+			    (in_double_quotes && next == '"')) {
+				block[written++] = next;
+				++i;
+				continue;
+			}
+		}
+		block[written++] = code[i];
+	}
+	return {block, written};
+}
+
+// The same context, marked as the interior of a `${...}`. Named rather than
+// written out at each of the four argument sites, because forgetting it at one of
+// them is a difference nobody would see until a `}` came out with a backslash.
+expander::expand_context expander::brace_ctx(expand_context ctx) noexcept {
+	ctx.in_braces = true;
+	return ctx;
+}
+
 // One byte of ordinary text. Ends any separator run in progress, which is what
 // makes a separator's trailing white space belong to the separator rather than
 // to the field after it.
@@ -717,6 +759,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						if (absent) {
 							expand_context arg = ctx;
 							arg.substituted = true;
+							arg.in_braces = true;
 							const expansion_status inner = expand_text(p.argument, arg, out);
 							if (inner != expansion_status::ok)
 								status = inner;
@@ -751,7 +794,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							// the VALUE, leading blank and all. quote-p.tst's 'quotes in
 							// substitution of expansion ${a=b}' turns on exactly that:
 							// `${a=\ x}` substitutes `[x]` while `${a+\ x}` gives `[ x]`.
-							const std::string_view d = expand_to_value(p.argument, ctx);
+							const std::string_view d = expand_to_value(p.argument, brace_ctx(ctx));
 							// A REFUSED assignment - `readonly x; : ${x=1}` - is a variable
 							// assignment error, which POSIX makes fatal to a non-interactive
 							// shell. The assigner has already reported it by name; what it
@@ -767,6 +810,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 						if (!absent) {
 							expand_context arg = ctx;
 							arg.substituted = true;
+							arg.in_braces = true;
 							const expansion_status inner = expand_text(p.argument, arg, out);
 							if (inner != expansion_status::ok)
 								status = inner;
@@ -782,7 +826,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 								        : std::string_view{"parameter not set"};
 							const std::string_view message =
 								p.argument.empty() ? fallback
-								                   : expand_to_value(p.argument, ctx);
+								                   : expand_to_value(p.argument, brace_ctx(ctx));
 							std::fprintf(stderr, "lesh: %.*s: %.*s\n",
 							             static_cast<int>(p.name.size()), p.name.data(),
 							             static_cast<int>(message.size()), message.data());
@@ -892,8 +936,12 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 					break;
 				}
 				arena_array<char> captured{_pool, 256};
-				if (_runner->run_and_capture(
-				        substitution_body(without_continuations(body)), captured)) {
+				// The backquoted form escapes; `$(...)` does not, which is the whole
+				// reason POSIX prefers it.
+				std::string_view code = substitution_body(without_continuations(body));
+				if (!body.empty() && body[0] == '`')
+					code = unescape_backquotes(code, ctx.double_quoted);
+				if (_runner->run_and_capture(code, captured)) {
 					std::string_view result{captured.data(), captured.size()};
 					// POSIX: trailing newlines are removed from the result.
 					while (!result.empty() && result.back() == '\n')

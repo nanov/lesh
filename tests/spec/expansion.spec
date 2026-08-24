@@ -188,3 +188,28 @@ a=1-2-3-4; printf '[%s][%s][%s]\n' "${a#*-}" "${a##*-}" "${a#*1}"
 
 --- an expansion in a trim pattern is a pattern unless it was quoted [xfail(legacy): legacy has no parameter expansion beyond $name]
 w='ab\bc'; a='*'; printf '[%s]\n' "${w#${a}b}"
+
+--- a substitution inside double quotes may hold quotes of its own [xfail(legacy): legacy has no command substitution]
+echoraw() { printf '%s\n' "$*"; }
+echoraw "$(echoraw "x")" "`echoraw "a"'b'`" "${e=a"b"c}"
+
+--- a brace inside quotes does not close an expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+a=set; printf '[%s][%s][%s]\n' "${a+'}'}" "${a+"}"}" "${a+a\}b}"
+
+--- and an opening brace is not special there [xfail(legacy): legacy has no parameter expansion beyond $name]
+a=set; printf '[%s]\n' "${a+\{}"
+
+--- a single quote inside braces inside double quotes is an ordinary byte [xfail(legacy): legacy has no parameter expansion beyond $name]
+printf '[%s]\n' "${x-'}"
+
+--- backquotes have their escapes removed before the body is parsed [xfail(legacy): legacy has no command substitution]
+echoraw() { printf '%s\n' "$*"; }
+echoraw `echoraw \`echoraw x\``
+echoraw `echoraw '\$y'`
+echoraw `printf '%s\n' \\\\`
+
+--- and double quotes add the quote to that set [xfail(legacy): legacy has no command substitution]
+echoraw() { printf '%s\n' "$*"; }
+echoraw "`echoraw \"1\"`"
+echoraw `echoraw \" "\"" '\"'`
+echoraw "`echoraw \'2\'`"

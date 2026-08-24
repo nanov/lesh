@@ -279,6 +279,66 @@ TEST(Lexer, ADollarLooksPastAContinuationForItsBrace) {
 	}
 }
 
+// One scan looking for one delimiter walked straight through nested constructs
+// that could contain it. Four scans had the defect and it cost five assertions
+// across quote-p.tst, param-p.tst and cmdsub-p.tst (#42).
+TEST(Lexer, AQuotedStringSurvivesQuotesInsideASubstitution) {
+	for (const std::string src : {"\"$(echo \"x\")\"", "\"`echo \"x\"`\"",
+	                             "\"${e=a\"b\"c}\"", "\"`echo \"a\"'b'`\""}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src << ": one word, not three";
+		EXPECT_EQ(tokens[0].kind, token_kind::word) << src;
+	}
+}
+
+TEST(Lexer, ABraceInsideQuotesDoesNotCloseAnExpansion) {
+	// `${a+\}}` ends at the SECOND brace and `${e=a"b"c}` at the last: counted
+	// braces alone stopped at whichever came first and left the rest of the word
+	// as literal text.
+	for (const std::string src : {"${a+'}'}", "${a+\"}\"}", "${a+\\}}", "${e=a\"b\"c}"}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+TEST(Lexer, ASingleQuoteInsideBracesInsideDoubleQuotesIsAnOrdinaryByte) {
+	// Not derivable from the bytes: `"${x-'}"` is a complete word - dash prints one
+	// single quote at status zero - while `${x-'}` on its own is unterminated,
+	// because there the quote IS a quote. The `${...}` body inherits the context;
+	// a `$(...)` starts the shell language over and does not.
+	lexer inside_quotes{"\"${x-'}\""};
+	EXPECT_EQ(inside_quotes.next().error, token_error::none);
+
+	lexer bare{"${x-'}"};
+	const token t = bare.next();
+	EXPECT_EQ(t.error, token_error::unterminated_parameter_expansion)
+		<< "outside double quotes the same bytes never close";
+}
+
+TEST(Lexer, NestingDeeperThanTheScanFollowsIsReportedRatherThanMisScanned) {
+	// A stack that has lost its closers would leave the scan somewhere arbitrary
+	// and hand the expander a word nobody wrote, so past the limit the construct is
+	// reported as unterminated - a diagnostic, never a silently wrong answer.
+	std::string deep;
+	for (int i = 0; i < 400; ++i)
+		deep += "${x-";
+	deep += "hi";
+	deep.append(400, '}');
+	lexer lx{deep};
+	const token t = lx.next();
+	EXPECT_EQ(t.error, token_error::unterminated_parameter_expansion);
+
+	std::string shallow;
+	for (int i = 0; i < 200; ++i)
+		shallow += "${x-";
+	shallow += "hi";
+	shallow.append(200, '}');
+	lexer ok{shallow};
+	EXPECT_EQ(ok.next().error, token_error::none) << "200 levels still lex";
+}
+
 TEST(Lexer, LexingNeverFailsOnHalfTypedInput) {
 	// A highlighter sees every prefix of what the user types. None may throw, hang,
 	// or fail to terminate.

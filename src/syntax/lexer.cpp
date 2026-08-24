@@ -49,6 +49,110 @@ bool lexer::skip_blanks_and_comments() noexcept {
 	return _position != start;
 }
 
+uint32_t lexer::skip_quoted_or_expansion(uint32_t at,
+                                         bool inside_double_quotes) const noexcept {
+	char expect[kMaxScanNesting];
+	// Whether a single quote is an ordinary byte at each level. `${...}` INHERITS
+	// the context it was opened in, while `$(...)` and a backquote start the shell
+	// language over and so reset it - which is why this travels beside the closer
+	// rather than being read off the bytes.
+	bool ordinary_single[kMaxScanNesting];
+	int depth = 0;
+	uint32_t p = at;
+
+	bool too_deep = false;
+	auto open = [&](char closer, uint32_t width, bool single_is_ordinary) {
+		if (depth < kMaxScanNesting) {
+			expect[depth] = closer;
+			ordinary_single[depth] = single_is_ordinary;
+			++depth;
+		} else {
+			too_deep = true;
+		}
+		p += width;
+	};
+
+	const char first = char_at(p);
+	if (first == '\'' && !inside_double_quotes) {
+		// Nothing inside single quotes is ever special, so there is no stack to
+		// keep: the run ends at the next quote or at the end of the input.
+		++p;
+		while (p < _source.size() && _source[p] != '\'')
+			++p;
+		return p < _source.size() ? p + 1 : p;
+	}
+	if (first == '"')
+		open('"', 1, /*single_is_ordinary=*/true);
+	else if (first == '`')
+		open('`', 1, false);
+	else if (first == '$' && char_at(p + 1) == '{')
+		open('}', 2, inside_double_quotes);
+	else if (first == '$' && char_at(p + 1) == '(')
+		open(')', 2, false);
+	else
+		return at;
+
+	while (depth > 0 && p < _source.size()) {
+		const char c = _source[p];
+		// A backslash consumes the next byte for DELIMITING purposes wherever it
+		// appears, which is what makes `\`` not close a backquote and `\"` not close
+		// a quoted string. What it MEANS is the expander's business.
+		if (c == '\\' && p + 1 < _source.size()) {
+			p += 2;
+			continue;
+		}
+		if (c == expect[depth - 1]) {
+			--depth;
+			++p;
+			continue;
+		}
+		if (c == '\'') {
+			// A single quote is a quote everywhere EXCEPT where double quotes are in
+			// force - the distinction that made `echo "it's"` print `it` when it was
+			// missed (#33), and that keeps `"${x-'}"` from swallowing the rest of the
+			// input.
+			if (ordinary_single[depth - 1]) {
+				++p;
+				continue;
+			}
+			p = skip_quoted_or_expansion(p);
+			continue;
+		}
+		if (c == '"') {
+			open('"', 1, true);
+			continue;
+		}
+		if (c == '`') {
+			open('`', 1, false);
+			continue;
+		}
+		if (c == '$' && char_at(p + 1) == '{') {
+			open('}', 2, ordinary_single[depth - 1]);
+			continue;
+		}
+		if (c == '$' && char_at(p + 1) == '(') {
+			open(')', 2, false);
+			continue;
+		}
+		// A bare paren or brace nests the construct it belongs to, which is how
+		// `$(a $(b) c)` and `${x-${y}}` were counted before there was a stack.
+		if (c == '(' && expect[depth - 1] == ')') {
+			open(')', 1, ordinary_single[depth - 1]);
+			continue;
+		}
+		if (c == '{' && expect[depth - 1] == '}') {
+			open('}', 1, ordinary_single[depth - 1]);
+			continue;
+		}
+		++p;
+	}
+	// Nested deeper than the scan will follow: report it as running to the end of
+	// the input, which the callers already treat as unterminated. Continuing with a
+	// stack that lost its closers would put `p` somewhere arbitrary and hand the
+	// expander a word nobody wrote.
+	return too_deep ? static_cast<uint32_t>(_source.size()) : p;
+}
+
 token lexer::lex_operator() noexcept {
 	const uint32_t start = _position;
 	// The characters of an operator may be separated by line continuations, which
@@ -149,19 +253,17 @@ token lexer::lex_word(lex_mode mode) noexcept {
 					_position += 2;
 					continue;
 				}
-				// A `$(...)` inside the quotes may contain quotes of its own, at any
-				// depth. The same fix was applied to the word-interior scan; this is
-				// the command-mode one, and missing it here meant two levels of
-				// nesting failed while one worked.
-				if (peek() == '$' && peek(1) == '(') {
-					_position += 2;
-					int depth = 1;
-					while (!at_end() && depth > 0) {
-						if (peek() == '(') ++depth;
-						else if (peek() == ')') --depth;
-						++_position;
+				// A substitution inside the quotes may contain quotes of its own, at
+				// any depth: `"$(echo "x")"`, `` "`echo "x"`" `` and `"${e=a"b"c}"` are
+				// each ONE quoted string, and scanning to the next `"` split all three.
+				if (peek() == '`' ||
+				    (peek() == '$' && (peek(1) == '(' || peek(1) == '{'))) {
+					const uint32_t after =
+						skip_quoted_or_expansion(_position, /*inside_double_quotes=*/true);
+					if (after > _position) {
+						_position = after;
+						continue;
 					}
-					continue;
 				}
 				++_position;
 			}
@@ -210,6 +312,23 @@ token lexer::lex_word(lex_mode mode) noexcept {
 			_position = past_continuations(_position + 1) + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
+				// A quote inside the braces is a quote, so a `}` inside it does NOT
+				// close the expansion: `${e=a"b"c}` ends at the last brace and
+				// `${a+\}}` at the second. Counted braces alone stopped at the first.
+				if (peek() == '\\' && _position + 1 < _source.size()) {
+					_position += 2;
+					continue;
+				}
+				if (peek() == '\'' || peek() == '"' || peek() == '`' ||
+				    (peek() == '$' && (peek(1) == '(' || peek(1) == '{'))) {
+					// Not inside double quotes: the `"` handler above owns those, so a
+					// `${` reaching here is at word level.
+					const uint32_t after = skip_quoted_or_expansion(_position);
+					if (after > _position) {
+						_position = after;
+						continue;
+					}
+				}
 				if (peek() == '{') ++depth;
 				else if (peek() == '}') --depth;
 				++_position;
@@ -327,18 +446,17 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 				_position += 2;
 				continue;
 			}
-			// A `$(...)` inside double quotes may itself contain quotes:
+			// A substitution inside double quotes may itself contain quotes:
 			// `"outer $(echo "inner") end"` is ONE quoted string. Scanning to the
 			// next `"` split it at the inner quote and left a stray `)`.
-			if (peek() == '$' && peek(1) == '(') {
-				_position += 2;
-				int depth = 1;
-				while (!at_end() && depth > 0) {
-					if (peek() == '(') ++depth;
-					else if (peek() == ')') --depth;
-					++_position;
+			if (peek() == '`' ||
+			    (peek() == '$' && (peek(1) == '(' || peek(1) == '{'))) {
+				const uint32_t after =
+					skip_quoted_or_expansion(_position, /*inside_double_quotes=*/true);
+				if (after > _position) {
+					_position = after;
+					continue;
 				}
-				continue;
 			}
 			++_position;
 		}
@@ -448,10 +566,24 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		}
 		if (next == '{') {
 			// Braces are COUNTED: `${x:-${y:-z}}` nests, and stopping at the first
-			// `}` left the outer brace as literal text.
+			// `}` left the outer brace as literal text. Quoted runs are skipped
+			// whole, because a `}` inside quotes closes nothing.
 			_position = at_next + 1;
 			int depth = 1;
 			while (!at_end() && depth > 0) {
+				if (peek() == '\\' && _position + 1 < _source.size()) {
+					_position += 2;
+					continue;
+				}
+				if (peek() == '\'' || peek() == '"' || peek() == '`' ||
+				    (peek() == '$' && (peek(1) == '(' || peek(1) == '{'))) {
+					const uint32_t after =
+						skip_quoted_or_expansion(_position, quotes_are_bytes);
+					if (after > _position) {
+						_position = after;
+						continue;
+					}
+				}
 				if (peek() == '{') ++depth;
 				else if (peek() == '}') --depth;
 				++_position;
