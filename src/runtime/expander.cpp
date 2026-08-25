@@ -1,5 +1,7 @@
 #include "runtime/expander.h"
 
+#include "substrate/numeric.h"
+
 #include "runtime/arithmetic.h"
 #include "runtime/glob.h"
 #include "runtime/pattern.h"
@@ -487,13 +489,23 @@ bool expander::lookup_parameter(std::string_view name, std::string_view& out) no
 		return true;
 	}
 	if (name[0] >= '1' && name[0] <= '9') {
-		size_t index = 0;
-		for (const char c : name) {
-			if (c < '0' || c > '9')
-				return _params.lookup(name, out);
-			index = index * 10 + static_cast<size_t>(c - '0');
-		}
-		return _params.positional_at(index, out);
+		// AN INDEX PAST THE END IS AN UNSET PARAMETER, so this site CLAMPS - and the
+		// clamp is not a compromise here, it is the right answer arrived at cheaply.
+		// INT64_MAX is past every $# there can be, so a value too large to represent
+		// substitutes nothing, which is what `${18446744073709551617}` should always
+		// have done. It used to accumulate into a size_t and WRAP: 2^64 + 1 came back
+		// as 1, and the expansion substituted `$1` (#63).
+		//
+		// A name that is not all digits is not an index at all - `1a` is a variable
+		// name - so not_a_number falls through to the ordinary lookup rather than
+		// being refused. dash, bash and zsh disagree with each other about where the
+		// wrap happens; none of them substitutes an argument the script did not ask
+		// for once the number is past their own limit.
+		const numeric_result parsed =
+			parse_integer(name, numeric_site::positional_parameter_index);
+		if (parsed.status == numeric_parse::not_a_number)
+			return _params.lookup(name, out);
+		return _params.positional_at(static_cast<size_t>(parsed.value), out);
 	}
 	return _params.lookup(name, out);
 }

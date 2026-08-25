@@ -1,5 +1,7 @@
 #include "syntax/lexer.h"
 
+#include "substrate/numeric.h"
+
 #include "substrate/char_utils.h"
 
 namespace lesh::syntax {
@@ -754,10 +756,33 @@ token lexer::next(lex_mode mode) noexcept {
 		// operator: `3\<newline>>\<newline>>redir` is `3>>redir`, and read as a word
 		// the `3` became an ARGUMENT and the redirection landed on stdout - which is
 		// how quote-p.tst's operator case came to report `3: not open for output`.
+		//
+		// AND ONLY WHEN THE DIGITS COULD BE A DESCRIPTOR. `4294967298>file` used to
+		// lex as an IO_NUMBER and accumulate into a uint32_t, so it wrapped onto
+		// fd 2 and redirected the shell's STDERR - a live descriptor, reached from a
+		// number the script wrote as something else entirely (#63). dash, zsh and
+		// ksh all read an over-long run as an ordinary word instead, which leaves
+		// `>` on its default fd and passes the digits to the command; dash's
+		// threshold is a single digit, which is why `99>` is already a word there.
+		// lesh's is what a descriptor can hold, so it agrees with bash below the
+		// limit and with the other three above it.
+		//
+		// The limit comes from the same policy row parse_redirect reads, because two
+		// readings of one bound is how the lexer and the parser would come to
+		// disagree about which words are redirections.
 		uint32_t ahead = past_continuations(_position);
-		while (ahead < _source.size() && is_digit(_source[ahead]))
+		uint64_t fd = 0;
+		bool fits = true;
+		const uint64_t limit = static_cast<uint64_t>(
+			lesh::policy_for(lesh::numeric_site::redirection_word_fd).high);
+		while (ahead < _source.size() && is_digit(_source[ahead])) {
+			if (!lesh::accumulate_digit(fd, static_cast<uint64_t>(_source[ahead] - '0'),
+			                            10, limit))
+				fits = false;
 			ahead = past_continuations(ahead + 1);
-		if (ahead < _source.size() && (_source[ahead] == '<' || _source[ahead] == '>')) {
+		}
+		if (fits && ahead < _source.size() &&
+		    (_source[ahead] == '<' || _source[ahead] == '>')) {
 			token t;
 			t.kind = token_kind::io_number;
 			t.offset = _position;

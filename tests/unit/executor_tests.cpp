@@ -1289,3 +1289,16 @@ TEST_F(ExecutorTest, UnaliasTakesItsOperandAfterASeparator) {
 	EXPECT_EQ(run("alias foo=bar; unalias -- foo"), 0);
 	EXPECT_EQ(run("alias foo=bar; unalias -- foo; alias foo 2>/dev/null"), 1);
 }
+
+TEST_F(ExecutorTest, ADigitRunTooLargeToBeAFileDescriptorIsAnOrdinaryWord) {
+	// It used to lex as an IO_NUMBER and accumulate into a uint32_t, so
+	// `4294967298>file` WRAPPED ONTO FD 2 and redirected the shell's stderr - a
+	// live descriptor reached from a number the script wrote as something else.
+	// dash, zsh and ksh all read an over-long run as a word instead, which leaves
+	// the operator on its default fd and passes the digits to the command.
+	EXPECT_EQ(capture("echo one 4294967298>/dev/null"), "");
+	EXPECT_EQ(capture("echo two 99999999999999999999>/dev/null"), "");
+	// A run that CAN be a descriptor still is one: `9>` opens fd 9 and leaves
+	// stdout alone.
+	EXPECT_EQ(capture("echo three 9>/dev/null"), "three\n");
+}

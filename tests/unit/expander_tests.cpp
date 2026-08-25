@@ -1084,3 +1084,21 @@ TEST(DeclarationScanTest, AnOptionBeforeAnyCommandPrefixIsTheCommandName) {
 	scan.note_expanded_word("export");
 	EXPECT_FALSE(scan.operand_is_assignment("A=$a"));
 }
+
+// --- a positional parameter index, read through the one numeric parser (#63) -
+
+TEST_F(ExpanderTest, APositionalIndexTooLargeToBeOneIsUnsetRatherThanWrapped) {
+	// It accumulated into a size_t and WRAPPED: `${18446744073709551617}` is
+	// 2^64 + 1, which came back as 1 and substituted the FIRST ARGUMENT. An index
+	// past the end is an unset parameter, which is exactly where the clamp lands -
+	// INT64_MAX is past every $# there can be.
+	params.args = {"a", "b", "c"};
+	EXPECT_EQ(expand("echo [${18446744073709551617}]"),
+	          (std::vector<std::string>{"echo", "[]"}));
+	EXPECT_EQ(expand("echo [${4294967297}]"), (std::vector<std::string>{"echo", "[]"}));
+	EXPECT_EQ(expand("echo [${9999999999999999999999999}]"),
+	          (std::vector<std::string>{"echo", "[]"}));
+	// And an index that IS one still resolves.
+	EXPECT_EQ(expand("echo [${2}]"), (std::vector<std::string>{"echo", "[b]"}));
+	EXPECT_EQ(expand("echo [${4}]"), (std::vector<std::string>{"echo", "[]"}));
+}

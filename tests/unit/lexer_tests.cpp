@@ -445,3 +445,22 @@ TEST(LexerDoubleQuoteInterior, ExpansionsAreStillRecognised) {
 	lexer sub{"$(echo hi)"};
 	EXPECT_EQ(sub.next(lex_mode::double_quote_interior).kind, token_kind::seg_command_sub);
 }
+
+// --- a digit run is an IO_NUMBER only when it could be a descriptor (#63) ----
+
+TEST(Lexer, ADigitRunTooLargeToBeAFileDescriptorIsNotAnIoNumber) {
+	// It accumulated into a uint32_t with nothing checking it, so
+	// `4294967298>file` wrapped onto FD 2 and redirected the shell's stderr. dash,
+	// zsh and ksh all read an over-long run as an ordinary word; the bound here is
+	// what a descriptor can hold, which is bash's, so lesh agrees with bash below
+	// it and with the other three above it.
+	const std::vector redirects{token_kind::io_number, token_kind::great,
+	                            token_kind::word};
+	const std::vector reads_as_a_word{token_kind::word, token_kind::great,
+	                                  token_kind::word};
+	EXPECT_EQ(kinds_of("9>x"), redirects);
+	EXPECT_EQ(kinds_of("2147483647>x"), redirects);
+	EXPECT_EQ(kinds_of("2147483648>x"), reads_as_a_word);
+	EXPECT_EQ(kinds_of("4294967298>x"), reads_as_a_word);
+	EXPECT_EQ(kinds_of("99999999999999999999>x"), reads_as_a_word);
+}

@@ -868,6 +868,25 @@ echo a | x=$(exit 3); echo "rc=$?"
 --- unalias takes its operand after a `--` separator [xfail(legacy): legacy has no aliases or command lists]
 alias foo=bar; unalias -- foo; echo "a=$?"; alias foo 2>/dev/null; echo "b=$?"
 
+# A POSITIONAL PARAMETER INDEX past the end is an unset parameter, which is what a
+# clamp lands on. It used to wrap a size_t: `${18446744073709551617}` is 2^64 + 1,
+# which wrapped onto `$1` and substituted the first argument.
+
+--- a positional parameter index too large to be one is unset rather than wrapped [xfail(legacy): legacy has no positional parameters or command lists]
+set -- a b c; echo "[${18446744073709551617}][${4}][${2}]"
+
+# A DIGIT RUN THAT CANNOT BE A FILE DESCRIPTOR IS NOT ONE. It used to be taken for
+# an IO_NUMBER and accumulated into a uint32_t, so `4294967298>file` wrapped onto
+# fd 2 and redirected the shell's STDERR. dash, zsh and ksh all read an over-long
+# run as an ordinary word instead - dash's threshold is a single digit, which is
+# why `99>` is already a word there - and lesh's is what a descriptor can hold, so
+# it agrees with bash below the limit and with the other three above it.
+
+--- a digit run too large to be a file descriptor is an ordinary word [xfail(legacy): legacy has no redirections or brace groups]
+{ echo one 99999999999999999999>/dev/null; }; echo "a=$?"
+{ echo two 4294967298>/dev/null; }; echo "b=$?"
+{ echo three 9>/dev/null; }; echo "c=$?"
+
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
 # assertion dash itself fails in the yash suite, so each is a place lesh is ahead.

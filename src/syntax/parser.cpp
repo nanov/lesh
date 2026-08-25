@@ -1,5 +1,7 @@
 #include "syntax/parser.h"
 
+#include "substrate/numeric.h"
+
 #include "substrate/char_utils.h"
 
 #include <utility>
@@ -1277,7 +1279,14 @@ private:
 
 		if (peek().kind == token_kind::io_number) {
 			const std::string_view digits = text_of_token(_index);
-			fd = 0;
+			// Accumulated through the shared checked form, though the LEXER has
+			// already guaranteed it fits: a run of digits too large to be a descriptor
+			// is not lexed as an IO_NUMBER at all. Both take the limit from the same
+			// policy row, which is what stops the guarantee from quietly ceasing to
+			// hold (#63).
+			uint64_t value = 0;
+			const uint64_t limit = static_cast<uint64_t>(
+				lesh::policy_for(lesh::numeric_site::redirection_word_fd).high);
 			for (size_t i = 0; i < digits.size(); ++i) {
 				// The token spans any line continuations between the digits, because
 				// the lexer records the extent it consumed rather than the text it
@@ -1286,8 +1295,10 @@ private:
 					++i;
 					continue;
 				}
-				fd = fd * 10 + static_cast<uint32_t>(digits[i] - '0');
+				(void)lesh::accumulate_digit(
+					value, static_cast<uint64_t>(digits[i] - '0'), 10, limit);
 			}
+			fd = static_cast<uint32_t>(value);
 			advance();
 		}
 

@@ -9,9 +9,12 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <vector>
 
 using namespace lesh::runtime;
 using namespace lesh::syntax;
@@ -315,4 +318,133 @@ TEST_F(BuiltinRegistryTest, KillRefusesEXITBecauseItIsATrapConditionAndNotASigna
 	EXPECT_EQ(run("kill -s EXIT $$ 2>/dev/null"), 2);
 	EXPECT_EQ(run("kill -EXIT $$ 2>/dev/null"), 2);
 	EXPECT_EQ(run("kill -s 0 $$"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// THE NO-BYPASS GUARD for the one numeric-operand parser (issue #63).
+//
+// substrate/numeric.h has TWO guarantees and they need two different mechanisms.
+//
+// The first is compile-time and lives in the header: `numeric_site` and
+// kNumericPolicies are static_asserted against each other, so a site cannot be
+// added to the enum without a row, and a row cannot drift out of order into
+// another site's range. That is #35's registry shape exactly, and #35's registry
+// is the precedent that actually prevented recurrence.
+//
+// The second is what a static_assert cannot express, and it is the one that
+// matters here: a NEW site could simply not use the mechanism. Fifteen sites and
+// six idioms is what this ticket found, and every one of the six was written out
+// by hand at its own call site - so the check has to be over the SOURCE, and it is
+// the same grep that took the inventory:
+//
+//     grep -rnE "atoi|\* *10 *\+" src/runtime src/syntax
+//
+// Kept as a test rather than a lint script because a lint script is a thing
+// someone has to remember to run, and #35's lesson is that the guard which works
+// is the one in the build. src/legacy/ is exempt: ADR-0002 deletes it and nothing
+// new may be added there anyway.
+
+namespace {
+
+// The repository root, from this file's own compile-time path. There is no
+// CMake-supplied define for it and adding one is a change to a file this ticket
+// does not own, so __FILE__ is the honest route - CMake passes source paths
+// absolutely, and the test fails loudly below if that ever stops being true.
+std::filesystem::path repository_root() {
+	std::filesystem::path here{__FILE__};
+	return here.parent_path().parent_path().parent_path();   // tests/unit/<this>
+}
+
+// The idioms a numeric operand must no longer be read with. The atoi family
+// CANNOT REPORT FAILURE AT ALL, which is the whole defect; the accumulation
+// shapes are the hand-written loops that overflowed.
+constexpr std::string_view kBannedIdioms[] = {
+	"atoi", "atol", "atoll",
+	"strtol", "strtoul", "strtoll", "strtoull", "strtoimax", "strtoumax",
+	"std::sto",
+	"* 10 +", "*10+", "* 8 +", "* 16 +", "* base +", "*base+",
+};
+
+// Everything outside a comment. The banned idioms are DISCUSSED at length in the
+// comments of the very files this scans - each one explains what it replaced -
+// so a guard that read prose would fire on the explanation of itself.
+std::string code_only(const std::string& line, bool& in_block) {
+	std::string out;
+	for (size_t i = 0; i < line.size(); ++i) {
+		if (in_block) {
+			if (line.compare(i, 2, "*/") == 0) {
+				in_block = false;
+				++i;
+			}
+			continue;
+		}
+		if (line.compare(i, 2, "//") == 0)
+			break;
+		if (line.compare(i, 2, "/*") == 0) {
+			in_block = true;
+			++i;
+			continue;
+		}
+		out.push_back(line[i]);
+	}
+	return out;
+}
+
+} // namespace
+
+TEST(NumericParserGuard, TheSourceTreeItScansIsActuallyThere) {
+	// The guard below can only fail if it is looking at something. An absolute
+	// __FILE__ is what makes that true, and a relative one would turn the whole
+	// check into a silent pass - the exact failure mode #35 was about.
+	const std::filesystem::path root = repository_root();
+	ASSERT_TRUE(std::filesystem::exists(root / "src" / "runtime" / "builtins.cpp"))
+		<< "the guard could not find the source tree from __FILE__ (" << __FILE__ << ")";
+	ASSERT_TRUE(std::filesystem::exists(root / "src" / "substrate" / "numeric.h"));
+}
+
+TEST(NumericParserGuard, NoSiteReadsANumberWithoutTheOneParser) {
+	const std::filesystem::path root = repository_root();
+	const std::filesystem::path legacy = root / "src" / "legacy";
+	const std::filesystem::path mechanism = root / "src" / "substrate" / "numeric.h";
+
+	std::vector<std::string> offences;
+	for (const auto& entry : std::filesystem::recursive_directory_iterator(root / "src")) {
+		if (!entry.is_regular_file())
+			continue;
+		const std::filesystem::path& path = entry.path();
+		if (path.extension() != ".cpp" && path.extension() != ".h")
+			continue;
+		// The mechanism itself is where these idioms are allowed to live, and
+		// src/legacy/ is the quarantine ADR-0002 deletes.
+		if (path == mechanism)
+			continue;
+		if (std::mismatch(legacy.begin(), legacy.end(), path.begin(), path.end()).first
+		    == legacy.end())
+			continue;
+
+		std::ifstream in{path};
+		std::string line;
+		bool in_block = false;
+		for (int number = 1; std::getline(in, line); ++number) {
+			const std::string code = code_only(line, in_block);
+			for (const std::string_view idiom : kBannedIdioms) {
+				if (code.find(idiom) == std::string::npos)
+					continue;
+				offences.emplace_back(
+					std::filesystem::relative(path, root).string() + ":" +
+					std::to_string(number) + ": " + std::string(idiom) + " -- " + code);
+			}
+		}
+	}
+
+	EXPECT_TRUE(offences.empty())
+		<< "a numeric operand is being read outside substrate/numeric.h.\n"
+		<< "Every site goes through parse_integer or scan_digits, and a new one adds\n"
+		<< "a numeric_site enumerator and a policy row rather than its own digits.\n"
+		<< [&offences] {
+			std::string joined;
+			for (const auto& o : offences)
+				joined += "  " + o + "\n";
+			return joined;
+		}();
 }
