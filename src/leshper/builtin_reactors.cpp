@@ -1,5 +1,7 @@
-// The built-in reactors - today, the highlighter (F-20/F-21/F-22) - registered
-// through the ABI and reachable by no other route (#93, ADR-0008, A-11).
+// The built-in reactors - the highlighter (F-20/F-21/F-22) and the
+// autosuggester (F-24 to F-26) - registered through the ABI and reachable by no
+// other route (#93, ADR-0008, A-11). Two sections, in that order; the
+// autosuggester's begins at the banner near the bottom.
 //
 // LOOK AT THE INCLUDES, and at what is NOT among them. This file sees
 // `leshper/abi.h` and nothing else from leshper - not state.h, not registry.h,
@@ -31,6 +33,16 @@
 // the worker and nothing else here changes.
 
 #include "leshper/abi.h"
+
+// The SEARCHER, on the same terms the syntax layer is here on, and the one
+// leshper header this file has that is not abi.h. history_search.h is itself
+// held to the abi.h-only discipline - read its own opening comment - so it
+// carries no editor state, no registry and no arena pointer, and including it
+// opens no door this file is meant to be shut out of. What it is, is #125's
+// pure searcher: query in, matches out, a `history_source` it does not own. The
+// alternative was reimplementing prefix search here, which is the C-5 bug class
+// with a different noun.
+#include "leshper/history_search.h"
 
 #include "substrate/arena.h"
 #include "syntax/ast.h"
@@ -582,6 +594,236 @@ std::size_t register_builtin_reactors(lesh_registry& reg, highlighter& self) {
 	// arrow key for an identical answer (A-10).
 	return lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
 	                             highlight, &self) == LESH_OK
+	       ? 1u : 0u;
+}
+
+} // namespace lesh::leshper
+
+// ===========================================================================
+// The autosuggester (#133: F-24, F-25, F-26)
+//
+// Fish's greyed-out completion, and the shape of it is one sentence: the newest
+// history entry that starts with what you have typed, drawn as VIRTUAL TEXT at
+// the end of the buffer and proposed whole, so that an accepting action has
+// something to apply and the buffer has nothing in it the user did not type.
+//
+// TWO EMISSIONS, ONE ANSWER, and the split is the design rather than an
+// accident. The virtual text is the CONTINUATION - the bytes past what is
+// typed - because that is what a renderer draws after the cursor. The proposal
+// is the WHOLE candidate, because that is what accepting means, and computing
+// "typed + continuation" at accept time would be an accepting action deriving
+// the answer a second time from two halves that a keystroke could have moved
+// between (N-4 again, one layer up).
+//
+// WHY IT LISTENS TO cursor_moved, where the highlighter does not. A highlight is
+// a function of the text alone, so a cursor move cannot change one (A-10). A
+// suggestion is not: it is shown only when the cursor is at the end, so moving
+// off the end must retract it and moving back must bring it back. Fish does
+// exactly this. The cost is one prefix walk per arrow key, which is a
+// starts_with per entry over memory the store already holds.
+//
+// WHAT IS NOT HERE, and it is one thing: F-27's validity filter, which greys a
+// `cd` suggestion whose directory no longer exists. It needs the cwd and a path
+// check, and both are the SHELL's - #130's door on the request token, which does
+// not exist yet. The follow-up is recorded on #130 rather than guessed at here;
+// a `stat` against the worker's own cwd would answer a different question than
+// the one the user's line asks.
+//
+// The completion-derived fallback F-24 lists as a SHOULD waits on the completion
+// engine, which is fog on the map. Nothing here has to change when it arrives:
+// a second reactor proposing under the same kind is what the ABI already is.
+// ===========================================================================
+
+namespace lesh::leshper {
+
+// The autosuggester's registration-time context. Opaque outside this file, like
+// `highlighter` - registry.h declares the type and the functions that make and
+// unmake one, and that is all any caller can see.
+struct autosuggester {
+	// Sized for a long command line, not for a parse: the only thing that goes
+	// in here is the snapshot, so this is an order of magnitude below the
+	// highlighter's arena on purpose. A paste past it falls back to malloc,
+	// which the allocation gate sees, rather than failing.
+	buffer_pool pool{64u * 1024u};
+	// Where the arena stands with nothing in it. Every compute rewinds here.
+	char* mark = pool.at();
+
+	// BORROWED, never owned, and null until the wiring site hands one in. The
+	// adapter over `history_store::for_each_newest_first` lives at that site,
+	// which is where lesh-side and leshper-side types are allowed to meet
+	// (#125); the tests hand in a `vector_history_source`.
+	const history_source* source = nullptr;
+
+	// F-21's one name for this reactor, interned once at registration on the
+	// loop thread. The theme decides what `suggestion` looks like - muted, in
+	// every implementation anyone has shipped - and a reactor that said "grey"
+	// here would be the thing F-21 exists to prevent.
+	std::uint32_t suggestion = LESH_STYLE_NONE;
+};
+
+} // namespace lesh::leshper
+
+namespace {
+
+using lesh::leshper::autosuggester;
+using lesh::leshper::history_search;
+
+// The sink `history_search::run` calls, as a type rather than as a capture.
+//
+// A LAMBDA CAPTURING ONE POINTER is what `run`'s `std::function` parameter can
+// hold inside itself; a lambda capturing four things is a `std::function` that
+// reaches the heap on a path that runs on every keystroke. So the state lives
+// here, on the compute's own stack, and the lambda captures `&this`.
+class candidate {
+public:
+	candidate(lesh_request* request, std::string_view typed, std::uint32_t style) noexcept
+		: _request(request), _typed(typed), _style(style) {}
+
+	// Answers `run`'s question: keep walking? Newest first, so the first entry
+	// this accepts is the answer and the walk stops.
+	bool offer(std::string_view entry) noexcept {
+		// Prefix mode guarantees `entry` starts with `_typed`, so "the match
+		// equals the buffer" is exactly "no bytes past what is typed". KEEP
+		// WALKING rather than giving up: an entry identical to the line is the
+		// commonest thing in a history the user is retyping from, and stopping on
+		// it would mean a line you have run before can never be suggested past.
+		// Fish walks on for the same reason.
+		if (entry.size() <= _typed.size())
+			return true;
+
+		const std::string_view rest = entry.substr(_typed.size());
+		// The continuation, at the end of the buffer. Styled, because a
+		// suggestion that renders like typed text is a suggestion the user will
+		// mistake for typed text.
+		_status = lesh_emit_virtual_text_styled(_request, _typed.size(), rest.data(),
+		                                        rest.size(), _style);
+		// And the whole candidate, for the accepting action (F-25). Under
+		// LESH_PROPOSAL_AUTOSUGGESTION, which is what that kind was reserved for
+		// when the header was written - see the report on #133 for why this is
+		// not a fourth kind.
+		if (_status == LESH_OK)
+			_status = lesh_propose(_request, LESH_PROPOSAL_AUTOSUGGESTION, entry.data(),
+			                       entry.size());
+		return false;
+	}
+
+	[[nodiscard]] std::int32_t status() const noexcept { return _status; }
+
+private:
+	lesh_request* _request;
+	std::string_view _typed;
+	std::uint32_t _style;
+	std::int32_t _status = LESH_OK;
+};
+
+// The reactor itself: one function, the shape a Lua trampoline would have.
+std::int32_t autosuggest(lesh_request* request, void* userdata) {
+	autosuggester* self = static_cast<autosuggester*>(userdata);
+	if (self == nullptr)
+		return LESH_ERR_INVAL;
+	// A provider wired up wrong says so, rather than looking like an empty
+	// history (#125). F-17's null history is a `vector_history_source` with
+	// nothing in it, which walks and matches nothing.
+	if (self->source == nullptr)
+		return LESH_ERR_INVAL;
+
+	// Reset first, so the arena is rewound even if the previous compute returned
+	// early. Nothing points into it: emit copied at the call site (#90).
+	self->pool.reset(self->mark);
+
+	std::size_t length = 0;
+	std::int32_t status = lesh_request_buffer_length(request, &length);
+	if (status != LESH_OK)
+		return status;
+	// Nothing typed, nothing suggested. An empty query matches every entry in
+	// every mode (#125), so without this guard an empty line would suggest the
+	// last command - which is what the up-arrow is for, and what F-26's "the
+	// suggestion is never in the buffer" would otherwise be constantly denying.
+	if (length == 0)
+		return LESH_OK;
+
+	std::size_t cursor = 0;
+	status = lesh_request_cursor(request, &cursor);
+	if (status != LESH_OK)
+		return status;
+	// Only at the end. The continuation is drawn after the cursor and accepting
+	// appends; with the cursor in the middle of the line neither is what the user
+	// asked for, and drawing text that Right-arrow would not accept is worse than
+	// drawing nothing.
+	if (cursor != length)
+		return LESH_OK;
+
+	// The snapshot, copied out of the token into the arena. No accessor lends a
+	// pointer (ADR-0006's WASM insurance), so the copy is the contract; the
+	// arena is where it belongs and it is rewound above.
+	const arena_block snapshot(self->pool, length);
+	if (snapshot.data() == nullptr)
+		return LESH_ERR_TOOSMALL;
+	std::size_t written = 0;
+	status = lesh_request_buffer(request, snapshot.data(), length, &written);
+	if (status != LESH_OK)
+		return status;
+
+	const std::string_view typed{snapshot.data(), written};
+	if (typed.empty())
+		return LESH_OK;
+
+	history_search::options options;
+	// F-33's mode and F-24's, which are the same one: the typed text IS the
+	// constraint.
+	options.search = history_search::mode::prefix;
+	// No cap. The walk stops at the first entry that is a STRICT extension, and
+	// that is not always the first match - see `candidate::offer` - so a cap of
+	// one would settle for the entry the user has already typed out in full.
+	options.max_matches = 0;
+	// No ranges. Nothing here highlights where the match fell, and asking for
+	// none is also what keeps the searcher's scratch vector from ever allocating
+	// on a path that runs per keystroke.
+	options.max_ranges = 0;
+
+	// On the compute's own stack, per #125: two requests in flight must not
+	// share scratch. In prefix mode with no ranges it holds nothing.
+	history_search searcher{options};
+	candidate answer{request, typed, self->suggestion};
+
+	const history_search::outcome walked = searcher.run(
+		typed, *self->source,
+		[&answer](const history_search::match& one) { return answer.offer(one.entry); },
+		// The cooperative poll, between entries (ADR-0008). Not checking would be
+		// safe - the loop drops a stale batch either way - it would just walk a
+		// history for a line the user has already typed past.
+		[request]() {
+			std::int32_t superseded = 0;
+			lesh_request_superseded(request, &superseded);
+			return superseded != 0;
+		});
+
+	if (walked.cancelled)
+		return LESH_ERR_SUPERSEDED;
+	return answer.status();
+}
+
+} // namespace
+
+namespace lesh::leshper {
+
+autosuggester* autosuggester_create(const history_source* source) {
+	autosuggester* self = new autosuggester{};
+	self->source = source;
+	return self;
+}
+
+void autosuggester_destroy(autosuggester* self) noexcept { delete self; }
+
+std::size_t register_autosuggester(lesh_registry& reg, autosuggester& self) {
+	// Interning is loop-thread only (ADR-0008), so the one id this reactor will
+	// ever emit is interned here and carried to the worker as a plain integer.
+	std::uint32_t id = LESH_STYLE_NONE;
+	if (lesh_style_intern(&reg, "suggestion", &id) == LESH_OK)
+		self.suggestion = id;
+	return lesh_reactor_register(&reg, "autosuggester",
+	                             LESH_EVENT_BUFFER_CHANGED | LESH_EVENT_CURSOR_MOVED,
+	                             autosuggest, &self) == LESH_OK
 	       ? 1u : 0u;
 }
 
