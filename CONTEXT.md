@@ -370,6 +370,13 @@ _Avoid_: treating a width as a constant, which is how a redraw drifts.
 A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
+**Replay file** _[lesh]_:
+The structured (jsonl) record of every loop input — key events, resize,
+signals, worker results with generation and timing — written by the logger's
+structured sink when asked. Feeding it back through the editor must reproduce
+an equal state; that equality is the N-3 harness.
+_Avoid_: a second event serialization for tests; the replay file is the one.
+
 **Kill store** _[lesh]_:
 The one keyed store of killed and yanked text. Emacs's kill ring and vi's
 unnamed register are the same store under its default key; named registers

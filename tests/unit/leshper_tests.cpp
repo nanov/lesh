@@ -1,13 +1,16 @@
+#include "leshper/blit.h"
 #include "leshper/decode.h"
 #include "leshper/editor.h"
 #include "leshper/effect.h"
 #include "leshper/event.h"
 #include "leshper/state.h"
+#include "leshper/surface.h"
 #include "leshper/undo.h"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1063,4 +1066,563 @@ TEST(LeshperDecodeReplay, DecodedKeysDriveTheEditorWithNoTerminalAnywhere) {
 		step(s, one);
 
 	EXPECT_EQ(std::string(s.buffer.text()), "echo x\xE4\xB8\xAD");
+}
+
+
+// ---------------------------------------------------------------------------
+// The surface, the blitter and the diff (#112, F-37, N-3).
+//
+// The split is the ticket's, and it is the point of the design: SURFACE tests
+// assert on cell grids and never look at a byte, BLITTER tests assert on the
+// byte stream and never build a grid by hand. Nothing below opens a terminal;
+// the blitter returns bytes and #98's loop is what writes them.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The glyphs of one row, concatenated. Continuation columns contribute
+// nothing - the cluster to their left already spoke for them.
+std::string glyphs_of(const cluster_pool& pool, const surface& painted, uint16_t row) {
+	std::string out;
+	for (uint16_t column = 0; column < painted.columns(); ++column) {
+		const cell& one = painted.at(row, column);
+		if (!one.glyph.is_continuation())
+			out.append(pool.cluster_of(one.glyph));
+	}
+	return out;
+}
+
+// Named so a test reads as text rather than as escaped bytes.
+constexpr std::string_view CJK_MIDDLE = "\xE4\xB8\xAD";  // U+4E2D, two columns
+constexpr std::string_view CJK_SUN = "\xE6\x97\xA5";     // U+65E5, two columns
+constexpr std::string_view E_ACUTE = "e\xCC\x81";        // e + U+0301, one cluster
+constexpr std::string_view COMBINING_ACUTE = "\xCC\x81"; // U+0301 with no base
+constexpr std::string_view FAMILY =
+	"\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA6";      // woman ZWJ boy
+constexpr std::string_view AMBIGUOUS = "\xC2\xA1";       // U+00A1, UAX #11 Ambiguous
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// The cell (#97 decision 4).
+// ---------------------------------------------------------------------------
+
+TEST(LeshperCell, IsTheSmallPodTheDifferCanMemcmp) {
+	// #97's constraint, checked at runtime as well as by the static_asserts in
+	// surface.h: two cells built independently from the same inputs have the
+	// same sixteen bytes. If a padding hole ever appears, memcmp starts
+	// comparing uninitialised memory and every row looks changed.
+	cluster_pool pool;
+	const style pen{color::of_rgb(1, 2, 3), color::of_index(4), attribute::bold};
+
+	surface first{2, 1};
+	surface second{2, 1};
+	first.write(pool, 0, 0, "x", pen);
+	second.write(pool, 0, 0, "x", pen);
+
+	EXPECT_EQ(std::memcmp(&first.at(0, 0), &second.at(0, 0), sizeof(cell)), 0);
+	EXPECT_TRUE(first.at(0, 0) == second.at(0, 0));
+	EXPECT_EQ(sizeof(cell), 16u);
+}
+
+TEST(LeshperCell, StoresWhatTheThemeAuthoredNotWhatTheTerminalCanShow) {
+	// The other half of #97 decision 4: the cell is always truecolor-valued and
+	// the surface never quantizes. A theme is authored once, and the 256-colour
+	// answer is computed at emit time by the one piece of code that owns it.
+	cluster_pool pool;
+	surface painted{2, 1};
+	painted.write(pool, 0, 0, "x",
+	              style{color::of_rgb(200, 100, 50), color::of_default(), attribute::none});
+
+	const color kept = painted.at(0, 0).pen.fg;
+	EXPECT_EQ(kept.kind, color_kind::truecolor);
+	EXPECT_EQ(kept.r, 200);
+	EXPECT_EQ(kept.g, 100);
+	EXPECT_EQ(kept.b, 50);
+}
+
+// ---------------------------------------------------------------------------
+// The cluster pool.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperClusterPool, GivesEqualClustersEqualIdsAcrossSurfaces) {
+	// The property the whole differ rests on. Two surfaces interned against one
+	// pool compare cell for cell; that is why the pool is a separate object a
+	// caller holds rather than a member of `surface`.
+	cluster_pool pool;
+	EXPECT_EQ(pool.intern(FAMILY), pool.intern(FAMILY));
+	EXPECT_NE(pool.intern(FAMILY), pool.intern(CJK_MIDDLE));
+	EXPECT_EQ(pool.cluster_of(pool.intern(FAMILY)), FAMILY);
+}
+
+TEST(LeshperClusterPool, SeedsTheTwoIdsTheCellFixesAtCompileTime) {
+	cluster_pool pool;
+	EXPECT_EQ(pool.intern(""), grapheme_ref::continuation());
+	EXPECT_EQ(pool.intern(" "), grapheme_ref::blank());
+	EXPECT_EQ(pool.intern("a"), grapheme_ref::of_ascii('a'));
+	EXPECT_TRUE(pool.cluster_of(grapheme_ref::continuation()).empty());
+	EXPECT_EQ(pool.cluster_of(grapheme_ref::blank()), " ");
+	// A default cell is a blank, which is what makes a cleared surface a
+	// constant rather than a pass over the pool.
+	EXPECT_EQ(cell{}.glyph, grapheme_ref::blank());
+	EXPECT_EQ(blank_cell.width, 1);
+}
+
+TEST(LeshperClusterPool, InterningIsIdempotentSoTheTableDoesNotGrow) {
+	cluster_pool pool;
+	const size_t seeded = pool.size();
+	const grapheme_ref first = pool.intern(CJK_MIDDLE);
+	const size_t after_first = pool.size();
+	EXPECT_EQ(after_first, seeded + 1);
+
+	EXPECT_EQ(pool.intern(CJK_MIDDLE), first);
+	EXPECT_EQ(pool.intern("z"), grapheme_ref::of_ascii('z'));
+	EXPECT_EQ(pool.size(), after_first);  // ASCII never allocates an entry
+}
+
+TEST(LeshperClusterPool, StaysCorrectWhenItGrowsPastItsSeededEntries) {
+	// The reason the storage is a deque. The map is keyed by a VIEW of the
+	// stored bytes, and a cluster short enough for the small-string buffer keeps
+	// its bytes inside the stored object - so storage that relocated its
+	// elements would leave every key in the map dangling, and this test running
+	// under ASan is what says so.
+	cluster_pool pool;
+	std::vector<std::string> clusters;
+	std::vector<grapheme_ref> refs;
+	for (int i = 0; i < 512; ++i) {
+		clusters.push_back("x" + std::to_string(i));
+		refs.push_back(pool.intern(clusters.back()));
+	}
+
+	for (size_t i = 0; i < clusters.size(); ++i) {
+		EXPECT_EQ(pool.intern(clusters[i]), refs[i]);
+		EXPECT_EQ(pool.cluster_of(refs[i]), clusters[i]);
+	}
+	EXPECT_EQ(pool.size(), 129u + clusters.size());
+}
+
+// ---------------------------------------------------------------------------
+// The surface: cell grids, never bytes (N-3).
+// ---------------------------------------------------------------------------
+
+TEST(LeshperSurface, StartsBlankAndResizeClears) {
+	cluster_pool pool;
+	surface painted{4, 2};
+	EXPECT_EQ(painted.columns(), 4);
+	EXPECT_EQ(painted.rows(), 2);
+	EXPECT_EQ(glyphs_of(pool, painted, 0), "    ");
+	EXPECT_TRUE(painted.at(1, 3) == blank_cell);
+
+	painted.write(pool, 0, 0, "hi", style{});
+	painted.resize(3, 1);
+	EXPECT_EQ(painted.columns(), 3);
+	EXPECT_EQ(glyphs_of(pool, painted, 0), "   ");
+
+	painted.write(pool, 0, 0, "hi", style{});
+	painted.clear();
+	EXPECT_EQ(glyphs_of(pool, painted, 0), "   ");
+}
+
+TEST(LeshperSurface, LaysAsciiOneCellPerColumnAndCarriesTheStyle) {
+	cluster_pool pool;
+	surface painted{6, 1};
+	const style pen{color::of_index(4), color::of_rgb(9, 9, 9),
+	                attribute::bold | attribute::italic};
+
+	EXPECT_EQ(painted.write(pool, 0, 1, "abc", pen), 4);
+	EXPECT_EQ(glyphs_of(pool, painted, 0), " abc  ");
+	for (uint16_t column = 1; column <= 3; ++column) {
+		EXPECT_EQ(painted.at(0, column).width, 1);
+		EXPECT_TRUE(painted.at(0, column).pen == pen);
+	}
+	EXPECT_TRUE(painted.at(0, 0) == blank_cell);
+	EXPECT_TRUE(painted.at(0, 4) == blank_cell);
+}
+
+TEST(LeshperSurface, AWideClusterOwnsTwoColumnsAndTheSecondIsAContinuation) {
+	cluster_pool pool;
+	surface painted{5, 1};
+	EXPECT_EQ(painted.write(pool, 0, 0, CJK_MIDDLE, style{}), 2);
+
+	EXPECT_EQ(pool.cluster_of(painted.at(0, 0).glyph), CJK_MIDDLE);
+	EXPECT_EQ(painted.at(0, 0).width, 2);
+	EXPECT_TRUE(painted.at(0, 1).glyph.is_continuation());
+	EXPECT_EQ(painted.at(0, 1).width, 0);
+	// The column index IS the screen column - the invariant the blitter and
+	// every test below depend on.
+	EXPECT_TRUE(painted.at(0, 2) == blank_cell);
+}
+
+TEST(LeshperSurface, ACombiningMarkStaysInsideItsBasesCell) {
+	// N-4: a combining mark is part of its base's cluster, so it is part of its
+	// base's CELL. Summing per-codepoint widths would have made this two.
+	cluster_pool pool;
+	surface painted{4, 1};
+	EXPECT_EQ(painted.write(pool, 0, 0, E_ACUTE, style{}), 1);
+	EXPECT_EQ(pool.cluster_of(painted.at(0, 0).glyph), E_ACUTE);
+	EXPECT_EQ(painted.at(0, 0).width, 1);
+	EXPECT_TRUE(painted.at(0, 1) == blank_cell);
+}
+
+TEST(LeshperSurface, AZwjSequenceIsOneClusterInTwoColumns) {
+	// The half of the problem #108 says no surveyed library solves: summing the
+	// codepoints of woman-ZWJ-boy gives four columns where a terminal draws two,
+	// and the cursor ends up two cells from where the user can see it.
+	cluster_pool pool;
+	surface painted{6, 1};
+	EXPECT_EQ(painted.write(pool, 0, 0, FAMILY, style{}), 2);
+	EXPECT_EQ(pool.cluster_of(painted.at(0, 0).glyph), FAMILY);
+	EXPECT_EQ(painted.at(0, 0).width, 2);
+	EXPECT_TRUE(painted.at(0, 1).glyph.is_continuation());
+}
+
+TEST(LeshperSurface, WidthComesFromThePolicySeamAndNotFromAHardcodedAnswer) {
+	// #108 decision 3, and all this ticket owes it: the answer is not hardcoded
+	// anywhere unreachable. Pass a policy that says UAX #11 Ambiguous is two
+	// columns - what a CJK locale's terminal shows - and the grid changes with
+	// nothing in the renderer changing.
+	cluster_pool pool;
+	surface narrow{4, 1};
+	surface wide{4, 1};
+
+	lesh::grapheme::width_policy cjk;
+	cjk.ambiguous = 2;
+
+	EXPECT_EQ(narrow.write(pool, 0, 0, AMBIGUOUS, style{}), 1);
+	EXPECT_EQ(wide.write(pool, 0, 0, AMBIGUOUS, style{}, cjk), 2);
+	EXPECT_EQ(narrow.at(0, 0).width, 1);
+	EXPECT_EQ(wide.at(0, 0).width, 2);
+	EXPECT_TRUE(wide.at(0, 1).glyph.is_continuation());
+}
+
+TEST(LeshperSurface, ClipsAtTheRightEdgeAndNeverWraps) {
+	// Where a line breaks is layout (F-37) and reflow is F-38. This ring leaves
+	// the seam and does not build it, so text that runs off the edge stops.
+	cluster_pool pool;
+	surface painted{3, 2};
+	EXPECT_EQ(painted.write(pool, 0, 0, "abcd", style{}), 3);
+	EXPECT_EQ(glyphs_of(pool, painted, 0), "abc");
+	EXPECT_EQ(glyphs_of(pool, painted, 1), "   ");  // nothing wrapped onto row 1
+}
+
+TEST(LeshperSurface, AWideClusterThatWouldStraddleTheEdgeIsNotWritten) {
+	cluster_pool pool;
+	surface painted{2, 1};
+	EXPECT_EQ(painted.write(pool, 0, 0, std::string("a").append(CJK_MIDDLE), style{}), 1);
+	EXPECT_EQ(pool.cluster_of(painted.at(0, 0).glyph), "a");
+	EXPECT_TRUE(painted.at(0, 1) == blank_cell);
+}
+
+TEST(LeshperSurface, ControlCharactersAreNotPainted) {
+	// HOW a control is DISPLAYED - `^C`, a tab expanded to the next stop - is an
+	// editor decision. What the surface guarantees is that a control byte never
+	// reaches the blitter's output, where it would corrupt the stream.
+	cluster_pool pool;
+	surface painted{6, 1};
+	EXPECT_EQ(painted.write(pool, 0, 0, "a\tb\nc", style{}), 3);
+	EXPECT_EQ(glyphs_of(pool, painted, 0), "abc   ");
+}
+
+TEST(LeshperSurface, AZeroWidthClusterJoinsTheCellBeforeItOrIsDropped) {
+	// A mark with no base of its own. The terminal would attach it to whatever
+	// precedes it, so the surface does too - otherwise a column index stops
+	// being a screen column. With nothing to attach to, it is dropped.
+	cluster_pool pool;
+
+	surface joined{4, 1};
+	// The tab breaks the cluster, so the acute arrives on its own.
+	joined.write(pool, 0, 0, std::string("a\t").append(COMBINING_ACUTE).append("b"), style{});
+	EXPECT_EQ(pool.cluster_of(joined.at(0, 0).glyph), std::string("a").append(COMBINING_ACUTE));
+	EXPECT_EQ(joined.at(0, 0).width, 1);
+	EXPECT_EQ(pool.cluster_of(joined.at(0, 1).glyph), "b");
+
+	surface orphaned{4, 1};
+	orphaned.write(pool, 0, 0, std::string(COMBINING_ACUTE).append("ab"), style{});
+	EXPECT_EQ(glyphs_of(pool, orphaned, 0), "ab  ");
+}
+
+TEST(LeshperSurface, EqualityCoversTheGridTheSizeAndTheCursor) {
+	cluster_pool pool;
+	surface first{4, 1};
+	surface second{4, 1};
+	EXPECT_TRUE(first == second);
+
+	first.write(pool, 0, 0, "a", style{});
+	EXPECT_FALSE(first == second);
+	second.write(pool, 0, 0, "a", style{});
+	EXPECT_TRUE(first == second);
+
+	first.write(pool, 0, 0, "a", style{color::of_index(2), color::of_default(), attribute::none});
+	EXPECT_FALSE(first == second);  // same glyph, different pen
+	second.write(pool, 0, 0, "a", style{color::of_index(2), color::of_default(), attribute::none});
+
+	first.cursor().column = 2;
+	EXPECT_FALSE(first == second);
+	second.cursor().column = 2;
+	EXPECT_TRUE(first == second);
+
+	first.resize(5, 1);
+	second.resize(4, 1);
+	EXPECT_FALSE(first == second);
+}
+
+// ---------------------------------------------------------------------------
+// The blitter: bytes, and only here (#97, F-37).
+// ---------------------------------------------------------------------------
+
+TEST(LeshperBlitter, NothingChangedIsNoBytes) {
+	cluster_pool pool;
+	surface before{10, 2};
+	before.write(pool, 0, 0, "echo hi", style{});
+	const surface after = before;
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "");
+}
+
+TEST(LeshperBlitter, OneChangedCellMovesThereAndWritesOnlyIt) {
+	cluster_pool pool;
+	surface before{5, 1};
+	surface after = before;
+	after.write(pool, 0, 2, "x", style{});
+
+	// Relative movement, never absolute: the surface is not the screen (F-39
+	// scrolls shell output above it), so a row number would be a lie.
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[2Cx\r");
+}
+
+TEST(LeshperBlitter, ARowThatGotShorterIsClearedNotSpacedOut) {
+	// fish's trick: ESC[K says in three bytes what a run of spaces says in a
+	// screen width. Deleting to end of line must not cost a repaint.
+	cluster_pool pool;
+	surface before{10, 1};
+	before.write(pool, 0, 0, "hello", style{});
+	surface after{10, 1};
+	after.write(pool, 0, 0, "he", style{});
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[2C\x1b[K\r");
+}
+
+TEST(LeshperBlitter, EmitsOneSgrPerStyleRun) {
+	cluster_pool pool;
+	surface before{5, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "ab",
+	            style{color::of_index(1), color::of_default(), attribute::bold});
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[1;38;5;1mab\x1b[0m\r");
+}
+
+TEST(LeshperBlitter, TurningAnAttributeOffResetsRatherThanGuessing) {
+	// SGR 22 clears bold and dim together, so "dim off, bold still on" is not
+	// expressible as one parameter. Reset and restate is the only correct move.
+	cluster_pool pool;
+	surface before{5, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "a",
+	            style{color::of_default(), color::of_default(), attribute::bold});
+	after.write(pool, 0, 1, "b", style{});
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[1ma\x1b[0mb\r");
+}
+
+TEST(LeshperBlitter, EmitsTruecolorWhenTheTerminalHasItAndQuantizesWhenItDoesNot) {
+	// #97: truecolor is opportunistic, the 256-colour downmap lives here and
+	// only here, and the surface is identical in both cases.
+	cluster_pool pool;
+	surface before{3, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "x",
+	            style{color::of_rgb(255, 0, 0), color::of_default(), attribute::none});
+
+	terminal_capabilities rich;
+	rich.colors = color_depth::truecolor;
+	EXPECT_EQ((blitter{pool, rich}.update(before, after)), "\x1b[38;2;255;0;0mx\x1b[0m\r");
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[38;5;196mx\x1b[0m\r");
+}
+
+TEST(LeshperBlitter, AnIndexedColourPassesThroughUntouchedAtEveryDepth) {
+	// An indexed colour names a slot in the user's palette, which the user may
+	// have redefined. Resolving it to RGB would replace their choice with ours.
+	cluster_pool pool;
+	surface before{3, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "x",
+	            style{color::of_default(), color::of_index(33), attribute::none});
+
+	terminal_capabilities rich;
+	rich.colors = color_depth::truecolor;
+	EXPECT_EQ((blitter{pool, rich}.update(before, after)), "\x1b[48;5;33mx\x1b[0m\r");
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[48;5;33mx\x1b[0m\r");
+}
+
+TEST(LeshperBlitter, MonochromeEmitsNoColourAtAll) {
+	cluster_pool pool;
+	surface before{3, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "x",
+	            style{color::of_rgb(255, 0, 0), color::of_index(4), attribute::none});
+
+	terminal_capabilities plain;
+	plain.colors = color_depth::monochrome;
+	EXPECT_EQ((blitter{pool, plain}.update(before, after)), "x\r");
+}
+
+TEST(LeshperBlitter, UndercurlIsOpportunisticAndDegradesToAnUnderline) {
+	cluster_pool pool;
+	surface before{3, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "x",
+	            style{color::of_default(), color::of_default(), attribute::undercurl});
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[4mx\x1b[0m\r");
+
+	terminal_capabilities rich;
+	rich.undercurl = true;
+	EXPECT_EQ((blitter{pool, rich}.update(before, after)), "\x1b[4:3mx\x1b[0m\r");
+}
+
+TEST(LeshperBlitter, SkipsTheContinuationColumnOfAWideCluster) {
+	// The wide glyph moved the terminal's cursor across both columns already;
+	// emitting anything for the second would overwrite the right half.
+	cluster_pool pool;
+	surface before{5, 1};
+	before.write(pool, 0, 0, CJK_MIDDLE, style{});
+	surface after{5, 1};
+	after.write(pool, 0, 0, CJK_MIDDLE,
+	            style{color::of_default(), color::of_default(), attribute::bold});
+
+	EXPECT_EQ(blitter{pool}.update(before, after),
+	          std::string("\x1b[1m").append(CJK_MIDDLE).append("\x1b[0m\r"));
+}
+
+TEST(LeshperBlitter, ChangingAWideClusterReemitsItWhole) {
+	cluster_pool pool;
+	surface before{6, 1};
+	before.write(pool, 0, 0, std::string("a").append(CJK_MIDDLE), style{});
+	surface after{6, 1};
+	after.write(pool, 0, 0, std::string("a").append(CJK_SUN), style{});
+
+	EXPECT_EQ(blitter{pool}.update(before, after),
+	          std::string("\x1b[1C").append(CJK_SUN).append("\r"));
+}
+
+TEST(LeshperBlitter, ACarriageReturnFollowsAGlyphInTheLastColumn) {
+	// A glyph written into the last column leaves the terminal in pending wrap,
+	// and whether the cursor has already moved to the next row is not knowable
+	// from here. `\r` is the one sequence that settles it.
+	cluster_pool pool;
+	surface before{2, 2};
+	surface after = before;
+	after.write(pool, 0, 0, "ab", style{});
+	after.write(pool, 1, 0, "c", style{});
+	after.cursor() = cursor_placement{1, 1, true};
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "ab\r\x1b[1Bc");
+}
+
+TEST(LeshperBlitter, LeavesTheCursorWhereTheSurfaceSays) {
+	cluster_pool pool;
+	surface before{5, 3};
+	surface after = before;
+	after.cursor() = cursor_placement{1, 3, true};
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[1B\x1b[3C");
+}
+
+TEST(LeshperBlitter, ChangesCursorVisibilityOnlyWhenItChanges) {
+	cluster_pool pool;
+	surface before{5, 1};
+	surface after = before;
+	EXPECT_EQ(blitter{pool}.update(before, after), "");
+
+	after.cursor().visible = false;
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[?25l");
+	EXPECT_EQ(blitter{pool}.update(after, before), "\x1b[?25h");
+}
+
+TEST(LeshperBlitter, ADifferentSizeIsAFullRepaint) {
+	// F-37: full repaint only on resize or explicit request. What a resize does
+	// to CONTENT is F-38's reflow; diffing two grids of different shapes would
+	// be inventing half of that answer here.
+	cluster_pool pool;
+	surface before{5, 1};
+	before.write(pool, 0, 0, "hello", style{});
+	surface after{3, 1};
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\x1b[K");
+}
+
+TEST(LeshperBlitter, PaintWritesEveryRowAndClearsTheRest) {
+	cluster_pool pool;
+	surface painted{4, 2};
+	painted.write(pool, 0, 0, "hi", style{});
+
+	EXPECT_EQ(blitter{pool}.paint(painted), "hi\x1b[K\r\x1b[1B\x1b[K\x1b[1A");
+}
+
+TEST(LeshperBlitter, TheIntoFormAppendsSoTheLoopCanReuseOneBuffer) {
+	// N-2: the hot path keeps one buffer. The returning forms are the
+	// convenience, not the primitive.
+	cluster_pool pool;
+	surface before{5, 1};
+	surface after = before;
+	after.write(pool, 0, 0, "x", style{});
+
+	std::string out = "keep:";
+	blitter{pool}.update_into(before, after, out);
+	EXPECT_EQ(out, "keep:x\r");
+}
+
+TEST(LeshperBlitter, NeverEmitsAControlByteOtherThanEscapeOrCarriageReturn) {
+	cluster_pool pool;
+	surface painted{8, 2};
+	painted.write(pool, 0, 0, std::string("a\tb\n").append(CJK_MIDDLE), style{});
+	painted.write(pool, 1, 0, FAMILY,
+	              style{color::of_rgb(1, 2, 3), color::of_index(9),
+	                    attribute::bold | attribute::undercurl});
+
+	for (const char byte : blitter{pool}.paint(painted)) {
+		const auto value = static_cast<unsigned char>(byte);
+		if (value < 0x20)
+			EXPECT_TRUE(value == 0x1B || value == '\r') << "control byte " << int(value);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Quantization, and the capability reads that decide whether it runs.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperBlitter, QuantizesIntoTheCubeAndTheGreyRampButNeverThePalette) {
+	EXPECT_EQ(quantize_to_256(255, 0, 0), 196);     // 16 + 36*5
+	EXPECT_EQ(quantize_to_256(255, 255, 255), 231); // the cube's white corner
+	EXPECT_EQ(quantize_to_256(0, 0, 0), 16);        // never 0: that slot is the user's
+	EXPECT_EQ(quantize_to_256(95, 135, 175), 67);   // an exact cube point
+	EXPECT_EQ(quantize_to_256(128, 128, 128), 244); // the ramp beats the cube on greys
+
+	// Indices 0..15 are the user's palette and are never a target.
+	for (int red = 0; red <= 255; red += 17)
+		for (int green = 0; green <= 255; green += 17)
+			for (int blue = 0; blue <= 255; blue += 17)
+				EXPECT_GE(quantize_to_256(static_cast<uint8_t>(red),
+				                          static_cast<uint8_t>(green),
+				                          static_cast<uint8_t>(blue)),
+				          16);
+}
+
+TEST(LeshperBlitter, ReadsCapabilitiesFromTheEnvironmentAndNeverAsksTheTerminal) {
+	// #97 decision 2: assume first, trivial env reads only, no startup query.
+	using caps = terminal_capabilities;
+	EXPECT_EQ(caps::from_env("xterm-256color", nullptr, nullptr).colors,
+	          color_depth::indexed_256);
+	EXPECT_EQ(caps::from_env("xterm-256color", "truecolor", nullptr).colors,
+	          color_depth::truecolor);
+	EXPECT_EQ(caps::from_env("xterm-256color", "24bit", nullptr).colors,
+	          color_depth::truecolor);
+	EXPECT_EQ(caps::from_env("dumb", "truecolor", nullptr).colors, color_depth::monochrome);
+	EXPECT_EQ(caps::from_env(nullptr, "truecolor", nullptr).colors, color_depth::monochrome);
+	EXPECT_EQ(caps::from_env("xterm-256color", "truecolor", "1").colors,
+	          color_depth::monochrome);
+	// Nothing announces undercurl and #97 forbids asking, so it stays off.
+	EXPECT_FALSE(caps::from_env("xterm-256color", "truecolor", nullptr).undercurl);
+	EXPECT_EQ(caps::floor().colors, color_depth::indexed_256);
 }
