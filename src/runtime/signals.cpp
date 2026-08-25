@@ -1,5 +1,7 @@
 #include "runtime/signals.h"
 
+#include "substrate/numeric.h"
+
 #include <cctype>
 #include <cstdlib>
 #include <string>
@@ -307,33 +309,36 @@ signal_state::signal_state() : _entries(kMaxSignal) {
 	}
 }
 
+// The seam between the two halves above, asserted rather than assumed: the policy
+// table admits everything an `int` can hold, and this is the check that a platform
+// whose NSIG outgrew that would not pass silently.
+static_assert(kMaxSignal <= policy_for(numeric_site::trap_signal_number).high,
+              "the signal policy range must cover every signal number NSIG allows");
+
 int signal_state::signal_number(std::string_view name) {
 	if (name.empty())
 		return -1;
 
 	// A bare number is accepted, which is how `trap - 2` works.
 	if (name[0] >= '0' && name[0] <= '9') {
-		int value = 0;
-		for (const char c : name) {
-			if (c < '0' || c > '9')
-				return -1;
-			value = value * 10 + (c - '0');
-			// THE VALID SET IS BOUNDED BY kMaxSignal, and the accumulator only ever
-			// grows, so a number that has already passed the ceiling can never come
-			// back under it. Refusing it here rather than after the whole string has
-			// been read gives `trap - 99999999999999999999` the same answer
-			// `trap - 99` already gets - `bad signal`, status 1, which is dash's
-			// `bad trap` at status 1 - instead of overflowing the accumulator on the
-			// way to it, which is undefined behaviour (#62).
-			//
-			// Not saturated, unlike an arithmetic literal (#59): a clamped signal
-			// number would name a real signal, so `trap '' 99999999999999999999`
-			// would install a handler for whatever sits at the ceiling. There is no
-			// value here that "too large" can safely become.
-			if (value >= kMaxSignal)
-				return -1;
-		}
-		return value;
+		// THE MECHANISM STOPS THE OVERFLOW; THE MEANING STAYS HERE (#63). The policy
+		// table's range for this site is what an `int` can hold, because NSIG is a
+		// platform constant the substrate layer must not include; kMaxSignal is the
+		// real ceiling and it is applied right here, where the shell knows it.
+		//
+		// Both failures answer the same way, and that is the decision rather than a
+		// shortcut: `trap - 99999999999999999999` gets exactly what `trap - 99`
+		// already gets - `bad signal`, status 1, which is dash's `bad trap` at
+		// status 1 - instead of overflowing an int on the way to it (#62).
+		//
+		// NOT SATURATED, unlike an arithmetic literal (#59): a clamped signal number
+		// would name a REAL SIGNAL, so `trap '' 99999999999999999999` would install
+		// a handler for whatever sits at the ceiling. There is no value here that
+		// "too large" can safely become.
+		const numeric_result parsed = parse_integer(name, numeric_site::trap_signal_number);
+		if (parsed.status != numeric_parse::ok || parsed.value >= kMaxSignal)
+			return -1;
+		return static_cast<int>(parsed.value);
 	}
 
 	std::string_view bare = name;

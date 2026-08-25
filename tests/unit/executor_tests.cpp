@@ -1185,3 +1185,14 @@ TEST_F(ExecutorTest, APipelineStageInheritsTheShellsSpecialParameters) {
 	EXPECT_EQ(capture("sleep 0 & b=$!; { [ \"$!\" = \"$b\" ] && echo inherited; } | cat; wait"),
 	          "inherited\n");
 }
+
+// --- #62's redirection fd, now reached through the one parser (#63) ---
+
+TEST_F(ExecutorTest, ARedirectionTargetFdTooLargeToBeOneIsRefused) {
+	// #62's answer, now reached through the shared parser: an fd is an `int`, so a
+	// number too large to be one is invalid the way `>&99` already is and takes the
+	// same diagnostic. Saturating would be meaningless - there is no "largest file
+	// descriptor" for a clamp to land on.
+	EXPECT_EQ(run("echo hi >&99999999999999999999 2>/dev/null"), 2);
+	EXPECT_EQ(run("echo hi >&x 2>/dev/null"), 2);
+}

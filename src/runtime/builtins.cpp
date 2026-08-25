@@ -1,5 +1,7 @@
 #include "runtime/builtins.h"
 
+#include "substrate/numeric.h"
+
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
@@ -460,46 +462,29 @@ bool is_test_binary(std::string_view op) {
 }
 
 // dash's `getn`: optional sign, decimal digits, blanks either side, and nothing
-// else. Overflow is an error rather than a wrap, because `test 99999999999999999999
-// -eq 1` must report `Illegal number` rather than compare a truncated value.
+// else - all four of which the `test_operand` row of the numeric policy table now
+// carries, so the tolerances are stated where every site's are and not buried in
+// a loop here (#63). Overflow is an error rather than a wrap, because
+// `test 99999999999999999999 -eq 1` must report `Illegal number` rather than
+// compare a truncated value.
 bool test_integer(std::string_view text, int64_t& out) {
-	size_t at = 0;
-	while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n'))
-		++at;
-	bool negative = false;
-	if (at < text.size() && (text[at] == '-' || text[at] == '+'))
-		negative = text[at++] == '-';
-	size_t digits = 0;
-	uint64_t magnitude = 0;
-	for (; at < text.size() && text[at] >= '0' && text[at] <= '9'; ++at, ++digits) {
-		if (magnitude > (UINT64_MAX - 9) / 10)
-			return false;
-		magnitude = magnitude * 10 + static_cast<uint64_t>(text[at] - '0');
-	}
-	if (digits == 0)
+	const numeric_result parsed = parse_integer(text, numeric_site::test_operand);
+	if (parsed.status != numeric_parse::ok)
 		return false;
-	while (at < text.size() && (text[at] == ' ' || text[at] == '\t' || text[at] == '\n'))
-		++at;
-	if (at != text.size())
-		return false;
-	const uint64_t limit = negative ? uint64_t{1} << 63
-	                                : static_cast<uint64_t>(INT64_MAX);
-	if (magnitude > limit)
-		return false;
-	// NEGATED IN THE UNSIGNED DOMAIN, because -INT64_MIN has no int64_t to be. The
-	// limit above deliberately ADMITS the magnitude 2^63, so INT64_MIN is a legal
-	// operand - dash, bash and zsh all compare `test -9223372036854775808 -eq 1`
-	// without complaint - and negating the signed conversion of it was undefined
+	// NEGATED IN THE UNSIGNED DOMAIN, which parse_integer does for every signed
+	// site: -INT64_MIN has no int64_t to be, and the `test_operand` row
+	// deliberately ADMITS the magnitude 2^63, so INT64_MIN is a legal operand -
+	// dash, bash and zsh all compare `test -9223372036854775808 -eq 1` without
+	// complaint - where negating the signed conversion of it was undefined
 	// behaviour on the one value the range check exists to let through (#62).
-	// Unsigned wrapping is defined, and 0 - 2^63 converts back to exactly INT64_MIN.
 	//
 	// SATURATING WOULD BE THE WRONG SHAPE HERE, unlike arithmetic's over-large
 	// literal (#59): `test` is comparing, not computing, so an operand it cannot
-	// represent is a usage error and stays one - the `magnitude > limit` return
-	// above, which reaches the caller as `Illegal number` and status 2, exactly as
-	// dash and bash answer. A clamped operand would silently compare a number the
-	// script never wrote.
-	out = static_cast<int64_t>(negative ? uint64_t{0} - magnitude : magnitude);
+	// represent is a usage error and stays one - the false return above, which
+	// reaches the caller as `Illegal number` and status 2, exactly as dash and bash
+	// answer. A clamped operand would silently compare a number the script never
+	// wrote. parse_integer hands back the clamp anyway; ignoring it is the policy.
+	out = parsed.value;
 	return true;
 }
 
@@ -1232,18 +1217,17 @@ builtin_result kill_usage() {
 // error, not EXIT - signal 0 is the null signal and has no name. dash agrees on
 // every one of those.
 builtin_result kill_list_one(const char* operand) {
-	std::string_view text{operand};
-	if (!is_unsigned_integer(text)) {
+	// Both ways the parse can fail take the SAME answer here, because both describe
+	// an operand that names no signal: `kill -l notanumber` and
+	// `kill -l 99999999999999999999` are the one diagnostic the reading below would
+	// reach anyway, arrived at without overflowing an int on the way (#63).
+	const numeric_result parsed = parse_integer(operand, numeric_site::kill_list_operand);
+	if (parsed.status != numeric_parse::ok) {
 		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
 		             operand);
 		return {kKillUsageError};
 	}
-	int value = 0;
-	for (const char c : text) {
-		value = value * 10 + (c - '0');
-		if (value > 1024)
-			break;  // no signal number is anywhere near this; stop before overflow
-	}
+	const int value = static_cast<int>(parsed.value);
 	const int signo = value > 128 ? value - 128 : value;
 	const std::string_view name = signal_state::signal_name(signo);
 	if (signo <= 0 || name.empty()) {
@@ -1283,30 +1267,27 @@ builtin_result kill_list_all() {
 // range check is dash's too - it refuses a number it cannot hold rather than
 // wrapping onto some unrelated process.
 bool read_pid_operand(const char* operand, pid_t& out) {
-	std::string_view text{operand};
-	while (!text.empty() && (text.front() == ' ' || text.front() == '\t'))
-		text.remove_prefix(1);
-	while (!text.empty() && (text.back() == ' ' || text.back() == '\t'))
-		text.remove_suffix(1);
 	// A NEGATIVE pid names a process group, and POSIX writes it after `--` -
 	// `kill -s HUP -- -$pgid`, which is the form kill4-p.tst uses. A bare `-$pgid`
 	// is an option as far as the option scan is concerned, and is refused there.
-	bool negative = false;
-	if (!text.empty() && (text.front() == '+' || text.front() == '-')) {
-		negative = text.front() == '-';
-		text.remove_prefix(1);
-	}
-	if (!is_unsigned_integer(text))
-		return false;
-	long long value = 0;
-	for (const char c : text) {
-		value = value * 10 + (c - '0');
-		if (value > static_cast<long long>(std::numeric_limits<pid_t>::max()))
-			return false;
-	}
-	out = static_cast<pid_t>(negative ? -value : value);
+	// The surrounding blanks and the leading `+` are dash's tolerances, copied
+	// deliberately rather than tightened, and they live in the policy table's
+	// `kill_pid_operand` row now that every site's tolerances are stated together.
+	const numeric_result parsed = parse_integer(operand, numeric_site::kill_pid_operand);
+	if (parsed.status != numeric_parse::ok)
+		return false;   // dash refuses a pid it cannot hold rather than wrapping
+	out = static_cast<pid_t>(parsed.value);
 	return true;
 }
+
+// The second seam between a representational range and a platform type. The table
+// says a pid is an `int`, which it is everywhere lesh builds; a platform with a
+// wider pid_t would merely be refused a pid it could have held, and one with a
+// NARROWER pid_t would be handed a value that does not fit - so only that
+// direction is an error.
+static_assert(std::numeric_limits<pid_t>::max() >=
+                  policy_for(numeric_site::kill_pid_operand).high,
+              "a pid_t must hold every value the kill_pid_operand range admits");
 
 // POSIX gives `kill` exactly two forms: a signal specification followed by AT
 // LEAST ONE pid, and `-l [exit_status]`. Every other spelling is a usage error,
@@ -1717,16 +1698,17 @@ int getopts_step(shell_state& state, char** argv, bool& refused) {
 	// keeping it there: a caller's `OPTIND=1` has to be obeyed, and a hidden
 	// counter would ignore it.
 	size_t index = 1;
-	if (std::string_view text; state.lookup("OPTIND", text) && is_unsigned_integer(text)) {
-		index = 0;
-		for (const char c : text) {
-			// Clamped rather than wrapped: `OPTIND=99999999999999999999` is a value
-			// the parse below only ever compares against $#, and an overflowed size_t
-			// would compare as small.
-			if (index > args.size() + 1)
-				break;
-			index = index * 10 + static_cast<size_t>(c - '0');
-		}
+	if (std::string_view text; state.lookup("OPTIND", text)) {
+		// CLAMPED RATHER THAN WRAPPED, which is this site's policy and not the
+		// mechanism's: `OPTIND=99999999999999999999` is a value the parse below only
+		// ever compares against $#, and an overflowed size_t would compare as SMALL -
+		// so a clamp at the top of the range lands exactly where the "options are
+		// exhausted" branch below wants it. A non-numeric OPTIND reads as 0 and is
+		// restarted at 1 by the check underneath, which is where that answer already
+		// lived.
+		const numeric_result parsed = parse_integer(text, numeric_site::optind);
+		index = parsed.status == numeric_parse::not_a_number
+		        ? 0 : static_cast<size_t>(parsed.value);
 	}
 	// A missing, empty, zero or non-numeric OPTIND - `-1` included, since a sign
 	// makes it non-numeric here - restarts the parse. POSIX specifies only the
@@ -1946,22 +1928,20 @@ bool read_flow_level(std::string_view name, char* const* argv, int& level) {
 	if (argv[operand] == nullptr)
 		return true;  // no operand: the default of one stands
 	const std::string_view text{argv[operand]};
-	unsigned long long value = 0;
-	if (!text.empty() &&
-	    text.find_first_not_of("0123456789") == std::string_view::npos) {
-		for (const char c : text) {
-			value = value * 10 + static_cast<unsigned long long>(c - '0');
-			// Clamped rather than wrapped: `break 99999999999999` means out of every
-			// loop there is, which is what any level past the nesting depth already
-			// means ('breaking much more than actual nest level'). Wrapping could land
-			// on zero and turn the break back into the no-op this function exists to
-			// refuse.
-			if (value > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
-				value = static_cast<unsigned long long>(std::numeric_limits<int>::max());
-				break;
-			}
-		}
-	}
+	const numeric_result parsed = parse_integer(text, numeric_site::loop_flow_level);
+	// CLAMPED rather than wrapped, and that is this site's policy: `break 99999999999999`
+	// means out of every loop there is, which is what any level past the nesting
+	// depth already means ('breaking much more than actual nest level'). Wrapping
+	// could land on zero and turn the break back into the no-op this function
+	// exists to refuse.
+	//
+	// A NON-NUMBER READS AS ZERO so it meets the same refusal an explicit `break 0`
+	// does: both ask to unwind no levels at all, and one message for the two is
+	// what the comment above promises. The `loop_flow_level` row takes no sign,
+	// which is what keeps `break -1` on this side of the line rather than letting
+	// it through as a negative level.
+	const int64_t value =
+		parsed.status == numeric_parse::not_a_number ? 0 : parsed.value;
 	if (value == 0) {
 		std::fprintf(stderr, "lesh: %.*s: %.*s: not a positive integer\n",
 		             static_cast<int>(name.size()), name.data(),

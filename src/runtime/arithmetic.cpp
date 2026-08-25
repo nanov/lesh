@@ -1,6 +1,7 @@
 #include "runtime/arithmetic.h"
 
 #include "substrate/char_utils.h"
+#include "substrate/numeric.h"
 
 #include <string>
 
@@ -448,7 +449,7 @@ private:
 
 	int64_t parse_number() noexcept {
 		// C bases, as POSIX requires: 0x hex, leading 0 octal, otherwise decimal.
-		int base = 10;
+		uint64_t base = 10;
 		if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
 			base = 16;
 			_at += 2;
@@ -457,33 +458,28 @@ private:
 			++_at;
 		}
 
-		int64_t value = 0;
-		bool any = base != 16;  // "0" alone is a valid decimal zero
-		bool saturated = false;
-		while (_at < _text.size()) {
-			const char c = _text[_at];
-			int digit;
-			if (c >= '0' && c <= '9') digit = c - '0';
-			else if (base == 16 && c >= 'a' && c <= 'f') digit = c - 'a' + 10;
-			else if (base == 16 && c >= 'A' && c <= 'F') digit = c - 'A' + 10;
-			else break;
-			if (digit >= base) break;
-			// A literal too large to represent SATURATES at INT64_MAX, which is dash's
-			// answer in each of the three bases. The digits are consumed either way:
-			// the literal ends where it ends, and stopping at the one that overflowed
-			// would leave the rest of it behind to be parsed as though it were
-			// operators, turning a representable answer into a syntax error.
-			int64_t scaled = 0;
-			if (mul_overflows(value, base, scaled) || add_overflows(scaled, digit, value))
-				saturated = true;
-			any = true;
-			++_at;
-		}
-		if (saturated)
-			value = INT64_MAX;
-		if (!any)
+		// A literal too large to represent SATURATES at INT64_MAX, which is dash's
+		// answer in each of the three bases. The digits are consumed either way -
+		// scan_digits keeps reading past the one that overflowed - because the
+		// literal ends where it ends, and stopping early would leave the rest of it
+		// behind to be parsed as though it were operators, turning a representable
+		// answer into a syntax error.
+		//
+		// The limit comes from the numeric policy table (#63) rather than from an
+		// INT64_MAX written out here, so this site and the fourteen others answer
+		// one question in one place. Saturating is still THIS caller's choice: the
+		// mechanism reports that the value ran past the range and hands back the
+		// clamped magnitude, and what that means is decided here.
+		const uint64_t limit =
+			static_cast<uint64_t>(policy_for(numeric_site::arithmetic_literal).high);
+		const digit_run run = scan_digits(_text.substr(_at), base, limit);
+		_at += run.consumed;
+		// "0x" with nothing after it names no number. A bare "0" is a valid decimal
+		// zero and the octal branch above has already eaten its leading digit, so
+		// only the hex prefix can leave the scan with nothing to read.
+		if (run.consumed == 0 && base == 16)
 			fail("malformed number");
-		return value;
+		return static_cast<int64_t>(run.value);
 	}
 };
 

@@ -217,3 +217,37 @@ TEST_F(TestBuiltinTest, FreshnessComparisonsAgainstAMissingFile) {
 	EXPECT_EQ(run("test " + present + " -ef " + present), 0);
 	std::remove(present.c_str());
 }
+
+// --- the `test` operand, read through the one numeric parser (issue #63) -----
+
+TEST_F(TestBuiltinTest, TheIntegerLimitsAreOperandsRatherThanOverflows) {
+	// INT64_MIN is a LEGAL operand - dash, bash and zsh all compare it without
+	// complaint - so the range deliberately admits magnitude 2^63 and the negation
+	// happens in the unsigned domain, where it is defined (#62). This is the one
+	// value the range check exists to let through and the one the old code
+	// negated undefined.
+	EXPECT_EQ(run("test -9223372036854775808 -eq 1"), 1);
+	EXPECT_EQ(run("test -9223372036854775808 -lt 0"), 0);
+	EXPECT_EQ(run("test 9223372036854775807 -gt 0"), 0);
+	EXPECT_EQ(run("test -9223372036854775808 -eq -9223372036854775808"), 0);
+}
+
+TEST_F(TestBuiltinTest, AnOperandPastTheLimitIsAUsageErrorRatherThanASaturatedOne) {
+	// `test` COMPARES rather than computes, so an operand it cannot represent has
+	// no nearest answer worth giving: 2 and a diagnostic, as dash and bash both
+	// answer. Saturating - which is what an arithmetic literal does (#59) - would
+	// silently compare a number the script never wrote.
+	EXPECT_EQ(fails("test 9223372036854775808 -gt 0"), 2);
+	EXPECT_EQ(fails("test -9223372036854775809 -eq 1"), 2);
+	EXPECT_EQ(fails("test 99999999999999999999 -eq 1"), 2);
+	EXPECT_EQ(fails("test 3x -eq 3"), 2) << "atoi would have truncated this to 3";
+}
+
+TEST_F(TestBuiltinTest, TheOperandKeepsDashsBlankAndSignTolerances) {
+	// Copied from dash's `getn` deliberately rather than tightened, and now stated
+	// in the policy table where every site's tolerances are: blanks either side,
+	// including a newline, and a leading `+`.
+	EXPECT_EQ(run("test ' 1 ' -eq 1"), 0);
+	EXPECT_EQ(run("test '+1' -eq 1"), 0);
+	EXPECT_EQ(fails("test '1 2' -eq 1"), 2);
+}

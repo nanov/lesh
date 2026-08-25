@@ -1,5 +1,7 @@
 #include "runtime/executor.h"
 
+#include "substrate/numeric.h"
+
 #include "runtime/builtins.h"
 #include "runtime/pattern.h"
 #include "runtime/signals.h"
@@ -309,31 +311,34 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 				close(fd);
 				return true;
 			}
-			int source = 0;
-			for (const char c : target) {
-				if (c < '0' || c > '9') {
-					std::fprintf(stderr, "lesh: %s: bad file descriptor\n", path);
-					return false;
-				}
-				// A FILE DESCRIPTOR IS AN `int`, so a number too large to be one is not
-				// invalid in some new way - it is invalid in the way `>&99` already is,
-				// and it takes the SAME diagnostic and the same status rather than a
-				// second one invented here (#62). The accumulator used to overflow on the
-				// way to that answer, which is undefined behaviour.
-				//
-				// Saturating, which is what #59 chose for an over-large arithmetic
-				// literal, would be meaningless at this site: a literal that will not fit
-				// still has a nearest representable value to stand in for it, whereas
-				// there is no "largest file descriptor" for a clamp to land on - every
-				// candidate is either a descriptor the script never wrote or one it did
-				// not mean. So the number is refused, and the diagnostic names the
-				// descriptor the script actually asked for.
-				if (source > (INT_MAX - (c - '0')) / 10) {
-					std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(EBADF));
-					return false;
-				}
-				source = source * 10 + (c - '0');
+			// A FILE DESCRIPTOR IS AN `int`, so a number too large to be one is not
+			// invalid in some new way - it is invalid in the way `>&99` already is,
+			// and it takes the SAME diagnostic and the same status rather than a
+			// second one invented here (#62). The accumulator used to overflow on the
+			// way to that answer, which is undefined behaviour.
+			//
+			// Saturating, which is what #59 chose for an over-large arithmetic
+			// literal, would be meaningless at this site: a literal that will not fit
+			// still has a nearest representable value to stand in for it, whereas
+			// there is no "largest file descriptor" for a clamp to land on - every
+			// candidate is either a descriptor the script never wrote or one it did
+			// not mean. So the number is refused, and the diagnostic names the
+			// descriptor the script actually asked for.
+			//
+			// THE TWO FAILURES KEEP THEIR OWN WORDINGS because they are different
+			// complaints: `>&x` names no descriptor at all, and `>&<huge>` names one
+			// the system cannot have. Both end the redirection at 2.
+			const numeric_result parsed =
+				parse_integer(target, numeric_site::redirection_target_fd);
+			if (parsed.status == numeric_parse::not_a_number) {
+				std::fprintf(stderr, "lesh: %s: bad file descriptor\n", path);
+				return false;
 			}
+			if (parsed.status == numeric_parse::out_of_range) {
+				std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(EBADF));
+				return false;
+			}
+			const int source = static_cast<int>(parsed.value);
 			// POSIX 2.7.5/2.7.6: `>&n` is an error unless n is open for OUTPUT and
 			// `<&n` unless n is open for INPUT, so the access mode is checked before
 			// anything is displaced. dup2 alone cannot tell - it happily aims a
