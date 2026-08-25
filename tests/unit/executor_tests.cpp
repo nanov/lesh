@@ -1070,6 +1070,115 @@ TEST_F(ExecutorTest, BreakInsideAnEvalBreaksTheLoopAroundIt) {
 	          "after\n");
 }
 
+// --- every compound body reads through that SAME loop too (#77) ---------------
+//
+// run_compound_list was the THIRD copy of it, and #74's note that it had no
+// `set -n` test named only half of what reading the two side by side found. It
+// also failed to RE-READ the status when a trap body asked to exit, so a trap
+// that exited 5 from inside any compound body lost the 5.
+//
+// Every compound command in the language funnels through this one function - a
+// brace group, a function body, a loop body, an `if` branch, a `case` item and a
+// subshell - which is why the guard cases below are worth as much as the fixes:
+// consuming an escaping `break` here would break every loop in the language.
+
+// ONE ASSERTION PER TEST for the noexec cases, and not for tidiness: `set -n` is
+// shell state that outlives a `run`, so a second assertion in the same fixture
+// starts with the option already on and passes without reaching the code under
+// test. Each of these must enter with noexec clear to be worth anything.
+TEST_F(ExecutorTest, NoexecSetInsideABraceGroupStopsTheRestOfThatGroup) {
+	EXPECT_EQ(capture("{ eval 'set -n'; echo in; }"), "");
+}
+
+TEST_F(ExecutorTest, NoexecSetInsideAFunctionBodyStopsTheRestOfThatBody) {
+	EXPECT_EQ(capture("f() { eval 'set -n'; echo in; }; f"), "");
+}
+
+TEST_F(ExecutorTest, NoexecSetInsideALoopBodyStopsTheBodyAndTheLoop) {
+	// Checked per command rather than once per body, so the option stops the
+	// SECOND iteration as well as the rest of the first.
+	EXPECT_EQ(capture("for i in 1 2 3; do eval 'set -n'; echo in; done"), "");
+}
+
+TEST_F(ExecutorTest, NoexecSetInsideAnIfBranchStopsTheRestOfThatBranch) {
+	EXPECT_EQ(capture("if :; then eval 'set -n'; echo in; fi"), "");
+}
+
+TEST_F(ExecutorTest, NoexecSetInsideACaseItemStopsTheRestOfThatItem) {
+	EXPECT_EQ(capture("case a in a) eval 'set -n'; echo in;; esac"), "");
+}
+
+TEST_F(ExecutorTest, NoexecSetInsideASubshellStopsThatSubshellOnly) {
+	// THE OVER-EAGER HALF. `set -n` is an option of the subshell that set it, so
+	// it stops that body and nothing after the child ends. The parent's own state
+	// is untouched here - the subshell forked - which is why this one may assert
+	// the `after` at all.
+	EXPECT_EQ(capture("( eval 'set -n'; echo in ); echo after"), "after\n");
+}
+
+TEST_F(ExecutorTest, ATrapThatExitsFromACompoundBodyCarriesItsStatusOut) {
+	// THE SECOND DIVERGENCE, found by reading rather than by the ticket. The
+	// status the shell leaves with is the TRAP BODY's, not that of the command the
+	// signal interrupted - run_parsed re-reads it for exactly this reason and this
+	// loop kept the interrupted command's status instead. The top level then wrote
+	// that stale value over the real one, so the 5 was lost twice over. dash and
+	// bash both report 5.
+	const lesh::testing::saved_disposition guard{SIGUSR1};
+	EXPECT_EQ(run("trap 'exit 5' USR1; { kill -s USR1 $$; echo in; }"), 5);
+	EXPECT_EQ(run("trap 'exit 5' USR1; f() { kill -s USR1 $$; echo in; }; f"), 5);
+	EXPECT_EQ(run("trap 'exit 5' USR1; for i in 1 2; do kill -s USR1 $$; echo in; done"), 5);
+	EXPECT_EQ(run("trap 'exit 5' USR1; if :; then kill -s USR1 $$; echo in; fi"), 5);
+}
+
+TEST_F(ExecutorTest, AnEmptyCompoundBodyAnswersZeroAndNotThePreviousStatus) {
+	// THE ROW A SHARED LOOP CANNOT TAKE FROM run_parsed, and the mirror of #74's
+	// empty-unit trap. The top level answers a unit holding no command with `$?`;
+	// a body answers ZERO. A `case` item is the shape that proves it, because
+	// POSIX makes its list the one compound list that may legitimately be empty -
+	// everywhere else require_list makes an empty body a syntax error. Taking
+	// run_parsed's starting status here would report 9.
+	EXPECT_EQ(run("(exit 9); case a in a) ;; esac"), 0);
+}
+
+TEST_F(ExecutorTest, AnEscapingUnwindStillTravelsOutOfACompoundBody) {
+	// A compound list is a BODY: an escaping `break`, `continue` or `return`
+	// belongs to the construct AROUND it, so it must travel outward rather than be
+	// consumed the way the shell's own input consumes one. #58, #49 and #24 all
+	// rest on this, and it is the single row that keeps this loop from being
+	// run_parsed's `shell_input` case.
+	EXPECT_EQ(capture("for i in 1 2 3; do { break; }; echo in; done; echo after"),
+	          "after\n");
+	EXPECT_EQ(capture("for i in 1 2 3; do { { continue; }; }; echo in; done; echo after"),
+	          "after\n");
+	EXPECT_EQ(capture("for i in 1 2 3; do if [ \"$i\" = 2 ]; then break; fi; echo \"$i\"; done"),
+	          "1\n");
+	// Through a nested loop, where the LEVEL has to survive the inner body as well.
+	EXPECT_EQ(capture("for i in 1 2; do for j in a b; do break 2; done; echo in; done; echo after"),
+	          "after\n");
+	EXPECT_EQ(capture("for i in 1 2; do for j in a b; do break; done; echo \"$i\"; done"),
+	          "1\n2\n");
+	// And `return`, whose status has to survive the unwind too.
+	EXPECT_EQ(run("f() { { return 7; }; echo in; }; f"), 7);
+	EXPECT_EQ(run("f() { for i in 1 2 3; do return 7; done; echo in; }; f"), 7);
+}
+
+TEST_F(ExecutorTest, ErrexitInsideACompoundBodyStillExitsTheShell) {
+	// Unchanged by #77 and asserted so it STAYS unchanged. Breaking out of the
+	// list alone left the enclosing loop free to iterate again, which is what made
+	// `set -e; while true; do false; done` run forever (#58) - so the guard has to
+	// request the exit and not merely end the body.
+	EXPECT_EQ(capture("set -e; { false; echo in; }; echo after"), "");
+	EXPECT_EQ(run("set -e; { false; echo in; }; echo after"), 1);
+	EXPECT_EQ(capture("set -e; f() { false; echo in; }; f; echo after"), "");
+	EXPECT_EQ(run("set -e; while true; do false; done; echo after"), 1);
+	// And the statuses a compound command TESTS still exempt: an `if` condition
+	// and the left side of an or-list are not failures.
+	EXPECT_EQ(capture("set -e; if false; then echo in; else echo taken; fi; echo after"),
+	          "taken\nafter\n");
+	EXPECT_EQ(capture("set -e; { false; } || echo handled; echo after"),
+	          "handled\nafter\n");
+}
+
 // --- a return outside a function ends the input -------------------------------
 
 TEST_F(ExecutorTest, ReturnOutsideAFunctionEndsTheInput) {

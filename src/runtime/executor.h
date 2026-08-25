@@ -207,7 +207,28 @@ private:
 	// is what #74 was opened to remove: run_source carried a near-copy of this
 	// function, and a guard added here - `run_pending_traps` - was silently absent
 	// there for as long as the path existed.
+	//
+	// The syntax-error exit and the empty-tree answer are this function's; the
+	// per-command work below is run_command_list's, which every compound body
+	// shares (#77).
 	int run_parsed(const syntax::tree& t, source_kind kind = source_kind::shell_input);
+	// THE COMMAND LOOP, and after #77 the only one in the shell. Runs the children
+	// of `list` one at a time, applying every guard exactly once for every reader:
+	// `set -n`, pending traps, the exit and interrupt unwinds, and `set -e`.
+	//
+	// Three parameters carry everything its readers disagree about. `kind` decides
+	// whether an escaping `break`, `continue` or `return` is consumed here - the
+	// shell's own input has nothing left to hand it to - or travels outward to the
+	// construct that owns it, which is what an `eval` operand and every compound
+	// BODY need. `status` is what an empty list answers with: `$?` for the shell's
+	// own input, and zero for a body, since POSIX gives an empty `case` item that
+	// answer regardless of what ran before it.
+	//
+	// Three parameters rather than three loops, because three loops is what this
+	// shell had: each of the two copies was missing a guard the original had, and
+	// in both cases the drift was wider than the symptom anyone had reported.
+	int run_command_list(const syntax::tree& t, syntax::node_index list,
+	                     source_kind kind, int status);
 	void echo_if_verbose(std::string_view unit, bool enabled);
 	int run_node(const syntax::tree& t, syntax::node_index n);
 	int run_simple_command(const syntax::tree& t, syntax::node_index n);

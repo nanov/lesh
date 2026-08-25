@@ -922,17 +922,45 @@ int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
 		return 2;
 	}
 
-	const node& program = t[t.root()];
-	int status = _state.last_status();
-	for (uint32_t i = 0; i < program.children_count; ++i) {
+	// Everything per command is run_command_list's, which every compound body
+	// shares. The starting status is the one row the two cannot agree on: the
+	// shell's own input answers a unit holding no command with `$?`, and a body
+	// answers zero. See run_command_list.
+	return run_command_list(t, t.root(), kind, _state.last_status());
+}
+
+// THE COMMAND LOOP, and after #77 the only one in the shell.
+//
+// Reached by the shell's own input, by an `eval`, a `.`, a trap body and a
+// command substitution (through run_parsed), and by every compound body in the
+// language (through run_compound_list) - a brace group, a function body, a loop
+// body, an `if` branch, a `case` item and a subshell.
+//
+// It is one function because the two it replaced were near-copies that had both
+// drifted. #74 merged run_source's copy after finding it had gone without
+// `run_pending_traps` for its whole life, which cost fifteen signal files three
+// assertions each the moment #67 routed a command substitution through it. This
+// third copy, in run_compound_list, was missing `set -n` - so `{ eval "set -n";
+// echo after; }` printed `after` - and was ALSO failing to re-read the status a
+// trap body exited with, which nobody had noticed at all.
+//
+// `list` is the node whose children are the commands, `kind` says whether an
+// escaping unwind is consumed here or travels outward, and `status` is what an
+// EMPTY list answers with. Three parameters rather than three loops: a copy is
+// how a guard added to one reader silently fails to reach the others.
+int tree_walking_executor::run_command_list(const tree& t, node_index list,
+                                            source_kind kind, int status) {
+	const node& self = t[list];
+	for (uint32_t i = 0; i < self.children_count; ++i) {
 		// `set -n`: read and parse, execute nothing. POSIX says the option is
 		// ignored by an INTERACTIVE shell, or a typo would end the session.
 		// Checked per command rather than once, so `set -n` partway through a
 		// script stops the rest of it as well as a `sh -n` invocation stopping
-		// everything.
+		// everything - and, since #77, a body it is set inside stops there too
+		// rather than running on to the next command in that body.
 		if (_state.opts().no_exec && !_state.interactive())
 			break;
-		status = run_node(t, t.child_of(program, i));
+		status = run_node(t, t.child_of(self, i));
 		_state.set_last_status(status);
 		run_pending_traps();
 		// The status is re-read rather than kept: when a TRAP BODY exited, the
@@ -947,23 +975,30 @@ int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
 			status = _state.last_status();
 			break;
 		}
-		// A `return` that reached HERE was inside no function and no dot script, and
-		// POSIX leaves that unspecified. dash and zsh both END THE INPUT with the
-		// status the return asked for - `return; echo x` prints nothing in either -
-		// and lesh went on to the next command, so `return 7` was a no-op that
-		// reported 7. Ending the input is also the only reading that keeps `.`
-		// consistent: a dot script's `return` ends the script, and the shell's own
-		// input is the outermost script there is.
+		// A `return` that reached the SHELL'S OWN INPUT was inside no function and no
+		// dot script, and POSIX leaves that unspecified. dash and zsh both END THE
+		// INPUT with the status the return asked for - `return; echo x` prints
+		// nothing in either - and lesh went on to the next command, so `return 7` was
+		// a no-op that reported 7. Ending the input is also the only reading that
+		// keeps `.` consistent: a dot script's `return` ends the script, and the
+		// shell's own input is the outermost script there is.
 		//
 		// The flow is CLEARED here rather than left for run_input, so a `return` at
 		// the top of a script leaves the EXIT trap free to run its whole body.
 		if (_flow == control_flow::return_from) {
-			// A NESTED source lets it through instead, and that is the whole of what
-			// `kind` decides. `eval return` inside a function returns from the FUNCTION
+			// EVERY OTHER READER lets it through, and that is the whole of what `kind`
+			// decides. `eval return` inside a function returns from the FUNCTION
 			// (return-p.tst's 'returning out of eval'), so the unwind has to survive
 			// this loop and be consumed by whatever invoked the source - try_run_function
 			// for a function, the `.` builtin for a dot script. Consuming it here would
 			// end the eval and carry on with the line after it.
+			//
+			// A COMPOUND BODY is the same case and the reason #77 could share this loop
+			// at all: `f() { { return 7; }; echo no; }` has to return from `f`, so the
+			// unwind travels out of the brace group to the construct that owns it. A
+			// body that consumed it would break every loop and every function in the
+			// language, which is why it is this one row that keeps run_compound_list
+			// from simply being run_parsed.
 			if (kind == source_kind::nested) {
 				status = _state.last_status();
 				break;
@@ -979,7 +1014,9 @@ int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
 		// dash does: `for i in 1; do echo "[$(break; echo insub)]"; done` prints `[]`.
 		if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop) {
 			// Nested, and for the same reason: `for i in 1 2; do eval break; done` has to
-			// break the loop the eval is INSIDE, so the level travels out to run_loop.
+			// break the loop the eval is INSIDE, so the level travels out to run_loop -
+			// as it does out of a loop's own body, which is the ordinary spelling of
+			// `break` and the case run_loop's consume_loop_flow is waiting for.
 			if (kind == source_kind::nested) {
 				status = _state.last_status();
 				break;
@@ -1219,25 +1256,29 @@ int tree_walking_executor::run_and_or(const tree& t, node_index n) {
 }
 
 int tree_walking_executor::run_compound_list(const tree& t, node_index n) {
-	const node& self = t[n];
-	int status = 0;
-	for (uint32_t i = 0; i < self.children_count; ++i) {
-		status = run_node(t, t.child_of(self, i));
-		_state.set_last_status(status);
-		run_pending_traps();
-		// A break, continue or return unwinds through here rather than being
-		// swallowed: the enclosing loop or function is what decides to stop.
-		if (_flow != control_flow::normal || _exit_requested)
-			break;
-		// POSIX: `set -e` EXITS the shell. Merely breaking out of this list left the
-		// enclosing loop free to iterate again, so `set -e; while true; do false;
-		// done` ran forever.
-		if (errexit_fires(status)) {
-			_exit_requested = true;
-			break;
-		}
-	}
-	return status;
+	// THE SAME LOOP THE TOP LEVEL READS THROUGH (#77). This carried a third copy of
+	// it, and a copy drifts: it had no `set -n` test, so `{ eval "set -n"; echo
+	// after; }` printed `after` where dash prints nothing, and it kept the status of
+	// the command a signal interrupted where run_parsed re-reads the one the TRAP
+	// BODY exited with - which lost the 5 from `trap "exit 5" USR1; { kill -USR1 $$;
+	// }` in every compound body in the language. Only the first of the two was known;
+	// the second came out of reading the loops side by side, which is exactly how #74
+	// found the `run_pending_traps` gap that had cost fifteen signal files.
+	//
+	// Two arguments carry everything the two readers disagree about:
+	//
+	//   `nested` - an escaping `break`, `continue` or `return` TRAVELS OUT of a body
+	//   to the construct that owns it, where the shell's own input consumes it and
+	//   ends there. Sharing the loop is only possible because #74 had already made
+	//   that row a parameter instead of a reason to write a second one.
+	//
+	//   0 - an EMPTY body answers zero, where run_parsed answers `$?`. The mirror of
+	//   the empty-unit trap #74 hit from the other side. `case a in a) ;; esac` is
+	//   the shape that reaches it: POSIX makes a case item's list the one compound
+	//   list that may be empty, and require_list makes every other spelling of an
+	//   empty body a syntax error. `(exit 9); case a in a) ;; esac` is 0 in dash, so
+	//   inheriting `$?` here would report 9.
+	return run_command_list(t, n, source_kind::nested, 0);
 }
 
 int tree_walking_executor::run_if(const tree& t, node_index n) {

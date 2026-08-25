@@ -1953,3 +1953,118 @@ printf 'echo one\necho "abc\n' >n.sh
 "$TESTEE" n.sh 2>&1 >/dev/null
 === expect [status: 2]
 n.sh:2:6: syntax error: unterminated quoted string
+
+# ISSUE #77. `run_compound_list` was the THIRD copy of the top-level command
+# loop - after run_parsed and the copy #74 removed from run_source - and it had
+# drifted the way a copy always does. EVERY compound body in the language runs
+# through it: a brace group, a function body, a loop body, an `if` branch, a
+# `case` item and a subshell. Two guards were missing, and only the first of the
+# two had ever been noticed.
+
+--- noexec set inside a brace group stops the rest of that group [xfail(legacy): legacy has no compound commands]
+{ eval "set -n"; echo notreached; }; echo alsonotreached
+
+--- noexec set inside a function body stops the rest of that body [xfail(legacy): legacy has no functions]
+f() { eval "set -n"; echo notreached; }; f; echo alsonotreached
+
+--- noexec set inside a for body stops the body and the loop [xfail(legacy): legacy has no compound commands]
+for i in 1 2 3; do eval "set -n"; echo notreached; done; echo alsonotreached
+
+--- noexec set inside an if branch stops the rest of that branch [xfail(legacy): legacy has no compound commands]
+if :; then eval "set -n"; echo notreached; fi; echo alsonotreached
+
+--- noexec set inside a case item stops the rest of that item [xfail(legacy): legacy has no compound commands]
+case a in a) eval "set -n"; echo notreached;; esac; echo alsonotreached
+
+--- noexec set inside a nested body stops every body enclosing it [xfail(legacy): legacy has no compound commands]
+for i in 1 2; do { eval "set -n"; echo notreached; }; done; echo alsonotreached
+
+# The half an over-eager guard breaks. `set -n` is an option of the SUBSHELL that
+# set it, so it stops that body and nothing after the child ends. A test that
+# reached out of the subshell would take the `after` with it.
+#
+# `while` is deliberately absent from the noexec cases above: with the body
+# unable to execute, the command that would end the loop cannot run either, and
+# dash itself spins forever on `while :; do eval "set -n"; break; done`. There is
+# no answer to differ from.
+
+--- noexec set inside a subshell stops that subshell only [xfail(legacy): legacy has no compound commands]
+( eval "set -n"; echo notreached ); echo after
+
+# THE SECOND DIVERGENCE, which reading the two loops side by side found and the
+# ticket had not. run_parsed RE-READS `$?` when a trap body asked to exit,
+# because the status the shell leaves with is the trap body's and not that of the
+# command the signal interrupted. run_compound_list returned the interrupted
+# command's status instead, and the top level then wrote that stale value over
+# the real one - so a trap that exited 5 from inside ANY compound body left the
+# shell reporting whatever it had interrupted. dash and bash both say 5.
+
+--- a trap that exits from inside a brace group carries its status out [xfail(legacy): legacy has no compound commands]
+trap "exit 5" USR1; { kill -USR1 $$; echo notreached; }; echo alsonotreached
+
+--- a trap that exits from inside a function body carries its status out [xfail(legacy): legacy has no functions]
+trap "exit 5" USR1; f() { kill -USR1 $$; echo notreached; }; f; echo alsonotreached
+
+--- a trap that exits from inside a loop body carries its status out [xfail(legacy): legacy has no compound commands]
+trap "exit 5" USR1; for i in 1 2; do kill -USR1 $$; echo notreached; done; echo alsonotreached
+
+--- a trap that exits from inside an if branch carries its status out [xfail(legacy): legacy has no compound commands]
+trap "exit 5" USR1; if :; then kill -USR1 $$; echo notreached; fi; echo alsonotreached
+
+# THE ROWS THAT MUST NOT MOVE. A compound list is a BODY, so an escaping `break`,
+# `continue` or `return` has to TRAVEL OUTWARD to the construct that owns it
+# rather than ending the shell's input the way the top level's does. #58, #49 and
+# #24 all rest on these, and a shared loop that consumed the unwind here would
+# break every loop and every function in the language.
+
+--- break escapes a brace group inside a loop [xfail(legacy): legacy has no compound commands]
+for i in 1 2 3; do { break; }; echo notreached; done; echo after
+
+--- continue escapes two brace groups inside a loop [xfail(legacy): legacy has no compound commands]
+for i in 1 2 3; do { { continue; }; }; echo notreached; done; echo after
+
+--- break escapes an if branch inside a loop [xfail(legacy): legacy has no compound commands]
+for i in 1 2 3; do if [ "$i" = 2 ]; then break; fi; echo "$i"; done; echo after
+
+--- break escapes a case item inside a loop [xfail(legacy): legacy has no compound commands]
+for i in 1 2 3; do case $i in 2) break;; esac; echo "$i"; done; echo after
+
+--- break with a level escapes both loops [xfail(legacy): legacy has no compound commands]
+for i in 1 2; do for j in a b; do break 2; done; echo notreached; done; echo after
+
+--- an inner break leaves the outer loop running [xfail(legacy): legacy has no compound commands]
+for i in 1 2; do for j in a b; do break; done; echo "$i"; done; echo after
+
+--- return escapes a brace group inside a function [xfail(legacy): legacy has no functions]
+f() { { return 7; }; echo notreached; }; f; echo "st=$?"
+
+--- return escapes a loop inside a function [xfail(legacy): legacy has no functions]
+f() { for i in 1 2 3; do return 7; done; echo notreached; }; f; echo "st=$?"
+
+# `set -e` inside a compound body already matched dash before #77, so these are a
+# GUARD rather than a fix: the shared loop has to keep the answer the copy
+# already gave. The `while` case is the one #58 traced - breaking out of the list
+# alone left the enclosing loop free to iterate again, and it ran forever.
+
+--- errexit inside a brace group exits the shell [xfail(legacy): legacy has no compound commands]
+set -e; { false; echo notreached; }; echo alsonotreached
+
+--- errexit inside a function body exits the shell [xfail(legacy): legacy has no functions]
+set -e; f() { false; echo notreached; }; f; echo alsonotreached
+
+--- errexit inside a while body exits rather than iterating again [xfail(legacy): legacy has no compound commands]
+set -e; while true; do false; done; echo notreached
+
+--- errexit does not fire on a condition an if tested [xfail(legacy): legacy has no compound commands]
+set -e; if false; then echo notreached; else echo taken; fi; echo after
+
+--- errexit does not fire on a status an or-list tested [xfail(legacy): legacy has no compound commands]
+set -e; { false; } || echo handled; echo after
+
+# The one row a shared loop CANNOT take from run_parsed. The top level answers a
+# unit holding no command with `$?`; a body answers ZERO, and a `case` item is
+# the shape that proves it because POSIX makes its list optional. The mirror of
+# #74's empty-unit trap, and the reason the starting status is a parameter.
+
+--- an empty case item body answers zero and not the previous status [xfail(legacy): legacy has no compound commands]
+(exit 9); case a in a) ;; esac; echo "st=$?"
