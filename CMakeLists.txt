@@ -177,7 +177,9 @@ add_library(lesh_leshper STATIC
 	src/leshper/surface.cpp
 	src/leshper/surface.h
 	src/leshper/text.h
-	src/leshper/undo.h)
+	src/leshper/undo.h
+	src/leshper/workers.cpp
+	src/leshper/workers.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
 
 add_subdirectory("tools")
@@ -194,6 +196,7 @@ add_executable(lesh_tests
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_tests.cpp
+	tests/unit/leshper_workers_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
