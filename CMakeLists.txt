@@ -201,6 +201,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/event.h
 	src/leshper/history_search.cpp
 	src/leshper/history_search.h
+	src/leshper/keymap.cpp
+	src/leshper/keymap.h
 	src/leshper/state.h
 	src/leshper/surface.cpp
 	src/leshper/surface.h
