@@ -300,6 +300,46 @@ int32_t lesh_style_name(lesh_registry* registry, uint32_t style_id, char* out,
 	return copy_out(registry->styles[style_id], out, capacity, length_out);
 }
 
+// --- Timers (#128 decision 3, #129's `timer` topic) -------------------------
+
+int32_t lesh_timer_start(lesh_registry* registry, uint64_t interval_ms, const char* action,
+                         uint64_t* id_out) {
+	if (registry == nullptr || action == nullptr || id_out == nullptr)
+		return LESH_ERR_INVAL;
+	// A zero interval is a busy loop with a name, and there is no reading of
+	// "every zero milliseconds" that a caller wants and cannot get from the
+	// ordinary turn.
+	if (interval_ms == 0)
+		return LESH_ERR_INVAL;
+
+	const std::string_view given{action};
+	if (!is_snake_case(given))
+		return LESH_ERR_INVAL;
+
+	// The name is NOT resolved here. A timer armed before its action is
+	// registered is legal, and re-registering the action replaces what the timer
+	// runs - the same late-binding rule a key follows.
+	const uint64_t id = ++registry->next_timer_id;
+	registry->timers.push_back(lesh_registry::timer_entry{id, interval_ms, std::string{given}});
+	*id_out = id;
+	return LESH_OK;
+}
+
+int32_t lesh_timer_stop(lesh_registry* registry, uint64_t id) {
+	if (registry == nullptr)
+		return LESH_ERR_INVAL;
+	for (auto it = registry->timers.begin(); it != registry->timers.end(); ++it) {
+		if (it->id != id)
+			continue;
+		registry->timers.erase(it);
+		return LESH_OK;
+	}
+	// Reported rather than silently accepted: stopping a timer twice means the
+	// caller has lost track of an id, and an id it has lost track of may now
+	// belong to somebody else's timer.
+	return LESH_ERR_NOTFOUND;
+}
+
 // --- Editor state ----------------------------------------------------------
 
 int32_t lesh_buffer_length(lesh_editor* editor, size_t* out) {

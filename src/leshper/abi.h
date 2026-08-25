@@ -384,6 +384,42 @@ int32_t lesh_style_intern(lesh_registry* registry, const char* name, uint32_t* o
 int32_t lesh_style_name(lesh_registry* registry, uint32_t style_id,
                         char* out, size_t capacity, size_t* length_out);
 
+/* ------------------------------------------------------------------------- */
+/* Timers (#128 decision 3, #129)                                             */
+/*                                                                            */
+/* THE LOOP'S TIMER TOPIC, MADE PUBLIC. There is no timer file descriptor and  */
+/* no `EVFILT_TIMER`: the loop's poll timeout IS `min(deadlines) - now` on a   */
+/* monotonic clock, and these two calls are how a binding puts a deadline into */
+/* that minimum. Spinners and plugin ticks, and §8's hook-table timers         */
+/* arriving early. Unarmed, the mechanism costs nothing - the timeout is -1    */
+/* and the loop blocks.                                                       */
+/*                                                                            */
+/* ADDITIVE, as growth here always is: two new functions, no signature         */
+/* changed, and a binding that never calls them cannot tell they exist.        */
+/*                                                                            */
+/* REPEATING, and rearmed FROM THE MOMENT IT FIRES rather than from the        */
+/* instant it was due. A loop that spent a minute inside a command must not    */
+/* then dispatch a one-second timer sixty times; catch-up is a behaviour a     */
+/* caller would have to ask for and nobody has.                                */
+/*                                                                            */
+/* Loop-thread only, like everything else on the registry (ADR-0008).          */
+/* ------------------------------------------------------------------------- */
+
+/* Arms a repeating timer that dispatches the action named `action` every
+ * `interval_ms` milliseconds. `*id_out` receives the handle `lesh_timer_stop`
+ * takes.
+ *
+ * The action is looked up BY NAME AT EXPIRY, not resolved here: a timer armed
+ * before its action is registered is legal, and re-registering the action
+ * replaces what the timer runs - which is the same rule dispatch follows for a
+ * key. LESH_ERR_INVAL for a zero interval or a name that is not snake_case. */
+int32_t lesh_timer_start(lesh_registry* registry, uint64_t interval_ms,
+                         const char* action, uint64_t* id_out);
+
+/* Disarms it. LESH_ERR_NOTFOUND for an id that is not armed, so stopping twice
+ * is reported rather than silently accepted. */
+int32_t lesh_timer_stop(lesh_registry* registry, uint64_t id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

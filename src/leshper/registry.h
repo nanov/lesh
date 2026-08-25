@@ -81,6 +81,24 @@ struct lesh_registry {
 	std::map<std::string, action_entry, std::less<>> actions;
 	std::map<std::string, reactor_entry, std::less<>> reactors;
 
+	// An armed timer (#128 decision 3, #129's `timer` topic).
+	//
+	// The INTERVAL lives here and the next DUE INSTANT does not: the registry
+	// has never heard of a clock, and the loop that polls is the only thing that
+	// knows what "now" is. So the loop keeps a due instant beside each id and
+	// this table stays the declaration rather than the schedule.
+	struct timer_entry {
+		std::uint64_t id = 0;
+		std::uint64_t interval_ms = 0;
+		std::string action;
+	};
+
+	// A vector rather than a map: a session has a handful of timers, they are
+	// walked in full on every turn to find the minimum deadline, and a walk is
+	// what a vector is for.
+	std::vector<timer_entry> timers;
+	std::uint64_t next_timer_id = 0;
+
 	// Interned style names. Index 0 is LESH_STYLE_NONE and is never a name.
 	std::vector<std::string> styles{std::string{}};
 
