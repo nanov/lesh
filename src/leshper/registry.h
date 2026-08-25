@@ -105,6 +105,16 @@ struct lesh_editor {
 	bool buffer_written = false;
 	bool cursor_written = false;
 
+	// The selection, staged like everything else (#96, spec §6.3). The head is
+	// `staged_cursor` - the model has no second stored position - so only the
+	// anchor and the flag need a home here. Staged rather than written straight
+	// through to the target, because an action that sets the selection and then
+	// edits would otherwise have its anchor adjusted a second time by the marker
+	// rules at commit, against a diff it had already accounted for.
+	std::size_t staged_anchor = 0;
+	bool staged_selection_active = false;
+	bool selection_written = false;
+
 	// Input pushed with lesh_push_input, delivered at commit so it drains
 	// through the keymap after the action's edits have landed.
 	std::string pushed_input;

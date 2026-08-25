@@ -380,29 +380,65 @@ int32_t lesh_cursor_set(lesh_editor* editor, size_t offset) {
 	return LESH_OK;
 }
 
+// The selection, backed for real (#96, spec §6.3).
+//
+// Singular, and staying singular until multi-cursor arrives as ADDITIVE plural
+// functions - #96 decision 5 and #93's growth rule, in the same breath.
+//
+// The region the getter reports is the derived one, `[min(anchor, head),
+// max(anchor, head))`, over the STAGED anchor and the STAGED cursor: an action
+// that has moved the cursor is looking at the selection its own motion made,
+// which is the whole of what a helix-mode motion needs to see.
 int32_t lesh_selection_get(lesh_editor* editor, size_t* start_out, size_t* end_out,
                            int32_t* active_out) {
 	LESH_EDITOR_HANDLE(editor);
 	if (start_out == nullptr || end_out == nullptr || active_out == nullptr)
 		return LESH_ERR_INVAL;
-	// PLACEHOLDER (#96). Answering "nothing is selected" is not a lie: there is
-	// no selection model yet, so there is no selection.
-	*start_out = 0;
-	*end_out = 0;
-	*active_out = 0;
+	const std::string_view text{editor->staged};
+	const std::size_t anchor = snap_back(text, editor->staged_anchor);
+	const std::size_t head = snap_back(text, editor->staged_cursor);
+	// Reported whether or not the region is live, because the anchor outlives
+	// deactivation (emacs's mark) and a binding asking where the mark is deserves
+	// an answer. The flag is the separate question, and it is the one that says
+	// whether the range means anything.
+	*start_out = anchor < head ? anchor : head;
+	*end_out = anchor < head ? head : anchor;
+	*active_out = editor->staged_selection_active ? 1 : 0;
 	return LESH_OK;
 }
 
+// Sets the region to `[start, end)` and activates it. The head lands on `end`,
+// because the head IS the cursor - there is nowhere else for it to go, and a
+// setter that left the cursor behind would leave the state describing a
+// different region than the one it was just handed.
+//
+// `start > end` is not an error and is not swapped: the pair is a direction, and
+// a backward selection (helix's, vi's `o`-flipped one) is the reason the model
+// stores an anchor and a head rather than a sorted pair. The derived range comes
+// out sorted either way.
+//
+// Both endpoints clamp and snap BACK to a cluster start, not outward the way
+// lesh_buffer_replace snaps: a selection endpoint is a cursor-like position that
+// rests on a cluster, where a replacement's range must swallow whole clusters.
 int32_t lesh_selection_set(lesh_editor* editor, size_t start, size_t end) {
 	LESH_EDITOR_HANDLE(editor);
-	(void)start;
-	(void)end;
-	return LESH_ERR_REFUSED;  // #96 decides what a selection is before one can be set
+	const std::string_view text{editor->staged};
+	editor->staged_anchor = snap_back(text, start);
+	editor->staged_cursor = snap_back(text, end);
+	editor->staged_selection_active = true;
+	editor->selection_written = true;
+	editor->cursor_written = true;
+	return LESH_OK;
 }
 
+// Deactivates the region and KEEPS the anchor, which is what state::
+// drop_selection does and for the reason it gives: emacs's mark survives
+// `deactivate-mark`. A binding that wants the mark moved says where.
 int32_t lesh_selection_clear(lesh_editor* editor) {
 	LESH_EDITOR_HANDLE(editor);
-	return LESH_OK;  // nothing is selected; clearing it succeeds vacuously
+	editor->staged_selection_active = false;
+	editor->selection_written = true;
+	return LESH_OK;
 }
 
 int32_t lesh_generation(lesh_editor* editor, uint64_t* out) {
@@ -488,11 +524,17 @@ int32_t lesh_undo(lesh_editor* editor) {
 	if (editor->buffer_written)
 		return LESH_ERR_REFUSED;
 	lesh::leshper::state& target = *editor->target;
-	if (target.undo.undo(target.buffer, target.cursor)) {
+	if (target.undo_one()) {
 		target.gen.bump();
 		editor->staged.assign(target.buffer.text());
 		editor->staged_cursor = target.cursor.byte_offset();
 		editor->cursor_written = false;
+		// The staging area is re-synced from the state history just restored,
+		// selection included: an action that undoes and then reads the selection
+		// must see the one that came back, not the one it started the call with.
+		editor->staged_anchor = target.selection_anchor().byte_offset();
+		editor->staged_selection_active = target.selection_active();
+		editor->selection_written = false;
 	}
 	return LESH_OK;  // nothing to undo is not an error
 }
@@ -502,11 +544,14 @@ int32_t lesh_redo(lesh_editor* editor) {
 	if (editor->buffer_written)
 		return LESH_ERR_REFUSED;
 	lesh::leshper::state& target = *editor->target;
-	if (target.undo.redo(target.buffer, target.cursor)) {
+	if (target.redo_one()) {
 		target.gen.bump();
 		editor->staged.assign(target.buffer.text());
 		editor->staged_cursor = target.cursor.byte_offset();
 		editor->cursor_written = false;
+		editor->staged_anchor = target.selection_anchor().byte_offset();
+		editor->staged_selection_active = target.selection_active();
+		editor->selection_written = false;
 	}
 	return LESH_OK;
 }
@@ -550,7 +595,7 @@ int32_t lesh_request_selection(const lesh_request* request, size_t* start_out,
 		return LESH_ERR_INVAL;
 	*start_out = request->selection_start;
 	*end_out = request->selection_end;
-	*active_out = request->selection_active ? 1 : 0;  // always 0 until #96
+	*active_out = request->selection_active ? 1 : 0;
 	return LESH_OK;
 }
 
@@ -693,6 +738,9 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.staged_cursor = target.cursor.byte_offset();
 	_handle.buffer_written = false;
 	_handle.cursor_written = false;
+	_handle.staged_anchor = target.selection_anchor().byte_offset();
+	_handle.staged_selection_active = target.selection_active();
+	_handle.selection_written = false;
 	_handle.pushed_input.clear();
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
@@ -747,6 +795,18 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 		target.cursor = position::from_byte_offset(snap_back(target.buffer.text(),
 		                                                     _handle.staged_cursor));
 	}
+
+	// The selection, committed AFTER the edit, and only when the action wrote
+	// one. An action that did not touch it has had its anchor carried across the
+	// edit by apply_edit's marker rules already; an action that did wrote offsets
+	// against the staged text, which is the text the buffer now holds, so the
+	// staged anchor is the one that means what the action meant.
+	if (_handle.selection_written) {
+		target.set_selection(
+			position::from_byte_offset(snap_back(target.buffer.text(), _handle.staged_anchor)),
+			_handle.staged_selection_active);
+	}
+
 	if (!_handle.pushed_input.empty())
 		target.pending.injected += _handle.pushed_input;
 
@@ -782,6 +842,16 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		request_token token;
 		token.buffer.assign(target.buffer.text());
 		token.cursor = target.cursor.byte_offset();
+		// The derived region, snapshotted with everything else (#96). Reported
+		// even when inactive, on the same reasoning lesh_selection_get gives: the
+		// anchor outlives deactivation and the flag is the separate question.
+		{
+			const std::size_t anchor = target.selection_anchor().byte_offset();
+			const std::size_t head = token.cursor;
+			token.selection_start = anchor < head ? anchor : head;
+			token.selection_end = anchor < head ? head : anchor;
+			token.selection_active = target.selection_active();
+		}
 		token.computed_against = target.gen;
 		token.event_kind = kinds;
 		token.superseded = &_superseded;
