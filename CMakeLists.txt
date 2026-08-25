@@ -100,6 +100,7 @@ target_sources(lesh_substrate INTERFACE
 	src/substrate/assert.h
 	src/substrate/char_utils.h
 	src/substrate/grapheme.h
+	src/substrate/measure.h
 	src/substrate/traits.h
 	src/substrate/unicode_tables.h)
 
@@ -185,6 +186,7 @@ add_executable(lesh_tests
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
 	tests/unit/invocation_tests.cpp
+	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
