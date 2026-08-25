@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -19,7 +20,8 @@ using namespace lesh::syntax;
 
 namespace {
 
-// `cd`: -L and -P, CDPATH, and the failure status. See issue #46.
+// `cd`: -L and -P, CDPATH, and the failure status. See issue #46. The startup value
+// of PWD joined them in #51, because it is the value `cd` extends onto.
 //
 // The shape of the scratch tree is cd-p.tst's, because the interesting cases all
 // need a SYMLINK to a directory: -L and -P differ nowhere else, and `cd link` then
@@ -251,4 +253,127 @@ TEST_F(CdTest, ReadonlyPwdFailsAfterTheDirectoryHasChanged) {
 	EXPECT_EQ(run("readonly PWD; cd real 2>/dev/null"), 2);
 	EXPECT_EQ(value_of("PWD"), root) << "the refused assignment left PWD alone";
 	EXPECT_EQ(std::filesystem::current_path(), root + "/real") << "the chdir stands";
+}
+
+// --- what a shell BELIEVES about where it is when it starts (#51) ------------
+
+namespace {
+
+// POSIX 2.5.3 makes setting PWD the shell's job at initialization, so what is under
+// test is what a CONSTRUCTOR decides: the environment and the working directory have
+// to be arranged before shell_state exists, which is why the state is built inside
+// each test rather than held as a fixture member.
+//
+// The process environment is global to the test binary. A leaked PWD would arrive at
+// the next test as an inherited value and make it pass or fail for a reason it does
+// not name, so it is saved and restored around every case.
+class StartupPwdTest : public ::testing::Test {
+protected:
+	lesh::buffer_pool pool{1024 * 64};
+	lesh::testing::temp_path scratch;
+	std::string root;   // the PHYSICAL pathname of the scratch tree
+
+	void SetUp() override {
+		_origin = std::filesystem::current_path();
+		if (const char* inherited = std::getenv("PWD")) {
+			_had_pwd = true;
+			_saved_pwd = inherited;
+		}
+		root = scratch.dir();
+		std::filesystem::create_directories(root + "/real/inner");
+		std::filesystem::create_directory_symlink(root + "/real", root + "/link");
+		std::filesystem::create_directories(root + "/sub");
+		std::filesystem::current_path(root);
+	}
+
+	void TearDown() override {
+		// Before `scratch` is destroyed, for the reason CdTest gives: a working
+		// directory left inside a deleted tree fails every later test in getcwd.
+		std::filesystem::current_path(_origin);
+		if (_had_pwd)
+			::setenv("PWD", _saved_pwd.c_str(), 1);
+		else
+			::unsetenv("PWD");
+	}
+
+	// What a shell started here would believe about where it is.
+	static std::string believed(const shell_state& state) {
+		std::string_view text;
+		return state.lookup("PWD", text) ? std::string{text} : std::string{"<unset>"};
+	}
+
+	int run(shell_state& state, std::string_view src) {
+		const tree t = parse(pool, src);
+		tree_walking_executor ex{pool, state};
+		return ex.run(t);
+	}
+
+private:
+	std::filesystem::path _origin;
+	bool _had_pwd = false;
+	std::string _saved_pwd;
+};
+
+} // namespace
+
+TEST_F(StartupPwdTest, AnAbsentPwdIsSetFromTheRealDirectory) {
+	// `env -u PWD lesh -c 'echo "[$PWD]"'` printed `[]`: the shell set nothing and a
+	// script that read $PWD got an empty string rather than a pathname.
+	::unsetenv("PWD");
+	shell_state state;
+	EXPECT_EQ(believed(state), root);
+	EXPECT_TRUE(state.is_exported("PWD")) << "a child shell inherits it, as in dash";
+}
+
+TEST_F(StartupPwdTest, AnInheritedPwdNamingSomewhereElseIsReplaced) {
+	// The bug this ticket is named for: `PWD=/etc lesh -c pwd` answered /etc.
+	::setenv("PWD", "/etc", 1);
+	shell_state state;
+	EXPECT_EQ(believed(state), root);
+}
+
+TEST_F(StartupPwdTest, ARelativeInheritedPwdIsReplaced) {
+	// POSIX describes PWD as an ABSOLUTE pathname, so a relative one names nowhere
+	// the shell could join a relative operand onto.
+	::setenv("PWD", "relative", 1);
+	shell_state state;
+	EXPECT_EQ(believed(state), root);
+}
+
+TEST_F(StartupPwdTest, AnInheritedPwdReachedThroughASymlinkIsKept) {
+	// The case the check exists FOR, and the one a string comparison would break.
+	// `link` and `real` are one directory; a logical PWD that names it through the
+	// symlink is exactly the value #46's -L maintains, so startup must not undo it.
+	std::filesystem::current_path(root + "/real");
+	::setenv("PWD", (root + "/link").c_str(), 1);
+	shell_state state;
+	EXPECT_EQ(believed(state), root + "/link")
+		<< "device and inode say these name one directory; the text does not";
+}
+
+TEST_F(StartupPwdTest, AnInheritedPwdWithADotComponentIsReplaced) {
+	// A deliberate divergence, recorded in #51: dash, bash and ksh keep these and
+	// then print a pathname with a `.` or `..` in it for a directory whose real name
+	// they know. POSIX 2.5.3 says PWD holds an absolute pathname containing no
+	// component that is dot or dot-dot; zsh replaces them as lesh does.
+	::setenv("PWD", (root + "/.").c_str(), 1);
+	shell_state dotted;
+	EXPECT_EQ(believed(dotted), root);
+
+	const std::string leaf = std::filesystem::path{root}.filename().string();
+	::setenv("PWD", (root + "/../" + leaf).c_str(), 1);
+	shell_state dotdotted;
+	EXPECT_EQ(believed(dotdotted), root);
+}
+
+TEST_F(StartupPwdTest, AWrongInheritedPwdDoesNotSteerARelativeCd) {
+	// Why the startup value is worth fixing rather than only reporting: a lie in the
+	// environment used to reach `cd` as the directory to join a relative operand
+	// onto, so `cd sub` looked for /etc/sub.
+	::setenv("PWD", "/etc", 1);
+	shell_state state;
+	EXPECT_EQ(run(state, "cd sub"), 0);
+	std::string_view where;
+	ASSERT_TRUE(state.lookup("PWD", where));
+	EXPECT_EQ(std::string{where}, root + "/sub");
 }

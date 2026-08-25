@@ -5,7 +5,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <climits>
 #include <pwd.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #if defined(__APPLE__)
@@ -93,11 +95,30 @@ shell_state::shell_state() {
 	_vars.insert_or_assign("PS2", variable{"> ", false});
 	_vars.insert_or_assign("PS4", variable{"+ ", false});
 
-	// PWD is deliberately NOT here. It is inherited from the environment and
-	// rewritten by `cd`, which owns the logical-versus-physical question POSIX
-	// attaches to it (#46); seeding it here would put a second author on one
-	// variable. dash refreshes it from getcwd at startup and lesh does not - a
-	// divergence visible only as `env -u PWD lesh -c 'echo ${PWD-unset}'`.
+	// PWD, which #42 left to #46's author and #51 closed. POSIX 2.5.3 makes setting
+	// it the SHELL's job at initialization: from the environment only when the
+	// inherited value still names the current directory, and from getcwd otherwise.
+	//
+	// Doing neither cost twice over. `PWD=/etc lesh -c 'pwd; cd ..; pwd'` answered
+	// /etc and then /, because a lie in the environment reached `pwd` AND became the
+	// directory every later relative `cd` was joined onto; and `env -u PWD lesh -c
+	// 'echo "[$PWD]"'` printed `[]`, where a script reading $PWD expects a pathname.
+	//
+	// The check is names_current_directory, whose whole point is that it is not a
+	// string comparison - an inherited `/tmp` on a system where /tmp is a symlink to
+	// /private/tmp is a LOGICAL pathname of this directory and is kept, which is what
+	// #46's -L exists to maintain. Exported, as dash exports it, so a child shell
+	// inherits the answer rather than recomputing a physical one.
+	//
+	// When getcwd cannot answer - the directory removed under the shell - nothing is
+	// written: there is no better value than the inherited one, and replacing a
+	// plausible pathname with an empty string would lose the last thing known.
+	if (std::string_view inherited;
+	    !lookup("PWD", inherited) || !names_current_directory(inherited)) {
+		if (std::string here = physical_working_directory(); !here.empty())
+			_vars.insert_or_assign("PWD", variable{std::move(here), true});
+	}
+
 	//
 	// LINENO is deliberately NOT here. It is not a constant to seed but a variable
 	// the shell must keep current as it reads, and a token's offset can land in an
@@ -207,6 +228,63 @@ std::string_view shell_state::ifs() const {
 	if (lookup("IFS", value))
 		return value;
 	return _ifs_default;
+}
+
+bool shell_state::names_current_directory(std::string_view path) {
+	// Absolute first, because everything after it is meaningless otherwise: `PWD=foo`
+	// is a plain assignment any script may make, and a relative value stat'ed below
+	// would be resolved against the very directory the question is about.
+	if (path.empty() || path.front() != '/')
+		return false;
+
+	// No component that is dot or dot-dot. POSIX 2.5.3 describes PWD as an absolute
+	// pathname containing neither, and a shell that adopts `/tmp/.` then prints it
+	// from `pwd` is naming a directory whose real name it knows. This is a deliberate
+	// divergence - dash, bash and ksh keep such a value, zsh replaces it as this does
+	// - and it is the one rule here that a stat cannot express: `/tmp/.` and `/tmp`
+	// share a device and an inode, so only the text can tell them apart.
+	//
+	// Dot-dot is the half that can mislead rather than merely look wrong. `cd -L`
+	// canonicalizes `..` LEXICALLY against $PWD, so a dot-dot the shell did not put
+	// there itself is a claim about the shape of the tree that nothing has checked.
+	for (size_t at = 0; at <= path.size();) {
+		const size_t slash = path.find('/', at);
+		const std::string_view part = path.substr(
+			at, slash == std::string_view::npos ? std::string_view::npos : slash - at);
+		if (part == "." || part == "..")
+			return false;
+		if (slash == std::string_view::npos)
+			break;
+		at = slash + 1;
+	}
+
+	// And it must NAME this directory. Device and inode rather than text: a logical
+	// pathname legitimately differs from getcwd's physical answer wherever a symlink
+	// is involved, which is the whole content of the -L/-P distinction #46 built.
+	// `/tmp` and `/private/tmp` are one directory and these two numbers say so.
+	struct stat named{};
+	struct stat here{};
+	const std::string terminated{path};   // stat needs a NUL, string_view has none
+	if (::stat(terminated.c_str(), &named) != 0 || ::stat(".", &here) != 0)
+		return false;
+	return named.st_dev == here.st_dev && named.st_ino == here.st_ino;
+}
+
+std::string shell_state::physical_working_directory() {
+	// PATH_MAX on the stack rather than getcwd's allocating GNU extension, which is
+	// not portable, and rather than a growing loop, which would answer a question
+	// nothing here asks: a pathname the kernel cannot fit in PATH_MAX is one no
+	// operand could name either.
+	char buffer[PATH_MAX];
+	if (::getcwd(buffer, sizeof buffer) == nullptr)
+		return {};
+	return std::string{buffer};
+}
+
+std::string shell_state::logical_working_directory() const {
+	if (std::string_view pwd; lookup("PWD", pwd) && names_current_directory(pwd))
+		return std::string{pwd};
+	return physical_working_directory();
 }
 
 int64_t shell_state::get(std::string_view name) const {

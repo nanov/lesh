@@ -90,6 +90,35 @@ public:
 	[[nodiscard]] bool unset(std::string_view name);
 	[[nodiscard]] bool is_exported(std::string_view name) const;
 
+	// --- the working directory, logical and physical --------------------------
+	//
+	// POSIX gives `cd`, `pwd` and the shell's own initialization ONE rule, and it
+	// lives here rather than in the two builtins because a shell whose `cd` and
+	// `pwd` disagree about which directory it is in is worse than one that is wrong
+	// in both. #46 gave `cd` its -L/-P pair; #51 gave `pwd` the same pair and made
+	// the constructor decide the starting value, and all three ask this question.
+
+	// Whether `path` may be believed as a LOGICAL pathname of the current working
+	// directory: absolute, no component that is dot or dot-dot, and naming the
+	// directory the process is actually in.
+	//
+	// The last test is DEVICE AND INODE, not text. Comparing against getcwd's answer
+	// would reject `/tmp` on a system where /tmp is a symlink to /private/tmp - and
+	// that value is precisely what the logical working directory is for, so a string
+	// comparison here would undo #46 at startup and again on every `pwd`.
+	[[nodiscard]] static bool names_current_directory(std::string_view path);
+
+	// getcwd, as a string. Empty when the kernel cannot say - a directory that has
+	// been removed under the shell, which is a state `pwd -P` and `cd -e` both have
+	// to report rather than paper over.
+	[[nodiscard]] static std::string physical_working_directory();
+
+	// The LOGICAL working directory: $PWD when it still names the current directory,
+	// and the physical one otherwise. `pwd` prints it and `cd` extends a relative
+	// operand onto it, which is why a stale $PWD - what `readonly PWD; cd sub` leaves
+	// behind - must not be believed by either.
+	[[nodiscard]] std::string logical_working_directory() const;
+
 	// Marks a name exported WITHOUT writing a value, which `export name` needs:
 	// exporting a readonly variable is not an assignment and dash allows it, so
 	// routing it through set() would refuse a command POSIX permits.

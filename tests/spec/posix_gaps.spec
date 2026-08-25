@@ -123,6 +123,36 @@ d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p a b; cd a; cd ../b; cd - > "$d/prin
 --- cd -- ends the options [xfail(legacy): legacy has no command substitution]
 d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -- -L; cd -- -L; echo "${PWD#$d}"
 
+# STARTUP `PWD`, and `pwd`'s own -L/-P (#51). POSIX 2.5.3 has the SHELL set PWD when
+# it starts: from the environment only when the inherited value still names the
+# current directory, and from getcwd otherwise. lesh did neither, so a lie in the
+# environment reached `pwd` and then steered every relative `cd` after it.
+#
+# These cases re-invoke `$TESTEE` because the value under test is one the shell reads
+# at INVOCATION - a case that only assigned PWD in the running shell would measure
+# `cd` instead. `[ "$out" = "$d" ]` rather than printing the path: the two shells get
+# different temporary directories, so the comparison has to happen inside the case.
+
+--- the shell sets PWD at startup when the environment has none [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; unset PWD; out=$("$TESTEE" -c 'printf %s "$PWD"'); [ "$out" = "$d" ] && echo same || echo "differs [$out] wanted [$d]"
+
+--- an inherited PWD that names another directory is replaced at startup [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; out=$(PWD=/etc "$TESTEE" -c 'printf %s "$PWD"'); [ "$out" = "$d" ] && echo same || echo "differs [$out] wanted [$d]"
+
+--- a relative PWD is not an absolute pathname of anywhere [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; out=$(PWD=relative "$TESTEE" -c 'printf %s "$PWD"'); [ "$out" = "$d" ] && echo same || echo "differs [$out] wanted [$d]"
+
+--- a wrong inherited PWD does not steer a relative cd [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p a/b; out=$(PWD=/etc "$TESTEE" -c 'cd a/b 2>/dev/null; printf %s "$PWD"'); echo "${out#$d}"
+
+# The other half of the same rule, and the one a string comparison would break: on a
+# system where /tmp is a symlink to /private/tmp, a LOGICAL PWD legitimately differs
+# from getcwd's answer. That is what #46's -L exists for, so the startup check has to
+# accept it - device and inode say the two name one directory where the text does not.
+
+--- an inherited PWD reached through a symlink is kept [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir real; ln -s real link; cd link; out=$(PWD="$d/link" "$TESTEE" -c 'printf %s "$PWD"'); echo "${out#$d}"
+
 --- export makes a variable visible to a child [xfail(legacy): legacy's export path is incomplete]
 export EXPORTED_VAR=visible; /usr/bin/env | /usr/bin/grep '^EXPORTED_VAR='
 
@@ -927,6 +957,16 @@ pathname
 : >foo; chmod a+x foo; case "$(command -v ./foo)" in (/*/foo) echo absolute;; (*) echo relative;; esac
 === expect
 absolute
+
+--- an inherited PWD with a dot component is replaced at startup [divergence: dash, bash and ksh keep it and then print a pathname with a `.` in it for a directory whose real name they know; POSIX 2.5.3 says PWD holds an absolute pathname containing no component that is dot or dot-dot, and zsh replaces it as lesh does]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; out=$(PWD="$d/." "$TESTEE" -c 'printf %s "$PWD"'); [ "$out" = "$d" ] && echo replaced || echo "kept [$out]"
+=== expect
+replaced
+
+--- an inherited PWD with a dot-dot component is replaced at startup [divergence: same rule, and the component that can actually mislead - `cd` canonicalizes `..` lexically, so a dot-dot the shell did not put in PWD itself is a claim about the tree that nothing has checked; dash, bash and ksh keep it, zsh replaces it]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; b=$(basename "$d"); out=$(PWD="$d/../$b" "$TESTEE" -c 'printf %s "$PWD"'); [ "$out" = "$d" ] && echo replaced || echo "kept [$out]"
+=== expect
+replaced
 
 # Assignment prefixes that never reached their command (#31). The prefix was
 # applied by four different paths and two of them dropped it: `x=1 eval 'echo $x'`
