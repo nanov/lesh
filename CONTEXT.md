@@ -384,6 +384,16 @@ Resumed after the command is reaped. Needed because lesh runs shell code in
 forked children (subshells); fish, which only ever execs, does not park and
 relies on the child touching nothing before exec — lesh does both.
 
+**Definitions version** _[lesh]_:
+The immutable, refcounted snapshot of what a worker may ask the shell —
+`$PATH`, function names, alias names. The loop mutates by copy-on-write and
+swaps the pointer; a request holds the version it was submitted against, so
+holding the pointer is the claim and a later mutation can only make the
+request stale, never unsafe. fish's environment snapshot, applied to all
+three tables.
+_Avoid_: concurrent collections for this — they make one lookup safe, not
+one computation's set of lookups consistent.
+
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,
 signals, worker results with generation and timing — written by the logger's
