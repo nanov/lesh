@@ -914,10 +914,20 @@ private:
 				// The lexer reports offsets within the body it was handed; the tree
 				// addresses that body above the input. Without the shift a token from an
 				// alias reads back as a slice of the script.
-				t.offset += _alias_stack.back().base;
+				alias_frame& frame = _alias_stack.back();
+				t.offset += frame.base;
 				if (t.is_error())
-					t.error_offset += _alias_stack.back().base;
+					t.error_offset += frame.base;
 				_index = _tree.add_token(t);
+				// A here-document opened on this line takes its body from the lines that
+				// follow the newline ENDING that line - and when the newline came from an
+				// alias body, those lines are in the alias body too. Collected before the
+				// eligible word is substituted, so the body is never lexed as commands.
+				if (!_pending_here_docs.empty() && t.kind == token_kind::newline) {
+					const uint32_t resume = collect_here_doc_bodies(
+						frame.text, frame.base, t.end_offset());
+					_alias_stack.back().lex.seek(resume - frame.base);
+				}
 				if (eligible)
 					substitute_word();
 				return;
@@ -946,7 +956,7 @@ private:
 			// input lexer to an alias offset would silently skip the rest of the
 			// script - so the here-doc is left unterminated, which is what it is.
 			if (after_newline <= _tree.source().size())
-				_lexer.seek(collect_here_doc_bodies(after_newline));
+				_lexer.seek(collect_here_doc_bodies(_tree.source(), 0, after_newline));
 			else {
 				_pending_here_docs.clear();
 				_tree.set_incomplete(true);
@@ -1104,15 +1114,24 @@ private:
 		uint32_t delimiter_token;
 	};
 
-	// Collects every pending here-doc body, starting at `from`. Returns where the
-	// last body ended so lexing can resume past it.
+	// Collects every pending here-doc body out of `src`, whose bytes begin at `base`
+	// in the tree's virtual text space, starting at the virtual offset `from`.
+	// Returns where the last body ended, again virtual, so lexing can resume past it.
+	//
+	// TEXT AND BASE RATHER THAN THE INPUT, because a here-document can be written
+	// entirely inside an alias body: `alias c='cat <<\END' d='c<newline>here-doc
+	// <newline>END'` puts the operator in one definition and the body in the other,
+	// and dash runs it (alias-p.tst:223). The body then lives in the alias text, and
+	// a collector that could only read _tree.source() had nowhere to find it. Both
+	// callers hand over the buffer the NEWLINE came from, which is the buffer whose
+	// following lines the body occupies.
 	//
 	// The parser does this, not the lexer. The lexer never reads and never seeks
 	// on its own - it is handed a buffer and a position, which is exactly what
 	// makes it safe to run on every keystroke over an editor's buffer.
-	uint32_t collect_here_doc_bodies(uint32_t from) noexcept {
-		const std::string_view src = _tree.source();
-		uint32_t at = from;
+	uint32_t collect_here_doc_bodies(std::string_view src, uint32_t base,
+	                                 uint32_t from) noexcept {
+		uint32_t at = from - base;
 
 		for (const auto& pending : _pending_here_docs) {
 			const std::string_view raw = text_of_token(pending.delimiter_token);
@@ -1170,7 +1189,8 @@ private:
 			}
 
 			syntax::here_doc_body body{};
-			body.offset = body_start;
+			// Back into the tree's virtual space, where the executor reads it from.
+			body.offset = base + body_start;
 			body.length = body_end > body_start ? body_end - body_start : 0;
 			body.expand = !quoted;
 			body.strip_tabs = n.aux != 0xFFFFFFFFu && _tree.here_doc_at(n.aux).strip_tabs;
@@ -1180,7 +1200,7 @@ private:
 		}
 
 		_pending_here_docs.clear();
-		return at;
+		return base + at;
 	}
 
 	// The alias name a word spells once its LINE CONTINUATIONS are removed, for a

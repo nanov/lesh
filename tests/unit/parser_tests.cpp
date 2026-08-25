@@ -942,6 +942,23 @@ TEST_F(ParserTest, AFunctionDefinitionMayTakeItsParenthesesFromAnotherAlias) {
 	EXPECT_TRUE(found) << "`f p` followed by a brace group defines a function";
 }
 
+TEST_F(ParserTest, AHereDocumentBodyMayLiveInsideAnAliasBody) {
+	// The operator is in one definition and the body in another, so the body's
+	// lines follow a newline drawn from the alias rather than from the script. The
+	// body's bytes then live in a registered text region above the input, which is
+	// why here_doc_text reads through text_at rather than the source.
+	fake_aliases aliases;
+	aliases.define("c", "cat <<\\END");
+	aliases.define("d", "c\nhere-document\nEND");
+	const tree t = parse(pool, "d\n", &aliases);
+	node_index doc = no_node;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::here_doc)
+			doc = n;
+	ASSERT_NE(doc, no_node) << "the operator inside the alias body opened one";
+	EXPECT_EQ(t.here_doc_text(t[doc].aux), "here-document\n");
+}
+
 TEST_F(ParserTest, ANewlineAfterAPipeContinuesThePipeline) {
 	// POSIX spells it `linebreak` in the grammar. Without it, reading one command
 	// at a time ended the unit at the newline and the right-hand side was lost.

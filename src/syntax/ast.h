@@ -262,9 +262,15 @@ public:
 	[[nodiscard]] const here_doc_body& here_doc_at(uint32_t i) const noexcept {
 		return _here_docs[i];
 	}
+	// Through text_at, not _source: a here-document can be written entirely inside
+	// an ALIAS body, so its bytes may live in a registered region above the input
+	// rather than in the script (alias-p.tst:223). Reading _source directly also
+	// made this noexcept function able to terminate the process - std::string_view
+	// ::substr throws when the offset is past the end, which is exactly what an
+	// alias-sourced body's offset is.
 	[[nodiscard]] std::string_view here_doc_text(uint32_t i) const noexcept {
 		const here_doc_body& b = _here_docs[i];
-		return _source.substr(b.offset, b.length);
+		return text_at(b.offset, b.length);
 	}
 
 	node_index add_node(node n) noexcept { return _nodes.push(n); }

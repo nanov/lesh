@@ -280,25 +280,6 @@ f w in 1 2; do echo "[$x]"; done
 alias forx='for x ' in='in 9'
 forx in a; do echo "[$x]"; done
 
-# yash substitutes an alias for a word that spells a reserved word whenever the
-# grammar cannot accept that reserved word there - `alias forx='for x ' for='in 2'`
-# makes `forx for a` a loop over 2. NO OTHER SHELL DOES: dash, bash and zsh all
-# recognise the keyword first and report a syntax error, and lesh follows them.
-# These are not divergences - lesh answers exactly what dash answers - so they are
-# asserted against dash like any other case, to pin the behaviour down against a
-# later change made in the belief that yash is the oracle here.
-
---- a keyword the grammar cannot accept where it stands is still a keyword, not an alias [stdin] [xfail(legacy): legacy's alias model differs]
-alias forx='for x ' for='in 2'
-forx for a; do echo "[$x]"; done
-echo "st=$?"
-
---- the same in the `in` position of a case statement [stdin] [xfail(legacy): legacy has no case statements]
-alias c='case a ' case='
- in a) :'
-c case X; echo A; esac
-echo "st=$?"
-
 # --- a function definition's parentheses may come from a DIFFERENT alias body
 # --- than its name (alias-p.tst:439) ------------------------------------------
 #
@@ -318,6 +299,49 @@ alias g='g( ' q=')'
 g q
 { echo G; }
 \g
+
+# --- a here-document can be written INSIDE an alias body (alias-p.tst:223) -----
+#
+# The operator is in one definition and the body in another, so the body's lines
+# follow a newline that came from the alias rather than from the script. The
+# collector therefore takes the buffer the newline came from; reading the input
+# alone had nowhere to find the body and lexed it as commands.
+
+--- an alias body supplies both the here-document operator and its body [stdin] [xfail(legacy): legacy has no here-documents]
+alias c='cat <<\END' d='c
+here-document
+END'
+d
+
+--- the same when one alias carries the whole construct [stdin] [xfail(legacy): legacy has no here-documents]
+alias d='cat <<\END
+body-line
+END'
+d
+
+# --- YASH-ONLY: a reserved word that is not valid WHERE IT STANDS ---------------
+#
+# yash substitutes an alias for a word that spells a reserved word whenever the
+# grammar cannot accept that reserved word there - `alias forx='for x ' for='; do'`
+# makes `forx for echo $x` a loop. NO OTHER SHELL DOES: dash, bash and zsh all
+# recognise the keyword first and report a syntax error, and lesh follows them.
+# These are not divergences - lesh answers exactly what dash answers - so they are
+# asserted against dash like any other case, to pin the behaviour down against a
+# later change made in the belief that yash is the oracle here.
+#
+# The positional rule lesh DOES implement is narrower and is asserted above: the
+# `for` NAME accepts no reserved word at all, so nothing is shadowed there.
+
+--- a keyword the grammar cannot accept where it stands is still a keyword, not an alias [stdin] [xfail(legacy): legacy's alias model differs]
+alias forx='for x ' for='in 2'
+forx for a; do echo "[$x]"; done
+echo "st=$?"
+
+--- the same in the `in` position of a case statement [stdin] [xfail(legacy): legacy has no case statements]
+alias c='case a ' case='
+ in a) :'
+c case X; echo A; esac
+echo "st=$?"
 
 --- a newline after a pipe continues the pipeline [stdin] [xfail(legacy): beyond legacy's single-pass parser]
 echo foo |
