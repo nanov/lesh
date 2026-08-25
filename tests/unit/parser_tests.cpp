@@ -1,4 +1,5 @@
 #include "syntax/parser.h"
+#include "syntax/source_map.h"
 
 #include <gtest/gtest.h>
 
@@ -968,4 +969,122 @@ TEST_F(ParserTest, ANewlineAfterAPipeContinuesThePipeline) {
 	ASSERT_EQ(t[t.root()].children_count, 1u);
 	EXPECT_EQ(t[t.child_of(t[t.root()], 0)].kind, node_kind::pipeline);
 	EXPECT_EQ(at, source.size());
+}
+
+// --- the offset -> (line, column) mapper (#76) --------------------------------
+//
+// Tested DIRECTLY rather than only through the shell. Three consumers ride on
+// this one answer - `$LINENO`, the line in a runtime diagnostic and the column in
+// it - so a defect here surfaces three times over, in three places that each look
+// like a different bug.
+
+TEST(SourceMapTest, TheFirstByteIsLineOneColumnOne) {
+	const source_map map{"echo hi\n"};
+	EXPECT_EQ(map.at(0).line, 1u);
+	EXPECT_EQ(map.at(0).column, 1u);
+}
+
+TEST(SourceMapTest, ColumnsCountAlongTheLine) {
+	const source_map map{"echo hi\n"};
+	EXPECT_EQ(map.at(5).line, 1u);
+	EXPECT_EQ(map.at(5).column, 6u);
+}
+
+TEST(SourceMapTest, TheByteAfterANewlineOpensTheNextLine) {
+	const source_map map{"a\nbb\nccc\n"};
+	EXPECT_EQ(map.at(2).line, 2u);
+	EXPECT_EQ(map.at(2).column, 1u);
+	EXPECT_EQ(map.at(5).line, 3u);
+	EXPECT_EQ(map.at(5).column, 1u);
+	EXPECT_EQ(map.at(7).line, 3u);
+	EXPECT_EQ(map.at(7).column, 3u);
+}
+
+TEST(SourceMapTest, AnEmptyLineStillCounts) {
+	// The `LINENO increments for each line` assertion turns on exactly this: the
+	// blank third line of the yash case has no command on it and the fourth line
+	// is still line 4.
+	const source_map map{"echo $LINENO\necho $LINENO\n\necho $LINENO\n"};
+	EXPECT_EQ(map.at(0).line, 1u);
+	EXPECT_EQ(map.at(13).line, 2u);
+	EXPECT_EQ(map.at(27).line, 4u);
+}
+
+TEST(SourceMapTest, AnOffsetPastTheEndClampsToTheEnd) {
+	// A defect can be reported at a virtual offset above the input - see
+	// tree::add_text_region - and a diagnostic that walked off the buffer looking
+	// for its line would be worse than one that names the last line.
+	const source_map map{"a\nb\n"};
+	EXPECT_EQ(map.at(4).line, 3u);
+	EXPECT_EQ(map.at(4).column, 1u);
+	EXPECT_EQ(map.at(4000).line, 3u);
+}
+
+TEST(SourceMapTest, TheEmptySourceIsOneOne) {
+	const source_map map{""};
+	EXPECT_EQ(map.at(0).line, 1u);
+	EXPECT_EQ(map.at(0).column, 1u);
+}
+
+TEST(SourceMapTest, ColumnsCountCHARACTERSRatherThanBytes) {
+	// The one case that distinguishes the two. `é` is two bytes, so the space
+	// after it is at BYTE 2 and at CHARACTER 2, and the `x` at byte 3 is the third
+	// character rather than the fourth. Every tool that reads `file:line:col`
+	// wants the second answer. See source_map's comment.
+	const source_map map{"\xc3\xa9 x\n"};
+	EXPECT_EQ(map.at(2).column, 2u) << "the space is the second character";
+	EXPECT_EQ(map.at(3).column, 3u) << "and x the third";
+}
+
+TEST(SourceMapTest, ARepeatedQueryIsAnsweredFromWhereverExecutionLeftIt) {
+	// The memo has to survive movement in BOTH directions, because a loop body run
+	// twice asks about the same offsets again after the answer has moved past them.
+	// Correctness first; the reason the mapper carries a memo at all is that
+	// without one the backward step rescans from byte zero every iteration.
+	const source_map map{"a\nb\nc\nd\ne\n"};
+	EXPECT_EQ(map.at(8).line, 5u);
+	EXPECT_EQ(map.at(2).line, 2u);
+	EXPECT_EQ(map.at(8).line, 5u);
+	EXPECT_EQ(map.at(0).line, 1u);
+	EXPECT_EQ(map.at(6).line, 4u);
+	EXPECT_EQ(map.at(4).line, 3u);
+}
+
+TEST_F(ParserTest, AnOffsetInsideAnAliasBodyResolvesToTheInvocationSite) {
+	// #40's regions put typed text in [0, source.size()) and each alias body ABOVE
+	// it, so "did this come from an alias?" is a comparison rather than a guess.
+	// That is what makes the fallback an explicit rule: a token with no position in
+	// the script is reported where the user can see it, at the word that ran.
+	fake_aliases aliases;
+	aliases.define("a", "nosuchcmd");
+	const std::string_view source = "echo one\na\n";
+	const tree t = parse(pool, source, &aliases);
+	const node& cmd = t[t.child_of(t[t.root()], 1)];
+	const uint32_t word = t.span_of(cmd).offset;
+	ASSERT_GE(word, source.size()) << "the command word came from the alias body";
+
+	const invocation_site site = t.invocation_of(word);
+	EXPECT_EQ(site.offset, 9u) << "the `a` the user typed, on line 2";
+	ASSERT_EQ(site.depth, 1u);
+	EXPECT_EQ(site.chain[0], "a");
+}
+
+TEST_F(ParserTest, ANestedAliasReportsTheWholeChainOutermostFirst) {
+	fake_aliases aliases;
+	aliases.define("a", "b");
+	aliases.define("b", "nosuchcmd");
+	const tree t = parse(pool, "a\n", &aliases);
+	const node& cmd = t[t.child_of(t[t.root()], 0)];
+	const invocation_site site = t.invocation_of(t.span_of(cmd).offset);
+	EXPECT_EQ(site.offset, 0u);
+	ASSERT_EQ(site.depth, 2u);
+	EXPECT_EQ(site.chain[0], "a");
+	EXPECT_EQ(site.chain[1], "b");
+}
+
+TEST_F(ParserTest, AnOffsetInTheInputPassesThroughUnchanged) {
+	const tree t = parse(pool, "echo hi\n");
+	const invocation_site site = t.invocation_of(5);
+	EXPECT_EQ(site.offset, 5u);
+	EXPECT_EQ(site.depth, 0u);
 }

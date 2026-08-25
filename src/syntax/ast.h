@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <string_view>
+#include <utility>
 
 namespace lesh::syntax {
 
@@ -220,6 +221,34 @@ struct span {
 	}
 };
 
+// How many alias bodies a chain may cross. The parser's own substitution ceiling,
+// so the chain below can never be truncated - `alias a=b; alias b=c; ...` stops
+// being substituted before it stops being reportable.
+inline constexpr uint32_t kMaxAliasChain = 16;
+
+// WHERE A VIRTUAL OFFSET REALLY CAME FROM, and what it passed through. See
+// issue #76 and add_text_region.
+//
+// A token lexed from an alias body has no position in the text the user typed -
+// the body was never in the script. Reporting a defect at its virtual offset
+// would name a line of a file that does not exist, so the rule is explicit: fall
+// back to the INVOCATION SITE, the word the user can see and edit, and name the
+// aliases crossed on the way out.
+//
+// A fixed array rather than a vector: this is built on the stack while a
+// diagnostic is being printed, and a diagnostic that allocated would be the one
+// thing guaranteed to run when the shell is already in trouble.
+struct invocation_site {
+	// A real offset into source(). Equal to the offset asked about whenever that
+	// offset was already in the input, which is the overwhelmingly common case.
+	uint32_t offset = 0;
+	// The aliases crossed, OUTERMOST FIRST: `alias a=b; alias b=nosuchcmd` gives
+	// {a, b}, which is the order a reader follows - a became b became the command
+	// that failed.
+	std::string_view chain[kMaxAliasChain];
+	uint32_t depth = 0;
+};
+
 class tree {
 public:
 	tree(buffer_pool& pool, std::string_view source) noexcept
@@ -249,9 +278,18 @@ public:
 	//
 	// The view must outlive the tree. Alias text does: shell_state owns it
 	// (ADR-0007), and a parse finishes before any command can redefine an alias.
-	uint32_t add_text_region(std::string_view text) noexcept {
+	//
+	// `name` and `invoked_at` are what turn a region from a place to READ bytes
+	// into a place a diagnostic can be reported FROM (#76). `invoked_at` is the
+	// offset of the word this body replaced - itself possibly in an outer region,
+	// which is exactly how a nested alias chain is walked - and `name` is the alias
+	// that word named. Both are already in the substituting caller's hand, and
+	// neither can be recovered afterwards: an alias body is just bytes, and two
+	// aliases may share the same ones.
+	uint32_t add_text_region(std::string_view text, std::string_view name,
+	                         uint32_t invoked_at) noexcept {
 		const uint32_t base = _region_end;
-		_regions.push(text);
+		_regions.push({text, name, invoked_at});
 		_region_end += static_cast<uint32_t>(text.size());
 		return base;
 	}
@@ -348,13 +386,53 @@ public:
 		if (offset < _source.size())
 			return _source.substr(offset, std::min<size_t>(length, _source.size() - offset));
 		uint32_t base = static_cast<uint32_t>(_source.size());
-		for (const std::string_view& region : _regions) {
-			const uint32_t end = base + static_cast<uint32_t>(region.size());
+		for (const text_region& region : _regions) {
+			const uint32_t end = base + static_cast<uint32_t>(region.text.size());
 			if (offset < end)
-				return region.substr(offset - base, std::min<size_t>(length, end - offset));
+				return region.text.substr(offset - base,
+				                          std::min<size_t>(length, end - offset));
 			base = end;
 		}
 		return {};
+	}
+
+	// Walks a virtual offset out to the text the user typed. See invocation_site.
+	//
+	// The test is a COMPARISON, not a heuristic, and that is what #40's region
+	// scheme bought: typed text is [0, source.size()) and every alias body sits
+	// above it, so an offset either has a real position or names the region that
+	// supplied it. Each step replaces the offset with the one the substituted word
+	// stood at, which is strictly lower - an alias body is registered only once the
+	// word it replaces has been read - so the walk terminates. The depth guard is
+	// belt and braces against a malformed tree, not against a shape the parser can
+	// build.
+	[[nodiscard]] invocation_site invocation_of(uint32_t offset) const noexcept {
+		invocation_site site;
+		while (offset >= _source.size() && site.depth < kMaxAliasChain) {
+			uint32_t base = static_cast<uint32_t>(_source.size());
+			const text_region* found = nullptr;
+			for (const text_region& region : _regions) {
+				const uint32_t end = base + static_cast<uint32_t>(region.text.size());
+				if (offset < end) {
+					found = &region;
+					break;
+				}
+				base = end;
+			}
+			// Above every region: nothing named this offset, so there is no invocation
+			// site to fall back to and the last real position is the best answer.
+			if (found == nullptr)
+				break;
+			site.chain[site.depth++] = found->name;
+			offset = found->invoked_at;
+		}
+		// OUTERMOST FIRST. The walk collects innermost first, because it goes from
+		// where the token really is toward what the user typed; a reader wants the
+		// other direction - `a → b` reads as "a became b".
+		for (uint32_t i = 0, j = site.depth; i + 1 < j; ++i, --j)
+			std::swap(site.chain[i], site.chain[j - 1]);
+		site.offset = offset;
+		return site;
 	}
 
 	// The deepest node whose span contains a byte offset. This is what completion
@@ -463,14 +541,20 @@ public:
 	}
 
 private:
+	// Text that is not the input, and where the user's own text asked for it. One
+	// entry per alias substitution. See add_text_region and invocation_of.
+	struct text_region {
+		std::string_view text;
+		std::string_view name;
+		uint32_t invoked_at = 0;
+	};
+
 	std::string_view _source;
 	arena_array<node> _nodes;
 	arena_array<uint32_t> _children;
 	arena_array<token> _tokens;
 	arena_array<here_doc_body> _here_docs;
-	// Text that is not the input: one entry per alias substitution. See
-	// add_text_region.
-	arena_array<std::string_view> _regions;
+	arena_array<text_region> _regions;
 	uint32_t _region_end = 0;
 	node_index _root = no_node;
 	bool _incomplete = false;

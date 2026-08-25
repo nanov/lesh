@@ -1278,10 +1278,23 @@ private:
 					return;
 
 			// Replace the word: drop it and lex the definition in its place.
+			//
+			// The word's own offset goes to the region as its invocation site (#76).
+			// It is read BEFORE the substitution because that is the last moment it
+			// exists: from here on the parser is looking at the replacement. For a
+			// NESTED alias this offset is itself inside the outer body, which is
+			// exactly what lets invocation_of walk the whole chain out.
+			const uint32_t invoked_at = peek().offset;
+			// The word AS SPELLED, not `name`: across a line continuation `name`
+			// views `joined`, a buffer that dies with this scope, and a region
+			// outlives the parse. The spelling is a view into the tree's own text and
+			// is what the user typed, which is what a diagnostic should quote back.
+			const std::string_view spelled = text_of_token(_index);
 			const bool trailing_blank =
 				!value.empty() && (value.back() == ' ' || value.back() == '\t');
 			_alias_stack.push_back(
-				{lexer{value}, value, _tree.add_text_region(value), trailing_blank});
+				{lexer{value}, value,
+				 _tree.add_text_region(value, spelled, invoked_at), trailing_blank});
 			_alias_depth = _alias_stack.size();
 			fill();
 
