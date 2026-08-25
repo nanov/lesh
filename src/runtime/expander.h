@@ -128,6 +128,54 @@ enum class value_context {
 	here_document_body,
 };
 
+// POSIX 2.9.1's DECLARATION UTILITY, as a scan over one simple command's words.
+//
+// `export A=$a` and `readonly A=$a` are assignments wearing a command's clothes:
+// POSIX expands their `NAME=value` operands the way it expands a plain `A=$a` -
+// a tilde is eligible after an unquoted colon, and neither field splitting nor
+// pathname expansion applies. Every such operand went through expand_word like
+// an ordinary argument, so `a='x y'; export A=$a` exported `x` and handed `y` to
+// export as a second operand, and `export A=~:~` exported the tildes verbatim.
+// One wrong entry point, two wrong answers.
+//
+// It is a SCAN the caller drives rather than a word_role on the node the way a
+// `case` pattern is (#54), because the parser cannot know: `v=export; $v A=~:~`
+// is a declaration utility in dash, so the utility's name is only settled once
+// the first word has been expanded. The executor is the one place that sees a
+// command's words in order and their fields as they arrive.
+class declaration_scan {
+public:
+	// True when `word` - the word's text AS WRITTEN - is one of the operands the
+	// rule covers. The unexpanded text is what decides, and that is not an
+	// approximation: declutil-p.tst asserts both halves of it, `export A=$a` not
+	// splitting and `export $a` with a='A B' exporting two names. dash reads the
+	// same text and answers the same way, which is why `export "A"=~` leaves the
+	// tilde alone - the word does not OPEN with a name.
+	[[nodiscard]] bool operand_is_assignment(std::string_view word) const noexcept;
+
+	// Offers the first field a word expanded to, for a word that was not taken as
+	// an assignment operand. Only the words BEFORE the utility's name can change
+	// the answer: once a declaration utility has been named nothing takes it back,
+	// so `export B A=$a` still assigns `x y` as dash does.
+	void note_expanded_word(std::string_view field) noexcept;
+
+private:
+	enum class state : uint8_t {
+		// Before the command name. `command` and its options may still precede it.
+		searching,
+		// A declaration utility has been named. Sticky.
+		declaring,
+		// Some other utility has been named.
+		other,
+	};
+	state _state = state::searching;
+	// A `command` has been seen, so a following `-p`/`-v`/`-V`/`--` belongs to it
+	// rather than being the command name - `command -p export A=~:~` expands both
+	// tildes in dash. Tracked rather than assumed of any leading `-`, because in
+	// the command name's OWN position a word opening with `-` is the name.
+	bool _after_command = false;
+};
+
 enum class expansion_status {
 	ok,
 	command_substitution_unavailable,  // no runner supplied - completion's mode

@@ -1085,6 +1085,39 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 	return status;
 }
 
+// POSIX 2.9.1's declaration utility. The header argues why this is a scan the
+// caller drives rather than a role the parser marks.
+
+bool declaration_scan::operand_is_assignment(std::string_view word) const noexcept {
+	if (_state != state::declaring)
+		return false;
+	// The word AS WRITTEN, so an `=` that only appears after an expansion does not
+	// count: `a='A=1'; export $a` sets A through field splitting, not through this.
+	const size_t eq = word.find('=');
+	return eq != std::string_view::npos && is_assignable_name(word.substr(0, eq));
+}
+
+void declaration_scan::note_expanded_word(std::string_view field) noexcept {
+	// The utility is settled by the first word that names one, and a later operand
+	// does not unname it: `export B A=$a` assigns `x y` in dash.
+	if (_state != state::searching)
+		return;
+	if (field == "export" || field == "readonly") {
+		_state = state::declaring;
+		return;
+	}
+	// `command` bypasses function lookup; it does not change what the utility it
+	// runs IS. declutil-p.tst requires the rule to survive TWO of them, which is
+	// the assertion zsh fails and dash passes.
+	if (field == "command") {
+		_after_command = true;
+		return;
+	}
+	if (_after_command && !field.empty() && field[0] == '-')
+		return;  // an option of that `command`, not the utility's name
+	_state = state::other;
+}
+
 // One VALUE rather than a field list, in the caller's own quoting rules.
 std::string_view expander::expand_value(std::string_view text,
                                         value_context context) noexcept {

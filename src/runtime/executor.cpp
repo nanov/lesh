@@ -1573,6 +1573,13 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 	expander ex = make_expander();
 	arena_array<std::string_view> fields{_pool, 8};
 
+	// POSIX 2.9.1's declaration utility: an `export`/`readonly` operand in
+	// `NAME=value` form is an assignment and is expanded as one. Which operands
+	// those are is not knowable at parse time - `v=export; $v A=~:~` is one in
+	// dash - so the scan runs here, where the words arrive in order and their
+	// fields arrive with them. See declaration_scan (#55).
+	declaration_scan declaration;
+
 	for (uint32_t i = 0; i < self.children_count; ++i) {
 		const node_index child = t.child_of(self, i);
 		if (t[child].kind == node_kind::assignment) {
@@ -1582,7 +1589,22 @@ bool tree_walking_executor::build_argv(const tree& t, node_index n,
 		}
 		if (t[child].kind != node_kind::word)
 			continue;
+		const std::string_view word = t.text_of(t[child]);
+		if (declaration.operand_is_assignment(word)) {
+			// The same entry point a plain `A=$a` takes, which is the whole of the
+			// fix: one value, no field splitting, no pathname expansion, and a tilde
+			// eligible after an unquoted colon. Going through expand_word instead
+			// made `a='x y'; export A=$a` export `x` and hand `y` to export as a
+			// second operand, and left `export A=~:~` holding both tildes.
+			fields.push(expand_assignment(word));
+			continue;
+		}
+		const size_t before = fields.size();
 		(void)ex.expand_word(t, child, fields);
+		// A word that expanded to no fields at all names no utility, so it leaves
+		// the scan where it was rather than settling it on nothing.
+		if (fields.size() > before)
+			declaration.note_expanded_word(fields[before]);
 	}
 
 	// `set -u` on an unset parameter, or `${x?}`, must stop the command rather

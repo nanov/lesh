@@ -351,3 +351,27 @@ case $* in 'x y') echo star;; *) echo notstar;; esac
 
 --- and IFS does not break it in two [xfail(legacy): legacy has no case clause]
 IFS=:; v='a:b'; case $v in 'a:b') echo whole;; *) echo halves;; esac
+
+# POSIX 2.9.1's DECLARATION UTILITY. `export` and `readonly` take operands that
+# LOOK like assignments and must be expanded like them: a tilde is eligible after
+# an unquoted colon, and neither field splitting nor pathname expansion applies.
+# Which words those are is decided from the word AS WRITTEN, so `export $a` is an
+# ordinary argument that really does split - declutil-p.tst asserts both halves.
+
+--- a declaration utility's assignment operand is neither split nor globbed [xfail(legacy): legacy has no field splitting]
+>tmpfile; a='1  *  2'; export A=$a; readonly R=$a; printf '[%s][%s]\n' "$A" "$R"
+
+--- a tilde after a colon is eligible in a declaration utility's operand [xfail(legacy): legacy has no tilde expansion]
+HOME=/foo; export A=~:~; readonly R=x:~/y:~; printf '[%s][%s]\n' "$A" "$R"
+
+--- a declaration utility's other operands are split and globbed as usual [xfail(legacy): legacy has no field splitting]
+A=foo B=bar a='A B'; export $a && printf '[%s][%s]\n' "$A" "$B"
+
+--- command does not stop a declaration utility from being one [xfail(legacy): legacy has no field splitting]
+a='1  *  2'; command command export A=$a; command readonly R=$a; printf '[%s][%s]\n' "$A" "$R"
+
+--- the assignment form is read from the word as written, not from its expansion [xfail(legacy): legacy has no tilde expansion]
+HOME=/foo; export "A"=~:~; a='x y'; export "B=$a"; printf '[%s][%s]\n' "$A" "$B"
+
+--- an ordinary utility's NAME=value argument is still a command argument [xfail(legacy): legacy has no field splitting]
+a='x y'; printf '[%s]\n' A=$a

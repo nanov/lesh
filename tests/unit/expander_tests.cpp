@@ -1011,3 +1011,76 @@ TEST_F(ExpanderTest, ASubstitutionThatRanIsNotAnErrorWhateverItsCommandDid) {
 	EXPECT_FALSE(fatal);
 	EXPECT_EQ(status, expansion_status::ok);
 }
+
+// --- POSIX 2.9.1's declaration utility (#55) ---------------------------------
+
+TEST(DeclarationScanTest, TheAssignmentFormIsReadFromTheWordAsWritten) {
+	// The unexpanded text decides, which is the whole of declutil-p.tst's two
+	// halves: `export A=$a` is an assignment and is not split, `export $a` is an
+	// ordinary argument and is. dash reads the same text and answers the same way.
+	declaration_scan scan;
+	scan.note_expanded_word("export");
+	EXPECT_TRUE(scan.operand_is_assignment("A=$a"));
+	EXPECT_TRUE(scan.operand_is_assignment("A="));
+	EXPECT_TRUE(scan.operand_is_assignment("_x9=~:~"));
+	EXPECT_FALSE(scan.operand_is_assignment("$a"))
+		<< "declutil-p.tst's `export $a` really does split into two names";
+	EXPECT_FALSE(scan.operand_is_assignment("\"A\"=~"))
+		<< "dash leaves the tilde alone here: the word does not OPEN with a name";
+	EXPECT_FALSE(scan.operand_is_assignment("=v"));
+	EXPECT_FALSE(scan.operand_is_assignment("1A=v"));
+	EXPECT_FALSE(scan.operand_is_assignment("A"));
+	EXPECT_FALSE(scan.operand_is_assignment("A-b=v"));
+}
+
+TEST(DeclarationScanTest, NothingIsAnAssignmentOperandUntilTheUtilityIsNamed) {
+	declaration_scan scan;
+	EXPECT_FALSE(scan.operand_is_assignment("A=$a")) << "this word is the command name";
+	scan.note_expanded_word("printf");
+	EXPECT_FALSE(scan.operand_is_assignment("A=$a"))
+		<< "`printf A=$a` is an ordinary argument and splits";
+}
+
+TEST(DeclarationScanTest, BothDeclarationUtilitiesAreOne) {
+	for (const std::string_view name : {"export", "readonly"}) {
+		declaration_scan scan;
+		scan.note_expanded_word(name);
+		EXPECT_TRUE(scan.operand_is_assignment("A=$a")) << name;
+	}
+}
+
+TEST(DeclarationScanTest, ACommandPrefixDoesNotHideTheUtility) {
+	// declutil-p.tst's 'command command export', which zsh fails and dash passes.
+	declaration_scan scan;
+	scan.note_expanded_word("command");
+	scan.note_expanded_word("command");
+	scan.note_expanded_word("export");
+	EXPECT_TRUE(scan.operand_is_assignment("A=$a"));
+
+	// `command`'s own options come between the two, and dash keeps the rule
+	// through them: `command -p export A=~:~` expands both tildes.
+	declaration_scan with_option;
+	with_option.note_expanded_word("command");
+	with_option.note_expanded_word("-p");
+	with_option.note_expanded_word("readonly");
+	EXPECT_TRUE(with_option.operand_is_assignment("A=$a"));
+}
+
+TEST(DeclarationScanTest, TheUtilityOnceNamedIsNotTakenBack) {
+	// `export B A=$a` assigns `x y` in dash: an operand that is not an assignment
+	// does not end the rule for the operands after it.
+	declaration_scan scan;
+	scan.note_expanded_word("export");
+	scan.note_expanded_word("B");
+	EXPECT_TRUE(scan.operand_is_assignment("A=$a"));
+}
+
+TEST(DeclarationScanTest, AnOptionBeforeAnyCommandPrefixIsTheCommandName) {
+	// Only `command` has options to skip. A word opening with `-` in the command
+	// name's own position is the name, however unlikely, and must not leave the
+	// scan waiting for a utility that never comes.
+	declaration_scan scan;
+	scan.note_expanded_word("-p");
+	scan.note_expanded_word("export");
+	EXPECT_FALSE(scan.operand_is_assignment("A=$a"));
+}
