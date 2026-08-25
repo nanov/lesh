@@ -282,9 +282,10 @@ buffer, cursor or selection, and it runs synchronously, only when invoked.
 _Avoid_: widget, zsh's word for this — reserved here for future UI surfaces.
 
 **Mode** _[lesh]_:
-A named keymap set defining an editing paradigm — emacs, vi-insert,
-vi-command. Not an enum anywhere: adding a mode is defining keymaps and
-actions.
+The named keymap at the base of the stack — emacs, vi_insert, vi_command.
+Switching mode swaps the base; **sub-modes** (visual, operator-pending, the
+pager) are pushes above it and never change the mode. Not an enum anywhere:
+adding a mode is registering keymaps and actions.
 
 **Reactor** _[lesh]_:
 A subscriber to editor state-change events that computes derived state —
@@ -370,9 +371,12 @@ A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
 **Keymap** _[lesh]_:
-A table binding key sequences to action names. First-class data: created,
-copied, modified, pushed and popped at runtime — modal input is a stack of
-keymaps, never a second dispatch system.
+A flat table binding key sequences to action names, keyed by symbolic key
+events — never raw bytes; the decoder owns escape sequences exactly once.
+First-class data: created, copied, modified, pushed and popped at runtime —
+modal input is a stack of keymaps, never a second dispatch system.
+_Avoid_: binding a key to another key sequence; a binding names an action,
+so vim's map-vs-noremap distinction has nothing to distinguish here.
 
 **Autosuggestion** _[lesh]_:
 The greyed-out completion of the current line drawn from history.
