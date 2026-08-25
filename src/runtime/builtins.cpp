@@ -1989,7 +1989,22 @@ builtin_result builtin_shift(shell_state& state, char** argv) {
 	}
 	if (!state.shift_positional(count)) {
 		std::fprintf(stderr, "lesh: shift: can't shift that many\n");
-		return {1};
+		// TWO, the same as the operand that would not parse above it (#73).
+		//
+		// lesh was the only shell of the four surveyed that gave two different
+		// answers to "shift refused": 1 here and 2 there. dash answers 2 for both and
+		// bash 1 for both, and nothing separated the two cases here - #63 routed them
+		// through the one numeric parser, so the split was a leftover rather than a
+		// reading of anything.
+		//
+		// 2 and not 1, on three counts that agree. ADR-0001 makes dash authoritative
+		// for the POSIX floor and dash says 2. Both refusals are already FATAL to a
+		// non-interactive shell - `failure_kind::usage`, POSIX XCU 2.8.1's utility
+		// syntax error row - so this number is the status the SHELL DIES WITH, and it
+		// is the one `shift abc`, `set -Z` and `export 1bad=x` already die with.
+		// Taking bash's 1 would have meant taking its non-fatality too, or leaving a
+		// shell that exits with the status of a command that merely failed.
+		return {2};
 	}
 	return {0};
 }

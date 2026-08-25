@@ -1580,9 +1580,15 @@ echo before; set -Z 2>/dev/null; echo notreached
 echo before; shift abc 2>/dev/null; echo notreached
 
 # A shift count PAST THE END is fatal here too - POSIX 2.14 lets a shell treat it
-# as a syntax error and dash does - but it is deliberately not a case here,
-# because lesh reports 1 for it where dash reports 2 and a case would be asserting
-# that unrelated difference. `shift abc` above covers the same row of 2.8.1.
+# as a syntax error and dash does. It could not be a case while lesh reported 1
+# for it and 2 for `shift abc`, because a case would have been asserting that
+# unrelated difference; #73 made the two agree on 2, so it is a case now.
+
+--- a shift count past the end still ends the shell [xfail(legacy): legacy has no shift builtin]
+set -- a; echo before; shift 5 2>/dev/null; echo notreached
+
+--- and the two ways of refusing a shift report the SAME status [xfail(legacy): legacy has no shift builtin]
+set -- a; ("$TESTEE" -c 'set -- a; shift 5') 2>/dev/null; echo "past=$?"; ("$TESTEE" -c 'shift abc') 2>/dev/null; echo "bad=$?"
 
 --- an operand that is not a NAME still ends the shell in `export` [xfail(legacy): legacy has no export builtin]
 echo before; export 1bad=x 2>/dev/null; echo notreached

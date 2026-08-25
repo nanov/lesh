@@ -1376,6 +1376,20 @@ TEST_F(ExecutorTest, ShiftRefusesAnOperandThatIsNotANumber) {
 	EXPECT_EQ(run("( set -- a b c; shift -1 ) 2>/dev/null"), 2);
 }
 
+TEST_F(ExecutorTest, ShiftRefusesBothWaysWithTheSAMEStatus) {
+	// lesh was the only shell of the four surveyed in #66 that answered "shift
+	// refused" two different ways - 2 for an operand that will not parse, 1 for a
+	// count past the end - and #63 had already routed both through the one numeric
+	// parser, so nothing was left to separate them. dash answers 2 for both.
+	EXPECT_EQ(run("( set -- a; shift 5 ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( shift abc ) 2>/dev/null"), 2);
+	// Still fatal to a non-interactive shell, which is the half that was already
+	// right: the number moved, the POSIX XCU 2.8.1 row did not.
+	EXPECT_EQ(capture("set -- a; shift 5 2>/dev/null; echo notreached"), "");
+	// And a shift that FITS is untouched by any of this.
+	EXPECT_EQ(capture("set -- a b c; shift 2; echo \"[$#][$1]\""), "[1][c]\n");
+}
+
 TEST_F(ExecutorTest, ShiftSilentlyShiftedNothingForABadOperand) {
 	// The failure mode, asserted directly: atoi's 0 asked to shift ZERO parameters,
 	// which succeeds, so the script carried on with its arguments untouched and no
