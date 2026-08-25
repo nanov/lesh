@@ -293,6 +293,17 @@ cursor or selection. The highlighter and the autosuggester are reactors.
 _Avoid_: calling a reactor's work an effect; an **effect** is synchronous and
 the loop's own.
 
+**Binding** _[lesh]_:
+A language's frontend to the action/reactor ABI: the lesh binding exposes
+editor state as shell variables, the Lua binding (later) as a table API. A
+binding wraps the one C surface; the ABI itself belongs to no binding.
+
+**Request token** _[lesh]_:
+The opaque, generation-bound handle a reactor computes against. The only
+mint for results: decorations and proposals are emitted through it or not at
+all, which is what makes applying a stale result impossible rather than
+checked.
+
 **Proposal** _[lesh]_:
 Derived state offered to the user — an autosuggestion, a candidate list. It
 becomes a buffer edit only through an accepting action; it never auto-applies.
