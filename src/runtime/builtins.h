@@ -37,10 +37,12 @@ enum class control_flow {
 
 // WHICH INPUT A COMMAND LOOP IS READING (#74).
 //
-// The shell reads commands in exactly two situations - its own input, and a
-// nested source an `eval`, a `.`, a trap body or a command substitution handed
-// it - and the loop is the SAME loop for both. Every guard it applies is shared:
-// the syntax-error exit, `set -n`, pending traps, the interrupt unwind, `set -e`.
+// The shell reads commands in three situations - its own input; a nested source
+// an `eval`, a `.`, a trap body or a command substitution handed it; and the body
+// of a compound command - and the loop is the SAME loop for all three
+// (`run_command_list`, reached from `run_parsed` and `run_compound_list`). Every
+// guard it applies is shared: the syntax-error exit, `set -n`, pending traps, the
+// interrupt unwind, `set -e`.
 //
 // One rule is not, and this enum exists to carry exactly that one. A `return`,
 // `break` or `continue` that escapes every construct around it ENDS the shell's
