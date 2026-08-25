@@ -138,9 +138,11 @@ target_sources(lesh_substrate INTERFACE
 	src/substrate/arena.h
 	src/substrate/assert.h
 	src/substrate/char_utils.h
+	src/substrate/grapheme.h
 	src/substrate/hybrid_vector.h
 	src/substrate/inline_vector.h
-	src/substrate/traits.h)
+	src/substrate/traits.h
+	src/substrate/unicode_tables.h)
 
 # ui: terminal presentation. Depends only on the substrate.
 add_library(lesh_ui STATIC
@@ -218,6 +220,7 @@ add_executable(lesh_tests
 	tests/unit/lexer_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
+	tests/unit/grapheme_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/options_tests.cpp
 	tests/unit/expander_tests.cpp
@@ -229,6 +232,11 @@ add_executable(lesh_tests
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
 target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
+# The grapheme tests read the vendored UCD conformance file rather than a
+# generated fixture, so a stale table cannot be validated by an equally stale
+# expectation (#108).
+target_compile_definitions(lesh_tests PRIVATE
+	LESH_UCD_DIR="${PROJECT_SOURCE_DIR}/third_party/ucd")
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
@@ -260,8 +268,18 @@ endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
 target_link_libraries(lesh_header_self_containment PRIVATE lesh_runtime lesh_substrate lesh_syntax)
 
-find_program(DASH_EXECUTABLE dash)
+# The committed src/substrate/unicode_tables.h must be exactly what the
+# generator emits from the vendored UCD (#108). The 766 conformance cases prove
+# the rules agree with the table; only this proves the table agrees with Unicode.
+# A hand-edited or half-regenerated table is a wrong answer that still compiles.
 find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+	add_test(NAME unicode_tables_current
+		COMMAND ${Python3_EXECUTABLE}
+			${PROJECT_SOURCE_DIR}/tools/gen_unicode_tables.py --check)
+endif()
+
+find_program(DASH_EXECUTABLE dash)
 if(DASH_EXECUTABLE AND Python3_Interpreter_FOUND)
 	# Both front ends are measured, continuously. Parity is tracked as the new
 	# front end grows rather than discovered at the end of the migration - see #8,

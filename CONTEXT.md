@@ -312,6 +312,28 @@ arriving later as an event.
 The grid of styled cells leshper renders into. A blitter turns surfaces into
 terminal output; tests assert cell grids, never escape sequences.
 
+**Grapheme cluster** _[lesh]_:
+What a user calls a character: the unit the cursor rests on, one Backspace deletes,
+one `forward-char` crosses. UAX #29 extended grapheme cluster boundaries, computed
+against tables lesh generates rather than a library's.
+_Avoid_: character, which the shell language already uses for a byte; codepoint,
+which is one of the several a cluster may hold.
+
+**Cluster width** _[lesh]_:
+How many terminal cells one grapheme cluster occupies. Not the sum of its
+codepoints' widths — that reads a woman-ZWJ-boy emoji as four columns where a
+terminal draws two, and leaves the cursor two cells from where the user sees it.
+The half of the problem no surveyed Unicode library answers.
+_Avoid_: wcwidth, which names the per-codepoint question and gets that answer.
+
+**Width policy** _[lesh]_:
+The replaceable object that turns a width class into a column count. Width belongs
+to the terminal on the far side of the pty, not to Unicode: East Asian Ambiguous is
+one cell or two depending on the locale, and a Unicode 9 terminal disagrees with a
+Unicode 17 one about emoji. The tables give the default; the policy is where a
+negotiated protocol or a user override lands, without the segmenter changing.
+_Avoid_: treating a width as a constant, which is how a redraw drifts.
+
 **Generation** _[lesh]_:
 A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
