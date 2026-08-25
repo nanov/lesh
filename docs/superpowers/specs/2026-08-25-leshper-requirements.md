@@ -183,12 +183,12 @@ Each open question is a ticket on [the leshper map](https://github.com/nanov/les
 
 Still open:
 
-- **Q-1** Vi depth at v1 → [#99](https://github.com/nanov/lesh/issues/99)
 - **Q-3** `vared`-equivalent entry point at v1 or later → [#102](https://github.com/nanov/lesh/issues/102) — unblocked by #94; the interfaces it tests are frozen
 
 Resolved:
 
 - **Q-2** Selection semantics → [#96](https://github.com/nanov/lesh/issues/96): anchor + active flag, the cursor is the head; shape is the mode's projection — architecture spec §6.3
+- **Q-1** Vi depth at v1 → [#99](https://github.com/nanov/lesh/issues/99): zle's repertoire + counts + text objects, one keyed kill store, minimal `.` — architecture spec §6.5
 
 - **Q-4** Terminal floor → [#97](https://github.com/nanov/lesh/issues/97): ANSI + 256 colors + bracketed paste required, truecolor opportunistic, never terminfo, no startup queries — architecture spec §7
 - The NG-4 language-neutral action/reactor ABI → [#93](https://github.com/nanov/lesh/issues/93): one C-shaped registry, results only through a generation-bound request token — ADR-0008, architecture spec §6.1

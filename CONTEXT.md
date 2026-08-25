@@ -370,6 +370,13 @@ _Avoid_: treating a width as a constant, which is how a redraw drifts.
 A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
+**Kill store** _[lesh]_:
+The one keyed store of killed and yanked text. Emacs's kill ring and vi's
+unnamed register are the same store under its default key; named registers
+and a clipboard-backed key arrive later as views over it.
+_Avoid_: clipboard as the primary name — the terminal clipboard is a
+possible backing for one key, not the store.
+
 **Keymap** _[lesh]_:
 A flat table binding key sequences to action names, keyed by symbolic key
 events — never raw bytes; the decoder owns escape sequences exactly once.
