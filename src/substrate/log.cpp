@@ -595,4 +595,57 @@ void shutdown() noexcept {
 int text_sink_fd() noexcept { return text_sink().fd; }
 int structured_sink_fd() noexcept { return structured_sink().fd; }
 
+// ---------------------------------------------------------------------------
+// LOG_SAFE (#129): between fork and exec, and in a signal handler.
+// ---------------------------------------------------------------------------
+
+namespace safe {
+
+int sink_fd() noexcept {
+	// One plain int read out of a file-scope struct. No lock, no allocation, no
+	// atomic - which is what makes this callable from a forked child whose
+	// sibling threads may have been holding any lock in the process when the
+	// address space was copied.
+	return text_sink().fd;
+}
+
+void put(int fd, const char* bytes, size_t length) noexcept {
+	if (fd < 0 || bytes == nullptr)
+		return;
+	size_t written = 0;
+	while (written < length) {
+		const ssize_t n = ::write(fd, bytes + written, length - written);
+		if (n > 0) {
+			written += static_cast<size_t>(n);
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		// Anything else and there is nothing a child between fork and exec can
+		// do about it. Silence beats a second failing write.
+		return;
+	}
+}
+
+void put(int fd, long long value) noexcept {
+	// 20 digits spans every int64_t, plus a sign. Fixed, on the stack, filled
+	// backwards so no division-by-ten table and no reverse pass are needed.
+	char digits[21];
+	size_t at = sizeof(digits);
+	const bool negative = value < 0;
+	// Negated as unsigned so LLONG_MIN does not overflow on the way in.
+	unsigned long long magnitude =
+		negative ? 0ULL - static_cast<unsigned long long>(value)
+		         : static_cast<unsigned long long>(value);
+	do {
+		digits[--at] = static_cast<char>('0' + (magnitude % 10));
+		magnitude /= 10;
+	} while (magnitude != 0 && at > 0);
+	if (negative && at > 0)
+		digits[--at] = '-';
+	put(fd, digits + at, sizeof(digits) - at);
+}
+
+} // namespace safe
+
 } // namespace lesh::log

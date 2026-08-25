@@ -372,4 +372,69 @@ void shutdown() noexcept;
 [[nodiscard]] int text_sink_fd() noexcept;
 [[nodiscard]] int structured_sink_fd() noexcept;
 
+// ---------------------------------------------------------------------------
+// LOG_SAFE: the only logging symbol reachable between fork and exec (#129, the
+// owner's fork-discipline scope note; fish's `FLOG_SAFE!`).
+// ---------------------------------------------------------------------------
+//
+// EVERYTHING ABOVE THIS LINE IS FORBIDDEN IN A FORKED CHILD. `LESH_LOG` calls
+// `vsnprintf` into a thread-local buffer - `vsnprintf` may take a locale lock
+// and locales are exactly the kind of lock another thread can be holding when
+// `fork()` copies the address space, which is a deadlock that reproduces on
+// one machine in fifty. `log::record` is worse: it writes into a 32 KiB
+// thread-local, and touching thread-local storage for the first time in a child
+// can allocate.
+//
+// So the child gets a different vocabulary, and it is deliberately impoverished:
+// string literals and integers, one `write(2)` per piece, no formatting, no
+// locks, no allocation, no atomics on the hot path but the one relaxed gate
+// load. Everything it needs is a stack buffer and a descriptor resolved before
+// the fork. fish's `postfork.rs` header states the same rule - "Everything in
+// this module must be async-signal safe. That means no locking, no allocating,
+// no freeing memory" - and `FLOG_SAFE!` is its equivalent.
+//
+// IT WRITES TO THE TEXT SINK ONLY, never to stderr. #98's rule has no exception
+// for the child: the child's stderr is the command's stderr and a diagnostic
+// line on it is output the user did not ask for. With no log file configured
+// this is silent, which is the correct amount of noise for a shell.
+namespace safe {
+
+// The descriptor, resolved from the already-open sink. A plain int read: no
+// lock, no allocation, safe in a signal handler and in a forked child.
+[[nodiscard]] int sink_fd() noexcept;
+
+// One `write(2)`, EINTR retried, short writes finished. Never fails loudly -
+// there is nothing a child between fork and exec could do about it.
+void put(int fd, const char* bytes, size_t length) noexcept;
+
+inline void put(int fd, std::string_view bytes) noexcept { put(fd, bytes.data(), bytes.size()); }
+
+// An integer, base ten, formatted into a stack buffer. 20 digits plus a sign
+// spans every int64_t, so the buffer is fixed and the formatting is a loop.
+void put(int fd, long long value) noexcept;
+
+inline void put(int fd, int value) noexcept { put(fd, static_cast<long long>(value)); }
+inline void put(int fd, unsigned value) noexcept { put(fd, static_cast<long long>(value)); }
+inline void put(int fd, long value) noexcept { put(fd, static_cast<long long>(value)); }
+inline void put(int fd, unsigned long value) noexcept { put(fd, static_cast<long long>(value)); }
+
+// The pieces, in order, then a newline. A variadic template rather than a
+// printf: there is no format string to parse, so there is no `vsnprintf` to
+// call, which is the whole point.
+template <typename... Args>
+void log(Args... pieces) noexcept {
+	const int fd = sink_fd();
+	if (fd < 0)
+		return;
+	(put(fd, pieces), ...);
+	put(fd, "\n", 1);
+}
+
+} // namespace safe
+
+// THE STATEMENT. Named differently from `LESH_LOG` on purpose: a reviewer
+// reading post-fork code can see at a glance that nothing else is reachable,
+// and a grep for `LESH_LOG(` in the post-fork file finds the violation.
+#define LESH_LOG_SAFE(...) ::lesh::log::safe::log(__VA_ARGS__)
+
 } // namespace lesh::log

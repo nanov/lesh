@@ -119,6 +119,7 @@ add_library(lesh_substrate STATIC
 	src/substrate/arena.h
 	src/substrate/assert.h
 	src/substrate/char_utils.h
+	src/substrate/fork_guard.h
 	src/substrate/grapheme.h
 	src/substrate/log.cpp
 	src/substrate/log.h
