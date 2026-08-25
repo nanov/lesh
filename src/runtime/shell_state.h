@@ -119,18 +119,32 @@ public:
 	// behind - must not be believed by either.
 	[[nodiscard]] std::string logical_working_directory() const;
 
-	// Marks a name exported WITHOUT writing a value, which `export name` needs:
-	// exporting a readonly variable is not an assignment and dash allows it, so
-	// routing it through set() would refuse a command POSIX permits.
-	void mark_exported(std::string_view name);
-
-	// --- readonly -------------------------------------------------------------
+	// --- marking a name: export and readonly ----------------------------------
 	//
-	// POSIX: a readonly variable cannot be assigned to and cannot be unset. The
-	// flag lives on the variable rather than in a separate set, so a name can be
-	// readonly while UNSET - `readonly x` then `x=1` fails, and `${x-unset}`
-	// still says unset, which is what dash does and what readonly-p.tst checks.
+	// ONE RULE, because POSIX asks both builtins the same question and answers it
+	// the same way: an attribute belongs to the NAME, so marking a name neither
+	// requires nor creates a value. `export x` marks it "whether or not it is set";
+	// a readonly variable cannot be assigned to or unset, set or not.
+	//
+	// Both flags therefore live ON THE VARIABLE, beside an `assigned` bit, rather
+	// than in a set of names off to the side. An entry that is marked but not
+	// assigned is ABSENT to every reader - `${x-unset}` says unset, `set -u` errors,
+	// the environment block skips it - and the mark is still there to catch the
+	// value when an assignment finally arrives.
+	//
+	// They were split once and drifted (#71): `readonly x` recorded the flag while
+	// `export x` fabricated an assignment of the empty string, so `${x-unset}` and
+	// `${x:-empty}` stopped being distinguishable after a bare `export x`, a child
+	// saw `x=` where dash exports nothing, and `export -p` listed a variable that
+	// did not exist - a listing POSIX requires to be re-inputtable, which is the
+	// defect #40 and #38 both hit. Sharing the mechanism is what stops that
+	// recurring; #24 chose it for readonly and export now uses it too.
+	//
+	// Marking is NOT an assignment, which is also why neither routes through set():
+	// `export x` on a readonly x is a command dash allows and POSIX permits, and
+	// set() would refuse it.
 
+	void mark_exported(std::string_view name);
 	void mark_readonly(std::string_view name);
 	[[nodiscard]] bool is_readonly(std::string_view name) const;
 
@@ -146,7 +160,7 @@ public:
 	struct variable_row {
 		std::string_view name;
 		std::string_view value;
-		bool assigned = false;   // false for a name that is readonly but unset
+		bool assigned = false;   // false for a name marked but never assigned
 		bool exported = false;
 		bool readonly = false;
 	};
@@ -352,10 +366,10 @@ private:
 		std::string value;
 		bool exported = false;
 		bool readonly = false;
-		// `readonly x` on an unset x creates the entry to hold the flag without
-		// creating the variable. lookup() reports it as absent, and the
-		// environment block leaves it out, or `sh -c 'readonly x' ` would export
-		// an empty x to every child.
+		// `readonly x` or `export x` on an unset x creates the entry to hold the
+		// flag without creating the variable. lookup() reports it as absent, and
+		// the environment block leaves it out - otherwise `export x` would send an
+		// empty x to every child, which dash does not (#71).
 		bool assigned = true;
 	};
 

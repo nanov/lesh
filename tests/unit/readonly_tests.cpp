@@ -201,3 +201,87 @@ TEST_F(ReadonlyTest, AReadonlyNameIsAbsentUntilItIsAssigned) {
 	EXPECT_EQ(capture("readonly x; set -u; echo ${x-unset}"), "unset\n");
 	EXPECT_FALSE(state.is_exported("x"));
 }
+
+// `export`, and the same question `readonly` answers. See issue #71.
+//
+// The two builtins ask whether MARKING a name creates it, and answered it two
+// ways: `readonly x` recorded the flag on an entry that lookup() reports as
+// absent, while `export x` fabricated an assignment of the empty string. So
+// `${x-unset}` and `${x:-empty}` stopped being distinguishable after a bare
+// `export x`, and a child saw `x=` where dash exports nothing. POSIX marks a name
+// for export "whether or not it is set": the attribute belongs to the NAME. Both
+// now use the one `assigned` flag on the variable, which is where #24 put
+// readonly's, so the answer cannot drift apart again.
+
+TEST_F(ReadonlyTest, ExportMarksANameWithoutCreatingTheVariable) {
+	EXPECT_EQ(run("export m"), 0);
+	EXPECT_TRUE(state.is_exported("m")) << "the NAME is marked";
+	EXPECT_EQ(value_of("m"), "<unset>") << "and no variable was created for it";
+	// The distinction the empty value destroyed: `-` tests for set, `:-` for
+	// set-and-non-empty, and dash tells them apart here.
+	EXPECT_EQ(capture("export m; echo \"[${m-unset}][${m:-empty}]\""), "[unset][empty]\n");
+	// `set -u` has to see it as unset too, for the same reason it does a readonly
+	// name that was never assigned.
+	EXPECT_EQ(capture("export m; set -u; echo ${m-unset}"), "unset\n");
+}
+
+TEST_F(ReadonlyTest, AMarkedButUnsetNameIsInNoChildsEnvironment) {
+	// Measured against dash first: `dash -c 'export A; env'` prints no A line and
+	// `sh -c 'echo ${A-unset}'` under it says unset. An `A=` in the block would be
+	// a variable the child can see and the parent cannot.
+	EXPECT_EQ(run("export gone"), 0);
+	bool found = false;
+	for (char** env = state.environment_block(); *env != nullptr; ++env)
+		if (std::string_view{*env}.starts_with("gone="))
+			found = true;
+	EXPECT_FALSE(found) << "a marked name with no value must not reach a child";
+
+	// And the mark is still there to catch the value when one arrives.
+	EXPECT_EQ(run("gone=1"), 0);
+	found = false;
+	for (char** env = state.environment_block(); *env != nullptr; ++env)
+		if (std::string_view{*env} == "gone=1")
+			found = true;
+	EXPECT_TRUE(found) << "assigning after export must export the value";
+}
+
+TEST_F(ReadonlyTest, ExportListsAMarkedButUnsetNameBare) {
+	// POSIX requires the listing to be RE-INPUTTABLE, which is the defect #40 and
+	// #38 both hit: `export m=''` names a variable that does not exist, so reading
+	// the listing back would CREATE it. dash prints `export m`, and so does this.
+	// Grepped rather than compared whole - the inherited environment is in there.
+	const std::string listed = capture("export m; export -p");
+	EXPECT_NE(listed.find("export m\n"), std::string::npos);
+	EXPECT_EQ(listed.find("export m="), std::string::npos);
+	// The round trip itself, which is what the requirement is FOR.
+	EXPECT_EQ(capture("export m; e='export m'; unset m; eval \"$e\"; echo \"[${m-unset}]\""),
+	          "[unset]\n");
+}
+
+TEST_F(ReadonlyTest, ExportOfASplitOperandMarksEveryNameItYields) {
+	// How this surfaced (#55, #71): `export $n` with n='a b' field-splits into two
+	// operands, and each was being ASSIGNED the empty string rather than marked.
+	EXPECT_EQ(capture("n='p q'; export $n; echo \"[${p-unset}][${q-unset}]\""),
+	          "[unset][unset]\n");
+	EXPECT_TRUE(state.is_exported("p"));
+	EXPECT_TRUE(state.is_exported("q"));
+}
+
+TEST_F(ReadonlyTest, ExportWithAValueStillAssignsAndStillExports) {
+	// The half that was always right, asserted so the fix above cannot take it out.
+	EXPECT_EQ(run("export v=1"), 0);
+	EXPECT_EQ(value_of("v"), "1");
+	EXPECT_TRUE(state.is_exported("v"));
+	EXPECT_NE(capture("export v=1; export -p").find("export v='1'\n"), std::string::npos);
+}
+
+TEST_F(ReadonlyTest, MarkingForExportIsNotAnAssignmentToAReadonlyName) {
+	// `export r` on a readonly-and-unset r is legal - marking is not writing - and
+	// it must not smuggle in the empty value that would make `r=1` impossible for a
+	// reason the author never asked for.
+	EXPECT_EQ(capture("readonly r; export r; echo \"[${r-unset}]\""), "[unset]\n");
+	EXPECT_TRUE(state.is_exported("r"));
+	EXPECT_TRUE(state.is_readonly("r"));
+	// #24's enforcement is untouched: the name is readonly while unset.
+	EXPECT_EQ(capture("readonly r; export r; r=1; echo not reached"), "");
+}

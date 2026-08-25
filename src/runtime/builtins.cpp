@@ -838,8 +838,9 @@ builtin_result builtin_exit(shell_state& state, char** argv) {
 //
 // POSIX requires the no-operand form of both builtins to print in a form that can
 // be RE-INPUT, which is what export-p.tst's `e="$(export -p)"; eval "$e"` round
-// trip checks. A name that is readonly but UNSET prints bare - `readonly x` - and
-// printing `x=''` for it would create the variable on re-input.
+// trip checks. A name that is MARKED BUT UNSET prints bare - `readonly x`,
+// `export x` - and printing `x=''` for it would create the variable on re-input,
+// naming something that does not exist. dash prints both forms bare (#71).
 void print_declaration(std::string_view keyword, const shell_state::variable_row& row) {
 	std::printf("%.*s %.*s", static_cast<int>(keyword.size()), keyword.data(),
 	            static_cast<int>(row.name.size()), row.name.data());
@@ -908,8 +909,11 @@ builtin_result run_declaration(shell_state& state, char** argv, bool make_readon
 				return {2};
 			}
 		} else if (!make_readonly) {
-			// `export name` is not an assignment, so it is allowed on a readonly
-			// variable and must not create a value for an unset one.
+			// `export name` is not an assignment: it is allowed on a readonly
+			// variable, and it must not create a value for an unset one. POSIX marks
+			// the name "whether or not it is set", the same rule mark_readonly obeys
+			// two lines below - which is why both go through a mark_ call and not
+			// through set() (#71).
 			state.mark_exported(name);
 		}
 		if (make_readonly)

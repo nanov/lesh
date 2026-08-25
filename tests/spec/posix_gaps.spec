@@ -770,6 +770,42 @@ readonly x; echo $((x=1)); echo not reached
 --- a readonly name with no value is still unset [xfail(legacy): legacy has no readonly builtin at all]
 readonly x; echo ${x-unset}; x=1
 
+# Issue #71: `export NAME` and `readonly NAME` ask the SAME question - does marking
+# a name CREATE it? - and answered it two ways. `export` created the variable with
+# an empty value, so `${xa-unset}` and `${xa:-empty}` stopped being distinguishable
+# after a bare `export xa`, a child saw `xa=` where dash exports nothing, and
+# `export -p` listed a variable that does not exist - the re-inputtability defect
+# #40 and #38 both hit. POSIX makes the export attribute a property of the NAME,
+# marked "whether or not it is set", which is the rule #24 already recorded for
+# readonly; the flag lives on the variable, and marking no longer assigns.
+
+--- export marks a name without creating the variable [xfail(legacy): legacy's export path is incomplete]
+export xa; echo "[${xa-unset}][${xa:-empty}]"; xa=1; echo "[${xa-unset}]"
+
+--- a name marked for export but unset is in no child's environment [xfail(legacy): legacy's export path is incomplete]
+export xb; /usr/bin/env | /usr/bin/grep -c '^xb='; sh -c 'echo "[${xb-unset}]"'
+
+--- assigning after export exports the value the assignment gave it [xfail(legacy): legacy's export path is incomplete]
+export xc; sh -c 'echo "[${xc-unset}]"'; xc=1; sh -c 'echo "[${xc-unset}]"'
+
+--- export -p prints a marked-but-unset name bare, so re-input does not create it [xfail(legacy): legacy has no export -p]
+export xd; export -p | /usr/bin/grep '^export xd'
+
+--- an export -p listing round-trips a marked-but-unset name [xfail(legacy): legacy has no export -p]
+export xe; e=$(export -p | /usr/bin/grep '^export xe'); unset xe; eval "$e"; echo "[${xe-unset}]"
+
+--- an operand that field-splits marks every name it yields rather than emptying them [xfail(legacy): legacy does not split an export operand]
+n='xf xg'; export $n; echo "[${xf-unset}][${xg-unset}]"; export -p | /usr/bin/grep -c '^export xf$'
+
+--- export NAME=VALUE still assigns and still exports [xfail(legacy): legacy's export path is incomplete]
+export xh=1; echo "$xh"; sh -c 'echo "[${xh-unset}]"'; export -p | /usr/bin/grep '^export xh='
+
+--- unset drops the export mark along with the variable [xfail(legacy): legacy's export path is incomplete]
+export xi=1; unset xi; xi=2; sh -c 'echo "[${xi-unset}]"'
+
+--- a readonly name with no value still refuses a later assignment [xfail(legacy): legacy has no readonly builtin at all]
+readonly xj; echo "[${xj-unset}]"; xj=1; echo not reached
+
 --- read reports a readonly target and, being regular, does not exit the shell [xfail(legacy): legacy has no readonly builtin at all]
 readonly v; echo hi | { read v 2>/dev/null; echo "st=$?"; }; echo reached
 

@@ -385,9 +385,14 @@ void shell_state::mark_exported(std::string_view name) {
 		it->second.exported = true;
 		return;
 	}
-	// `export x` on an unset x exports the NAME: dash's `export -p` lists it and
-	// a child sees x set to the empty string.
-	_vars.emplace(std::string(name), variable{std::string{}, true, false, true});
+	// Exported and UNSET, which is the whole of POSIX's "the export attribute is
+	// set for the given name whether or not it is set". The entry exists to hold
+	// the flag, exactly as mark_readonly's does, and `assigned` false is what keeps
+	// it from being a variable: lookup() reports it absent, so `${x-unset}` and
+	// `${x:-empty}` stay distinguishable, and environment_block() leaves it out, so
+	// a child sees NOTHING rather than `x=`. Measured: `dash -c 'export A; env'`
+	// prints no A line, and `sh -c 'echo ${A-unset}'` under it says unset (#71).
+	_vars.emplace(std::string(name), variable{std::string{}, true, false, false});
 }
 
 void shell_state::mark_readonly(std::string_view name) {
