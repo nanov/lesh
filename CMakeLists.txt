@@ -193,6 +193,7 @@ add_executable(lesh_tests
 	tests/unit/cd_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/leshper_selection_tests.cpp
 	tests/unit/leshper_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
