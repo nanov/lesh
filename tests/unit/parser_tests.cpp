@@ -1174,3 +1174,212 @@ TEST_F(ParserTest, TheLexerEmitsACommentTokenWhereAWordCouldBegin) {
 	EXPECT_EQ(w.kind, token_kind::word);
 	EXPECT_EQ(w.length, 7u);
 }
+
+// --- #104: a command substitution's interior is parsed ------------------------
+//
+// `$(ls -l foo | grep bar)` used to reach the tree as one opaque segment of one
+// word token: the pipeline inside painted as a blob. The interior is parsed now
+// and recorded on a side table, the here-document and comment shape - see
+// sub_parse in ast.h for why it is not a child of the word node.
+
+namespace {
+
+// The simple_command node of a one-command program.
+const node& only_command(const tree& t) {
+	return t[t.child_of(t[t.root()], 0)];
+}
+
+// True when any node of a recorded interior carries a defect.
+bool interior_is_defective(const tree& t, const sub_parse& s) {
+	for (uint32_t n = s.node_begin; n < s.node_end; ++n)
+		if (tree::is_defective(t[n]))
+			return true;
+	return false;
+}
+
+// The text one recorded interior spans, out of the input it points into.
+std::string_view interior_text(const tree& t, uint32_t i) {
+	const sub_parse& s = t.sub_parse_at(i);
+	return t.source().substr(s.interior.offset, s.interior.length);
+}
+
+} // namespace
+
+TEST_F(ParserTest, ACommandSubstitutionInteriorIsParsedIntoTheSameTree) {
+	const std::string_view src = "echo $(ls -l foo | grep bar)";
+	const tree t = parse_it(src);
+	ASSERT_EQ(t.sub_parse_count(), 1u);
+	const sub_parse& s = t.sub_parse_at(0);
+
+	// The span is the text BETWEEN the delimiters, at its real offset in the input.
+	EXPECT_EQ(interior_text(t, 0), "ls -l foo | grep bar");
+	EXPECT_EQ(s.depth, 0u);
+
+	// The subtree is a program, and the pipeline the user typed is inside it.
+	ASSERT_NE(s.root, no_node);
+	ASSERT_EQ(t[s.root].kind, node_kind::program);
+	ASSERT_EQ(t[s.root].children_count, 1u);
+	const node& pipe = t[t.child_of(t[s.root], 0)];
+	ASSERT_EQ(pipe.kind, node_kind::pipeline);
+	ASSERT_EQ(pipe.children_count, 2u);
+	EXPECT_EQ(t.text_of(t[t.child_of(pipe, 0)]), "ls -l foo");
+	EXPECT_EQ(t.text_of(t[t.child_of(pipe, 1)]), "grep bar");
+
+	// Every span in the subtree is an offset into what the user typed, so a
+	// decoration lands on the right bytes.
+	const node& grep = t[t.child_of(t[t.child_of(pipe, 1)], 0)];
+	EXPECT_EQ(static_cast<word_role>(grep.aux), word_role::command_name);
+	EXPECT_EQ(t.span_of(grep).offset, src.find("grep"));
+
+	// And the word that holds it is still one word to everybody else.
+	const node& cmd = only_command(t);
+	ASSERT_EQ(cmd.children_count, 2u);
+	const node& word = t[t.child_of(cmd, 1)];
+	EXPECT_EQ(word.kind, node_kind::word);
+	EXPECT_EQ(word.children_count, 0u) << "a word node stays a leaf";
+	EXPECT_EQ(s.word_token, word.first_token);
+	EXPECT_FALSE(t.has_errors());
+	EXPECT_FALSE(t.incomplete());
+}
+
+TEST_F(ParserTest, ASubstitutionInsideASubstitutionIsParsedToo) {
+	const tree t = parse_it("echo $(echo $(date))");
+	ASSERT_EQ(t.sub_parse_count(), 2u);
+	EXPECT_EQ(interior_text(t, 0), "echo $(date)");
+	EXPECT_EQ(t.sub_parse_at(0).depth, 0u);
+	EXPECT_EQ(interior_text(t, 1), "date");
+	EXPECT_EQ(t.sub_parse_at(1).depth, 1u) << "one substitution encloses it";
+
+	// The runs of nodes never overlap: an interior is parsed after the one that
+	// contains it has finished, so a painter can walk either linearly.
+	EXPECT_LE(t.sub_parse_at(0).node_end, t.sub_parse_at(1).node_begin);
+	const node& inner = t[t.sub_parse_at(1).root];
+	ASSERT_EQ(inner.children_count, 1u);
+	EXPECT_EQ(t.text_of(t[t.child_of(inner, 0)]), "date");
+}
+
+TEST_F(ParserTest, ASubstitutionInsideDoubleQuotesIsFound) {
+	const tree t = parse_it("echo \"a $(ls) b\"");
+	ASSERT_EQ(t.sub_parse_count(), 1u);
+	EXPECT_EQ(interior_text(t, 0), "ls");
+}
+
+TEST_F(ParserTest, TwoSubstitutionsInOneWordAreBothRecorded) {
+	const tree t = parse_it("echo $(a)$(b)");
+	ASSERT_EQ(t.sub_parse_count(), 2u);
+	EXPECT_EQ(t.sub_parse_at(0).word_token, t.sub_parse_at(1).word_token)
+		<< "one word holds both";
+	EXPECT_EQ(interior_text(t, 0), "a");
+	EXPECT_EQ(interior_text(t, 1), "b");
+}
+
+TEST_F(ParserTest, ASubstitutionInAnAssignmentOrARedirectTargetIsFound) {
+	const tree assigned = parse_it("x=$(ls)");
+	ASSERT_EQ(assigned.sub_parse_count(), 1u);
+	EXPECT_EQ(interior_text(assigned, 0), "ls");
+
+	const tree target = parse_it("echo x > $(dir)/f");
+	ASSERT_EQ(target.sub_parse_count(), 1u);
+	EXPECT_EQ(interior_text(target, 0), "dir");
+}
+
+TEST_F(ParserTest, ADefectInsideAnInteriorIsNotThisCommandsDefect) {
+	// The interior is a syntax error and the command containing it is not. The
+	// executor re-parses interiors through the expander and reports this at
+	// expansion time, at status 2 (#57); letting it into has_errors() would stop
+	// the outer command from running at all.
+	const tree t = parse_it("echo $(if true)");
+	EXPECT_FALSE(t.has_errors()) << "the outer command is well formed";
+	EXPECT_FALSE(t.incomplete()) << "the input the user typed is finished";
+	ASSERT_EQ(t.sub_parse_count(), 1u);
+	EXPECT_TRUE(interior_is_defective(t, t.sub_parse_at(0)))
+		<< "the defect is still recorded, on the interior's own nodes";
+}
+
+TEST_F(ParserTest, AnUnterminatedSubstitutionKeepsItsDefectAndStillParsesWhatIsThere) {
+	// `echo $(ls -l` - the WORD carries the defect, exactly as before, and the
+	// interior is parsed anyway so a line editor has something to paint.
+	const tree t = parse_it("echo $(ls -l");
+	EXPECT_TRUE(t.has_errors()) << "the word token is unterminated";
+	EXPECT_TRUE(t.incomplete()) << "more input would close it";
+	EXPECT_STREQ(t.error_detail(t[t.first_error()]), "unterminated command substitution");
+	ASSERT_EQ(t.sub_parse_count(), 1u);
+	const sub_parse& s = t.sub_parse_at(0);
+	EXPECT_EQ(interior_text(t, 0), "ls -l")
+		<< "the interior runs to the end of what was typed";
+	ASSERT_NE(s.root, no_node);
+	ASSERT_EQ(t[s.root].children_count, 1u);
+	EXPECT_EQ(t.text_of(t[t.child_of(t[s.root], 0)]), "ls -l");
+}
+
+TEST_F(ParserTest, ABackquotedInteriorIsParsedUntilABackslashMakesItsSpansALie) {
+	// POSIX 2.6.3 removes a `\` before `$`, a backquote or another `\` BEFORE the
+	// body is shell input, so an escaped body is a rewritten string rather than a
+	// run of input bytes - and every span here has to be a real input offset.
+	const tree t = parse_it("echo `ls -l`");
+	ASSERT_EQ(t.sub_parse_count(), 1u);
+	EXPECT_EQ(interior_text(t, 0), "ls -l");
+	EXPECT_EQ(t[t.sub_parse_at(0).root].children_count, 1u);
+
+	// With a backslash in it, the segment stays opaque - the answer it gave before
+	// this existed.
+	EXPECT_EQ(parse_it("echo `echo \\`date\\``").sub_parse_count(), 0u);
+}
+
+TEST_F(ParserTest, ArithmeticAndParameterInteriorsStayOpaque) {
+	// `$(( ))`'s mini-parser lives in the expander (#30/#56) and is not the shell
+	// grammar, so this parser has no subtree to hang there.
+	EXPECT_EQ(parse_it("echo $((1 + 2))").sub_parse_count(), 0u);
+	// `${x:-$(ls)}` is a limitation of this version: the `${...}` interior has its
+	// own grammar the parser does not model, and guessing where the word begins
+	// would put spans on text by position rather than by rule.
+	EXPECT_EQ(parse_it("echo ${x:-$(ls)}").sub_parse_count(), 0u);
+}
+
+TEST_F(ParserTest, NestingStopsAtTheDepthCeiling) {
+	std::string src = "echo ";
+	for (uint32_t i = 0; i < kMaxSubParseDepth + 8; ++i)
+		src += "$(";
+	src += "x";
+	for (uint32_t i = 0; i < kMaxSubParseDepth + 8; ++i)
+		src += ")";
+	const tree t = parse_it(src);
+	EXPECT_EQ(t.sub_parse_count(), kMaxSubParseDepth)
+		<< "the parser stops following where the lexer and the expander do";
+	for (uint32_t i = 0; i < t.sub_parse_count(); ++i)
+		EXPECT_EQ(t.sub_parse_at(i).depth, i);
+}
+
+TEST_F(ParserTest, AWordWithNoSubstitutionRecordsNothing) {
+	// flag_literal keeps the scan off the common path entirely.
+	EXPECT_EQ(parse_it("echo hello world").sub_parse_count(), 0u);
+	EXPECT_EQ(parse_it("echo 'a $(b)'").sub_parse_count(), 0u)
+		<< "single quotes suppress the substitution";
+	EXPECT_EQ(parse_it("echo $x").sub_parse_count(), 0u);
+}
+
+TEST_F(ParserTest, ReadingOneCommandAtATimeParsesInteriorsAndResumesCorrectly) {
+	// The interior parse runs after the command has been read, so it must not move
+	// the cursor the next read starts from.
+	const std::string_view src = "echo $(a b)\necho second\n";
+	size_t position = 0;
+	const tree one = parse_next_command(pool, src, position);
+	EXPECT_EQ(one.sub_parse_count(), 1u);
+	EXPECT_EQ(position, 12u) << "past the newline, not past the interior";
+	const tree two = parse_next_command(pool, src, position);
+	EXPECT_EQ(two.sub_parse_count(), 0u);
+	EXPECT_EQ(two.text_of(only_command(two)), "echo second");
+}
+
+TEST_F(ParserTest, TheInteriorExtentIsAskedOfTheLexerDirectly) {
+	// C-6: a client holding a token and the bytes it came from can ask without a
+	// parse. The `$\<newline>(` spelling is why the opener is looked for rather
+	// than assumed two bytes wide.
+	const std::string_view src = "$\\\n(ls)";
+	lexer lx(src);
+	const token seg = lx.next(lex_mode::word_interior);
+	ASSERT_EQ(seg.kind, token_kind::seg_command_sub);
+	uint32_t begin = 0, end = 0;
+	ASSERT_TRUE(command_sub_interior(src, seg, begin, end));
+	EXPECT_EQ(src.substr(begin, end - begin), "ls");
+}

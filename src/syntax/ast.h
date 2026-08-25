@@ -233,6 +233,58 @@ struct span {
 	}
 };
 
+// ONE COMMAND SUBSTITUTION'S INTERIOR, PARSED. See issue #104.
+//
+// `$(ls -l foo | grep bar)` reaches the tree as one opaque segment of one word
+// token, so a painter walking the tree sees a blob where a pipeline was typed.
+// The interior is parsed recursively and recorded HERE, beside the tree, rather
+// than as a child of the word node - the here-document and comment shape (#103),
+// chosen for the same reason and one more:
+//
+//   - Node children are contiguous runs, and a word node has none today. Giving
+//     it some would put a subtree where every existing walker expects a leaf.
+//   - The EXECUTOR must be able to keep ignoring this entirely. It re-parses
+//     interiors through the expander at expansion time and C-5's one-grammar
+//     migration is not this ticket, so the subtree has to be additive in the
+//     strict sense: nothing the executor reads may move. A side table cannot move
+//     anything, because nothing the executor reads points at it.
+//   - The word node's `aux` already holds its word_role, which the expander
+//     reads. There is no second slot, and overloading the first one is how a role
+//     comes to mean two things.
+//
+// The nodes themselves live in this tree's OWN node array - one arena, one tree,
+// one set of spans, all of them real input offsets - with `root` naming where the
+// interior's parse begins. They are added only after the top-level parse is
+// finished, which is what makes `node_begin` a watermark: see seal_top_level().
+struct sub_parse {
+	// The word token the segment was found in. A word may hold more than one
+	// substitution - `echo $(a)$(b)` - so this is not a key, and a painter that
+	// wants a word's interiors scans for every record naming its token.
+	uint32_t word_token = 0;
+	// The text BETWEEN the delimiters, at its true offset in the input. Never in
+	// an alias body and never a rewritten string: see command_sub_interior.
+	span interior;
+	node_index root = no_node;
+	// How many substitutions enclose this one. 0 for one written in the input.
+	uint32_t depth = 0;
+	// The half-open run of nodes this interior's parse produced. Records are
+	// filled in discovery order and a nested interior is parsed after the one
+	// containing it finishes, so these runs never overlap - which is what lets a
+	// painter walk one interior's nodes linearly instead of recursing.
+	uint32_t node_begin = 0;
+	uint32_t node_end = 0;
+};
+
+// How deeply the parser follows `$(...)` inside `$(...)`. Mirrors the lexer's
+// kMaxScanNesting and the expander's kMaxExpansionDepth, which are the layers
+// that refuse well-formed input nested deeper than this anyway - a fourth number
+// would be a fourth place for the three to disagree.
+//
+// The ceiling guards WORK, not stack: interiors are drained from a worklist, so
+// depth costs no parser frames. It exists because the parser is on the keystroke
+// path and each level re-reads the text of every level inside it.
+inline constexpr uint32_t kMaxSubParseDepth = 256;
+
 // How many alias bodies a chain may cross. The parser's own substitution ceiling,
 // so the chain below can never be truncated - `alias a=b; alias b=c; ...` stops
 // being substituted before it stops being reportable.
@@ -265,7 +317,7 @@ class tree {
 public:
 	tree(buffer_pool& pool, std::string_view source) noexcept
 		: _source(source), _nodes(pool, 32), _children(pool, 64), _tokens(pool, 32),
-		  _here_docs(pool, 4), _comments(pool, 4), _regions(pool, 4),
+		  _here_docs(pool, 4), _comments(pool, 4), _sub_parses(pool, 4), _regions(pool, 4),
 		  _region_end(static_cast<uint32_t>(source.size())) {}
 
 	// --- construction ---------------------------------------------------------
@@ -330,6 +382,41 @@ public:
 	[[nodiscard]] std::string_view here_doc_text(uint32_t i) const noexcept {
 		const here_doc_body& b = _here_docs[i];
 		return text_at(b.offset, b.length);
+	}
+
+	// A command substitution's interior, recorded beside the tree. See sub_parse.
+	uint32_t add_sub_parse(const sub_parse& s) noexcept { return _sub_parses.push(s); }
+	[[nodiscard]] size_t sub_parse_count() const noexcept { return _sub_parses.size(); }
+	[[nodiscard]] const sub_parse& sub_parse_at(uint32_t i) const noexcept {
+		return _sub_parses[i];
+	}
+	// Filled in once the interior has been parsed. The record is created when the
+	// interior is FOUND, so the table stays in source order while the roots arrive
+	// later.
+	void set_sub_parse_result(uint32_t i, node_index root, uint32_t node_begin,
+	                          uint32_t node_end) noexcept {
+		_sub_parses[i].root = root;
+		_sub_parses[i].node_begin = node_begin;
+		_sub_parses[i].node_end = node_end;
+	}
+
+	// DRAWS THE LINE THE EXECUTOR IS ANSWERABLE FOR. Every node added after this
+	// call belongs to a command substitution's interior (#104).
+	//
+	// This is what keeps a recursive interior parse invisible to execution. A
+	// syntax error INSIDE `$(...)` is not a syntax error in the command containing
+	// it: the executor re-parses the interior through the expander and reports it
+	// at expansion time, at status 2, which is what #57 settled. Let those defects
+	// into has_errors() and `lesh -c 'echo $(if true)'` stops running at all -
+	// the tree the executor refuses would not be the tree it was given, which is
+	// #47 read backwards.
+	//
+	// A watermark rather than a flag on the node, because a node is exactly 24
+	// bytes and that is a cache property this tree is built around. It works
+	// because interiors are parsed AFTER the top-level parse finishes, so every
+	// node and every token the executor reads sits below the line.
+	void seal_top_level() noexcept {
+		_top_level_node_end = static_cast<uint32_t>(_nodes.size());
 	}
 
 	node_index add_node(node n) noexcept { return _nodes.push(n); }
@@ -506,8 +593,14 @@ public:
 	// The first node carrying a defect, or no_node. Nodes are added as they are
 	// completed, so among defective ones the first is the earliest in the source -
 	// which is the one worth naming in a diagnostic.
+	//
+	// Nodes BELOW THE TOP-LEVEL WATERMARK only: a defect inside a command
+	// substitution's interior is the expander's to report at expansion time, not
+	// this command's to refuse. See seal_top_level().
 	[[nodiscard]] node_index first_error() const noexcept {
-		for (uint32_t i = 0; i < _nodes.size(); ++i)
+		const uint32_t end = std::min<uint32_t>(static_cast<uint32_t>(_nodes.size()),
+		                                        _top_level_node_end);
+		for (uint32_t i = 0; i < end; ++i)
 			if (is_defective(_nodes[i]))
 				return i;
 		return no_node;
@@ -576,9 +669,15 @@ private:
 	arena_array<token> _tokens;
 	arena_array<here_doc_body> _here_docs;
 	arena_array<span> _comments;
+	arena_array<sub_parse> _sub_parses;
 	arena_array<text_region> _regions;
 	uint32_t _region_end = 0;
 	node_index _root = no_node;
+	// Where the nodes the executor is answerable for end. All of them until
+	// seal_top_level() says otherwise, so a tree nobody sealed - a hand-built one,
+	// or one from a caller that never asked for interiors - reads exactly as it
+	// did before #104.
+	uint32_t _top_level_node_end = 0xFFFFFFFFu;
 	bool _incomplete = false;
 };
 
