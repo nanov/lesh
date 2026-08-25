@@ -213,13 +213,17 @@ int32_t lesh_buffer_set(lesh_editor* editor, const char* bytes, size_t length);
 int32_t lesh_cursor_get(lesh_editor* editor, size_t* out);
 int32_t lesh_cursor_set(lesh_editor* editor, size_t offset);
 
-/* The selection (F-10).
+/* The selection (F-10, #96).
  *
- * PLACEHOLDER, and marked as one rather than designed: #96 owns the selection
- * model and has not decided it. The getter answers honestly - there is no
- * selection, so `*active_out` is 0 - and the setter is LESH_ERR_REFUSED. The
- * entry points exist so that #96 fills bodies in rather than growing the ABI,
- * and so a binding written against this header today keeps compiling. */
+ * An anchor and a flag, with the CURSOR as the head - so setting a region moves
+ * the cursor to `end`, and moving the cursor moves the region. The pair the
+ * getter reports is the derived one, `[min, max)`, exclusive half-open and on
+ * cluster boundaries; `*active_out` is the separate question of whether it
+ * means anything, and the anchor outlives a clear (emacs's mark). `start > end`
+ * in the setter is a direction, not an error.
+ *
+ * Singular by decision, not by omission: multi-cursor arrives as ADDITIONAL
+ * plural functions and leaves these three alone. */
 int32_t lesh_selection_get(lesh_editor* editor,
                            size_t* start_out, size_t* end_out, int32_t* active_out);
 int32_t lesh_selection_set(lesh_editor* editor, size_t start, size_t end);

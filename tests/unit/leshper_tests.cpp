@@ -340,7 +340,7 @@ TEST(LeshperUndo, RedoPutsBackWhatUndoTookAway) {
 	type(s, "abc");
 	press(s, undo_key);
 	ASSERT_EQ(text_of(s), "");
-	ASSERT_TRUE(s.undo.redo(s.buffer, s.cursor));
+	ASSERT_TRUE(s.redo_one());
 	EXPECT_EQ(text_of(s), "abc");
 	EXPECT_EQ(cursor_of(s), 3u);
 }
@@ -1999,8 +1999,7 @@ TEST(LeshperAbiStaging, SixWritesInOneActionAreOneUndoEntryAndOneGenerationBump)
 	EXPECT_EQ(count_of<worker_request>(out.produced), 1u);
 
 	// And it undoes as one.
-	position cursor = s.cursor;
-	EXPECT_TRUE(s.undo.undo(s.buffer, cursor));
+	EXPECT_TRUE(s.undo_one());
 	EXPECT_EQ(std::string(s.buffer.text()), "");
 }
 
@@ -2330,11 +2329,12 @@ TEST(LeshperAbiHandles, ReadingCopiesOutAndSaysHowMuchWouldNotFit) {
 	EXPECT_EQ(slice, "cde");
 }
 
-TEST(LeshperAbiHandles, SelectionAccessorsAreAnHonestPlaceholderUntilTheModelExists) {
-	// #96 owns the selection model and has not decided it. The getter answers
-	// truthfully - there is no selection - and the setter refuses. The entry
-	// points exist so that #96 fills bodies in rather than growing the ABI, and
-	// so a binding written against this header today keeps compiling.
+TEST(LeshperAbiHandles, SelectionAccessorsAnswerFromTheModel) {
+	// #96 has landed, so these three are backed rather than stubbed: the getter
+	// reports the derived region and the setter takes one. The suites that
+	// exercise the model itself are in leshper_selection_tests.cpp; this one
+	// stays here to hold the ABI's own shape - the entry points did not have to
+	// grow for the model to arrive.
 	registry reg;
 	static int32_t get_status = LESH_OK;
 	static int32_t set_status = LESH_OK;
@@ -2353,8 +2353,8 @@ TEST(LeshperAbiHandles, SelectionAccessorsAreAnHonestPlaceholderUntilTheModelExi
 	loop_harness loop(reg);
 	loop.invoke(s, "select", invocation{});
 	EXPECT_EQ(get_status, LESH_OK);
-	EXPECT_EQ(active, 0);
-	EXPECT_EQ(set_status, LESH_ERR_REFUSED);
+	EXPECT_EQ(active, 0);  // a fresh state has an anchor and no live region
+	EXPECT_EQ(set_status, LESH_OK);
 }
 
 // ---------------------------------------------------------------------------

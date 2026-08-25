@@ -186,13 +186,13 @@ void perform(state& current, action chosen, const key_event& key, effects& out) 
 		break;
 
 	case action::undo:
-		if (!current.undo.undo(current.buffer, current.cursor))
+		if (!current.undo_one())
 			return;
 		current.gen.bump();
 		break;
 
 	case action::redo:
-		if (!current.undo.redo(current.buffer, current.cursor))
+		if (!current.redo_one())
 			return;
 		current.gen.bump();
 		break;
@@ -246,19 +246,81 @@ void drain_pending(state& current, effects& out) {
 
 } // namespace
 
+namespace {
+
+// The marker rules, and the whole of what an edit does to a selection (#96
+// decision 4, spec §6.3). `[begin, end)` is the replaced span, already clamped
+// and ordered the way text_buffer::replace clamps and orders it, and `inserted`
+// is how many bytes went in.
+//
+// Three cases, and they are total:
+//
+//   the edit lies entirely AFTER the anchor  -> the anchor does not move
+//   the edit lies entirely BEFORE it         -> the anchor shifts by the delta
+//   the anchor is INSIDE the replaced span   -> it clamps to the edit's start
+//
+// The first branch also settles the gravity question at a pure insertion, where
+// `begin == end == anchor` and the other two readings would both apply: the
+// anchor stays put and the typed text falls INSIDE the region. That is emacs's
+// default marker insertion type, and emacs's mark is the paradigm §6.3 says
+// projects onto this one exactly. It is also the only answer under which typing
+// into an empty active region grows it rather than leaving it forever empty.
+//
+// `active` is not consulted and not changed. An inactive selection's anchor
+// still tracks the buffer - emacs's mark survives `deactivate-mark` and has to
+// still mean something when the region comes back - and a region collapsed to
+// nothing by an edit that ate it stays live and renders as nothing.
+//
+// The one place in leshper outside text_buffer that does position arithmetic,
+// and it is here rather than in state.h because a marker rule is a fact about
+// an EDIT. text.h's rule survives it: the offsets go straight back into
+// position::from_byte_offset and no caller sees a size_t.
+void adjust_anchor_for_edit(state& current, position begin, position end, size_t inserted) {
+	const size_t anchor = current.selection_anchor().byte_offset();
+	const size_t first = begin.byte_offset();
+	const size_t last = end.byte_offset();
+
+	if (anchor <= first)
+		return;  // the edit is at or after the anchor: nothing moved under it
+	if (anchor >= last) {
+		// Entirely before: shift by the delta, in two unsigned steps so that a
+		// deletion larger than the insertion cannot underflow on the way.
+		current.move_anchor(position::from_byte_offset(anchor - (last - first) + inserted));
+		return;
+	}
+	current.move_anchor(begin);  // inside the replaced span
+}
+
+} // namespace
+
 // The one buffer mutation. See the note in editor.h for why it is declared
 // there: #93's ABI commit is its second caller, and a second copy of these
 // eight lines would be a second mutation path.
 void apply_edit(state& current, position from, position to, std::string_view with,
                 const position* cursor_after) {
+	// The span the buffer will actually replace, computed BEFORE the replace
+	// because the marker rules are about the old text's coordinates. Clamped and
+	// ordered here the same way text_buffer::replace does it internally, so the
+	// anchor is adjusted against the edit that happened rather than the edit that
+	// was asked for.
+	const position begin = current.buffer.clamped(from);
+	position end = current.buffer.clamped(to);
+	if (end < begin)
+		end = begin;
+
 	edit_record edit;
 	edit.at = from;
 	edit.removed = std::string(current.buffer.slice(from, to));
 	edit.inserted = std::string(with);
 	edit.cursor_before = current.cursor;
+	edit.anchor_before = current.selection_anchor();
+	edit.selection_active_before = current.selection_active();
 	const position landed = current.buffer.replace(from, to, with);
 	current.cursor = cursor_after != nullptr ? *cursor_after : landed;
 	edit.cursor_after = current.cursor;
+	adjust_anchor_for_edit(current, begin, end, with.size());
+	edit.anchor_after = current.selection_anchor();
+	edit.selection_active_after = current.selection_active();
 	current.undo.record(std::move(edit));
 	current.gen.bump();
 }

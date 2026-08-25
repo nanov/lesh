@@ -27,6 +27,19 @@ struct edit_record {
 	position cursor_before;   // where the cursor was before the edit
 	position cursor_after;    // where it went after
 
+	// The selection, both halves, on both sides of the edit (spec §6.3).
+	//
+	// The anchor and the flag rather than a `selection`: the type lives in
+	// state.h, state.h includes this header, and a record that named it would
+	// close the cycle text.h exists to break. They are stored the way the cursor
+	// is - two plain positions and no history logic - for the same reason F-4
+	// gives for the cursor: undo restoring the region is a property of the
+	// record, not of whoever replays it.
+	position anchor_before;
+	position anchor_after;
+	bool selection_active_before = false;
+	bool selection_active_after = false;
+
 	// A pure insertion of new text at the cursor - what typing produces, and the
 	// only shape that coalesces.
 	[[nodiscard]] bool is_plain_insertion() const noexcept {
@@ -39,7 +52,10 @@ struct edit_record {
 
 	friend bool operator==(const edit_record& a, const edit_record& b) noexcept {
 		return a.at == b.at && a.removed == b.removed && a.inserted == b.inserted
-		    && a.cursor_before == b.cursor_before && a.cursor_after == b.cursor_after;
+		    && a.cursor_before == b.cursor_before && a.cursor_after == b.cursor_after
+		    && a.anchor_before == b.anchor_before && a.anchor_after == b.anchor_after
+		    && a.selection_active_before == b.selection_active_before
+		    && a.selection_active_after == b.selection_active_after;
 	}
 };
 
@@ -127,9 +143,15 @@ public:
 	[[nodiscard]] bool can_redo() const noexcept { return !_redoable.empty(); }
 	[[nodiscard]] size_t step_count() const noexcept { return _steps.size(); }
 
-	// Undoes one step: restores the text and the cursor (F-4). Answers false when
-	// there is nothing to undo, so the editor can leave the generation alone.
-	bool undo(text_buffer& buffer, position& cursor) {
+	// Undoes one step: restores the text, the cursor and the selection (F-4,
+	// spec §6.3). Answers false when there is nothing to undo, so the editor can
+	// leave the generation alone.
+	//
+	// Four out-parameters rather than a `state&`, and for the reason the class
+	// comment already gives: the history does not own what it restores, it is
+	// handed it. That is also what keeps the history testable against a bare
+	// buffer with no editor anywhere.
+	bool undo(text_buffer& buffer, position& cursor, position& anchor, bool& selection_active) {
 		if (_steps.empty())
 			return false;
 		undo_step step = std::move(_steps.back());
@@ -141,13 +163,15 @@ public:
 			const edit_record& edit = step.records[i];
 			buffer.replace(edit.at, edit.end_after_insertion(), edit.removed);
 			cursor = edit.cursor_before;
+			anchor = edit.anchor_before;
+			selection_active = edit.selection_active_before;
 		}
 		_redoable.push_back(std::move(step));
 		_coalescing = false;
 		return true;
 	}
 
-	bool redo(text_buffer& buffer, position& cursor) {
+	bool redo(text_buffer& buffer, position& cursor, position& anchor, bool& selection_active) {
 		if (_redoable.empty())
 			return false;
 		undo_step step = std::move(_redoable.back());
@@ -157,6 +181,8 @@ public:
 			               position::from_byte_offset(edit.at.byte_offset() + edit.removed.size()),
 			               edit.inserted);
 			cursor = edit.cursor_after;
+			anchor = edit.anchor_after;
+			selection_active = edit.selection_active_after;
 		}
 		_steps.push_back(std::move(step));
 		_coalescing = false;
@@ -199,6 +225,12 @@ private:
 		}
 		previous.inserted += edit.inserted;
 		previous.cursor_after = edit.cursor_after;
+		// The merged record ends where the LAST keystroke of the run left things,
+		// selection included. Undoing a coalesced run puts the region back where
+		// it was before the first keystroke, which is the state the user watched
+		// the run begin from.
+		previous.anchor_after = edit.anchor_after;
+		previous.selection_active_after = edit.selection_active_after;
 		return true;
 	}
 
