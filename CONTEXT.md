@@ -299,10 +299,22 @@ editor state as shell variables, the Lua binding (later) as a table API. A
 binding wraps the one C surface; the ABI itself belongs to no binding.
 
 **Request token** _[lesh]_:
-The opaque, generation-bound handle a reactor computes against. The only
-mint for results: decorations and proposals are emitted through it or not at
-all, which is what makes applying a stale result impossible rather than
-checked.
+The opaque, generation-bound handle a reactor or provider computes against.
+The only mint for results: decorations, proposals and candidates are emitted
+through it or not at all, which is what makes applying a stale result
+impossible rather than checked.
+
+**Provider** _[lesh]_:
+A named lesh subsystem leshper pulls from on demand — the syntax layer,
+completer, history store, prompt. The syntax layer is sealed; the other three
+are **override points**: replaceable by user code behind the same contract.
+_Avoid_: calling a provider a reactor; reactors are pushed events, providers
+are asked.
+
+**Override point** _[lesh]_:
+A provider whose default implementation user code may replace or wrap.
+Native implementations run as trusted threads; user-supplied ones run as
+killable spawned processes, so a broken override cannot wedge the editor.
 
 **Proposal** _[lesh]_:
 Derived state offered to the user — an autosuggestion, a candidate list. It
