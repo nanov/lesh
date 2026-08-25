@@ -217,6 +217,16 @@ printf '. %s/lib\ndata line\necho tail\n' "$d" > $d/s
 [data line]
 tail
 
+--- an alias defined inside a command substitution is in effect on its next line [divergence: bash, dash and zsh all parse the substituted text as one unit; yash reads it a command at a time, which is what POSIX 2.3.1 requires of ANY shell input (input-p.tst's 'shell input is line-wise (command substitution)')]
+x=$(alias f=:
+f)
+echo "[$?][$x]"
+=== expect
+[0][]
+
+--- a command substitution that runs nothing reports zero rather than the status before it [xfail(legacy): legacy has no command substitution]
+false; x=$( ); echo "[$?]"
+
 # The other half of the rule, and the half that must NOT change: a PIPE cannot be
 # un-read, so POSIX lets the shell buffer ahead of itself there and dash agrees.
 # These are ordinary differential cases for that reason - if the fix for the

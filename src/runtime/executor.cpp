@@ -3095,8 +3095,15 @@ substitution_result tree_walking_executor::capture(std::string_view code,
 	// running anything. Parsing here costs nothing and saves a fork: a body that
 	// will not parse no longer forks at all.
 	//
-	// The tree must outlive the child's run(), and it does: fork copies the address
-	// space, so the child inherits this pool as it stands.
+	// This parse is now a CHECK and nothing else: the child reads the body a
+	// command at a time and parses it again as it goes (#67). Two parses of the
+	// same text, deliberately, because they answer different questions and only
+	// one of them can be asked here. "Will this parse" has to be answered before
+	// the fork, since a status cannot carry it back. "What does the next command
+	// mean" cannot be, because the answer depends on aliases the EARLIER commands
+	// of this same body define, and defining them means running them - in the
+	// child. `x=$(alias false=:<newline>false)` is that difference, and yash is
+	// the shell that gets it right.
 	buffer_pool inner_pool{BUFFER_POOL_SIZE};
 	const tree inner = syntax::parse(inner_pool, code, &_state);
 	// has_errors() and never incomplete(): the body arrived whole, so there is no
@@ -3135,9 +3142,26 @@ substitution_result tree_walking_executor::capture(std::string_view code,
 		// EXIT; x=$(echo body)` put T into x.
 		_state.enter_subshell();
 		_exit_trap_ran = false;
-		// The tree was parsed above, before the fork, and nesting still works
-		// because this is the same code path reached recursively.
-		const int status = run(inner);
+		// ONE COMPLETE COMMAND AT A TIME, the way every other shell input is read.
+		// A substituted body is shell input like any other: POSIX 2.3.1 has the
+		// shell read a command, run it, and only then read the next, which is why an
+		// alias defined on one of its lines is in effect on the following one.
+		// Running the whole-body tree parsed above instead made the body the one
+		// place in the shell where that was not true (input-p.tst's 'shell input is
+		// line-wise (command substitution)').
+		//
+		// run_source, not run_input: `eval` and `.` already read exactly this way,
+		// into a nested pool whose trees live only as long as the call, and a third
+		// spelling of the same loop is the shape #34, #35, #49 and #63 each cost
+		// this project once already.
+		int status = run_source(code, /*echo_as_read=*/false);
+		// The EXIT trap is the child's own - enter_subshell() cleared the parent's
+		// above - and it runs on the way out of the substitution: `x=$(trap "echo T"
+		// EXIT; echo body)` puts both lines in x. run_source does not run it,
+		// because `eval` and `.` are not the end of anything.
+		int from_trap = 0;
+		if (run_exit_trap(from_trap))
+			status = from_trap;
 		std::fflush(nullptr);
 		_exit(status);
 	}
