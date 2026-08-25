@@ -126,17 +126,81 @@ public:
 
 	tree take() noexcept { return std::move(_tree); }
 
-	void parse_program() noexcept { parse_body(false); }
+	void parse_program() noexcept { _tree.set_root(parse_body(false)); }
 
 	// One complete command, so the caller can run it before the next is read.
-	void parse_complete_command() noexcept { parse_body(true); }
+	void parse_complete_command() noexcept { _tree.set_root(parse_body(true)); }
+
+	// Parses the interior of every command substitution the parse above found, and
+	// the interiors those turn up in their turn. See sub_parse in ast.h.
+	//
+	// AFTER the top-level parse rather than at the word that holds the segment,
+	// and that ordering is the whole safety argument. Parsed in place, an
+	// interior's tokens would land in the middle of the token array, inside the
+	// range of the simple_command still being built - and tree::error_detail
+	// SCANS a node's token range for a defect to name, so a half-typed quote three
+	// levels down inside a substitution would become the phrase reported for the
+	// command containing it. Deferred, every token and every node the executor
+	// reads is below the watermark seal_top_level() draws, and a walker that never
+	// heard of #104 cannot reach one of these.
+	//
+	// A WORKLIST rather than recursion: parsing `$(echo $(date))`'s interior
+	// appends the inner `$(date)` to the same table being drained, so nesting
+	// falls out of the loop and costs no parser frames.
+	void parse_sub_interiors() noexcept {
+		_tree.seal_top_level();
+		if (_tree.sub_parse_count() == 0)
+			return;
+		// State the top-level parse ended in and the caller still reads:
+		// parse_next_command resumes from the cursor, which the fills below move.
+		const uint32_t cursor = _input_cursor;
+		// ALIASES ARE NOT SUBSTITUTED IN AN INTERIOR. The subtree exists to be
+		// painted, and an alias body is text the user cannot see or edit - which is
+		// the same reason parse() defaults the table to nullptr for the highlight
+		// parse (#95). It also keeps every span here an offset into the input,
+		// rather than into a region registered above it.
+		const alias_source* const aliases = _aliases;
+		_aliases = nullptr;
+		_in_sub_parse = true;
+		_alias_stack.clear();
+		_pending_here_docs.clear();
+		for (uint32_t i = 0; i < _tree.sub_parse_count(); ++i) {
+			// BY VALUE: parsing this interior appends to the table being iterated.
+			const sub_parse entry = _tree.sub_parse_at(i);
+			// What a substitution found INSIDE this one is worth. The top-level parse
+			// leaves this 0, so a `$(...)` the user typed is at depth 0.
+			_sub_depth = entry.depth + 1;
+			// The source is TRUNCATED rather than the lexer bounded: a view ending at
+			// the interior's last byte makes the closing delimiter end-of-input, so
+			// every offset the lexer reports is still its true position in the text
+			// the user typed. That is the whole reason the lexer takes (source,
+			// position) and owns neither (#9).
+			_lexer = lexer(_tree.source().substr(0, entry.interior.end()),
+			               entry.interior.offset);
+			_index = 0;
+			fill();
+			const uint32_t node_begin = static_cast<uint32_t>(_tree.node_count());
+			const node_index root = parse_body(false);
+			_tree.set_sub_parse_result(i, root, node_begin,
+			                           static_cast<uint32_t>(_tree.node_count()));
+			// A here-document opened inside an interior has no line after it to take
+			// a body from once the interior ends; leaving the record pending would
+			// hand it to the NEXT interior's fill.
+			_pending_here_docs.clear();
+		}
+		_in_sub_parse = false;
+		_aliases = aliases;
+		_input_cursor = cursor;
+	}
 
 	// Where reading stopped, as a byte offset into the source. Only meaningful
 	// after parse_complete_command: it is what the next call must start from.
 	[[nodiscard]] uint32_t input_cursor() const noexcept { return _input_cursor; }
 
 private:
-	void parse_body(bool one_command) noexcept {
+	// Returns the root of what it parsed rather than setting the tree's, because
+	// an interior's parse produces a root that is nobody's tree root (#104).
+	node_index parse_body(bool one_command) noexcept {
 		const uint32_t mark = mark_scratch();
 		const uint32_t first = _index;
 
@@ -180,7 +244,7 @@ private:
 		n.first_token = first;
 		n.last_token = _index;
 		commit_children(n, mark);
-		_tree.set_root(_tree.add_node(n));
+		return _tree.add_node(n);
 	}
 
 	static constexpr bool is_separator(token_kind k) noexcept {
@@ -347,7 +411,7 @@ private:
 	// unterminated quote and a trailing backslash.
 	bool record_missing(parse_error& defect, parse_error why) noexcept {
 		if (peek().kind == token_kind::end)
-			_tree.set_incomplete(true);
+			mark_incomplete();
 		// The FIRST thing missing is the one worth naming, and a construct has one
 		// error field: `if true` misses `then` and `fi` both, and `while; do` misses
 		// its condition before it misses anything else.
@@ -759,7 +823,15 @@ private:
 			bodies[depth++] = {frame.lex.source(), frame.lex.position(),
 			                   frame.trailing_blank};
 		}
-		probe_frame input{_tree.source(), _lexer.position(), false};
+		// THE LEXER'S VIEW, not the tree's. They are the same text for the input
+		// itself, and different while a command substitution's interior is being
+		// parsed: the interior is bounded by handing the lexer a view that ends at
+		// its last byte (#104). Reading the tree's source here probed straight past
+		// that bound and into the rest of the script - correct answers, because the
+		// probe only ever looks for `(` and `)`, but it scanned every construct
+		// between the interior and the end of the input, once per interior, which
+		// made a 100 KiB paste with a thousand substitutions in it QUADRATIC.
+		probe_frame input{_lexer.source(), _lexer.position(), false};
 		for (size_t i = 0; i < count; ++i) {
 			bool eligible = false;
 			// Bounded rather than `for (;;)`: each round either draws the token or
@@ -961,7 +1033,7 @@ private:
 		}
 		_index = _tree.add_token(drawn);
 		if (_lexer.incomplete())
-			_tree.set_incomplete(true);
+			mark_incomplete();
 
 		// A here-doc body begins after the newline that ends the command line.
 		// Collect the pending ones and resume past them, so the body is never
@@ -973,11 +1045,15 @@ private:
 			// A newline drawn from an ALIAS body has no such line, and seeking the
 			// input lexer to an alias offset would silently skip the rest of the
 			// script - so the here-doc is left unterminated, which is what it is.
-			if (after_newline <= _tree.source().size())
-				_lexer.seek(collect_here_doc_bodies(_tree.source(), 0, after_newline));
+			// THE LEXER'S VIEW, for probe_ahead's reason: inside a command
+			// substitution's interior it ends where the interior does, so a body that
+			// never terminates inside the interior is unterminated rather than
+			// swallowing the rest of the script.
+			if (after_newline <= _lexer.source().size())
+				_lexer.seek(collect_here_doc_bodies(_lexer.source(), 0, after_newline));
 			else {
 				_pending_here_docs.clear();
-				_tree.set_incomplete(true);
+				mark_incomplete();
 			}
 		}
 
@@ -1209,7 +1285,7 @@ private:
 			if (!terminated) {
 				// An unterminated here-doc is INCOMPLETE, not malformed: an
 				// interactive shell answers it with a continuation prompt.
-				_tree.set_incomplete(true);
+				mark_incomplete();
 			}
 
 			syntax::here_doc_body body{};
@@ -1442,6 +1518,94 @@ private:
 		return _tree.add_node(n);
 	}
 
+	// The input ran out mid-construct - unless the construct is inside a command
+	// substitution's interior, where it did not.
+	//
+	// `echo $(if true)` is COMPLETE input holding an incomplete interior, and an
+	// interactive reader that saw incomplete() there would sit at a continuation
+	// prompt for a line the user has finished typing. The interior's own defect is
+	// still on its own nodes; it just does not speak for the command containing
+	// it, which is seal_top_level()'s rule applied to the other half of C-2's
+	// tristate. An interior that is incomplete because the SUBSTITUTION never
+	// closed - `echo $(ls` - is already reported by the word token that holds it.
+	void mark_incomplete() noexcept {
+		if (!_in_sub_parse)
+			_tree.set_incomplete(true);
+	}
+
+	// Records every command substitution written in a word, for parse_sub_interiors
+	// to come back to. See sub_parse in ast.h.
+	//
+	// Called from word_node for the reason the defect is recorded there: it is the
+	// ONE place a word node is made, and every grammatical position that makes one
+	// - command word, assignment, `for` list word, `case` subject, `case` pattern,
+	// redirect target - would otherwise each have to remember.
+	void queue_sub_parses(uint32_t word_token) noexcept {
+		if (_sub_depth >= kMaxSubParseDepth)
+			return;
+		const token& w = _tree.token_at(word_token);
+		// flag_literal means the word holds no `$` and no backquote, so it provably
+		// holds no substitution. Most words are literal, and this is what keeps the
+		// scan off the common path entirely.
+		if ((w.flags & flag_literal) != 0 || w.length == 0)
+			return;
+		// A word drawn from an ALIAS body. Its bytes are not in the input, so a span
+		// into them would not point at anything the user typed.
+		const uint32_t input_end = static_cast<uint32_t>(_tree.source().size());
+		if (w.offset >= input_end)
+			return;
+		scan_for_interiors(w.offset, std::min(w.end_offset(), input_end), word_token,
+		                   lex_mode::word_interior, 0);
+	}
+
+	// Walks one run of word interior and records the `$(...)` it finds.
+	//
+	// Re-lexing the word rather than having the lexer record the extent on the
+	// token: a token is exactly 16 bytes and one is produced per input byte run,
+	// so the extent would cost every word in the input to serve the few that hold
+	// a substitution. The lexer is independently callable at any offset (C-6),
+	// which is how the expander reads the same segments, so this is the cheap half
+	// of the same question.
+	//
+	// It descends into a DOUBLE-QUOTED segment, because `echo "$(ls)"` is one such
+	// segment with a substitution inside it. It does NOT descend into
+	// `seg_parameter`: `${x:-$(ls)}` is a limitation of this version, and a
+	// deliberate one - the `${...}` interior has its own grammar (which operator,
+	// where the word begins) that the parser does not model at all, and guessing
+	// at it here would put spans on text by position rather than by rule.
+	// `seg_arithmetic` is opaque for the settled reason: `$(( ))`'s mini-parser
+	// lives in the expander (#30/#56), it is not the shell grammar, and a tree
+	// this parser did not build has no business hanging off this tree's words.
+	void scan_for_interiors(uint32_t from, uint32_t to, uint32_t word_token,
+	                        lex_mode mode, uint32_t quote_nesting) noexcept {
+		// `"..."` cannot nest directly - only through a substitution, which this does
+		// not follow - so one level is all a well-formed word needs. The ceiling is
+		// against a pathological run of quotes on the keystroke path, where each
+		// level is a stack frame.
+		if (quote_nesting > 8 || from >= to)
+			return;
+		lexer scan{_tree.source().substr(0, to), from};
+		for (;;) {
+			const token s = scan.next(mode);
+			if (s.kind == token_kind::end || s.length == 0)
+				break;
+			if (s.kind == token_kind::seg_command_sub) {
+				uint32_t begin = 0, end = 0;
+				if (command_sub_interior(_tree.source(), s, begin, end))
+					_tree.add_sub_parse({.word_token = word_token,
+					                     .interior = {begin, end - begin},
+					                     .root = no_node,
+					                     .depth = _sub_depth});
+			} else if (s.kind == token_kind::seg_double_quoted) {
+				// The closing `"` is the segment's last byte when it closed at all.
+				const uint32_t inner_end =
+					s.error == token_error::none ? s.end_offset() - 1 : s.end_offset();
+				scan_for_interiors(s.offset + 1, inner_end, word_token,
+				                   lex_mode::double_quote_interior, quote_nesting + 1);
+			}
+		}
+	}
+
 	// A node for one word token, carrying that token's own defect.
 	//
 	// The defect has to travel with the word or nothing downstream can see it:
@@ -1463,6 +1627,10 @@ private:
 		w.aux = static_cast<uint32_t>(role);
 		if (_tree.token_at(at).is_error())
 			w.error = parse_error::unterminated_word;
+		// The word's `$(...)` interiors, for parse_sub_interiors to come back to
+		// once this parse is finished (#104). Recorded here and parsed later; doing
+		// it now would interleave the interior's tokens with this command's.
+		queue_sub_parses(at);
 		return _tree.add_node(w);
 	}
 
@@ -1506,6 +1674,12 @@ private:
 	std::vector<uint32_t> _strip_tabs_for;
 	uint32_t _index = 0;
 	uint32_t _input_cursor = 0;
+	// Parsing a command substitution's interior rather than the input itself. What
+	// it changes: incomplete() is not the outer input's to report (mark_incomplete)
+	// and aliases are not substituted (parse_sub_interiors).
+	bool _in_sub_parse = false;
+	// The depth a substitution found right now would have. See kMaxSubParseDepth.
+	uint32_t _sub_depth = 0;
 };
 
 } // namespace
@@ -1514,6 +1688,7 @@ tree parse(buffer_pool& pool, std::string_view source,
            const alias_source* aliases) noexcept {
 	parser_impl p{pool, source, aliases};
 	p.parse_program();
+	p.parse_sub_interiors();
 	return p.take();
 }
 
@@ -1521,6 +1696,7 @@ tree parse_next_command(buffer_pool& pool, std::string_view source, size_t& posi
                         const alias_source* aliases) noexcept {
 	parser_impl p{pool, source, aliases, static_cast<uint32_t>(position)};
 	p.parse_complete_command();
+	p.parse_sub_interiors();
 	position = p.input_cursor();
 	return p.take();
 }

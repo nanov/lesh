@@ -40,7 +40,11 @@ TEST_F(AllocationTest, ParsingNeverFallsBackToTheHeap) {
 	                        "cat f | grep p | wc -l",
 	                        "a && b || c",
 	                        "cmd arg > out 2>&1",
-	                        "ls -la -h -R /usr /var /etc /tmp"}) {
+	                        "ls -la -h -R /usr /var /etc /tmp",
+	                        // A command substitution's interior is parsed recursively
+	                        // (#104) - into the same arena, out of the same pool.
+	                        "echo $(ls -l foo | grep bar)",
+	                        "echo $(echo $(date)) \"$(uname -a)\""}) {
 		metrics::allocations().reset();
 		buffer_pool fresh{BUFFER_POOL_SIZE};
 		const syntax::tree t = syntax::parse(fresh, src);

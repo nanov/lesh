@@ -88,6 +88,59 @@ bool lexer::starts_a_command(uint32_t p, uint32_t begin) const noexcept {
 	       before == "do" || before == "{" || before == "!";
 }
 
+bool command_sub_interior(std::string_view source, const token& segment,
+                          uint32_t& begin, uint32_t& end) noexcept {
+	if (segment.kind != token_kind::seg_command_sub)
+		return false;
+	// A token drawn from an ALIAS body sits above the input in the tree's virtual
+	// text space (see tree::add_text_region), and this function is handed the
+	// input. There is no interior to name here, so there is none reported.
+	if (segment.offset >= source.size() || segment.length == 0)
+		return false;
+	uint32_t stop = segment.end_offset();
+	if (stop > source.size())
+		stop = static_cast<uint32_t>(source.size());
+	// The construct CLOSED, so its last byte is the `)` or the backquote. When it
+	// never closed - `echo $(ls` - the interior simply runs to the end of what was
+	// typed, which is what a line editor wants to paint.
+	if (segment.error == token_error::none && stop > segment.offset)
+		--stop;
+
+	uint32_t open;
+	if (source[segment.offset] == '`') {
+		open = segment.offset + 1;
+		// BACKQUOTES ARE EXCLUDED THE MOMENT A BACKSLASH APPEARS. POSIX 2.6.3 makes
+		// the backquoted text the interior AFTER removing a `\` that precedes `$`,
+		// a backquote or another `\` - so `` `echo \`date\`` ``'s interior is not a
+		// run of input bytes at all, it is a rewritten string. The expander can
+		// rewrite it because it owns a buffer (unescape_backquotes); this cannot,
+		// because every span the parser hangs on the result has to be a real input
+		// offset or a decoration lands on text the user never typed. A backquoted
+		// interior with NO backslash in it needs no rewriting and is descended into
+		// like any other; one with a backslash stays opaque, which is the same
+		// answer the segment gave before this existed.
+		for (uint32_t i = open; i < stop; ++i)
+			if (source[i] == '\\')
+				return false;
+	} else {
+		if (source[segment.offset] != '$')
+			return false;
+		// `$\<newline>(` is a command substitution: POSIX removes the continuation
+		// before the input is tokenised, so the opener is three bytes wide here and
+		// two there. Looked for rather than assumed, because assuming `offset + 2`
+		// would put the interior one byte inside the `(`.
+		const uint32_t at = past_continuations(source, segment.offset + 1);
+		if (at >= source.size() || source[at] != '(')
+			return false;
+		open = at + 1;
+	}
+	if (open > stop)
+		return false;
+	begin = open;
+	end = stop;
+	return true;
+}
+
 bool here_doc_delimiter_matches(std::string_view raw, std::string_view line) noexcept {
 	size_t r = 0, l = 0;
 	while (r < raw.size()) {

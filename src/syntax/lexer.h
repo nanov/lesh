@@ -40,6 +40,26 @@ enum class lex_mode : uint8_t {
 	here_doc_delimiter,  // the word after << : quoting matters, expansion does not
 };
 
+// The first position at or after `at` that does not begin a line continuation.
+//
+// POSIX 2.2.1 removes `\<newline>` BEFORE the input is tokenised, so every
+// lookahead has to look PAST one: `>\<newline>>` is the operator `>>`,
+// `c\<newline>ase` is the reserved word `case`, and `$\<newline>{f}` is a
+// parameter expansion. Treated as removal here rather than by rewriting the
+// input, because the lexer owns no memory (#9) and a rewritten buffer would break
+// every offset the line editor and `node_at` depend on. A TRAILING backslash is
+// left alone: it is incomplete input, not a continuation yet.
+//
+// Free rather than a member because command_sub_interior below asks the same
+// question of a segment the lexer has already produced, and a second copy of the
+// rule is a second place for it to drift.
+[[nodiscard]] constexpr uint32_t past_continuations(std::string_view source,
+                                                    uint32_t at) noexcept {
+	while (at + 1 < source.size() && source[at] == '\\' && source[at + 1] == '\n')
+		at += 2;
+	return at;
+}
+
 // A cursor over bytes it does not own and never modifies.
 //
 // Owning nothing is what lets the same lexer serve the parser and a highlighter
@@ -93,19 +113,9 @@ private:
 	[[nodiscard]] constexpr char char_at(uint32_t at) const noexcept {
 		return at < _source.size() ? _source[at] : '\0';
 	}
-	// The first position at or after `at` that does not begin a line continuation.
-	//
-	// POSIX 2.2.1 removes `\<newline>` BEFORE the input is tokenised, so every
-	// lookahead has to look PAST one: `>\<newline>>` is the operator `>>`,
-	// `c\<newline>ase` is the reserved word `case`, and `$\<newline>{f}` is a
-	// parameter expansion. Treated as removal here rather than by rewriting the
-	// input, because the lexer owns no memory (#9) and a rewritten buffer would
-	// break every offset the line editor and `node_at` depend on. A TRAILING
-	// backslash is left alone: it is incomplete input, not a continuation yet.
+	// This lexer's source, at `at`. See the free function above.
 	[[nodiscard]] constexpr uint32_t past_continuations(uint32_t at) const noexcept {
-		while (at + 1 < _source.size() && _source[at] == '\\' && _source[at + 1] == '\n')
-			at += 2;
-		return at;
+		return syntax::past_continuations(_source, at);
 	}
 
 	// Advances past ONE quoted run or expansion beginning at `at`, returning the
@@ -189,6 +199,27 @@ private:
 // handed text the scan already ruled out.
 [[nodiscard]] bool here_doc_delimiter_matches(std::string_view raw,
                                               std::string_view line) noexcept;
+
+// WHERE A COMMAND SUBSTITUTION'S INTERIOR IS, as real offsets into `source`.
+//
+// A `seg_command_sub` token spans the WHOLE construct - `$(ls -l)` including its
+// delimiters - because segments are delimited and not interpreted (#9). The
+// parser needs the inside of it to parse recursively (#104), and the inside is
+// not at a fixed offset: the opener is two bytes for `$(`, three or more once a
+// line continuation sits between the `$` and the `(`, and one for a backquote.
+//
+// Beside the lexer rather than in the parser, because this is the same escaping
+// question the segment scan already answered and the answer must not exist twice.
+// It is a free function over (source, token) for the reason the lexer itself is
+// restartable at any offset: a caller holding a token and the bytes it came from
+// can ask, without a parse.
+//
+// Returns false when there is no interior a SPAN can honestly describe - a
+// backquoted body carrying a backslash, whose interior is text POSIX rewrites
+// rather than a run of input bytes, and a token drawn from an alias body, which
+// has no position in the input at all. `begin` and `end` are untouched then.
+[[nodiscard]] bool command_sub_interior(std::string_view source, const token& segment,
+                                        uint32_t& begin, uint32_t& end) noexcept;
 
 // ONE STEP of `$'...'` decoding: what the bytes at `at` mean, and how many of
 // them the step used.
