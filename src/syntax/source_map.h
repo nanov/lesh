@@ -47,6 +47,22 @@ struct source_position {
 // line by line instead costs the size of the loop body. The memo is `mutable`
 // because it changes nothing an observer can see - two calls with the same offset
 // give the same answer - so the queries stay const.
+//
+// A LINE-START TABLE IS THE ALTERNATIVE, and it is left as an optimisation
+// rather than rejected. Measured, so that whoever picks it up starts from a
+// number: on a 20,000-line script whose execution ALTERNATES between line 2 and
+// line 20,005 - a function at the top called from a loop at the bottom, reading
+// `$LINENO` at both ends, which is the shape the memo is worst at - the mapper
+// costs 0.12s over 20,000 iterations against a 2.63s baseline. Under 5%, on a
+// script written specifically to defeat it, and below the noise floor at 2,000
+// iterations. A binary search over a table would make that O(log n), at the cost
+// of O(lines) of memory that has nowhere good to live: the arena is 32 KB
+// (BUFFER_POOL_SIZE) and overflows to malloc, which is the ONE counter
+// arena.h:26 says to watch, and a table for this script would be 40 KB on its
+// own. It would also have to be keyed on the SOURCE rather than owned by the
+// tree, because run_input parses one tree per COMMAND over a single shared
+// source - so a per-tree table would be built once per command, not once per
+// script.
 class source_map {
 public:
 	explicit source_map(std::string_view source) noexcept : _source(source) {}
