@@ -1,5 +1,6 @@
 #include "leshper/layout.h"
 
+#include "leshper/sgr.h"
 #include "substrate/assert.h"
 #include "substrate/measure.h"
 
@@ -66,6 +67,22 @@ public:
 
 	geometry run() {
 		place(_in.prompt, _in.prompt_pen, escapes::skip, no_cursor, secondary::no);
+
+		// THE WIDTH INVARIANT, checked rather than only tested. #131 made a
+		// prompt's SGR set a pen instead of being merely skipped, and the thing
+		// that must survive that is #114's contract: what this paints for a
+		// prompt is exactly what `display_width` measures for it, so a theme
+		// author never does width arithmetic and `%{ %}` folklore never exists.
+		//
+		// Single-row prompts only, and that is not a weakening. A prompt that
+		// broke a line or wrapped has its columns spread over rows and no single
+		// number to compare against; `_column == _in.columns` is pending wrap,
+		// where `advance` has clamped and the column stopped being a sum. Both
+		// are excluded by the guard rather than by a flag, because both are
+		// exactly "the walk left row 0's column arithmetic".
+		LESH_ASSERT(_row != 0 || _column >= _in.columns
+		            || _column == grapheme::display_width(_in.prompt, _in.width));
+
 		// The one place this file reads a byte offset out of a `position`
 		// (text.h: every such call is a site #88 must revisit). It is a
 		// comparison against buffer offsets and never arithmetic on them.
@@ -90,7 +107,12 @@ private:
 	enum class escapes { skip, paint };
 	enum class secondary { no, yes };
 
-	void place(std::string_view text, const style& pen, escapes on_escape,
+	// `pen` BY VALUE, and that is the whole of #131 on this side: an SGR in
+	// prompt bytes moves it, and it moves for the clusters that FOLLOW. One
+	// copy per call, eleven bytes, and no pen state outlives the text it
+	// belongs to - the prompt's colours cannot bleed into the buffer, because
+	// the buffer's `place` starts from `text_pen` again.
+	void place(std::string_view text, style pen, escapes on_escape,
 	           std::size_t cursor_at, secondary continuations) {
 		std::size_t i = 0;
 		while (i < text.size()) {
@@ -102,7 +124,9 @@ private:
 			    && static_cast<unsigned char>(text[i]) == 0x1B) {
 				const std::size_t length = grapheme::measure_detail::escape_length(text, i);
 				if (length != 0) {
-					flush();  // the escape's bytes are not paintable text
+					flush();  // the escape's bytes are not paintable text,
+					          // and a pen change belongs to what comes AFTER
+					pen = apply_sgr(text.substr(i, length), pen);
 					i += length;
 					continue;
 				}
@@ -179,6 +203,9 @@ private:
 		note_row(_row);
 	}
 
+	// The pen is COPIED into the run, not pointed at. It has to be: `place`'s
+	// pen is a local that the next SGR moves, and a pointer would emit the run
+	// that came before an SGR in the colour that came after it.
 	void open_run(std::string_view source, std::size_t at, const style& pen) {
 		if (_run_open)
 			return;
@@ -187,14 +214,14 @@ private:
 		_run_end = at;
 		_run_row = _row;
 		_run_column = _column;
-		_run_pen = &pen;
+		_run_pen = pen;
 		_run_open = true;
 	}
 
 	void flush() {
 		if (_run_open && _run_end > _run_begin)
 			_emit(_run_row, _run_column,
-			      _run_source.substr(_run_begin, _run_end - _run_begin), *_run_pen);
+			      _run_source.substr(_run_begin, _run_end - _run_begin), _run_pen);
 		_run_open = false;
 	}
 
@@ -242,7 +269,7 @@ private:
 	std::size_t _run_end = 0;
 	std::uint16_t _run_row = 0;
 	std::uint16_t _run_column = 0;
-	const style* _run_pen = nullptr;
+	style _run_pen;
 };
 
 // Which content row the top of the screen shows (layout.h, decision 4):
