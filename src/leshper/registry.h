@@ -298,4 +298,38 @@ private:
 // this module. Answers how many were registered.
 std::size_t register_builtin_actions(registry& reg);
 
+// The highlighter's registration-time context: its per-request arena and the
+// style ids it interned (#124). OPAQUE - defined in builtin_reactors.cpp, which
+// like builtin_actions.cpp includes abi.h and nothing else from this module, so
+// a built-in reactor that wanted a shortcut would not compile.
+//
+// It exists as a named thing at all because a reactor, unlike an action, has
+// state: an arena it rewinds per request (#90) and a dozen interned ids. That
+// state needs an owner that frees it before main returns (ADR-0007), and the
+// registry cannot be it - the registry stores a `void*` it never dereferences,
+// which is exactly the language-neutral shape #93 asked for.
+struct highlighter;
+
+[[nodiscard]] highlighter* highlighter_create();
+void highlighter_destroy(highlighter* self) noexcept;
+
+// Registers the built-in reactors (F-20/F-22) through the ABI and by no other
+// route (A-11). `self` must outlive `reg`. Answers how many were registered.
+std::size_t register_builtin_reactors(registry& reg, highlighter& self);
+
+// The owner ADR-0007 asks for, so no caller has to remember the pair above.
+class owned_highlighter {
+public:
+	owned_highlighter() : _self(highlighter_create()) {}
+	~owned_highlighter() { highlighter_destroy(_self); }
+
+	owned_highlighter(const owned_highlighter&) = delete;
+	owned_highlighter& operator=(const owned_highlighter&) = delete;
+
+	[[nodiscard]] highlighter& get() const noexcept { return *_self; }
+
+private:
+	highlighter* _self;
+};
+
 } // namespace lesh::leshper

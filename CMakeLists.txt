@@ -167,6 +167,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/blit.h
 	src/leshper/abi.h
 	src/leshper/builtin_actions.cpp
+	src/leshper/builtin_reactors.cpp
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
@@ -193,6 +194,7 @@ add_executable(lesh_tests
 	tests/unit/cd_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/leshper_highlight_tests.cpp
 	tests/unit/leshper_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
