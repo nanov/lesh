@@ -18,64 +18,59 @@
 # Only the emptiness of stderr is compared, never its text - the wording is
 # lesh's own (`lesh: syntax error: unterminated quoted string`), and dash's names
 # the same constructs differently.
-#
-# Every case that asserts a REFUSAL is xfail on the legacy front end. Legacy's
-# single-pass parser has no error channel at all: it truncates the input at the
-# unterminated construct and reports success, which is the bug in the first place.
-# The trailing backslash is the one case legacy already gets right, so it carries
-# no marker.
 
---- an unterminated single quote is a syntax error [xfail(legacy): legacy truncates the input at the quote and reports success]
+
+--- an unterminated single quote is a syntax error
 echo it's
 
---- an unterminated double quote is a syntax error [xfail(legacy): legacy truncates the input at the quote and reports success]
+--- an unterminated double quote is a syntax error
 echo "unterminated
 
---- an unterminated command substitution is a syntax error [xfail(legacy): legacy has no error channel for an unterminated construct]
+--- an unterminated command substitution is a syntax error
 echo $(
 
---- an unterminated backquote is a syntax error [xfail(legacy): legacy has no error channel for an unterminated construct]
+--- an unterminated backquote is a syntax error
 echo `
 
---- an unterminated parameter expansion is a syntax error [xfail(legacy): legacy has no error channel for an unterminated construct]
+--- an unterminated parameter expansion is a syntax error
 echo ${x
 
---- an unterminated arithmetic expansion is a syntax error [xfail(legacy): legacy has no error channel for an unterminated construct]
+--- an unterminated arithmetic expansion is a syntax error
 echo $((1
 
---- an unterminated assignment prefix is a syntax error [xfail(legacy): legacy runs the rest of the input regardless]
+--- an unterminated assignment prefix is a syntax error
 x="abc
 echo not reached
 
---- an unterminated redirection target is a syntax error rather than a bad filename [xfail(legacy): legacy passes the operator through as an argument]
+--- an unterminated redirection target is a syntax error rather than a bad filename
 cat > "x
 
---- an unterminated word in a for list is a syntax error [xfail(legacy): legacy has no for loop]
+--- an unterminated word in a for list is a syntax error
 for i in "a; do echo $i; done
 
---- an unterminated case pattern is a syntax error [xfail(legacy): legacy has no case clause]
+--- an unterminated case pattern is a syntax error
 case a in "a) echo matched;; esac
 
---- an unterminated here-document delimiter is a syntax error [xfail(legacy): legacy has no here-documents]
+--- an unterminated here-document delimiter is a syntax error
 cat <<"EOF
 body
 EOF
 
---- an unterminated quote inside eval kills the shell [xfail(legacy): legacy has no eval]
+--- an unterminated quote inside eval kills the shell
 eval 'echo "x'
 echo not reached
 
---- a syntax error stops the input rather than truncating one command [xfail(legacy): legacy truncates the command and carries on]
+--- a syntax error stops the input rather than truncating one command
 echo one
 echo "two
 echo three
 
---- a syntax error stops the input read from standard input [stdin] [xfail(legacy): legacy truncates the command and carries on]
+--- a syntax error stops the input read from standard input [stdin]
 echo one
 echo $(
 echo three
 
---- a syntax error stops a script read from a file [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- a syntax error stops a script read from a file
 d=$(mktemp -d); printf 'echo one\necho "two\necho three\n' > $d/s; "$TESTEE" $d/s; echo "status=$?"
 
 # MALFORMED NESTING THE WORD SCAN CANNOT SEE (#48). Everything above is refused by
@@ -95,53 +90,53 @@ d=$(mktemp -d); printf 'echo one\necho "two\necho three\n' > $d/s; "$TESTEE" $d/
 # Unterminated QUOTES inside a default are deliberately NOT refused - the
 # second-to-last case says why. That is #42's, not this one's.
 
---- an unterminated arithmetic expansion inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated arithmetic expansion inside a parameter default is refused
 echo ${x-$((1}
 
---- an unterminated arithmetic expansion inside a nested default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated arithmetic expansion inside a nested default is refused
 echo ${x-${y-$((1}}
 
---- an unterminated arithmetic expansion in an alternate value is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated arithmetic expansion in an alternate value is refused
 x=1; echo ${x+$((1}
 
---- an unterminated arithmetic expansion in a trim pattern is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated arithmetic expansion in a trim pattern is refused
 x=abc; echo ${x#$((1}
 
---- an unterminated command substitution inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated command substitution inside a parameter default is refused
 echo ${x-$(}
 
---- an unterminated backquote inside a parameter default is refused [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- an unterminated backquote inside a parameter default is refused
 echo ${x-`}
 
---- an unterminated parameter expansion inside arithmetic is refused [xfail(legacy): legacy never expands arithmetic, so it echoes the parens as literal text]
+--- an unterminated parameter expansion inside arithmetic is refused
 echo $((${x-))
 
---- a malformed expansion in an assignment value is refused [xfail(legacy): legacy never expands a parameter, so the assignment takes the braces as its value]
+--- a malformed expansion in an assignment value is refused
 v=${x-$((1}
 echo not reached
 
---- a malformed expansion in a redirection target is refused [xfail(legacy): legacy never expands a parameter, so it creates a file named after the braces]
+--- a malformed expansion in a redirection target is refused
 cat > ${x-$((1}
 
---- a TERMINATED arithmetic expansion inside a parameter default still expands [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- a TERMINATED arithmetic expansion inside a parameter default still expands
 echo ${x-$((1+2))}
 
---- a TERMINATED command substitution inside a parameter default still expands [xfail(legacy): legacy never expands a parameter, so it echoes the braces as literal text]
+--- a TERMINATED command substitution inside a parameter default still expands
 echo ${x-`echo hi`}
 
---- an unterminated quote inside a parameter default is refused [xfail(legacy): legacy has no parameter expansion beyond $name, so it echoes the braces]
+--- an unterminated quote inside a parameter default is refused
 echo ${x-'a}
 
---- a single quote inside a double-quoted parameter default is a byte, not a quote [xfail(legacy): legacy has no parameter expansion beyond $name, so it echoes the braces]
+--- a single quote inside a double-quoted parameter default is a byte, not a quote
 echo "${x-'}"
 
---- a malformed expansion in a for list stops the shell [xfail(legacy): legacy has no compound commands]
+--- a malformed expansion in a for list stops the shell
 for i in ${x-$((1}; do echo $i; done
 
---- and a FATAL expansion error in a for list stops it too [xfail(legacy): legacy has no compound commands]
+--- and a FATAL expansion error in a for list stops it too
 for i in ${x?}; do echo $i; done; echo after
 
---- a default the operator never reaches is refused too [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a default the operator never reaches is refused too
 x=1; echo ${x-$((1}
 
 # AN UNTERMINATED COMPOUND COMMAND (#49). The same user-visible defect as
@@ -160,55 +155,53 @@ x=1; echo ${x-$((1}
 # NOT incomplete: `if true; fi` - no continuation helps. The two cases at the very
 # end of this file are the third combination, and they are what stops any of this
 # from becoming "a missing terminator is incomplete, so incomplete is an error".
-#
-# Every refusal here is xfail on legacy, which has no compound commands at all:
-# `{ echo x` runs `{` as a command name and `if true` runs `if`.
 
---- an unterminated subshell is a syntax error [xfail(legacy): legacy runs the subshell body and reports success]
+
+--- an unterminated subshell is a syntax error
 ( echo x
 
---- an unterminated brace group is a syntax error [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+--- an unterminated brace group is a syntax error
 { echo x
 
---- an `if` with no `then` is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- an `if` with no `then` is a syntax error
 if true
 
---- an `if` with no `fi` is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- an `if` with no `fi` is a syntax error
 if true; then echo hi
 
---- a `while` with no `do` is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+--- a `while` with no `do` is a syntax error
 while true
 
---- a `while` with no `done` is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+--- a `while` with no `done` is a syntax error
 while true; do echo hi
 
---- an `until` with no `do` is a syntax error [xfail(legacy): legacy has no until loop, so it runs `until` as a command name]
+--- an `until` with no `do` is a syntax error
 until true
 
---- a `for` with no `do` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a `for` with no `do` is a syntax error
 for i in 1
 
---- a `for` with no `done` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a `for` with no `done` is a syntax error
 for i in 1; do echo hi
 
---- a `case` with no `esac` is a syntax error [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+--- a `case` with no `esac` is a syntax error
 case a in
 
---- a case item with no closing paren is a syntax error [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+--- a case item with no closing paren is a syntax error
 case a in b echo hi;; esac
 
---- an unterminated function body is a syntax error [xfail(legacy): legacy has no function definitions]
+--- an unterminated function body is a syntax error
 f() { echo x
 
---- a compound command closed by the wrong word is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- a compound command closed by the wrong word is a syntax error
 if true; fi
 
---- an unterminated compound command stops the input rather than truncating one command [xfail(legacy): legacy has no brace group and carries on regardless]
+--- an unterminated compound command stops the input rather than truncating one command
 echo one
 { echo x
 echo three
 
---- an unterminated compound command read from standard input stops the input [stdin] [xfail(legacy): legacy has no if clause and carries on regardless]
+--- an unterminated compound command read from standard input stops the input [stdin]
 echo one
 if true
 echo three
@@ -220,12 +213,12 @@ echo three
 # second passed by accident. Requiring the keyword would have made both syntax
 # errors, so the linebreak is skipped where the grammar puts one.
 
---- a linebreak before a for loop's `in` still runs the loop [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a linebreak before a for loop's `in` still runs the loop
 for i
 in 1 2
 do echo $i; done
 
---- a linebreak before a case clause's `in` still runs the clause [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+--- a linebreak before a case clause's `in` still runs the clause
 case a
 in
 b) echo hi;;
@@ -251,52 +244,52 @@ esac
 # `until` is the same defect without the hang: an empty condition is status 0 and an
 # `until` stops when its condition succeeds, so it ran the body zero times instead.
 
---- an `if` with an empty condition is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- an `if` with an empty condition is a syntax error
 if; then echo x; fi
 
---- a `while` with an empty condition is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+--- a `while` with an empty condition is a syntax error
 while; do :; done
 
---- an `until` with an empty condition is a syntax error [xfail(legacy): legacy has no until loop, so it runs `until` as a command name]
+--- an `until` with an empty condition is a syntax error
 until; do echo x; done
 
---- a `for` with no variable name is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a `for` with no variable name is a syntax error
 for ; do echo x; done
 
---- a `while` with an empty body is a syntax error [xfail(legacy): legacy has no while loop, so it runs `while` as a command name]
+--- a `while` with an empty body is a syntax error
 while true; do done
 
---- an `if` with an empty body is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- an `if` with an empty body is a syntax error
 if true; then fi
 
---- an `else` part with an empty body is a syntax error [xfail(legacy): legacy has no if clause, so it runs `if` as a command name]
+--- an `else` part with an empty body is a syntax error
 if false; then echo a; else fi
 
---- a `for` with an empty body is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a `for` with an empty body is a syntax error
 for i in a; do done
 
---- an empty brace group is a syntax error [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+--- an empty brace group is a syntax error
 { }
 
---- an empty subshell is a syntax error [xfail(legacy): legacy has no subshell]
+--- an empty subshell is a syntax error
 ( )
 
---- an empty function body is a syntax error [xfail(legacy): legacy has no function definitions]
+--- an empty function body is a syntax error
 f() { }
 
 # The over-eager half. A `case` item's `compound_list` is the one POSIX makes
 # optional, and a group holding only a redirection is a simple command with no
 # words rather than an empty list - so neither may be refused.
 
---- a case item with an empty body still runs [xfail(legacy): legacy has no case clause, so it runs `case` as a command name]
+--- a case item with an empty body still runs
 case a in a) ;; b) echo no;; esac
 echo done
 
---- a brace group holding only a redirection still runs [xfail(legacy): legacy has no brace group, so it runs `{` as a command name]
+--- a brace group holding only a redirection still runs
 { >/dev/null; }
 echo done
 
---- a for loop over an empty word list still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop over an empty word list still runs
 for i in; do echo x; done
 echo done
 
@@ -314,33 +307,33 @@ echo done
 # and nothing then closes the list - dash refuses it, and the case at the end of
 # this block checks lesh matches rather than assuming so.
 
---- a for loop word list item spelled `in` still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop word list item spelled `in` still runs
 for i in in; do echo $i; done
 
---- a for loop word list item spelled `do`, separated from the real `do` by a semicolon, still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop word list item spelled `do`, separated from the real `do` by a semicolon, still runs
 for i in do; do echo $i; done
 
---- a for loop word list item spelled `do`, separated from the real `do` by a newline, still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop word list item spelled `do`, separated from the real `do` by a newline, still runs
 for i in do
 do
 echo $i
 done
 
---- a for loop word list holding `do` and `done` back to back still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop word list holding `do` and `done` back to back still runs
 for word in do done
 do
 echo $word
 done
 
---- a for loop word list holding `done`, `esac` and `fi` still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop word list holding `done`, `esac` and `fi` still runs
 for i in done esac fi; do echo $i; done
 
---- a for loop with no separator before `do` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+--- a for loop with no separator before `do` is a syntax error
 for i in a b do echo $i; done
 
 --- a trailing backslash is incomplete without being an error
 echo one\
 
---- an unterminated here-document is incomplete without being an error [xfail(legacy): legacy has no here-documents]
+--- an unterminated here-document is incomplete without being an error
 cat <<EOF
 body

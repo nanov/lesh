@@ -217,9 +217,9 @@ The interactive layer as a whole: leshper, prompts, rendering — what
 **Front end** _[retired]_:
 A word that carried three meanings at once and now carries none. What it
 named: the lexer and parser together is the **syntax layer**; the interactive
-side is the **UI**; the legacy-or-next axis lives on only in the
-`LESH_FRONTEND` environment variable and `spec_run.py --frontend`, live
-interfaces that die with legacy.
+side is the **UI**; the legacy-or-next axis is gone entirely - #28 deleted
+`src/legacy/`, the `LESH_FRONTEND` variable and `spec_run.py --frontend` with
+it, so there is one shell and nothing to select between.
 _Avoid_: the word itself, in every sense.
 
 **Shell state** _[lesh]_:
@@ -334,7 +334,7 @@ keymaps, never a second dispatch system.
 
 **Autosuggestion** _[lesh]_:
 The greyed-out completion of the current line drawn from history.
-_Avoid_: hint, which is replxx's word and leaves with replxx.
+_Avoid_: hint, which was replxx's word and left with replxx (#28).
 
 **Capability surface** _[lesh]_:
 The flat C ABI a plugin is written against. Everything a plugin can do, and nothing

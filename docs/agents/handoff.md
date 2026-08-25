@@ -49,11 +49,11 @@ traps rather than a summary of them.
 - **When a proven fix moves nothing, look at what runs BEFORE the thing under
   test.** Three times on map #17 a correct fix scored nothing because something
   earlier aborted the file.
-- **Set `LESH_FRONTEND=next` on every invocation.** The DEFAULT is still `legacy`, the
-  strangler quarantine ADR-0002 deletes, and it is missing most of the language. A bare
-  `./build/debug/lesh -c 'set -m'` reports `set: No such file or directory` — not a bug,
-  just the wrong shell. This has already produced one false finding in a handoff report.
-  `tools/spec_run.py` and `tools/conformance.py` set it for you; a hand-written probe
+- **`LESH_FRONTEND` is gone (#28).** There is one shell: `./build/debug/lesh` IS the
+  shell under development, and nothing selects a front end any more. While two were
+  live the default was `legacy`, and a bare `./build/debug/lesh -c 'set -m'` reporting
+  `set: No such file or directory` was the wrong shell rather than a bug — which
+  produced one false finding in a handoff report. That trap is closed; a probe
   does not.
 - **Verify against dash before believing anything.** dash is authoritative for the
   POSIX floor (ADR-0001); zsh only for the curated layer. Where dash is behind the

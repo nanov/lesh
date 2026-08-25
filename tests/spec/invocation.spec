@@ -18,91 +18,86 @@
 # with any argv it likes and the comparison stays lesh-invoking-lesh against
 # dash-invoking-dash. A case that needs a particular argv[0] symlinks it itself.
 #
-# EVERY case here is xfail on the legacy front end, and for one reason each time:
-# legacy never expands a parameter inside double quotes, so `"$TESTEE"` is not a
-# command it can run. That is the same defect basics.spec records; it is not new
-# here, and none of these cases will pass on legacy before it is fixed.
-#
 # Files go under `mktemp -d`, as everywhere else in this corpus: cases run in
 # whatever directory ctest was started from.
 
---- +i and +m are accepted, and the script still arrives on standard input [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- +i and +m are accepted, and the script still arrives on standard input
 d=$(mktemp -d); printf 'echo ok\n' > $d/s; "$TESTEE" +i +m < $d/s
 
---- +i and +m are accepted alongside -c [xfail(legacy): same quote-expansion defect]
+--- +i and +m are accepted alongside -c
 "$TESTEE" +i +m -c 'echo ok'
 
---- an option and its negation on the same command line [xfail(legacy): same quote-expansion defect]
+--- an option and its negation on the same command line
 "$TESTEE" -f +f -c 'echo ok'
 
---- read reads fd 0 when the script itself arrives on standard input [stdin] [xfail(legacy): legacy has neither here-documents nor expansion inside double quotes]
+--- read reads fd 0 when the script itself arrives on standard input [stdin]
 read a <<\END
 A
 END
 echo "$? [${a-unset}]"
 
---- read reads fd 0 in a shell whose script arrives on standard input [xfail(legacy): same quote-expansion defect]
+--- read reads fd 0 in a shell whose script arrives on standard input
 d=$(mktemp -d); printf 'read a <<\\END\nA\nEND\necho "$? [${a-unset}]"\n' > $d/s; "$TESTEE" < $d/s
 
---- a script on standard input is read ahead of itself, so read sees EOF [stdin] [xfail(legacy): legacy never expands a parameter inside double quotes]
+--- a script on standard input is read ahead of itself, so read sees EOF [stdin]
 printf 'first\n'
 read x
 echo "[${x-unset}]"
 
---- the shell with no arguments at all reads its script from standard input [stdin] [xfail(legacy): legacy has no positional parameters and never expands inside double quotes]
+--- the shell with no arguments at all reads its script from standard input [stdin]
 echo ok
 echo "[$#]"
 
---- the exit status of a script that arrived on standard input [stdin] [xfail(legacy): legacy matches only the bare word exit, so `exit 17` is looked up as a command]
+--- the exit status of a script that arrived on standard input [stdin]
 exit 17
 
---- with -c the operand after the command string is $0 and the next is $1 [xfail(legacy): same quote-expansion defect]
+--- with -c the operand after the command string is $0 and the next is $1
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' 'command  name' 1 '2  2'
 
---- with -c and no operands there are no positional parameters [xfail(legacy): same quote-expansion defect]
+--- with -c and no operands there are no positional parameters
 "$TESTEE" -c 'echo "[$#]"'
 
---- -s reads standard input even though operands were given [xfail(legacy): same quote-expansion defect]
+--- -s reads standard input even though operands were given
 "$TESTEE" -s X 'Y  Y' <<'EOF'
 printf '[%s]\n' "$@"
 EOF
 
---- -c does not consume standard input [xfail(legacy): same quote-expansion defect]
+--- -c does not consume standard input
 d=$(mktemp -d); printf 'printed text\n' > $d/in; "$TESTEE" -c cat < $d/in
 
---- a script's pathname is its own $0 [xfail(legacy): same quote-expansion defect]
+--- a script's pathname is its own $0
 d=$(mktemp -d); printf 'echo "$0"\n' > $d/s; cd $d && "$TESTEE" ./s
 
---- -cn reads the n as an option and still honours noexec [xfail(legacy): same quote-expansion defect]
+--- -cn reads the n as an option and still honours noexec
 d=$(mktemp -d); cd $d && "$TESTEE" -cn 'echo hi > f'; echo "status=$? [$(ls $d)]"
 
---- -e on the command line makes a failing command exit the shell [xfail(legacy): same quote-expansion defect]
+--- -e on the command line makes a failing command exit the shell
 "$TESTEE" -e -c 'false; echo not reached'; echo "status=$?"
 
---- an invalid option letter is refused rather than run [xfail(legacy): same quote-expansion defect]
+--- an invalid option letter is refused rather than run
 "$TESTEE" -Z -c 'echo hi' 2>/dev/null; echo "status=$?"
 
---- exec replaces the shell with another shell [xfail(legacy): same quote-expansion defect]
+--- exec replaces the shell with another shell
 "$TESTEE" -c 'exec "$TESTEE" -c "echo inner"; echo not reached'
 
---- $0 is the pathname the shell was invoked as [xfail(legacy): same quote-expansion defect]
+--- $0 is the pathname the shell was invoked as
 d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -c 'echo "$0"'
 
---- $0 is argv[0] for a shell whose script arrives on standard input [xfail(legacy): same quote-expansion defect]
+--- $0 is argv[0] for a shell whose script arrives on standard input
 d=$(mktemp -d); ln -s "$TESTEE" $d/sh; cd $d && ./sh -s X <<'EOF'
 printf '[%s]\n' "$0" "$@"
 EOF
 
---- a word after -c's command string is an operand, not another option [xfail(legacy): same quote-expansion defect]
+--- a word after -c's command string is an operand, not another option
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -- -x
 
---- a word after -c's command string is an operand even when it is a valid option letter [xfail(legacy): same quote-expansion defect]
+--- a word after -c's command string is an operand even when it is a valid option letter
 "$TESTEE" -c 'printf "[%s]\n" "$0" "$@"' -s foo
 
---- the command string is the first OPERAND, so an option may sit between -c and it [xfail(legacy): same quote-expansion defect]
+--- the command string is the first OPERAND, so an option may sit between -c and it
 "$TESTEE" -c -e 'false; echo not reached'; echo "status=$?"
 
---- a single hyphen before the command string is an operand and then ignored [xfail(legacy): same quote-expansion defect]
+--- a single hyphen before the command string is an operand and then ignored
 "$TESTEE" -c - 'echo OK'; "$TESTEE" -c -- 'echo OK'
 
 --- a command_file that cannot be opened exits 127 [divergence: dash reports 2; startup-p.tst's 'reading non-existing file' requires 127 and bash agrees]
@@ -149,7 +144,7 @@ END
 echo - read by the nested shell and printed by printf
 - read and executed by the outer shell
 
---- a here-document body is collected from the seekable script and the line after it still runs [xfail(legacy): legacy has no here-documents]
+--- a here-document body is collected from the seekable script and the line after it still runs
 d=$(mktemp -d)
 cat > $d/s <<'END'
 cat <<EOF
@@ -192,7 +187,7 @@ loop 1
 loop 2
 [data line]
 
---- an alias defined on one line of a seekable script is in effect on the next [xfail(legacy): legacy's alias model differs]
+--- an alias defined on one line of a seekable script is in effect on the next
 d=$(mktemp -d); printf 'alias f=:\nf\n' > $d/s; "$TESTEE" < $d/s; echo "[$?]"
 
 --- eval re-entering the front end does not disturb the outer script's position [divergence: dash and zsh have already consumed the data line; bash and yash have not]
@@ -224,7 +219,7 @@ echo "[$?][$x]"
 === expect
 [0][]
 
---- a command substitution that runs nothing reports zero rather than the status before it [xfail(legacy): legacy has no command substitution]
+--- a command substitution that runs nothing reports zero rather than the status before it
 false; x=$( ); echo "[$?]"
 
 # The other half of the rule, and the half that must NOT change: a PIPE cannot be
@@ -232,7 +227,7 @@ false; x=$( ); echo "[$?]"
 # These are ordinary differential cases for that reason - if the fix for the
 # seekable path leaked into the non-seekable one, they would start failing.
 
---- input from a pipe is not seekable, so the shell may read past the command it runs [stdin] [xfail(legacy): legacy never expands a parameter inside double quotes]
+--- input from a pipe is not seekable, so the shell may read past the command it runs [stdin]
 read x
 data line
 echo "[${x-unset}]"

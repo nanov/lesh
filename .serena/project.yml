@@ -76,11 +76,7 @@ additional_workspace_folders: []
 ignored_paths:
 # Vendored third-party sources. ~1500 headers that made find_symbol walk the
 # whole tree and time out; clangd still resolves them for our own files.
-- "include/abseil/**"
-- "include/sol2/**"
 - "include/googletest/**"
-- "include/lua/**"
-- "include/replxx/**"
 - "third_party/**"
 - "build/**"
 

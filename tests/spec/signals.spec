@@ -29,13 +29,13 @@
 # child and lesh writes nothing, which is a separate divergence and not this
 # ticket's.
 
---- SIGURG is reachable at all, which is the whole of issue #38 [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill, which cannot take $$ from a shell that does not expand it]
+--- SIGURG is reachable at all, which is the whole of issue #38
 kill -s URG $$; echo survived
 
---- an unknown signal name is still refused, because the suite depends on refusal [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- an unknown signal name is still refused, because the suite depends on refusal
 "$TESTEE" -c 'trap : NOSUCHSIGNAL' 2>/dev/null; [ $? -ne 0 ] && echo refused
 
---- trap takes SIGURG in each of its three forms [xfail(legacy): legacy has no trap builtin and runs /bin/trap, which does not exist]
+--- trap takes SIGURG in each of its three forms
 trap '' URG; trap - URG; trap : URG; echo $?
 
 --- the SIG prefix is accepted on a signal name [divergence: dash recognises only the unprefixed spellings POSIX lists and rejects SIGURG outright; bash, ksh, yash and zsh all accept the prefix, and no case in the conformance suite asserts rejection]
@@ -43,37 +43,37 @@ trap : SIGURG; kill -s SIGURG $$; echo ok
 === expect
 ok
 
---- a trap on SIGURG runs between commands, not during one [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- a trap on SIGURG runs between commands, not during one
 trap 'echo trapped' URG; kill -s URG $$; echo after
 
---- SIGURG's default action is to discard it, so the shell survives [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- SIGURG's default action is to discard it, so the shell survives
 "$TESTEE" -c 'kill -s URG $$; echo alive'; echo $?
 
---- the spare signals are all discarded rather than fatal [xfail(legacy): same quote-expansion defect]
+--- the spare signals are all discarded rather than fatal
 for s in URG CHLD CONT WINCH; do "$TESTEE" -c "kill -s $s \$\$" && echo "$s spared"; done
 
---- a fatal signal's default action still kills, and the status names it back [xfail(legacy): same quote-expansion defect]
+--- a fatal signal's default action still kills, and the status names it back
 for s in TERM HUP USR1 USR2 SYS XCPU; do "$TESTEE" -c "kill -s $s \$\$" 2>/dev/null; kill -l $?; done
 
---- kill -l lists the null signal first and one name per line [xfail(legacy): legacy has no kill builtin, so `kill -l` runs /bin/kill and prints its own format]
+--- kill -l lists the null signal first and one name per line
 kill -l | sed -n 1p; kill -l | grep -x URG; kill -l | grep -c '^[A-Z]'
 
---- every name kill -l lists is a name trap accepts [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- every name kill -l lists is a name trap accepts
 kill -l | tail -n +2 | while read s; do trap : "$s" 2>/dev/null || echo "trap rejected $s"; done; echo checked
 
---- kill -l NUMBER names a signal number [xfail(legacy): legacy has no kill builtin, so `kill -l 1` runs /bin/kill]
+--- kill -l NUMBER names a signal number
 kill -l 1; kill -l 9; kill -l 15
 
---- kill -l EXITSTATUS takes the 128 back off, which is what run-test.sh needs [xfail(legacy): legacy has no kill builtin, so `kill -l 129` runs /bin/kill]
+--- kill -l EXITSTATUS takes the 128 back off, which is what run-test.sh needs
 kill -l 129; kill -l 137; kill -l 143
 
---- kill -l refuses an operand that names no signal, rather than inventing one [xfail(legacy): legacy has no kill builtin, so `kill -l 0` runs /bin/kill]
+--- kill -l refuses an operand that names no signal, rather than inventing one
 for n in 0 128 99999; do kill -l $n 2>/dev/null; [ $? -ne 0 ] && echo "refused $n"; done
 
---- the terminal-stop signals are named even though job control is not implemented [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- the terminal-stop signals are named even though job control is not implemented
 trap : STOP TSTP TTIN TTOU; echo $?
 
---- SIGSTOP's default action stops the shell and a subshell resumes it [xfail(legacy): legacy has no kill builtin, so `kill -s STOP $$` runs /bin/kill]
+--- SIGSTOP's default action stops the shell and a subshell resumes it
 (kill -s STOP $$; s=$?; kill -s CONT $$; exit $s); echo st=$?
 
 # ISSUE #37. POSIX XCU 2.11: a signal ignored on entry to a NON-INTERACTIVE shell
@@ -88,28 +88,28 @@ trap : STOP TSTP TTIN TTOU; echo $?
 # dash's bug; the exclusion is covered by sigurg6-p.tst, which runs the testee
 # interactively with SIGURG ignored and requires the trap to fire.
 
---- a signal ignored on entry cannot be RESET, which is the half that killed the shell [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- a signal ignored on entry cannot be RESET, which is the half that killed the shell
 trap '' INT; "$TESTEE" -c 'trap - INT; kill -s INT $$; echo survived-reset'; echo "status=$?"
 
---- a signal ignored on entry cannot be TRAPPED, so the handler never runs [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+--- a signal ignored on entry cannot be TRAPPED, so the handler never runs
 trap '' INT; "$TESTEE" -c 'trap "echo trapped" INT; kill -s INT $$; echo after'
 
---- trap on such a signal still reports success, because POSIX asks for no error [xfail(legacy): same quote-expansion defect]
+--- trap on such a signal still reports success, because POSIX asks for no error
 trap '' URG; "$TESTEE" -c 'trap "echo x" URG; echo $?; trap - URG; echo $?'
 
---- the rule survives a subshell, where an ordinary handler would not [xfail(legacy): same quote-expansion defect]
+--- the rule survives a subshell, where an ordinary handler would not
 trap '' URG; "$TESTEE" -c '( trap "echo trapped" URG; kill -s URG $$; echo after )'
 
---- a child shell inherits SIG_IGN and so discovers the rule for itself [xfail(legacy): same quote-expansion defect]
+--- a child shell inherits SIG_IGN and so discovers the rule for itself
 trap '' URG; "$TESTEE" -c '"$TESTEE" -c "trap \"echo trapped\" URG; kill -s URG \$\$; echo after"'
 
---- exec carries it, because SIG_IGN survives execve [xfail(legacy): same quote-expansion defect]
+--- exec carries it, because SIG_IGN survives execve
 trap '' INT; "$TESTEE" -c 'exec "$TESTEE" -c "trap - INT; kill -s INT \$\$; echo survived-exec"'
 
---- the rule is per signal: another signal in the same shell traps normally [xfail(legacy): same quote-expansion defect]
+--- the rule is per signal: another signal in the same shell traps normally
 trap '' URG; "$TESTEE" -c 'trap "echo trapped" USR1; kill -s USR1 $$; echo after'
 
---- an EXIT trap is unaffected, since EXIT has no inherited disposition [xfail(legacy): same quote-expansion defect]
+--- an EXIT trap is unaffected, since EXIT has no inherited disposition
 trap '' INT; "$TESTEE" -c 'trap "echo bye" EXIT; echo hi'
 
 --- trap lists nothing for a signal it cannot trap [divergence: dash and zsh accept the trap command, list it back, and then never run it; bash lists nothing and lesh follows bash, because a listing that names an action the shell will not take is the same defect as a builtin that succeeds without doing anything. See ADR-0001.]
@@ -135,36 +135,36 @@ end
 # takes the default action back), so ADR-0001's "dash is authoritative where they
 # disagree about POSIX" is settled here by the suite rather than by either shell.
 
---- an interactive shell ignores SIGQUIT at its top level [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- an interactive shell ignores SIGQUIT at its top level
 "$TESTEE" -i +m -c 'trap - QUIT
 kill -s QUIT $$
 echo spared'; echo "status=$?"
 
---- an interactive shell ignores SIGTERM at its top level [xfail(legacy): same quote-expansion defect]
+--- an interactive shell ignores SIGTERM at its top level
 "$TESTEE" -i +m -c 'trap - TERM
 kill -s TERM $$
 echo spared'; echo "status=$?"
 
---- SIGHUP still terminates an interactive shell, so the rule did not spread [xfail(legacy): same quote-expansion defect]
+--- SIGHUP still terminates an interactive shell, so the rule did not spread
 "$TESTEE" -i +m -c 'trap - HUP
 kill -s HUP $$
 echo not printed' 2>/dev/null; kill -l $?
 
---- a NON-interactive shell is untouched: the same three signals still kill it [xfail(legacy): same quote-expansion defect]
+--- a NON-interactive shell is untouched: the same three signals still kill it
 for s in INT QUIT TERM; do "$TESTEE" +i +m -c "kill -s $s \$\$" 2>/dev/null; kill -l $?; done
 
---- an explicit trap wins over the interactive default [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+--- an explicit trap wins over the interactive default
 "$TESTEE" -i +m -c 'trap "echo trapped" TERM
 kill -s TERM $$
 echo after'
 
---- trap '' on such a signal is a real ignore the shell can report [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+--- trap '' on such a signal is a real ignore the shell can report
 "$TESTEE" -i +m -c "trap '' TERM
 trap
 kill -s TERM \$\$
 echo after"
 
---- trap reports the interactive default as the default action, because that is what was asked for [xfail(legacy): same quote-expansion defect, and legacy has no trap builtin]
+--- trap reports the interactive default as the default action, because that is what was asked for
 "$TESTEE" -i +m -c 'trap - TERM
 trap
 echo end'
@@ -183,7 +183,7 @@ echo not printed'\''' 2>/dev/null; kill -l $?
 === expect
 TERM
 
---- exec hands over a killable SIGTERM, since SIG_IGN would survive execve [xfail(legacy): same quote-expansion defect]
+--- exec hands over a killable SIGTERM, since SIG_IGN would survive execve
 "$TESTEE" -i +m -c 'trap - TERM
 exec "$TESTEE" -c '\''kill -s TERM $$
 echo not printed'\''' 2>/dev/null; kill -l $?
@@ -210,31 +210,31 @@ abandoned after 1
 # POSIX XCU `exit`: "the last command is considered to be the command that
 # executed immediately preceding the trap action".
 
---- the EXIT trap runs its whole body after an exit [xfail(legacy): legacy has no trap builtin]
+--- the EXIT trap runs its whole body after an exit
 trap 'echo A; echo B' EXIT; exit 1
 
---- an exit in the EXIT trap replaces the shell's status [xfail(legacy): legacy has no trap builtin]
+--- an exit in the EXIT trap replaces the shell's status
 trap 'exit 7' EXIT; exit 1
 
---- an exit with status zero in the EXIT trap wins too [xfail(legacy): legacy has no trap builtin]
+--- an exit with status zero in the EXIT trap wins too
 trap 'exit 0' EXIT; exit 1
 
---- an EXIT trap that only runs commands leaves the status alone [xfail(legacy): legacy has no trap builtin]
+--- an EXIT trap that only runs commands leaves the status alone
 trap '(exit 2)' EXIT; (exit 1); exit
 
---- exit with no operand in the EXIT trap reports the status the trap was entered with [xfail(legacy): legacy has no trap builtin]
+--- exit with no operand in the EXIT trap reports the status the trap was entered with
 trap '(exit 1); exit' EXIT; (exit 2); exit
 
---- an exit in a signal trap replaces the shell's status [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- an exit in a signal trap replaces the shell's status
 trap '(exit 2); exit 3' INT; (exit 1); kill -INT $$
 
---- exit with no operand in a signal trap reports the status the trap interrupted [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- exit with no operand in a signal trap reports the status the trap interrupted
 trap '(exit 2); exit' INT; (exit 1); kill -INT $$
 
---- a signal trap that exits stops the commands after it [xfail(legacy): legacy has neither trap nor a kill builtin]
+--- a signal trap that exits stops the commands after it
 trap 'echo A; exit 4; echo B' USR1; kill -s USR1 $$; echo after
 
---- an exit in a subshell's EXIT trap is the subshell's status [xfail(legacy): legacy has no trap builtin]
+--- an exit in a subshell's EXIT trap is the subshell's status
 ( trap 'exit 7' EXIT; exit 1 ); echo "sub=$?"
 
 --- return with no operand in a trap reports the status the trap interrupted [divergence: ADR-0001. POSIX makes "the last command" the one before the trap action for `return` as much as for `exit`, which is what return-p.tst's 'default exit status in function in trap' requires (19, not 0). dash applies the rule to `exit` only; bash and zsh to neither]
@@ -255,37 +255,37 @@ trapped 19
 # from a stage signals the shell, and the shell then runs the trap perfectly
 # correctly, which is how this bug survived twenty signal files.
 
---- a pipeline stage does not run the trap handler it inherited [xfail(legacy): legacy never expands a parameter inside double quotes, so "$TESTEE" is not a command it can run]
+--- a pipeline stage does not run the trap handler it inherited
 "$TESTEE" -c 'trap "echo TRAP" USR1; { "$TESTEE" -c "kill -s USR1 \$PPID"; echo body; } | cat; echo done' 2>/dev/null
 
---- but an IGNORE does carry into a pipeline stage, which is the asymmetry [xfail(legacy): same quote-expansion defect]
+--- but an IGNORE does carry into a pipeline stage, which is the asymmetry
 trap '' USR1; { "$TESTEE" -c 'kill -s USR1 $PPID'; echo body; } | cat
 
---- a trap set INSIDE a stage still fires there [xfail(legacy): same quote-expansion defect]
+--- a trap set INSIDE a stage still fires there
 { trap 'echo INSIDE' USR1; "$TESTEE" -c 'kill -s USR1 $PPID'; echo body; } | cat
 
---- a stage of an ASYNC pipeline keeps the SIGINT ignore XCU 2.11 gave it [xfail(legacy): same quote-expansion defect]
+--- a stage of an ASYNC pipeline keeps the SIGINT ignore XCU 2.11 gave it
 { "$TESTEE" -c 'kill -s INT $PPID'; echo body; } | cat & wait
 
---- a pipeline stage runs its OWN EXIT trap [xfail(legacy): legacy has no trap builtin]
+--- a pipeline stage runs its OWN EXIT trap
 { trap 'echo S' EXIT; echo body; } | cat
 
---- and runs it when the stage exits early [xfail(legacy): legacy has no trap builtin]
+--- and runs it when the stage exits early
 { trap 'echo S' EXIT; exit 3; } | cat; echo "st=$?"
 
---- the LAST stage runs its own EXIT trap too, and the shell still runs the one it kept [xfail(legacy): legacy has no trap builtin]
+--- the LAST stage runs its own EXIT trap too, and the shell still runs the one it kept
 trap 'echo T' EXIT; echo a | { trap 'echo S' EXIT; cat; }
 
---- a stage does NOT run the EXIT trap it inherited [xfail(legacy): legacy has no trap builtin]
+--- a stage does NOT run the EXIT trap it inherited
 trap 'echo T' EXIT; { echo body; } | cat; echo after
 
---- both an inherited EXIT trap and the stage's own, each in its own process [xfail(legacy): legacy has no trap builtin]
+--- both an inherited EXIT trap and the stage's own, each in its own process
 trap 'echo T' EXIT; { trap 'echo S' EXIT; echo body; } | cat
 
---- $$ in a pipeline stage is still the shell's pid [xfail(legacy): legacy has no compound commands, so the brace group is not a stage it can run]
+--- $$ in a pipeline stage is still the shell's pid
 p=$$; { [ "$$" = "$p" ] && echo same; } | cat
 
---- $! in a pipeline stage is the one the shell recorded [xfail(legacy): legacy has no compound commands, so the brace group is not a stage it can run]
+--- $! in a pipeline stage is the one the shell recorded
 sleep 0 & b=$!; { [ "$!" = "$b" ] && echo inherited; } | cat; wait
 
 --- trap still REPORTS what a stage inherited, though the action is gone [divergence: the #33 divergence reaching a pipeline stage - dash reports nothing in any subshell, which leaves `saved=$(trap)` with nothing to save, and POSIX.1-2024 requires the listing. bash reports the inherited traps, and lesh follows bash]
@@ -300,49 +300,49 @@ trap -- 'echo TRAP' USR1
 # therefore killed the shell it was typed into. dash answers 2 for a line it
 # refused to run and 1 only for one the system refused, and lesh now agrees.
 
---- kill with a signal and no pid is a usage error, not a silent success [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill, which answers its own way]
+--- kill with a signal and no pid is a usage error, not a silent success
 kill -s TERM; echo "st=$?"
 
---- kill with nothing at all is a usage error [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- kill with nothing at all is a usage error
 kill; echo "st=$?"
 
---- kill -s with no signal name names no signal [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- kill -s with no signal name names no signal
 kill -s; echo "st=$?"
 
---- a pid operand that is not a number is refused, rather than becoming the process group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- a pid operand that is not a number is refused, rather than becoming the process group
 kill -s TERM notanumber; echo "st=$?"
 
---- and so is one that only starts as a number [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- and so is one that only starts as a number
 kill -s TERM 12abc; echo "st=$?"
 
---- an empty pid operand is refused too [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- an empty pid operand is refused too
 kill -s TERM ''; echo "st=$?"
 
---- a job specification is refused rather than taken for the process group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- a job specification is refused rather than taken for the process group
 kill %1; echo "st=$?"
 
---- a bare negative operand is an option, and an unknown one [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill, which reads it as a process group]
+--- a bare negative operand is an option, and an unknown one
 kill -s 0 -1; echo "st=$?"
 
---- `--` ends kill's options, which is how a POSIX process group is written [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- `--` ends kill's options, which is how a POSIX process group is written
 kill -s 0 -- $$; echo "st=$?"
 
---- `--` with no operand after it is a usage error, not a signal to the whole group [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- `--` with no operand after it is a usage error, not a signal to the whole group
 kill -s TERM --; echo "st=$?"
 
---- an unknown option is refused by name [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- an unknown option is refused by name
 kill -x 1; echo "st=$?"
 
---- an unknown signal name is a usage error [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- an unknown signal name is a usage error
 kill -s NOSUCH $$; echo "st=$?"
 
---- kill -l refuses an operand that names no signal with the same status [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- kill -l refuses an operand that names no signal with the same status
 kill -l 0; echo "st=$?"
 
---- the forms that ARE valid still work, and the null signal still asks nothing [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- the forms that ARE valid still work, and the null signal still asks nothing
 kill -s 0 $$; echo "s=$?"; kill -0 $$; echo "n=$?"; kill -s URG $$; echo "u=$?"
 
---- EXIT is a trap condition and not a signal kill can send [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
+--- EXIT is a trap condition and not a signal kill can send
 kill -s EXIT $$; echo "st=$?"
 
 # ISSUE #66. AN INVALID SIGNAL NAME IS A RUNTIME OPERAND ERROR, NOT A SYNTAX ONE.
@@ -371,22 +371,22 @@ kill -s EXIT $$; echo "st=$?"
 # `2>/dev/null` throughout: dash writes `bad trap` where lesh writes `bad signal`,
 # which is a diagnostic wording these cases are not about.
 
---- an invalid signal name is reported without ending the shell [xfail(legacy): legacy has no trap builtin and runs /bin/trap, which does not exist]
+--- an invalid signal name is reported without ending the shell
 trap '' '' 2>/dev/null; echo "st=$?"; echo reached
 
---- and neither does a name that is merely unknown [xfail(legacy): legacy has no trap builtin]
+--- and neither does a name that is merely unknown
 trap '' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
 
---- a signal NUMBER outside the range is the same kind of error [xfail(legacy): legacy has no trap builtin]
+--- a signal NUMBER outside the range is the same kind of error
 trap '' 9999 2>/dev/null; echo "st=$?"; echo reached
 
---- the reset form answers the same way as the ignore form [xfail(legacy): legacy has no trap builtin]
+--- the reset form answers the same way as the ignore form
 trap - NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
 
---- and so does the set form, whose action is a real command [xfail(legacy): legacy has no trap builtin]
+--- and so does the set form, whose action is a real command
 trap 'echo x' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
 
---- a `command` prefix reaches the same answer, having only demotion to offer [xfail(legacy): legacy has no command builtin]
+--- a `command` prefix reaches the same answer, having only demotion to offer
 command trap '' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
 
 # THE OTHER HALF, which is what a narrowing has to prove it did not take with it:
@@ -395,10 +395,10 @@ command trap '' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
 # rather than passing on an empty stdout it would also produce if it had died
 # earlier.
 
---- a redirection failure on trap still ends the shell [xfail(legacy): legacy has no trap builtin]
+--- a redirection failure on trap still ends the shell
 echo before; trap '' INT 2>/dev/null <./_lesh_no_such_file_; echo notreached
 
---- and a redirection failure on a REGULAR builtin still does not [xfail(legacy): legacy has no redirections]
+--- and a redirection failure on a REGULAR builtin still does not
 echo before; kill -l 2>/dev/null <./_lesh_no_such_file_; echo "st=$?"; echo reached
 
 # WHEN A PENDING TRAP ACTION RUNS, and it is between COMMANDS wherever the
@@ -410,15 +410,15 @@ echo before; kill -l 2>/dev/null <./_lesh_no_such_file_; echo "st=$?"; echo reac
 # signal files each lost three assertions. dash and bash both run the action in
 # place.
 
---- a trap raised inside eval runs between eval's own commands [xfail(legacy): legacy has no trap builtin]
+--- a trap raised inside eval runs between eval's own commands
 eval 'trap "echo trapped" USR1
 kill -s USR1 $$
 echo after'
 
---- a trap raised inside a dot script runs between the script's own commands [xfail(legacy): legacy has no trap builtin]
+--- a trap raised inside a dot script runs between the script's own commands
 d=$(mktemp -d); printf 'trap "echo trapped" USR1\nkill -s USR1 $$\necho after\n' > $d/lib; . $d/lib
 
---- a trap raised inside a command substitution runs between the body's commands [xfail(legacy): legacy has no command substitution]
+--- a trap raised inside a command substitution runs between the body's commands
 x=$(trap 'echo trapped' USR1
 "$TESTEE" -c 'kill -s USR1 $PPID'
 echo after); echo "[$x]"

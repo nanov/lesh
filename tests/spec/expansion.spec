@@ -36,9 +36,8 @@
 # whose literal overflows still reports nothing and still assigns nothing.
 #
 # Prose lives HERE and not between cases: a case body runs to the next `---`, so a
-# comment block in the middle of the file becomes part of the PRECEDING case - and
-# the legacy front end aborts on one, which showed up as a FAIL on a case this
-# ticket never touched.
+# comment block in the middle of the file becomes part of the PRECEDING case - which
+# once showed up as a FAIL on a case the ticket in hand never touched.
 
 --- bare parameter
 echo $HOME
@@ -58,25 +57,25 @@ echo a${HOME}b
 --- braced unset parameter
 echo ${NOPE}y
 
---- parameter with a suffix [xfail(legacy): the name scan runs past the parameter and swallows the suffix]
+--- parameter with a suffix
 echo a$HOME-b
 
---- parameter with a dot suffix [xfail(legacy): same name-scan defect]
+--- parameter with a dot suffix
 echo a$HOME.b
 
---- parameter followed by a path separator [xfail(legacy): same name-scan defect]
+--- parameter followed by a path separator
 echo $HOME/sub
 
---- unset parameter with prefix and suffix [xfail(legacy): same name-scan defect]
+--- unset parameter with prefix and suffix
 echo x$NOPE-y
 
---- two parameters in one word [xfail(legacy): the second expansion overwrites rather than appends]
+--- two parameters in one word
 echo $HOME$HOME
 
---- two braced parameters around a literal [xfail(legacy): the second expansion overwrites rather than appends]
+--- two braced parameters around a literal
 echo ${HOME}x${HOME}
 
---- parameters and literals alternating [xfail(legacy): both name-scan and accumulation defects]
+--- parameters and literals alternating
 echo a$HOME-$HOME-b
 
 --- braced parameter as the last word of a pipeline stage
@@ -85,100 +84,100 @@ echo ${HOME} | cat
 --- braced parameter alone
 echo ${HOME}
 
---- IFS is a variable the shell sets, not only a mechanism [xfail(legacy): legacy has no IFS]
+--- IFS is a variable the shell sets, not only a mechanism
 printf '[%s]' "$IFS" | od -c | head -1
 
---- IFS is set even when the environment says otherwise [xfail(legacy): legacy has no IFS]
+--- IFS is set even when the environment says otherwise
 IFS=X "$TESTEE" -c 'printf "[%s]" "$IFS"' | od -c | head -1
 
---- successive non-whitespace separators leave an empty field [xfail(legacy): legacy has no field splitting]
+--- successive non-whitespace separators leave an empty field
 IFS=-; a=1--2; for f in $a; do printf '[%s]' "$f"; done; echo
 
---- a leading non-whitespace separator leaves an empty field [xfail(legacy): legacy has no field splitting]
+--- a leading non-whitespace separator leaves an empty field
 IFS=-; a=-1; for f in $a; do printf '[%s]' "$f"; done; echo
 
---- a leading whitespace separator does not [xfail(legacy): legacy has no field splitting]
+--- a leading whitespace separator does not
 IFS=' '; a=' 1'; for f in $a; do printf '[%s]' "$f"; done; echo
 
---- whitespace around a non-whitespace separator belongs to it [xfail(legacy): legacy has no field splitting]
+--- whitespace around a non-whitespace separator belongs to it
 IFS=' -'; a='1 - 2'; for f in $a; do printf '[%s]' "$f"; done; echo
 
---- a separator that used its slot starts a new one [xfail(legacy): legacy has no field splitting]
+--- a separator that used its slot starts a new one
 IFS=' -'; a='  --33'; for f in $a; do printf '[%s]' "$f"; done; echo
 
---- a trailing separator adds no empty last field [xfail(legacy): legacy has no field splitting]
+--- a trailing separator adds no empty last field
 IFS=-; for a in 1- 1-- - --; do set -- $a; printf '%d:' $#; for f in "$@"; do printf '[%s]' "$f"; done; echo; done
 
---- one separator may span two expansions [xfail(legacy): legacy has no field splitting]
+--- one separator may span two expansions
 IFS=' '; a='1 '; b=' 2'; for f in $a$b; do printf '[%s]' "$f"; done; echo
 
---- an arithmetic result is field split like any other [xfail(legacy): legacy has no arithmetic expansion]
+--- an arithmetic result is field split like any other
 IFS=' 0'; for f in $((708)); do printf '[%s]' "$f"; done; echo
 
---- an empty expansion yields no field but quotes make one [xfail(legacy): legacy has no field splitting]
+--- an empty expansion yields no field but quotes make one
 a=; for f in x $a ''$a; do printf '[%s]' "$f"; done; echo
 
---- an assignment value uses unquoted backslash rules [xfail(legacy): legacy applies no quote removal to an assignment value]
+--- an assignment value uses unquoted backslash rules
 x=\!; y=a\ b; printf '[%s][%s]\n' "$x" "$y"
 
---- a redirection operand has its quotes removed [xfail(legacy): legacy ignores redirect nodes entirely]
+--- a redirection operand has its quotes removed
 echo body > /tmp/lesh_spec_in0; cat </tmp/lesh_spec_i'n'"0"
 
---- a here-document body keeps its quotes [xfail(legacy): legacy has no here-documents]
+--- a here-document body keeps its quotes
 cat <<END
 it's a"b" c
 END
 
---- a here-document body escapes only dollar, backquote and backslash [xfail(legacy): legacy has no here-documents]
+--- a here-document body escapes only dollar, backquote and backslash
 cat <<END
 \$ \\ \` \" \z
 END
 
---- an expansion error in a here-document body fails the redirection [xfail(legacy): legacy has no here-documents]
+--- an expansion error in a here-document body fails the redirection
 echo not printed <<END
 ${nope?}
 END
 
---- an unquoted dollar-at in an assignment joins rather than keeping the last field [xfail(legacy): legacy has no positional parameters]
+--- an unquoted dollar-at in an assignment joins rather than keeping the last field
 set a b c; x=$@; y="$@"; printf '[%s][%s]\n' "$x" "$y"
 
---- a default argument is expanded in the context of the expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a default argument is expanded in the context of the expansion
 for f in ${u-\!a b} "${u-\!a b}"; do printf '[%s]' "$f"; done; echo
 
---- a single quote in a default is a quote outside double quotes [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a single quote in a default is a quote outside double quotes
 for f in ${u-a'b c'd}; do printf '[%s]' "$f"; done; echo
 
---- assign-default removes quotes before assigning and splits the value after [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- assign-default removes quotes before assigning and splits the value after
 for f in ${a=\ x}; do printf '[%s]' "$f"; done; echo; printf '[%s]\n' "$a"
 
---- only hash and percent have a doubled form [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- only hash and percent have a doubled form
 printf '[%s][%s]\n' "${u--x}" "${u-=x}"
 
---- a command substitution result is glob-eligible [xfail(legacy): legacy has no command substitution]
+--- a command substitution result is glob-eligible
 mkdir -p /tmp/lesh_spec_glob && : > /tmp/lesh_spec_glob/dummyfile && cd /tmp/lesh_spec_glob && for f in $(echo 'dumm*ile'); do printf '[%s]' "$f"; done; echo
 
---- a named tilde expands to that user's home [xfail(legacy): legacy has no tilde expansion]
+--- a named tilde expands to that user's home
 printf '[%s][%s]\n' ~root ~root/sub
 
 --- an unknown user leaves the word alone
 printf '[%s]\n' ~nosuchuser12345 ~nosuchuser12345/x
 
---- a quoted tilde name is not a login name but its quotes come off [xfail(legacy): legacy has no tilde expansion]
+--- a quoted tilde name is not a login name but its quotes come off
 printf '[%s][%s][%s][%s]\n' ~"root" ~'root' ~ro\ot ~\/
 
---- a tilde is eligible after an unquoted colon in an assignment [xfail(legacy): legacy has no tilde expansion]
+--- a tilde is eligible after an unquoted colon in an assignment
 a=x:~root:~root; b=x:~; c=':'~root; printf '[%s][%s][%s]\n' "$a" "$b" "$c"
 
 --- a tilde after a colon is not eligible outside an assignment
 printf '[%s]\n' x:~ ~:~
 
---- a tilde prefix holding an expansion is not a login name [xfail(legacy): legacy has no tilde expansion]
+--- a tilde prefix holding an expansion is not a login name
 u=root; printf '[%s]\n' ~$u
 
---- an absent dollar-at in double quotes yields no field at all [xfail(legacy): legacy has no positional parameters]
+--- an absent dollar-at in double quotes yields no field at all
 set --; for f in "$@"; do printf '[%s]' "$f"; done; echo END
 
---- but an empty variable in those quotes still starts one [xfail(legacy): legacy has no positional parameters]
+--- but an empty variable in those quotes still starts one
 set --; n=; for f in "$n""$@" "=$@=" ""; do printf '[%s]' "$f"; done; echo END
 
 --- two absent dollar-ats in one quoted region [divergence: dash prints one empty field here where bash, zsh and macOS /bin/sh all print none. POSIX makes `"$@"` with no positional parameters zero fields, quotes and all, and lesh applies that to a quoted region holding nothing else; dash's own `"$@""$@"` prints none, so it is inconsistent with itself]
@@ -186,99 +185,99 @@ set --; for f in "$@$@"; do printf '[%s]' "$f"; done; echo END
 === expect
 END
 
---- assigning to a positional parameter is refused [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- assigning to a positional parameter is refused
 echo ${1:=x}
 
---- assigning to a special parameter is refused [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- assigning to a special parameter is refused
 echo ${*:=x}
 
---- but not when the parameter is already set [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- but not when the parameter is already set
 set a; echo ${1=x}
 
---- dollar-at and dollar-star are always set [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- dollar-at and dollar-star are always set
 printf '[%s][%s][%s]\n' "${@-unset}" "${*-unset}" "${@:-unset}"
 
---- the length form needs a name after the hash [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- the length form needs a name after the hash
 set a b; printf '[%s][%s][%s][%s][%s]\n' "${#+y}" "${#-y}" "${#=y}" "${#?}" "${#?X}"
 
---- a quoted metacharacter in a trim pattern is data [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a quoted metacharacter in a trim pattern is data
 s='***'; h='###'; printf '[%s][%s][%s][%s]\n' "${s#'*'}" "${s##'*'}" "${s#\*}" "${h#'#'}"
 
---- an unquoted metacharacter in a trim pattern still wildcards [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- an unquoted metacharacter in a trim pattern still wildcards
 a=1-2-3-4; printf '[%s][%s][%s]\n' "${a#*-}" "${a##*-}" "${a#*1}"
 
---- an expansion in a trim pattern is a pattern unless it was quoted [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- an expansion in a trim pattern is a pattern unless it was quoted
 w='ab\bc'; a='*'; printf '[%s]\n' "${w#${a}b}"
 
---- a substitution inside double quotes may hold quotes of its own [xfail(legacy): legacy has no command substitution]
+--- a substitution inside double quotes may hold quotes of its own
 echoraw() { printf '%s\n' "$*"; }
 echoraw "$(echoraw "x")" "`echoraw "a"'b'`" "${e=a"b"c}"
 
---- a brace inside quotes does not close an expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a brace inside quotes does not close an expansion
 a=set; printf '[%s][%s][%s]\n' "${a+'}'}" "${a+"}"}" "${a+a\}b}"
 
---- and an opening brace is not special there [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- and an opening brace is not special there
 a=set; printf '[%s]\n' "${a+\{}"
 
---- a single quote inside braces inside double quotes is an ordinary byte [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a single quote inside braces inside double quotes is an ordinary byte
 printf '[%s]\n' "${x-'}"
 
---- backquotes have their escapes removed before the body is parsed [xfail(legacy): legacy has no command substitution]
+--- backquotes have their escapes removed before the body is parsed
 echoraw() { printf '%s\n' "$*"; }
 echoraw `echoraw \`echoraw x\``
 echoraw `echoraw '\$y'`
 echoraw `printf '%s\n' \\\\`
 
---- and double quotes add the quote to that set [xfail(legacy): legacy has no command substitution]
+--- and double quotes add the quote to that set
 echoraw() { printf '%s\n' "$*"; }
 echoraw "`echoraw \"1\"`"
 echoraw `echoraw \" "\"" '\"'`
 echoraw "`echoraw \'2\'`"
 
---- a paren inside quotes does not close a command substitution [xfail(legacy): legacy has no command substitution]
+--- a paren inside quotes does not close a command substitution
 echo "$(echo ")")" $(echo ')')
 
---- a paren inside a comment does not close one either [xfail(legacy): legacy has no command substitution]
+--- a paren inside a comment does not close one either
 echo $(
 echo a # ) comment
 )
 
---- a short-circuited && operand is not evaluated [xfail(legacy): legacy has no arithmetic expansion]
+--- a short-circuited && operand is not evaluated
 x=0; echo $(( 0 && (x=1) )); echo "x=$x"
 
---- a short-circuited || operand is not evaluated [xfail(legacy): legacy has no arithmetic expansion]
+--- a short-circuited || operand is not evaluated
 x=0; echo $(( 1 || (x=1) )); echo "x=$x"
 
---- a conditional evaluates only the branch it takes [xfail(legacy): legacy has no arithmetic expansion]
+--- a conditional evaluates only the branch it takes
 a=0; b=0; echo $(( 1 ? (a=5) : (b=-5) )); echo "$a $b"
 a=0; b=0; echo $(( 0 ? (a=-5) : (b=5) )); echo "$a $b"
 
---- an operand that is reached still assigns [xfail(legacy): legacy has no arithmetic expansion]
+--- an operand that is reached still assigns
 x=0; echo $(( 1 && (x=1) )); echo "x=$x"; echo $(( x = 7 )) $(( x += 3 )); echo "x=$x"
 
---- skipping stops where the skipped operand does [xfail(legacy): legacy has no arithmetic expansion]
+--- skipping stops where the skipped operand does
 x=0; echo $(( 0 && (x=1) || (x=2) )); echo "x=$x"
 
---- and it does not resume inside the operand it skipped [xfail(legacy): legacy has no arithmetic expansion]
+--- and it does not resume inside the operand it skipped
 x=0; y=0; echo $(( 0 && (0 || (x=1)) )); echo $(( 1 || (x=1) && (y=1) )); echo "$x $y"
 
---- a division by zero in a skipped operand is not an error [xfail(legacy): legacy has no arithmetic expansion]
+--- a division by zero in a skipped operand is not an error
 echo $(( 0 && 1/0 )) $(( 1 || 1%0 )) $(( 1 ? 2 : 1/0 ))
 
---- nor is an unset variable one, with nounset on [xfail(legacy): legacy has no arithmetic expansion]
+--- nor is an unset variable one, with nounset on
 set -u; echo $(( 0 && y )); echo after
 
---- an arithmetic operator wraps rather than overflowing [xfail(legacy): legacy has no arithmetic expansion]
+--- an arithmetic operator wraps rather than overflowing
 echo $(( 9223372036854775807 + 1 )) $(( -9223372036854775807 - 2 )) $(( 9223372036854775807 * 2 ))
 
---- a literal too large to represent saturates, in every base [xfail(legacy): legacy has no arithmetic expansion]
+--- a literal too large to represent saturates, in every base
 echo $(( 99999999999999999999 )) $(( 0xFFFFFFFFFFFFFFFFF )) $(( 077777777777777777777777 ))
 echo $(( 99999999999999999999 - 7 )) $(( -9223372036854775808 ))
 
---- dividing the negative limit by -1 wraps [xfail(legacy): legacy has no arithmetic expansion]
+--- dividing the negative limit by -1 wraps
 m=$(( -9223372036854775807 - 1 )); echo $(( m / -1 )) $(( m % -1 )) $(( -m ))
 
---- overflow in a skipped operand is not reported [xfail(legacy): legacy has no arithmetic expansion]
+--- overflow in a skipped operand is not reported
 x=0; echo $(( 0 && 99999999999999999999 )) $(( 1 || 9223372036854775807 + 1 )); echo $(( 0 && (x=99999999999999999999) )); echo "x=$x"
 
 # A `case` pattern is a PATTERN, which is the same property `${x#word}` already
@@ -288,26 +287,26 @@ x=0; echo $(( 0 && 99999999999999999999 )) $(( 1 || 9223372036854775807 + 1 )); 
 # nothing is an EMPTY pattern that matches an empty subject - not a pattern that
 # is skipped, which is what dropped the item in `case $(true) in $(true))`.
 
---- a quoted metacharacter in a case pattern is data [xfail(legacy): legacy has no case clause]
+--- a quoted metacharacter in a case pattern is data
 case '*ab' in \*\*\*) echo no1;; '***') echo no2;; "***") echo no3;; \**) echo matched;; esac
 
---- and so is a quoted question mark or bracket [xfail(legacy): legacy has no case clause]
+--- and so is a quoted question mark or bracket
 case '?a' in \?\?) echo no1;; '??') echo no2;; \??) echo yes1;; esac
 case '[a' in \[\[abc]) echo no3;; '[['abc]) echo no4;; \[[abc]) echo yes2;; esac
 
---- an unquoted metacharacter in a case pattern still wildcards [xfail(legacy): legacy has no case clause]
+--- an unquoted metacharacter in a case pattern still wildcards
 case abc in a*) echo star;; esac; case abc in a?c) echo quest;; esac; case abc in [ab]bc) echo brack;; esac
 
---- a backslash arriving from an expansion in a case pattern is special unless quoted [xfail(legacy): legacy has no case clause]
+--- a backslash arriving from an expansion in a case pattern is special unless quoted
 bs='\a\z'; case az in $bs) echo bs1;; esac; case '\a\z' in "$bs") echo bs2;; esac
 
---- quoting in a case subject comes off without leaving escapes behind [xfail(legacy): legacy has no case clause]
+--- quoting in a case subject comes off without leaving escapes behind
 bs='\a\z'; case $bs in '\a\z') echo bs1;; esac; case "$bs" in '\a\z') echo bs2;; esac
 
---- a case pattern that expands to nothing is an empty pattern, not no pattern [xfail(legacy): legacy has no case clause]
+--- a case pattern that expands to nothing is an empty pattern, not no pattern
 n=; case '' in $n) echo one;; esac; case $n in $n) echo two;; esac; case $(true) in $(true)) echo three;; esac
 
---- a case pattern is not field-split however IFS reads [xfail(legacy): legacy has no case clause]
+--- a case pattern is not field-split however IFS reads
 IFS=:; p='a:b'; case 'a:b' in $p) echo joined;; esac; case a in $p) echo no;; esac
 
 # A bracket expression is not just a list of bytes. POSIX admits `[:class:]`,
@@ -316,7 +315,7 @@ IFS=:; p='a:b'; case 'a:b' in $p) echo joined;; esac; case a in $p) echo no;; es
 # characters is three kinds of element and a range that may be written the long
 # way. fnmatch-p.tst's 'brackets' is the whole of it in eighteen lines.
 
---- a bracket expression holds character classes [xfail(legacy): legacy has no case clause]
+--- a bracket expression holds character classes
 for c in a Z 7 ' ' '!' '	'; do
   for k in lower upper alpha digit alnum punct graph print cntrl blank space xdigit; do
     eval "case \"\$c\" in [[:\$k:]]) printf '%s ' \"\$k\";; esac"
@@ -324,32 +323,32 @@ for c in a Z 7 ' ' '!' '	'; do
   echo
 done
 
---- a class is one member of a set like any other [xfail(legacy): legacy has no case clause]
+--- a class is one member of a set like any other
 for c in a 7 b; do case $c in [a[:digit:]]) echo "$c in";; *) echo "$c out";; esac; done
 for c in a 7; do case $c in [![:digit:]]) echo "$c in";; *) echo "$c out";; esac; done
 
---- collating symbols and equivalence classes name one character each [xfail(legacy): legacy has no case clause]
+--- collating symbols and equivalence classes name one character each
 case a in [[.a.]]) echo dot;; esac
 case a in [[=a=]]) echo equiv;; esac
 case 1 in [[.0.]-[.2.]]) echo range;; esac
 case 3 in [[.0.]-[.2.]]) echo notreached;; esac
 
---- a quoted metacharacter inside a bracket expression is one member of it [xfail(legacy): legacy has no case clause]
+--- a quoted metacharacter inside a bracket expression is one member of it
 case '*' in ["*"]) echo star;; esac
 case '\' in ["*"]) echo notreached;; esac
 case '-' in [a\-c]) echo dash;; esac
 case b in [a\-c]) echo notreached;; esac
 
---- an unknown class name matches nothing at all [xfail(legacy): legacy has no case clause]
+--- an unknown class name matches nothing at all
 for c in a '[' ':'; do case $c in [[:nosuch:]]) echo "$c in";; *) echo "$c out";; esac; done
 
---- a case subject is one value rather than a field list [xfail(legacy): legacy has no case clause]
+--- a case subject is one value rather than a field list
 c=' '; case $c in ' ') echo space;; *) echo other;; esac
 d='a b'; case $d in 'a b') echo joined;; *) echo split;; esac
 set -- x y; case $@ in 'x y') echo at;; *) echo notat;; esac
 case $* in 'x y') echo star;; *) echo notstar;; esac
 
---- and IFS does not break it in two [xfail(legacy): legacy has no case clause]
+--- and IFS does not break it in two
 IFS=:; v='a:b'; case $v in 'a:b') echo whole;; *) echo halves;; esac
 
 # POSIX 2.9.1's DECLARATION UTILITY. `export` and `readonly` take operands that
@@ -358,22 +357,22 @@ IFS=:; v='a:b'; case $v in 'a:b') echo whole;; *) echo halves;; esac
 # Which words those are is decided from the word AS WRITTEN, so `export $a` is an
 # ordinary argument that really does split - declutil-p.tst asserts both halves.
 
---- a declaration utility's assignment operand is neither split nor globbed [xfail(legacy): legacy has no field splitting]
+--- a declaration utility's assignment operand is neither split nor globbed
 >tmpfile; a='1  *  2'; export A=$a; readonly R=$a; printf '[%s][%s]\n' "$A" "$R"
 
---- a tilde after a colon is eligible in a declaration utility's operand [xfail(legacy): legacy has no tilde expansion]
+--- a tilde after a colon is eligible in a declaration utility's operand
 HOME=/foo; export A=~:~; readonly R=x:~/y:~; printf '[%s][%s]\n' "$A" "$R"
 
---- a declaration utility's other operands are split and globbed as usual [xfail(legacy): legacy has no field splitting]
+--- a declaration utility's other operands are split and globbed as usual
 A=foo B=bar a='A B'; export $a && printf '[%s][%s]\n' "$A" "$B"
 
---- command does not stop a declaration utility from being one [xfail(legacy): legacy has no field splitting]
+--- command does not stop a declaration utility from being one
 a='1  *  2'; command command export A=$a; command readonly R=$a; printf '[%s][%s]\n' "$A" "$R"
 
---- the assignment form is read from the word as written, not from its expansion [xfail(legacy): legacy has no tilde expansion]
+--- the assignment form is read from the word as written, not from its expansion
 HOME=/foo; export "A"=~:~; a='x y'; export "B=$a"; printf '[%s][%s]\n' "$A" "$B"
 
---- an ordinary utility's NAME=value argument is still a command argument [xfail(legacy): legacy has no field splitting]
+--- an ordinary utility's NAME=value argument is still a command argument
 a='x y'; printf '[%s]\n' A=$a
 
 # yash's tilde-p.tst expects `~/foo` under HOME=/ to collapse to /foo, and `~/~`
@@ -398,7 +397,7 @@ a='x y'; printf '[%s]\n' A=$a
 # where it would make one expansion's output disagree with the value of HOME it
 # was told to substitute.
 
---- a tilde prefix is replaced by HOME exactly, doubled slash and all [xfail(legacy): legacy has no tilde expansion]
+--- a tilde prefix is replaced by HOME exactly, doubled slash and all
 HOME=/foo/bar/; printf '[%s][%s]\n' ~ ~/~
 HOME=/; printf '[%s][%s]\n' ~ ~/foo
 HOME=//; printf '[%s][%s]\n' ~ ~/foo
@@ -421,7 +420,7 @@ HOME=//; printf '[%s][%s]\n' ~ ~/foo
 # permission check underneath is what makes dash and lesh agree either way, not a
 # fixed expected value asserted here.
 
---- a literal component past a directory the walk cannot search is not confirmed [xfail(legacy): legacy has no pathname expansion]
+--- a literal component past a directory the walk cannot search is not confirmed
 mkdir -p foo/no_search_dir; >foo/no_search_dir/file; chmod a-x foo/no_search_dir
 echo foo/no_search_d*r/file
 chmod a+x foo/no_search_dir
@@ -442,7 +441,7 @@ chmod a+x foo/no_search_dir
 # words only where a command could begin, which is why `echo case` below still
 # prints a word rather than opening a clause.
 
---- a case pattern list's paren does not end a command substitution [xfail(legacy): legacy misreads the pattern's paren]
+--- a case pattern list's paren does not end a command substitution
 echo $(case a in a) echo x;; esac)
 echo $(case a in (a) echo x;; *) echo y;; esac)
 echo $(case b in a) echo x;; *) echo y;; esac)
@@ -450,13 +449,13 @@ echo $(case a in a) case b in b) echo nested;; esac;; esac)
 echo $(case a in a|b) echo alt;; esac)
 echo $(case a in a) (echo sub);; esac)
 
---- case and esac away from command position stay ordinary words [xfail(legacy): legacy misreads the pattern's paren]
+--- case and esac away from command position stay ordinary words
 echo $(echo case)
 echo $(echo esac in)
 echo $(case a in a) echo esac;; esac)
 echo $(echo $(echo a) case)
 
---- a paren in a here-document body does not end a command substitution [xfail(legacy): legacy ends the substitution inside the body]
+--- a paren in a here-document body does not end a command substitution
 echo $(cat <<\END
 foo)
 END
@@ -476,7 +475,7 @@ two)
 B
 )
 
---- a here-document inside a substitution leaves the enclosing one alone [xfail(legacy): legacy ends the substitution inside the body]
+--- a here-document inside a substitution leaves the enclosing one alone
 cat <<\OUTER; echo "$(cat <<\INNER
 inner)
 INNER
@@ -484,7 +483,7 @@ INNER
 outer)
 OUTER
 
---- arithmetic inside a substitution is not read as a command list [xfail(legacy): legacy misreads the pattern's paren]
+--- arithmetic inside a substitution is not read as a command list
 echo $((1<<2))
 echo $(echo $((1<<2)))
 echo $(( (1<<2) + 3 ))

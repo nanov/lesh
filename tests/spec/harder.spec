@@ -3,134 +3,134 @@
 # A scoreboard everything passes has stopped measuring. These probe the corners
 # where shells actually differ, so the number keeps meaning something.
 
---- nested command substitution inside a quoted string [xfail(legacy): beyond legacy's single-pass parser]
+--- nested command substitution inside a quoted string
 echo "outer $(echo "inner $(echo deep)") end"
 
---- a pipeline inside command substitution [xfail(legacy): beyond legacy's single-pass parser]
+--- a pipeline inside command substitution
 echo $(echo a b c | tr ' ' '-')
 
---- a for loop over a command substitution [xfail(legacy): beyond legacy's single-pass parser]
+--- a for loop over a command substitution
 for x in $(echo a b c); do printf '[%s]' "$x"; done; echo
 
---- a case inside a function inside a loop [xfail(legacy): beyond legacy's single-pass parser]
+--- a case inside a function inside a loop
 f() { case $1 in a*) echo A;; *) echo O;; esac; }; for x in ab cd; do f $x; done
 
---- an if whose condition is a pipeline [xfail(legacy): beyond legacy's single-pass parser]
+--- an if whose condition is a pipeline
 if echo hi | grep -q hi; then echo found; fi
 
---- nested parameter expansion defaults [xfail(legacy): beyond legacy's single-pass parser]
+--- nested parameter expansion defaults
 x=; echo "${x:-${HOME:-fallback}}"
 
---- arithmetic inside a parameter default [xfail(legacy): beyond legacy's single-pass parser]
+--- arithmetic inside a parameter default
 echo "${undefined:-$((6 * 7))}"
 
---- trimming applied to a command substitution result [xfail(legacy): beyond legacy's single-pass parser]
+--- trimming applied to a command substitution result
 p=$(echo /a/b/c.txt); echo "${p##*/}"
 
---- a redirection inside a loop body [xfail(legacy): beyond legacy's single-pass parser]
+--- a redirection inside a loop body
 d=$(mktemp -d); for x in a b; do echo $x >> $d/f; done; cat $d/f
 
---- a here-document inside a function [xfail(legacy): beyond legacy's single-pass parser]
+--- a here-document inside a function
 f() { cat <<EOT
 from a function
 EOT
 }; f
 
---- exit status propagates out of a function through a pipeline [xfail(legacy): beyond legacy's single-pass parser]
+--- exit status propagates out of a function through a pipeline
 f() { return 2; }; f | cat; echo $?
 
---- a subshell does not leak function definitions [xfail(legacy): beyond legacy's single-pass parser]
+--- a subshell does not leak function definitions
 (g() { echo inner; }); g 2>/dev/null || echo not-defined
 
---- IFS affects splitting of a command substitution [xfail(legacy): beyond legacy's single-pass parser]
+--- IFS affects splitting of a command substitution
 IFS=:; x=$(echo a:b:c); for i in $x; do printf '[%s]' "$i"; done; echo
 
---- backslash continues a line [xfail(legacy): beyond legacy's single-pass parser]
+--- backslash continues a line
 echo one\
 two
 
---- an empty command list between separators [xfail(legacy): beyond legacy's single-pass parser]
+--- an empty command list between separators
 echo a;; echo b
 
---- an alias is not substituted in the same parse unit [xfail(legacy): legacy's alias model differs]
+--- an alias is not substituted in the same parse unit
 alias g="echo hi"; g 2>/dev/null; echo after
 
---- unalias is a builtin [xfail(legacy): legacy's alias model differs]
+--- unalias is a builtin
 unalias nothing 2>/dev/null; echo ok
 
---- a quoted command name bypasses alias substitution [xfail(legacy): legacy's alias model differs]
+--- a quoted command name bypasses alias substitution
 alias ls=echo; \ls -d /tmp 2>/dev/null | head -1
 
---- eval runs its arguments as shell input [xfail(legacy): not implemented in legacy]
+--- eval runs its arguments as shell input
 eval "echo from-eval"
 
---- eval sets state in the current environment [xfail(legacy): not implemented in legacy]
+--- eval sets state in the current environment
 eval "x=set-by-eval"; echo $x
 
---- read splits a line on IFS [xfail(legacy): not implemented in legacy]
+--- read splits a line on IFS
 echo "a b c" | { read x y z; echo "$z-$y-$x"; }
 
---- the last variable of read takes the remainder [xfail(legacy): not implemented in legacy]
+--- the last variable of read takes the remainder
 echo "one two three" | { read a b; echo "[$a][$b]"; }
 
---- a while loop can read a stream [xfail(legacy): not implemented in legacy]
+--- a while loop can read a stream
 printf 'a\nb\n' | while read l; do echo "[$l]"; done
 
---- command runs a command bypassing functions [xfail(legacy): not implemented in legacy]
+--- command runs a command bypassing functions
 f() { echo function; }; command echo not-the-function
 
 --- command -v reports a builtin
 command -v cd
 
---- a for loop can be redirected [xfail(legacy): not implemented in legacy]
+--- a for loop can be redirected
 d=$(mktemp -d); for x in a b; do echo $x; done > $d/f; cat $d/f
 
---- an if can be redirected [xfail(legacy): not implemented in legacy]
+--- an if can be redirected
 d=$(mktemp -d); if true; then echo yes; fi > $d/f; cat $d/f
 
---- a compound command with a bad redirection spares the shell [xfail(legacy): not implemented in legacy]
+--- a compound command with a bad redirection spares the shell
 if echo x; then echo y; fi <_no_such_dir_/foo 2>/dev/null; printf 'reached\n'
 
---- a for loop without in iterates the positional parameters [xfail(legacy): not implemented in legacy]
+--- a for loop without in iterates the positional parameters
 set -- x y; for i do echo $i; done
 
---- a for loop without in inside a function [xfail(legacy): not implemented in legacy]
+--- a for loop without in inside a function
 f() { for i do echo $i; done; }; f a b
 
---- for with an empty in list iterates nothing [xfail(legacy): not implemented in legacy]
+--- for with an empty in list iterates nothing
 set -- a; for i in; do echo never; done; echo after
 
---- a background command does not block the shell [xfail(legacy): legacy runs `&` in the foreground]
+--- a background command does not block the shell
 d=$(mktemp -d); mkfifo $d/f; cat $d/f & echo piped > $d/f; wait
 
---- wait reports the background command's status [xfail(legacy): legacy has no asynchronous lists]
+--- wait reports the background command's status
 true & wait; echo $?
 
---- an ampersand is not a semicolon [xfail(legacy): legacy has no asynchronous lists]
+--- an ampersand is not a semicolon
 # Interleaving `echo one & echo two` is a RACE, and a corpus case that sometimes
 # passes is worse than none. What is deterministic is that the shell does not wait:
 # the async list's status is zero however the command ends, and $! is set.
 false & echo "status=$?"; [ -n "$!" ] && echo "pid set"; wait
 
---- an EXIT trap runs on normal completion [xfail(legacy): legacy has no signal handling]
+--- an EXIT trap runs on normal completion
 trap "echo caught" EXIT; echo body
 
---- an EXIT trap runs on explicit exit [xfail(legacy): legacy has no signal handling]
+--- an EXIT trap runs on explicit exit
 trap "echo bye" EXIT; exit 0
 
---- trap lists in re-inputtable form [xfail(legacy): legacy has no signal handling]
+--- trap lists in re-inputtable form
 trap "echo x" INT; trap
 
---- trap with an empty action lists as ignore [xfail(legacy): legacy has no signal handling]
+--- trap with an empty action lists as ignore
 trap "" INT; trap
 
---- a trap fires when its signal arrives [xfail(legacy): legacy has no signal handling]
+--- a trap fires when its signal arrives
 trap "echo got" USR1; kill -USR1 $$; echo after
 
---- trap - resets to default [xfail(legacy): legacy has no signal handling]
+--- trap - resets to default
 trap "echo a" USR1; trap - USR1; trap
 
---- a subshell keeps an ignored trap [xfail(legacy): legacy has no signal handling]
+--- a subshell keeps an ignored trap
 trap "" USR1; (trap)
 
 # `read`, whose input source was the bug: it read the stdio `stdin` rather than
@@ -139,47 +139,47 @@ trap "" USR1; (trap)
 # `shell -c code` - so it is asserted in tests/unit/read_tests.cpp instead. What
 # follows is the semantics, which `-c` can reach.
 
---- read assigns at end of input and still fails [xfail(legacy): not implemented in legacy]
+--- read assigns at end of input and still fails
 printf 'foo bar baz' | { read a b; printf '%s [%s] [%s]\n' "$?" "$a" "$b"; }
 
---- read at end of input assigns the empty string rather than leaving it unset [xfail(legacy): not implemented in legacy]
+--- read at end of input assigns the empty string rather than leaving it unset
 read a </dev/null; printf '%s [%s]\n' "$?" "${a-unset}"
 
---- read consumes no more of its input than the line it needs [xfail(legacy): not implemented in legacy]
+--- read consumes no more of its input than the line it needs
 { read a; echo B; cat; } <<\END
 \
 A
 C
 END
 
---- an assignment prefix is visible to read [xfail(legacy): not implemented in legacy]
+--- an assignment prefix is visible to read
 printf 'A-B-C\n' | { IFS=' -' read a b; printf '[%s][%s]\n' "$a" "$b"; }
 
---- a delimiter running to the end of the line yields no empty field [xfail(legacy): not implemented in legacy]
+--- a delimiter running to the end of the line yields no empty field
 printf 'A-B-C - \n' | { IFS=' -' read a b c; printf '[%s][%s][%s]\n' "$a" "$b" "$c"; }
 
---- a non-whitespace IFS character at the start yields an empty field [xfail(legacy): not implemented in legacy]
+--- a non-whitespace IFS character at the start yields an empty field
 printf -- '--CC--\n' | { IFS=' -' read a b c d e; printf '[%s][%s][%s][%s][%s]\n' "$a" "$b" "$c" "$d" "$e"; }
 
---- read joins surplus fields into the last variable, keeping a trailing delimiter [xfail(legacy): not implemented in legacy]
+--- read joins surplus fields into the last variable, keeping a trailing delimiter
 printf 'A B C-C D -  \n' | { IFS=' -' read a b c; printf '[%s][%s][%s]\n' "$a" "$b" "$c" ; }
 
---- a backslash prevents field splitting [xfail(legacy): not implemented in legacy]
+--- a backslash prevents field splitting
 printf 'A\\ A B\n' | { read a b; printf '[%s][%s]\n' "$a" "$b"; }
 
---- read -r takes every backslash literally [xfail(legacy): not implemented in legacy]
+--- read -r takes every backslash literally
 printf 'A\\ A B\n' | { read -r a b; printf '[%s][%s]\n' "$a" "$b"; }
 
---- read joins a continued line and stops at the one after it [xfail(legacy): not implemented in legacy]
+--- read joins a continued line and stops at the one after it
 printf 'A\\\nB\nC\n' | { read a; printf '[%s]\n' "$a"; cat; }
 
---- an empty IFS splits nothing and strips nothing [xfail(legacy): not implemented in legacy]
+--- an empty IFS splits nothing and strips nothing
 printf ' A B \n' | { IFS= read a b; printf '[%s][%s]\n' "$a" "$b"; }
 
---- an assignment prefix does not outlive a regular builtin [xfail(legacy): not implemented in legacy]
+--- an assignment prefix does not outlive a regular builtin
 x=outer; x=inner read v </dev/null; printf '[%s]\n' "$x"
 
---- an assignment prefix persists on a special builtin [xfail(legacy): legacy has no export builtin]
+--- an assignment prefix persists on a special builtin
 x=outer; x=inner export y; printf '[%s]\n' "$x"
 
 # --- alias substitution at read time (#40) ----------------------------------
@@ -190,65 +190,65 @@ x=outer; x=inner export y; printf '[%s]\n' "$x"
 # case above still holds for one LINE - `alias g=x; g` does not substitute, because
 # the whole line was read before any of it ran.
 
---- an alias defined on one line is substituted on the next [stdin] [xfail(legacy): legacy's alias model differs]
+--- an alias defined on one line is substituted on the next [stdin]
 alias e=echo
 e hi
 
---- a substituted alias runs the command its text names, not a slice of the script [stdin] [xfail(legacy): legacy's alias model differs]
+--- a substituted alias runs the command its text names, not a slice of the script [stdin]
 alias e=echo
 e one two three
 
---- a definition ending in a blank makes the next word eligible too [stdin] [xfail(legacy): legacy's alias model differs]
+--- a definition ending in a blank makes the next word eligible too [stdin]
 alias c=cat e='echo '
 e c c cat
 
---- an alias may expand to a reserved word, because the replacement is re-scanned [stdin] [xfail(legacy): legacy's alias model differs]
+--- an alias may expand to a reserved word, because the replacement is re-scanned [stdin]
 alias i='if echo' t='then echo'
 i if; t then; fi
 
---- a reserved word is never itself replaced by an alias [stdin] [xfail(legacy): legacy's alias model differs]
+--- a reserved word is never itself replaced by an alias [stdin]
 alias if=: then=: fi=: do=: done=: for=: in=:
 if true; then echo then; else echo else; fi
 for a in A; do echo $a; done
 
---- the command word after an assignment prefix is substituted [stdin] [xfail(legacy): legacy's alias model differs]
+--- the command word after an assignment prefix is substituted [stdin]
 alias e=echo
 a=A e after-assignment
 
---- the command word after a redirection prefix is substituted [stdin] [xfail(legacy): legacy's alias model differs]
+--- the command word after a redirection prefix is substituted [stdin]
 alias e=echo
 >/dev/null e not-printed
 echo done
 
---- an alias expanding to nothing but a blank leaves the exit status alone [stdin] [xfail(legacy): legacy's alias model differs]
+--- an alias expanding to nothing but a blank leaves the exit status alone [stdin]
 alias b=' '
 set +e
 false
 b
 echo $?
 
---- an alias is re-scanned so it can expand twice [stdin] [xfail(legacy): legacy's alias model differs]
+--- an alias is re-scanned so it can expand twice [stdin]
 alias echo='echo % ' e='echo echo'
 e !
 
---- a line continuation inside a word does not stop it being an alias [stdin] [xfail(legacy): legacy's alias model differs]
+--- a line continuation inside a word does not stop it being an alias [stdin]
 alias eeee=echo
 ee\
 e\
 e ok
 
---- the listing quotes a value containing a blank so it can be read back [stdin] [xfail(legacy): legacy has no alias listing]
+--- the listing quotes a value containing a blank so it can be read back [stdin]
 alias e='echo hi'
 alias
 
---- a printed alias can be fed back in [stdin] [xfail(legacy): legacy has no alias listing]
+--- a printed alias can be fed back in [stdin]
 alias e='echo hi'
 save="$(alias e)"
 unalias e
 eval alias "$save"
 e
 
---- alias with no operands prints nothing when there are none [xfail(legacy): legacy has no alias listing]
+--- alias with no operands prints nothing when there are none
 alias; echo "[$?]"
 
 --- unalias -a removes every alias [stdin]
@@ -257,10 +257,10 @@ unalias -a
 alias
 echo done
 
---- unalias of an alias that does not exist is an error [xfail(legacy): legacy's unalias reports nothing]
+--- unalias of an alias that does not exist is an error
 unalias nosuch; echo "[$?]"
 
---- alias reports an operand it cannot find and still defines the others [xfail(legacy): legacy has no alias listing]
+--- alias reports an operand it cannot find and still defines the others
 alias nosuch x=1; echo "[$?]"; alias x
 
 # --- reserved words are recognised BY POSITION, and only a word that is reserved
@@ -272,11 +272,11 @@ alias nosuch x=1; echo "[$?]"; alias x
 # it, and so must lesh. The converse still holds and is asserted below: in a
 # position where the word IS reserved, the alias table is never consulted.
 
---- the for-loop NAME position is not a reserved-word position, so `in` is an alias there [stdin] [xfail(legacy): legacy's alias model differs]
+--- the for-loop NAME position is not a reserved-word position, so `in` is an alias there [stdin]
 alias f=' for ' w=' in ' in=' x '
 f w in 1 2; do echo "[$x]"; done
 
---- but `in` where the grammar really does expect it stays the keyword [stdin] [xfail(legacy): legacy's alias model differs]
+--- but `in` where the grammar really does expect it stays the keyword [stdin]
 alias forx='for x ' in='in 9'
 forx in a; do echo "[$x]"; done
 
@@ -288,13 +288,13 @@ forx in a; do echo "[$x]"; done
 # blank, so the two-token lookahead has to cross the boundary AND substitute as it
 # goes.
 
---- a name from one alias and `()` from another still define a function [stdin] [xfail(legacy): legacy has no function definitions]
+--- a name from one alias and `()` from another still define a function [stdin]
 alias f='f ' p='()'
 f p
 { echo F; }
 f
 
---- the same when the opening parenthesis is inside the first body [stdin] [xfail(legacy): legacy has no function definitions]
+--- the same when the opening parenthesis is inside the first body [stdin]
 alias g='g( ' q=')'
 g q
 { echo G; }
@@ -307,13 +307,13 @@ g q
 # collector therefore takes the buffer the newline came from; reading the input
 # alone had nowhere to find the body and lexed it as commands.
 
---- an alias body supplies both the here-document operator and its body [stdin] [xfail(legacy): legacy has no here-documents]
+--- an alias body supplies both the here-document operator and its body [stdin]
 alias c='cat <<\END' d='c
 here-document
 END'
 d
 
---- the same when one alias carries the whole construct [stdin] [xfail(legacy): legacy has no here-documents]
+--- the same when one alias carries the whole construct [stdin]
 alias d='cat <<\END
 body-line
 END'
@@ -332,27 +332,27 @@ d
 # The positional rule lesh DOES implement is narrower and is asserted above: the
 # `for` NAME accepts no reserved word at all, so nothing is shadowed there.
 
---- a keyword the grammar cannot accept where it stands is still a keyword, not an alias [stdin] [xfail(legacy): legacy's alias model differs]
+--- a keyword the grammar cannot accept where it stands is still a keyword, not an alias [stdin]
 alias forx='for x ' for='in 2'
 forx for a; do echo "[$x]"; done
 echo "st=$?"
 
---- the same in the `in` position of a case statement [stdin] [xfail(legacy): legacy has no case statements]
+--- the same in the `in` position of a case statement [stdin]
 alias c='case a ' case='
  in a) :'
 c case X; echo A; esac
 echo "st=$?"
 
---- a newline after a pipe continues the pipeline [stdin] [xfail(legacy): beyond legacy's single-pass parser]
+--- a newline after a pipe continues the pipeline [stdin]
 echo foo |
 cat
 
---- a newline after && continues the list, and the right side is still conditional [stdin] [xfail(legacy): beyond legacy's single-pass parser]
+--- a newline after && continues the list, and the right side is still conditional [stdin]
 false &&
 echo not-printed
 echo done
 
---- an alias that expands to nothing lets the pipeline continue on the next line [stdin] [xfail(legacy): legacy's alias model differs]
+--- an alias that expands to nothing lets the pipeline continue on the next line [stdin]
 alias a=
 echo foo | a
 cat
@@ -363,17 +363,17 @@ echo one
 # a comment
 echo two
 
---- a line continuation splits an operator [xfail(legacy): legacy's lexer treats a backslash-newline as an escape]
+--- a line continuation splits an operator
 : > /tmp/lesh_spec_lc; echo one >\
 > /tmp/lesh_spec_lc && cat /tmp/lesh_spec_lc
 
---- a line continuation splits a reserved word [xfail(legacy): legacy has no compound commands]
+--- a line continuation splits a reserved word
 i\
 f true; th\
 en echo yes; f\
 i
 
---- a line continuation splits a brace group and its operator [xfail(legacy): legacy has no compound commands]
+--- a line continuation splits a brace group and its operator
 \
 {\
  echo 1
@@ -386,7 +386,7 @@ i
 \
 }
 
---- a line continuation splits a for loop [xfail(legacy): legacy has no compound commands]
+--- a line continuation splits a for loop
 f\
 o\
 r i\
@@ -398,14 +398,14 @@ o
 d\
 one
 
---- a line continuation splits an io number from its operator [xfail(legacy): legacy ignores redirect nodes entirely]
+--- a line continuation splits an io number from its operator
 : > /tmp/lesh_spec_lc2; echo two 3\
 >\
 > /tmp/lesh_spec_lc2 >\
 &\
 3; cat /tmp/lesh_spec_lc2
 
---- a line continuation splits an assignment [xfail(legacy): legacy has no assignments]
+--- a line continuation splits an assignment
 fo\
 o\
 =\
@@ -413,7 +413,7 @@ b\
 ar
 echo $foo
 
---- a line continuation splits a function definition [xfail(legacy): legacy has no function definitions]
+--- a line continuation splits a function definition
 f\
 un\
 c \
@@ -424,7 +424,7 @@ c \
  ( echo ok )
 func
 
---- a line continuation splits a parameter expansion [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- a line continuation splits a parameter expansion
 f=foo
 echo $\
 f ${\
@@ -433,7 +433,7 @@ f} ${f#\
 f} ${f:\
 +x}
 
---- a line continuation splits an arithmetic expansion [xfail(legacy): legacy has no arithmetic expansion]
+--- a line continuation splits an arithmetic expansion
 echo $\
 (\
 (\
@@ -441,13 +441,13 @@ echo $\
 )\
 )
 
---- a line continuation splits a command substitution [xfail(legacy): legacy has no command substitution]
+--- a line continuation splits a command substitution
 echo $\
 (\
 echo 1\
 )
 
---- a line continuation splits a here-document operator and its delimiter [xfail(legacy): legacy has no here-documents]
+--- a line continuation splits a here-document operator and its delimiter
 cat \
 <\
 <\
@@ -459,6 +459,6 @@ D\
 foo
 END
 
---- but a backslash-newline inside single quotes is two literal bytes [xfail(legacy): legacy has no parameter expansion beyond $name]
+--- but a backslash-newline inside single quotes is two literal bytes
 printf '[%s]\n' "${x-'a\
 b'}"

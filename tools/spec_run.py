@@ -49,11 +49,6 @@ Consequences worth stating, because each is a cost:
     inside the previous case's region, and those comments would otherwise be read
     as expected output. So an expectation whose stdout contains or ends with a
     blank line cannot be written - and would FAIL loudly rather than pass quietly.
-  - A divergence is asserted on the `next` front end only. `legacy` is the strangler
-    quarantine ADR-0002 deletes; it is missing most of the language and has no
-    chosen behaviour to record, so asserting lesh's answer there would turn every
-    divergence into a legacy failure that means nothing. On legacy they are reported
-    as not asserted, and counted as neither pass nor known-fail there either.
 
 HOW A CASE IS INVOKED (issue #41). Until #41 every case ran as `shell -c code` and
 nothing else, so no case could see a bug in how the shell reads its own command
@@ -99,26 +94,21 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-_FRONTEND = None
-
-# The front end a divergence's expectation describes. See the module docstring:
-# legacy is a quarantine, not a shell with chosen behaviour.
-DIVERGENCE_FRONTEND = "next"
-
 # A case header is `--- name` followed by any number of bracketed directives:
 #
 #   [stdin]                 feed the body to the shell on fd 0 instead of -c
-#   [xfail: reason]         known failure on every front end
-#   [xfail(next): reason]   known failure on one front end
+#   [xfail: reason]         known failure: a gap nobody has closed yet
 #   [divergence: reason]    deliberate difference from the reference shell; the
 #                           case carries its own expectation and dash is not run
 #
-# xfail scoping became necessary the moment both front ends were live: they fail
-# different things, and one shared marker list would hide a regression in
-# whichever front end happened not to be under test.
+# The marker used to carry a SCOPE - `[xfail(legacy): ...]` - because two front
+# ends were live and failed different things, and one shared list would have hidden
+# a regression in whichever was not under test. #28 deleted legacy, and with it 767
+# scoped markers and the axis itself: there is one shell, so an xfail is a fact
+# about lesh rather than about which half of it ran.
 CASE_RE = re.compile(r"^---\s+(?P<name>.+?)\s*(?P<tags>(?:\[[^\]]*\]\s*)*)$")
 TAG_RE = re.compile(r"\[([^\]]*)\]")
-XFAIL_RE = re.compile(r"^xfail(?:\((?P<scope>[a-z]+)\))?:\s*(?P<reason>.*)$")
+XFAIL_RE = re.compile(r"^xfail:\s*(?P<reason>.*)$")
 DIVERGENCE_RE = re.compile(r"^divergence:\s*(?P<reason>.*)$")
 
 # The expectation of a divergence case: `=== expect` with the same bracketed
@@ -146,7 +136,6 @@ class Case:
     name: str
     code: str
     xfail: str | None
-    xfail_scope: str | None  # None = all front ends
     divergence: str | None  # `[divergence: reason]`; mutually exclusive with xfail
     expect: Expect | None  # set exactly when divergence is
     on_stdin: bool  # `[stdin]`: the body arrives on fd 0, not as -c
@@ -162,8 +151,8 @@ class Run:
     timed_out: bool
 
 
-def parse_directives(tags: str, where: str) -> tuple[bool, str | None, str | None, str | None]:
-    """Read a case header's directives. Returns (on_stdin, xfail, scope, divergence).
+def parse_directives(tags: str, where: str) -> tuple[bool, str | None, str | None]:
+    """Read a case header's directives. Returns (on_stdin, xfail, divergence).
 
     An unrecognised directive is a hard error rather than a warning or a silent
     skip. A misspelled `[stdni]` that quietly ran the case as `-c` would recreate
@@ -171,13 +160,13 @@ def parse_directives(tags: str, where: str) -> tuple[bool, str | None, str | Non
     the stdin path and does not.
     """
     on_stdin = False
-    xfail = scope = divergence = None
+    xfail = divergence = None
     for tag in TAG_RE.findall(tags):
         directive = tag.strip()
         if directive == "stdin":
             on_stdin = True
         elif m := XFAIL_RE.match(directive):
-            xfail, scope = m["reason"], m["scope"]
+            xfail = m["reason"]
         elif m := DIVERGENCE_RE.match(directive):
             divergence = m["reason"]
         else:
@@ -185,7 +174,7 @@ def parse_directives(tags: str, where: str) -> tuple[bool, str | None, str | Non
     if xfail is not None and divergence is not None:
         raise SystemExit(f"{where}: a case is either an xfail or a divergence, not both - "
                          "an xfail is a gap to close, a divergence is a decision to keep")
-    return on_stdin, xfail, scope, divergence
+    return on_stdin, xfail, divergence
 
 
 def parse_expect(tags: str, lines: list[str], where: str) -> Expect:
@@ -204,7 +193,7 @@ def parse_expect(tags: str, lines: list[str], where: str) -> Expect:
 
 def parse_spec(path: Path) -> list[Case]:
     cases: list[Case] = []
-    name = xfail = scope = divergence = expect_tags = None
+    name = xfail = divergence = expect_tags = None
     on_stdin = expect_open = False
     start = 0
     body: list[str] = []
@@ -218,14 +207,14 @@ def parse_spec(path: Path) -> list[Case]:
             raise SystemExit(f"{where}: [divergence: ...] with no `=== expect` block - dash "
                              "cannot be the expectation of a case that deliberately differs")
         expect = parse_expect(expect_tags, expect_body, where) if divergence is not None else None
-        cases.append(Case(name, code, xfail, scope, divergence, expect, on_stdin, path, start))
+        cases.append(Case(name, code, xfail, divergence, expect, on_stdin, path, start))
 
     for lineno, raw in enumerate(path.read_text().splitlines(), 1):
         if m := CASE_RE.match(raw):
             flush()
             name, start, body, expect_body, expect_tags = m["name"], lineno, [], [], None
             expect_open = False
-            on_stdin, xfail, scope, divergence = parse_directives(m["tags"], f"{path}:{lineno}")
+            on_stdin, xfail, divergence = parse_directives(m["tags"], f"{path}:{lineno}")
         elif m := EXPECT_RE.match(raw):
             if divergence is None:
                 raise SystemExit(f"{path}:{lineno}: `=== expect` on a case that is not a "
@@ -279,8 +268,6 @@ def child_env(testee: str) -> dict[str, str]:
     env = dict(os.environ)
     opts = [o for o in env.get("ASAN_OPTIONS", "").split(":") if o and not o.startswith("detect_leaks")]
     env["ASAN_OPTIONS"] = ":".join(opts + ["detect_leaks=0"])
-    if _FRONTEND is not None:
-        env["LESH_FRONTEND"] = _FRONTEND
     # The shell under test, reachable from inside a case. See the module docstring.
     env["TESTEE"] = testee
     return env
@@ -295,13 +282,14 @@ def run_shell(shell: str, testee: str, code: str, timeout: float, on_stdin: bool
     hid #31.
 
     EVERY CASE RUNS IN ITS OWN EMPTY DIRECTORY. Not for isolation between cases -
-    they use absolute paths - but because a case is also run against `legacy`, which
-    has no command substitution and no compound commands, so it reads a one-line
-    case as a single command with every later word as an operand. One `mkdir` case
-    therefore created twelve directories named `for`, `in`, `do`, `;`, `[%s]` and
-    friends. They were EMPTY, so `git status` could not see them, and they sat in the
-    repo root until someone listed it by hand. A runner that litters the tree it is
-    testing is a runner nobody trusts.
+    they use absolute paths - but because a case used to be run against `legacy`
+    too, which had no command substitution and no compound commands, so it read a
+    one-line case as a single command with every later word as an operand. One
+    `mkdir` case therefore created twelve directories named `for`, `in`, `do`, `;`,
+    `[%s]` and friends. They were EMPTY, so `git status` could not see them, and they
+    sat in the repo root until someone listed it by hand. Legacy is gone (#28) and
+    the rule stays: a runner that litters the tree it is testing is a runner nobody
+    trusts, and any shell can be made to misread a case.
     """
     with tempfile.TemporaryDirectory(prefix="spec.") as work:
         proc = subprocess.Popen(
@@ -340,13 +328,8 @@ def main() -> int:
     ap.add_argument("--ref", default="dash", help="reference shell (dash for the POSIX floor)")
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--verbose", "-v", action="store_true", help="show diffs for expected failures too")
-    ap.add_argument("--frontend", default=None, choices=["legacy", "next"],
-                    help="which lesh front end to exercise (sets LESH_FRONTEND)")
     ap.add_argument("paths", nargs="*", default=["tests/spec"])
     args = ap.parse_args()
-
-    global _FRONTEND
-    _FRONTEND = args.frontend
 
     files: list[Path] = []
     for p in map(Path, args.paths):
@@ -355,7 +338,7 @@ def main() -> int:
         print("no .spec files found", file=sys.stderr)
         return 2
 
-    passed = xfailed = failed = xpassed = diverged = unasserted = 0
+    passed = xfailed = failed = xpassed = diverged = 0
     ref_testee = testee_path(args.ref)
     shell_testee = testee_path(args.shell)
     # The shells themselves are addressed absolutely for the same reason $TESTEE is:
@@ -363,9 +346,6 @@ def main() -> int:
     # would resolve against that and vanish. testee_path already does the work.
     args.ref = ref_testee
     args.shell = shell_testee
-
-    if args.frontend:
-        print(f"front end under test: {args.frontend}")
 
     for path in files:
         print(f"\n{path}")
@@ -375,11 +355,6 @@ def main() -> int:
             # A DIVERGENCE IS NOT COMPARED. Its own expectation stands in for the
             # reference shell, which is not run at all here.
             if case.divergence is not None:
-                if (args.frontend or "legacy") != DIVERGENCE_FRONTEND:
-                    unasserted += 1
-                    print(f"  skip   {label}  -- divergence, not asserted on "
-                          f"{args.frontend or 'legacy'}")
-                    continue
                 got = run_shell(args.shell, shell_testee, case.code, args.timeout, case.on_stdin)
                 problems = ["      TIMED OUT (process group killed)"] if got.timed_out else []
                 problems += diff("stdout", got.stdout, case.expect.stdout)
@@ -406,9 +381,7 @@ def main() -> int:
             # stderr text is implementation-specific; compare only whether it is empty.
             problems += diff("stderr?", str(bool(got.stderr)), str(bool(ref.stderr)))
 
-            # A scoped marker applies only when that front end is under test.
-            expected_to_fail = case.xfail is not None and (
-                case.xfail_scope is None or case.xfail_scope == (args.frontend or "legacy"))
+            expected_to_fail = case.xfail is not None
 
             if problems and expected_to_fail:
                 xfailed += 1
@@ -426,14 +399,12 @@ def main() -> int:
                 passed += 1
                 print(f"  pass   {label}")
 
-    total = passed + xfailed + failed + xpassed + diverged + unasserted
+    total = passed + xfailed + failed + xpassed + diverged
     # A divergence is neither a pass nor a known failure. Its own tally is the whole
     # point: `known-fail` now counts only gaps, so the number means one thing.
     tally = f"{passed} pass, {xfailed} known-fail, {failed} FAIL, {xpassed} XPASS"
     if diverged:
         tally += f", {diverged} divergence"
-    if unasserted:
-        tally += f", {unasserted} divergence not asserted on {args.frontend or 'legacy'}"
     print(f"\n{total} cases against {args.ref}: {tally}")
     # Known failures are the score, not a gate. Unexpected failures and cases that
     # started passing without their marker being removed are both regressions - and

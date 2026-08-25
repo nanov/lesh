@@ -28,13 +28,16 @@ the signals `kill2-p.tst` asserts. Build it with `cmake --preset release &&
 cmake --build --preset release -j8`. The tool refuses and tells you how if the
 binary is absent, rather than quietly measuring the wrong thing.
 
-**`spec_run.py` needs `--frontend next`.** With no flag it runs the *legacy*
-implementation and reports about 35 passes instead of ~690. Legacy is the old
-implementation being replaced; it is not the shell under development.
+**There is ONE shell.** `LESH_FRONTEND` and `spec_run.py --frontend` are gone with
+`src/legacy/` (#28); nothing reads the variable, and the corpus runs on one axis.
+A command remembered from an older session that still sets it is harmless, and its
+output is the shell you wanted either way.
 
-**Never invoke `third_party/yash-tests/run-test.sh` directly.** It does not set
-`LESH_FRONTEND`, so it measures the *legacy* implementation and scores near zero.
-`tools/conformance.py` sets it. Six times on this map a runner defect has
+**Never invoke `third_party/yash-tests/run-test.sh` directly.** It has no timeout
+and reaps nothing, so one hung case spins a core until you notice - nineteen
+minutes, once, on this machine. `tools/conformance.py` gives every case its own
+process group and kills by group, and it clears the stale `.trs` files that would
+otherwise be counted as this run's. Six times on this map a runner defect has
 masqueraded as a shell bug, and this is the cheapest one to fall into.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
