@@ -195,6 +195,7 @@ add_executable(lesh_tests
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_selection_tests.cpp
 	tests/unit/leshper_tests.cpp
+	tests/unit/leshper_paste_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
