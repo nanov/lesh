@@ -19,6 +19,7 @@
 #include "runtime/executor.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
+#include "substrate/grapheme.h"
 #include "syntax/lexer.h"
 #include "syntax/parser.h"
 
@@ -69,6 +70,9 @@ void report_header(const char* title) {
 	std::printf("%-22s %10s %10s %10s %12s\n",
 	            "----------------------", "----------", "----------", "----------", "------------");
 }
+
+// Keeps the optimiser from deleting a scan whose result nothing reads.
+volatile int benchmark_sink = 0;
 
 } // namespace
 
@@ -155,6 +159,50 @@ int main() {
 		});
 		std::printf("  %zu-char line, all %zu prefixes: %.0f ns (%.1f ns per prefix)\n",
 		            line.size(), line.size(), ns, ns / static_cast<double>(line.size()));
+	}
+
+	// Grapheme scanning. #108's latency clause: boundary walking and cluster
+	// width are O(cluster) with two dependent trie loads per codepoint, and the
+	// unit of work that matters is one line of a prompt, not one codepoint. A
+	// redraw walks the whole line, so that is what is measured.
+	std::printf("\ngrapheme scan (one line: boundaries + cluster width)\n");
+	std::printf("  %-26s %6s %9s %10s %9s\n",
+	            "line", "bytes", "clusters", "ns/scan", "ns/byte");
+	{
+		struct Line { const char* name; std::string text; };
+		std::string cjk, emoji, marks;
+		// U+6F22, then U+1F469 U+200D U+1F466, then e with three combining marks.
+		for (int i = 0; i < 40; ++i) cjk += "\xe6\xbc\xa2";
+		for (int i = 0; i < 10; ++i) emoji += "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa6";
+		for (int i = 0; i < 20; ++i) marks += "e\xcc\x81\xcc\x88\xcc\xb1";
+
+		const std::vector<Line> lines = {
+			{"ascii, 80 columns",       std::string(80, 'x')},
+			{"a real command line",     "git commit -m \"a message with $VAR\" --amend"},
+			{"CJK, 40 clusters",        cjk},
+			{"ZWJ emoji, 10 clusters",  emoji},
+			{"combining marks, 20",     marks},
+		};
+
+		for (const Line& l : lines) {
+			size_t clusters = 0;
+			for (size_t i = 0; i < l.text.size(); ++clusters)
+				i = grapheme::next_boundary(l.text, i);
+
+			const double ns = time_ns(20000, [&] {
+				int columns = 0;
+				for (size_t i = 0; i < l.text.size();) {
+					const size_t next = grapheme::next_boundary(l.text, i);
+					columns += grapheme::cluster_width(
+						std::string_view(l.text).substr(i, next - i));
+					i = next;
+				}
+				benchmark_sink += columns;
+			});
+
+			std::printf("  %-26s %6zu %9zu %10.0f %9.2f\n", l.name, l.text.size(),
+			            clusters, ns, ns / static_cast<double>(l.text.size()));
+		}
 	}
 
 	std::printf("\n");
