@@ -46,6 +46,9 @@ namespace lesh::leshper {
 struct decoration_span;
 struct virtual_text;
 struct proposal;
+// One reactor's whole answer. The editor handle points at the applied ones so
+// an accepting action can read a proposal back (#133); defined below.
+struct reactor_batch;
 
 } // namespace lesh::leshper
 
@@ -118,6 +121,21 @@ struct lesh_editor {
 	// Input pushed with lesh_push_input, delivered at commit so it drains
 	// through the keymap after the action's edits have landed.
 	std::string pushed_input;
+
+	// What the loop currently has applied, for lesh_proposal_read (#133, F-25).
+	//
+	// A borrowed pointer, never owned, and READ-ONLY from the ABI's side: there
+	// is no emit function on this handle, so an accepting action can learn what
+	// was proposed and can reach the buffer only by staging a write (A-12). Null
+	// when the loop has nothing applied, which reads as "no proposal" rather
+	// than as an error.
+	const std::vector<lesh::leshper::reactor_batch>* applied = nullptr;
+
+	// A dismissal the action REQUESTED (lesh_proposal_dismiss), honoured by the
+	// loop after the action's writes have been committed - the same shape the
+	// loop outcomes have, for the same reason: the action goes on running.
+	std::uint32_t dismissed_kind = 0;
+	bool dismiss_requested = false;
 
 	std::uint8_t outcome = 0;  // lesh::leshper::loop_outcome
 	std::int32_t exit_status = 0;
@@ -217,6 +235,10 @@ struct decoration_span {
 struct virtual_text {
 	std::size_t at = 0;
 	std::string bytes;
+	// The interned semantic id lesh_emit_virtual_text_styled carried, or
+	// LESH_STYLE_NONE from the unstyled emit (#133). Additive, and defaulted, so
+	// the two emit functions differ in exactly this field.
+	std::uint32_t style_id = LESH_STYLE_NONE;
 
 	friend bool operator==(const virtual_text&, const virtual_text&) noexcept = default;
 };
@@ -340,6 +362,54 @@ public:
 
 private:
 	highlighter* _self;
+};
+
+// ---------------------------------------------------------------------------
+// The autosuggester (#133: F-24 to F-26), the second built-in reactor.
+// ---------------------------------------------------------------------------
+
+// Where the entries come from (#125). Declared, not included: this header hands
+// a pointer through and never touches one, so the wiring site chooses between
+// the store's adapter and a `vector_history_source` without registry.h knowing
+// either exists.
+class history_source;
+
+// The autosuggester's registration-time context: its per-request arena, the
+// history it searches, and the one style id it interns. OPAQUE, exactly as
+// `highlighter` is and for the same reason - builtin_reactors.cpp defines it and
+// includes nothing from this module, so a built-in reactor that wanted a
+// shortcut would not compile.
+struct autosuggester;
+
+// `source` is BORROWED and must outlive the returned context. Null is accepted
+// here and refused per request as LESH_ERR_INVAL, on #125's reasoning: a
+// provider wired up wrong should say so rather than look like an empty history.
+[[nodiscard]] autosuggester* autosuggester_create(const history_source* source);
+void autosuggester_destroy(autosuggester* self) noexcept;
+
+// Registers the autosuggester through the ABI and by no other route (A-11).
+// `self` must outlive `reg`. Answers how many were registered.
+//
+// Its own function rather than a second argument to register_builtin_reactors,
+// because that would be a signature change on a call site the loop already
+// makes - the same additive-growth rule the ABI is held to, applied one layer
+// up.
+std::size_t register_autosuggester(registry& reg, autosuggester& self);
+
+// The owner ADR-0007 asks for. `source` is borrowed and must outlive this.
+class owned_autosuggester {
+public:
+	explicit owned_autosuggester(const history_source* source)
+		: _self(autosuggester_create(source)) {}
+	~owned_autosuggester() { autosuggester_destroy(_self); }
+
+	owned_autosuggester(const owned_autosuggester&) = delete;
+	owned_autosuggester& operator=(const owned_autosuggester&) = delete;
+
+	[[nodiscard]] autosuggester& get() const noexcept { return *_self; }
+
+private:
+	autosuggester* _self;
 };
 
 } // namespace lesh::leshper

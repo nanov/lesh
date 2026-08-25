@@ -651,6 +651,23 @@ int32_t lesh_emit_virtual_text(lesh_request* request, size_t at, const char* byt
 	return LESH_OK;
 }
 
+int32_t lesh_emit_virtual_text_styled(lesh_request* request, size_t at, const char* bytes,
+                                      size_t length, uint32_t style_id) {
+	LESH_REQUEST_HANDLE(request);
+	if (request->texts == nullptr)
+		return LESH_ERR_INVAL;
+	if (bytes == nullptr && length != 0)
+		return LESH_ERR_INVAL;
+	// An id nobody interned is not refused. The registry is the loop's and this
+	// runs on a worker, which has no business looking it up; a batch carrying a
+	// nonsense id renders unstyled, which is the same failure an unthemed name
+	// already has.
+	request->texts->push_back(
+		virtual_text{clamp_into(request->buffer, at),
+	                 std::string(bytes == nullptr ? "" : bytes, length), style_id});
+	return LESH_OK;
+}
+
 int32_t lesh_propose(lesh_request* request, uint32_t kind, const char* bytes, size_t length) {
 	LESH_REQUEST_HANDLE(request);
 	if (request->proposals == nullptr)
@@ -662,6 +679,42 @@ int32_t lesh_propose(lesh_request* request, uint32_t kind, const char* bytes, si
 		return LESH_ERR_INVAL;
 	request->proposals->push_back(
 		proposal{kind, std::string(bytes == nullptr ? "" : bytes, length)});
+	return LESH_OK;
+}
+
+// --- Proposals, from the action side (#133, F-25) --------------------------
+
+int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index, char* out,
+                           size_t capacity, size_t* length_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (length_out == nullptr)
+		return LESH_ERR_INVAL;
+	*length_out = 0;
+	if (editor->applied == nullptr)
+		return LESH_ERR_NOTFOUND;
+	// Emission order across the applied batches. Within one batch that is the
+	// order the reactor proposed in, which is what makes the search UI's list
+	// (#118) index 0, 1, 2 and the autosuggester's single candidate index 0.
+	std::size_t seen = 0;
+	for (const lesh::leshper::reactor_batch& batch : *editor->applied) {
+		for (const proposal& one : batch.proposals) {
+			if (one.kind != kind)
+				continue;
+			if (seen++ != index)
+				continue;
+			return copy_out(one.bytes, out, capacity, length_out);
+		}
+	}
+	return LESH_ERR_NOTFOUND;
+}
+
+int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind) {
+	LESH_EDITOR_HANDLE(editor);
+	// Requested, never performed - see the header. The loop reads this once the
+	// action's writes have been committed, so an action that dismisses and then
+	// changes its mind leaves the screen as it found it.
+	editor->dismissed_kind = kind;
+	editor->dismiss_requested = true;
 	return LESH_OK;
 }
 
@@ -743,6 +796,12 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.staged_selection_active = target.selection_active();
 	_handle.selection_written = false;
 	_handle.pushed_input.clear();
+	// What is on screen, for an accepting action to read (#133). A pointer to
+	// what the loop already holds: no copy, and nothing for the keystroke path
+	// to allocate.
+	_handle.applied = &_applied;
+	_handle.dismissed_kind = 0;
+	_handle.dismiss_requested = false;
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
 	_handle.depth = 0;
@@ -811,10 +870,29 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	if (!_handle.pushed_input.empty())
 		target.pending.injected += _handle.pushed_input;
 
+	// The dismissal, honoured after the commit (#133). The WHOLE batch goes, not
+	// the proposal alone: the drawn half of a suggestion is its virtual text, and
+	// a dismissal that left that on screen would have dismissed nothing the user
+	// can see.
+	if (_handle.dismiss_requested) {
+		const std::uint32_t kind = _handle.dismissed_kind;
+		for (auto it = _applied.begin(); it != _applied.end();) {
+			bool carries = false;
+			for (const proposal& one : it->proposals) {
+				if (one.kind == kind) {
+					carries = true;
+					break;
+				}
+			}
+			it = carries ? _applied.erase(it) : it + 1;
+		}
+	}
+
 	result.outcome = static_cast<loop_outcome>(_handle.outcome);
 	result.exit_status = _handle.exit_status;
 	result.cursor_moved = target.cursor != cursor_before;
 	_handle.target = nullptr;
+	_handle.applied = nullptr;
 
 	// The same rule the enum path follows: an action that changed nothing asks
 	// for nothing, a mutation asks the reactors to recompute, and a bare cursor

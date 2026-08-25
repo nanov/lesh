@@ -352,6 +352,22 @@ int32_t lesh_emit_span(lesh_request* request, size_t start, size_t end, uint32_t
 int32_t lesh_emit_virtual_text(lesh_request* request, size_t at,
                                const char* bytes, size_t length);
 
+/* The same, carrying an interned semantic style id (F-21).
+ *
+ * ADDITIVE, and a new function rather than a fifth parameter, because #93 wrote
+ * the emit as `emit_virtual_text(pos, bytes)` and a signature change is the one
+ * kind of growth this header forbids. The unstyled call is exactly this one
+ * with LESH_STYLE_NONE, which is what "no style, the renderer decides" already
+ * meant.
+ *
+ * The autosuggester (#133) is the consumer that asked: its continuation is
+ * muted, and "muted" is the THEME's word for the id it interns as `suggestion`
+ * - a reactor that named a colour here would be the thing F-21 exists to
+ * prevent. Without an id to carry, interning one would be ceremony. */
+int32_t lesh_emit_virtual_text_styled(lesh_request* request, size_t at,
+                                      const char* bytes, size_t length,
+                                      uint32_t style_id);
+
 /* Proposal kinds (a proposal becomes a buffer edit only through an accepting
  * action; it never auto-applies). */
 #define LESH_PROPOSAL_AUTOSUGGESTION 0u
@@ -383,6 +399,52 @@ int32_t lesh_style_intern(lesh_registry* registry, const char* name, uint32_t* o
  * nobody interned. */
 int32_t lesh_style_name(lesh_registry* registry, uint32_t style_id,
                         char* out, size_t capacity, size_t* length_out);
+
+/* ------------------------------------------------------------------------- */
+/* Proposals, from the ACTION side (#133, F-25)                               */
+/*                                                                            */
+/* A reactor proposes; an accepting action decides. The two halves are         */
+/* deliberately not symmetric: `lesh_propose` exists only on the request       */
+/* token, and there is no way to read a proposal back from there, because a    */
+/* reactor reading its own stale output is the loop's job to prevent and not   */
+/* a thing to be careful about. These two exist only on the EDITOR handle,     */
+/* which an action holds and a reactor never does.                            */
+/*                                                                            */
+/* There is still no apply path. An accepting action reads the bytes and       */
+/* stages a buffer write like any other action (A-12), so accepting a          */
+/* suggestion is one undo entry and one generation bump, and nothing about it  */
+/* is privileged. That is why this is an ACCESSOR and not `lesh_accept`.       */
+/* ------------------------------------------------------------------------- */
+
+/* Copies out the `index`-th proposal of `kind` that is currently on screen.
+ *
+ * Currently on screen, not "ever emitted": the loop applies only batches
+ * computed against the generation the editor is still at (N-4), so what this
+ * reads is by construction a proposal about the text the buffer holds now.
+ *
+ * `index` walks the proposals of that kind in emission order across the applied
+ * batches, so an autosuggester's single candidate is index 0 and the search
+ * UI's list (#118) is 0, 1, 2, ... LESH_ERR_NOTFOUND once they run out, which
+ * is also the answer when nothing has been proposed - pressing the accept key
+ * with no suggestion showing is not an error.
+ *
+ * Copy-out, like every other reading accessor: `*length_out` is the proposal's
+ * full length whether or not it fit, and `out` may be NULL with `capacity`
+ * zero to ask the length first. No NUL is appended. */
+int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index,
+                           char* out, size_t capacity, size_t* length_out);
+
+/* Dismisses what is on screen for `kind` (F-25's third action).
+ *
+ * REQUESTED, NEVER PERFORMED, the same shape the loop outcomes have: the action
+ * goes on running and the loop drops the batches when it returns. Two dismisses
+ * in one action are one dismissal, and the last kind wins.
+ *
+ * It drops the whole batch that carried the proposal, virtual text and spans
+ * included, because a suggestion the user dismissed must stop being drawn and
+ * the drawn half is the virtual text. The reactor is free to propose again on
+ * the next event - dismissal is about what is showing, not a mute. */
+int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind);
 
 #ifdef __cplusplus
 } /* extern "C" */
