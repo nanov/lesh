@@ -32,6 +32,8 @@ x .d88"               z`    ^%    .uef^"
 #include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
+#include <vector>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -47,8 +49,13 @@ x .d88"               z`    ^%    .uef^"
 #include <unordered_set>
 #include <vector>
 
-#include "utils.h"
-#include "zsh_parser_plus.h"
+#include "legacy/shell_state.h"
+#include "legacy/zsh_parser_plus.h"
+
+#include "runtime/executor.h"
+#include "runtime/invocation.h"
+#include "runtime/shell_state.h"
+#include "syntax/parser.h"
 
 #include "replxx.hxx"
 #include <sol/sol.hpp>
@@ -67,189 +74,12 @@ const std::optional<std::string> file_found(const std::vector<std::filesystem::p
 // end tools
 
 
-/*
-void split_string(char* actual_command, char* input, std::vector<char*>& target) {
-	target.clear();
-
-	if (!input || !*input) return;
-
-	char* p = input;
-	bool in_space = true;
-	char wait_closing = '\0';
-
-	for (char* mp = input; *mp; mp++) {
-			if (*mp == '"') {
-				if (wait_closing==*mp) {
-					*mp='\0';
-					wait_closing='\0';
-				} else {
-					wait_closing=*mp;
-				}
-			} else if (*mp == ' ') {
-					if (in_space)
-						continue;
-					*mp = '\0';
-					in_space = true;
-					target.push_back(p);
-			} else if (in_space) {
-					p = mp;
-					in_space = false;
-			}
-	}
-
-	if (!in_space)
-			target.push_back(p);
-	target[0] = actual_command;
-	target.push_back(nullptr);
-}
-
-int gogo2(std::vector<std::vector<char*>>& commands, char** envp) {
-		// Total number of commands
-		int num_commands = commands.size();
-
-		// Array to store pipe file descriptors
-		std::vector<int> pipefd(2 * (num_commands - 1));
-
-		// Create pipes between commands
-		for (int i = 0; i < num_commands - 1; i++) {
-				if (pipe(pipefd.data() + i * 2) == -1) {
-						throw std::runtime_error("Pipe creation failed: " + std::string(std::strerror(errno)));
-				}
-		}
-
-		// Vector to store child process IDs
-		std::vector<pid_t> pids(num_commands);
-
-		for (int i = 0; i < num_commands; i++) {
-				pids[i] = fork();
-
-				if (pids[i] == -1) {
-						throw std::runtime_error("Fork failed: " + std::string(std::strerror(errno)));
-				}
-
-				if (pids[i] == 0) {  // Child process
-						// Redirect input if not the first command
-						if (i > 0) {
-								if (dup2(pipefd[(i-1) * 2], STDIN_FILENO) == -1) {
-										std::cerr << "Input redirection failed: " << std::strerror(errno) << std::endl;
-										exit(EXIT_FAILURE);
-								}
-						}
-
-						// Redirect output if not the last command
-						if (i < num_commands - 1) {
-								if (dup2(pipefd[i * 2 + 1], STDOUT_FILENO) == -1) {
-										std::cerr << "Output redirection failed: " << std::strerror(errno) << std::endl;
-										exit(EXIT_FAILURE);
-								}
-						}
-
-						// Close all pipe file descriptors in child
-						for (int j = 0; j < pipefd.size(); j++) {
-								close(pipefd[j]);
-						}
-
-						// Execute the command
-						execve(commands[i][0], commands[i].data(), envp);
-
-						// If execve fails
-						std::cerr << "Error executing command: " << commands[i][0]
-											<< " " << std::strerror(errno) << std::endl;
-						exit(EXIT_FAILURE);
-				}
-		}
-
-		// Close all pipe file descriptors in parent
-		for (int j = 0; j < pipefd.size(); j++) {
-				close(pipefd[j]);
-		}
-
-		// Wait for last command and return its exit status
-		int status;
-		waitpid(pids[num_commands - 1], &status, 0);
-
-		// Optionally wait for other processes to avoid zombies
-		for (int i = 0; i < num_commands - 1; i++) {
-				waitpid(pids[i], nullptr, 0);
-		}
-
-		if (WIFEXITED(status)) {
-				return WEXITSTATUS(status);
-		}
-
-		return -1;
-}
-
-int gogo(std::vector<char*> &a, char** envp) {
-	std::cerr << "executing: " << a[0] << std::endl;
-	id_t pid = fork();
-
-	if (pid == -1) {
-			//TODO : NO EXPECTIOMS
-			throw std::runtime_error("Fork failed: " + std::string(std::strerror(errno)));
-	}
-	if (pid != 0) {
-			int status;
-			waitpid(pid, &status, 0);
-
-			if (WIFEXITED(status))
-					return WEXITSTATUS(status);
-
-			return -1;
-	}
-
-	execve(a[0], a.data(), envp);
-	std::cerr << "Error executing command: " << a[0] << " " << std::strerror(errno) << std::endl;
-	exit(EXIT_FAILURE);
-	return 0;
-}
-
-
-/* class aliases {
-	private:
-		class alias_record {
-			const size_t _id;
-			std::string _value;
-			public:
-				alias_record(size_t id, const std::string value) :  _id(id), _value(value) {}
-				void update_value(const std::string value) { _value = value; }
-				size_t id() const { return  _id; }
-				const std::string value() const { return  _value; }
-		};
-private:
-		std::unordered_map<std::string_view, alias_record> _aliases;
-
-	public:
-		aliases() {
-			_aliases.reserve(100);
-		}
-
-		void add(std::string_view key, std::string value) {
-			if (auto it = _aliases.find(key); it != _aliases.end())
-				it->second.update_value(value);
-			else
-				_aliases.emplace(key, _aliases.size(), value);
-		}
-
-		size_t count()  {
-			return  _aliases.size();
-		}
-
-		const std::string& find_alias(std::string_view key) {
-		std::bitset<sizeof(size_t)> a;
-			auto m = a[0];
-			if (auto s = _aliases.find(key); s != _aliases.end()) {
-				s->second;
-			}
-			return std::nullopt;
-		}
-};*/
 
 
 #include <replxx.h>
 
 
-#include "lolcat.h"
+#include "ui/lolcat.h"
 
 void print_lesh(double gradient = 0.6) {
 	std::stringstream ss;
@@ -299,23 +129,222 @@ private:
 	ZshParserPlus::Parser& _parser;
 };
 
+namespace {
+
+// The strangler seam (issue #8, ADR-0002).
+//
+// Both front ends are compiled in and chosen at runtime, so neither rots while
+// the other is being worked on - a compile-time switch guarantees the idle one
+// breaks silently. Selection is by environment rather than a flag because POSIX
+// constrains argv, and because it lets the differential harness compare the two
+// by spawning the same binary twice with LESH_FRONTEND set differently.
+//
+// Parity is measured against the reference shell, not against the legacy parser:
+// legacy is wrong in known ways, and bug-compatibility would be the wrong target.
+// Legacy's score is the baseline to beat.
+enum class front_end { legacy, next };
+
+front_end select_front_end() {
+	const char* choice = std::getenv("LESH_FRONTEND");
+	if (choice == nullptr || *choice == '\0' || std::string_view{choice} == "legacy")
+		return front_end::legacy;
+	if (std::string_view{choice} == "next")
+		return front_end::next;
+	std::fprintf(stderr, "lesh: LESH_FRONTEND must be 'legacy' or 'next', got '%s'\n", choice);
+	std::exit(2);
+}
+
+// One command line, from whatever source. Returns its exit status.
+// `exit` is still matched here as a string rather than being a real built-in;
+// that moves when the executor gains proper built-in dispatch.
+int run_line(ZshParserPlus::Parser& parser, std::string& line, bool& should_exit, int& last_status) {
+	if (line.empty())
+		return last_status;
+	if (line == "exit") {
+		should_exit = true;
+		return last_status;
+	}
+	last_status = parser.parse_and_execute(line);
+	return last_status;
+}
+
+// Feed a script line by line.
+//
+// NOTE: this reads through a buffered stream, so a script that itself consumes
+// stdin cannot see what the shell has already buffered ahead. POSIX requires a
+// script to be consumed incrementally for exactly that reason. Fixing it needs a
+// read(2)-based input source, which belongs with the lexer's input model rather
+// than here.
+int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
+	std::string line;
+	bool should_exit = false;
+	int last_status = 0;
+	while (!should_exit && std::getline(in, line))
+		run_line(parser, line, should_exit, last_status);
+	return last_status;
+}
+
+[[noreturn]] void usage_error(const char* message, const char* operand = nullptr) {
+	if (operand != nullptr)
+		std::fprintf(stderr, "lesh: %s: %s\n", message, operand);
+	else
+		std::fprintf(stderr, "lesh: %s\n", message);
+	std::fprintf(stderr,
+	             "usage: lesh [-abCefhimnsuvx] [-o option]... "
+	             "[-c command | script] [args...]\n");
+	// POSIX: a shell that cannot parse its own invocation exits >0; 2 is the
+	// conventional choice, matching a syntax error.
+	std::exit(2);
+}
+
+} // namespace
+
+// Runs input through the replacement front end: read, parse, execute, one
+// complete command at a time.
+//
+// The read loop lives in the executor, not here: it owns the trees, and a
+// function defined by one command is a node in the tree that command was parsed
+// from. See tree_walking_executor::run_input.
+//
+// `echo_when_verbose` is false for `-c`: POSIX makes `set -v` a property of
+// reading INPUT, and dash prints nothing for `dash -v -c 'echo hi'`.
+int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state,
+                       bool echo_when_verbose = true,
+                       lesh::runtime::script_input* input = nullptr) {
+	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
+	lesh::runtime::tree_walking_executor executor{pool, state};
+	return executor.run_input(source, echo_when_verbose, input);
+}
+
+// Reads a whole stream. The bytes are still slurped up front - stdin is drained
+// so `read` can share the descriptor with the script (#31) - but they are PARSED
+// one command at a time, which is what makes an alias defined on one line take
+// effect on the next.
+//
+// Slurping is no longer visible to anything else on a SEEKABLE input: the read
+// loop hands the descriptor back at each command boundary, so what the shell
+// holds in memory and what the file offset says are two different questions
+// (#67, and see runtime::script_input).
+std::string read_all(std::istream& in) {
+	std::string out;
+	std::string line;
+	while (std::getline(in, line)) {
+		out += line;
+		out += '\n';
+	}
+	return out;
+}
+
 int main(int argc, char **argv, char **envp) {
-	_hint_callback_results.reserve(10);
+	const bool use_next = select_front_end() == front_end::next;
+
+	// Command-line parsing lives in runtime/invocation.h, not here: main() cannot
+	// be unit-tested, and getting this wrong silently gated 3,600 conformance
+	// assertions (issue #33).
+	const lesh::runtime::invocation inv = lesh::runtime::parse_invocation(argc, argv);
+	if (inv.error != nullptr)
+		usage_error(inv.error, inv.error_operand);
+
+	const char* const command_string = inv.command_string;
+	const char* const script_path = inv.script_path;
+	const int i = inv.first_argument;
+
+	// POSIX: interactive means -i, or no operands with both stdin and stderr
+	// attached to a terminal. Everything user-facing hangs off this one decision
+	// rather than off separate ad-hoc checks. `+i` says NOT interactive explicitly,
+	// which is why the flag is a tri-state rather than a bool.
+	const bool interactive = inv.interactive.value_or(
+		!command_string && !script_path && isatty(STDIN_FILENO) && isatty(STDERR_FILENO));
+
 	setenv("TERM", "xterm-256color", 1);
 
-
-	int exit_code = -1;
-	// Flush after every std::cout / std:cerr
+	// Flush after every std::cout / std::cerr
 	std::cout << std::unitbuf;
 	std::cerr << std::unitbuf;
 
+	// The new front end is chosen BEFORE any legacy object is built. Constructing
+	// the legacy parser first ran init_aliases(), whose strdup'd text is
+	// deliberately never freed (see SimpleParsingState) - so a `next` run reported
+	// 14 bytes leaked from a front end it was not even using. ADR-0007 expects
+	// exactly zero.
+	if (use_next) {
+		// The new front end handles every non-interactive form. Interactive is the
+		// line editor's business and stays on legacy until Phase 4.
+		lesh::runtime::shell_state next_state;
+		next_state.set_interactive(interactive);
+		next_state.opts() = inv.options;
+		// $0. With -c the operand after the command string is the command name, not
+		// the first positional parameter - which is why first_argument is past it.
+		// parse_invocation falls back to argv[0] when no operand names $0, so this
+		// is set for every real invocation and shell_state's literal default never
+		// reaches a running shell (issue #43). The guard is for an empty argv, not
+		// for an ordinary one.
+		if (inv.command_name != nullptr)
+			next_state.set_script_name(inv.command_name);
+		std::vector<std::string> args;
+		for (int a = i; a < argc; ++a)
+			args.emplace_back(argv[a]);
+		next_state.set_positional(std::move(args));
+
+		if (command_string)
+			// `-c` does not echo under `set -v`; see run_next_front_end.
+			return run_next_front_end(command_string, next_state, false);
+		if (script_path) {
+			std::ifstream script{script_path};
+			if (!script) {
+				std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
+				return 127;
+			}
+			const std::string source = read_all(script);
+			return run_next_front_end(source, next_state);
+		}
+		// `-i` with input that is not a terminal is an ordinary POSIX invocation:
+		// interactive is about SEMANTICS - which signals are fatal, whether an error
+		// exits - not about line editing. There is nothing to edit when the input is
+		// a file, so only a terminal needs the editor lesh does not have yet.
+		//
+		// Refusing it outright cost 1,800 conformance assertions: ten of the signal
+		// files run the shell under test as `sh -i` with the case piped in.
+		if (!interactive || !isatty(STDIN_FILENO)) {
+			// Bound BEFORE a byte is read: what it records is where the script
+			// begins, and read_all drains the descriptor to EOF on the next line.
+			// A pipe or a terminal leaves it inert and nothing below changes (#67).
+			lesh::runtime::script_input input{STDIN_FILENO};
+			const std::string source = read_all(std::cin);
+			return run_next_front_end(source, next_state, true, &input);
+		}
+		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
+		return 2;
+	}
+
 	lesh_state state {std::filesystem::current_path(), envp};
-
-	print_lesh();
-
-
 	auto zsh_parser = ZshParserPlus::Parser(state);
 	zsh_parser.init_aliases();
+
+
+	if (command_string) {
+		std::string line{command_string};
+		bool should_exit = false;
+		int last_status = 0;
+		return run_line(zsh_parser, line, should_exit, last_status);
+	}
+
+	if (script_path) {
+		std::ifstream script{script_path};
+		if (!script) {
+			std::fprintf(stderr, "lesh: %s: cannot open\n", script_path);
+			return 127;
+		}
+		return run_stream(zsh_parser, script);
+	}
+
+	if (!interactive)
+		return run_stream(zsh_parser, std::cin);
+
+	// Interactive from here down. The banner, the prompt, history and replxx
+	// itself all belong to this branch and must never touch a pipe or a script.
+	_hint_callback_results.reserve(10);
+	print_lesh();
 
 	replxx::Replxx rx;
 	rx.bind_key_internal(replxx::Replxx::KEY::UP,  "history_previous");
@@ -326,64 +355,25 @@ int main(int argc, char **argv, char **envp) {
 	rx.set_max_hint_rows(1);
 	std::string history_file = ".lesh_history";
 	rx.history_load(history_file);
-	std::vector<const char*> p = {"mitko"};
-	const char* p2[] = {"mitko", nullptr};
 
-	/*
-	// Lua shit!
-	auto lua_a = lesh_lua_api(state, zsh_parser);
-	auto lua_env = sol::environment(lua, sol::create);
-	lua_a.init(lua, lua_env);
-	{
-		// auto lua_rc = lua.load_file("leshrc.lua");
-		auto lua_rc = lua.script_file("leshrc.lua", lua_env, [](lua_State*, sol::protected_function_result pfr) {
-			std::cerr << sol::error(pfr).what() << std::endl;
-			return pfr;
-		});
-		if (!lua_rc.valid()) {
-			sol::error err{lua_rc};
-			std::cerr << err.what() << std::endl;
-		}
-		auto f = lua_env.get<std::optional<sol::function>>("show");
-		if (f.has_value()) {
-			f.value()(sol::as_args(p2));
-		}
-		lua.script("show('hello')", lua_env);
-	}
-	*/
-
-
-
-	while(true) {
-		std::string dbg ="mi t";
-		zsh_parser.parse_and_execute(dbg);
-		// display the prompt and retrieve input from the user
+	int last_status = 0;
+	bool should_exit = false;
+	while (!should_exit) {
 		char const* cinput{ nullptr };
-		// break;
-
 		do {
 			cinput = rx.input(state.pmt());
-		} while ( ( cinput == nullptr ) && ( errno == EAGAIN ) );
+		} while ((cinput == nullptr) && (errno == EAGAIN));
 
-		if (cinput == nullptr) {
+		if (cinput == nullptr)
 			break;
-		}
 
-		// TODO: prevent copy
 		std::string input = {cinput};
-
 		if (input.empty())
 			continue;
 		rx.history_add(cinput);
-
-		if (input == "exit") {
-			exit_code = 0;
-			break;
-		}
-
-		zsh_parser.parse_and_execute(input);
+		run_line(zsh_parser, input, should_exit, last_status);
 	}
 
 	rx.history_sync(history_file);
-	return exit_code;
+	return last_status;
 }

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
-#include <utils.h>
-#include <zsh_parser_plus.h>
+#include "legacy/shell_state.h"
+#include "legacy/zsh_parser_plus.h"
 
 // fixture
 class LeshStateTests : public::testing::Test {
@@ -16,7 +16,7 @@ TEST_F(LeshStateTests, HomeDirExtraction) {
 	EXPECT_EQ("users/lesh", state.home());
 }
 
-TEST_F(LeshStateTests, EnvVarExtration) {
+TEST_F(LeshStateTests, EnvVarExtraction) {
 	std::string_view envv;
 	auto there = state.try_get_env("ENV", envv);
 	EXPECT_EQ(there, true);

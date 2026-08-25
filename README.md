@@ -18,24 +18,58 @@ J88"
 :"
 ```
 
-## NOTES:
+A POSIX shell, built from scratch in C++23 as a systems-craft exercise.
 
-- https://zsh.sourceforge.io/Doc/Release/Prompt-Expansion.html#Prompt-Expansion - implement
-- https://github.com/AmokHuginnsson/replxx - read line but done right
-- https://edw.is/using-lua-with-cpp/ - future lua integration
-- https://github.com/rothgar/mastering-zsh/blob/master/docs/helpers/aliases.md - important regarding aliases
-- Bash performs the expansion by executing command and replacing the command substitution with the standard output of the command, with any  trailing  newlines  deleted.
+Allocation discipline, data layout, and latency are treated as correctness properties
+rather than optimizations. POSIX conformance is the scoreboard that keeps that honest.
+Nobody has to use lesh for it to have succeeded.
 
-## TODOS:
+## Status
 
-### Command parsing:
+Early, and openly incomplete. What works today: pipelines, aliases, quoting, command
+substitution, brace expansion, and scalar/array/map variables, behind a replxx-based
+line editor with history.
 
-- [X] pipes ( ```ls -lA | grep R```)
-- [X] aliases
-- [ ] respect brackets (' or ")
-  - [X] basic brackets support
-  - [X] partial expansion support ( mi'tko' and 'mi'tko )
-  - [ ] Support escaping inside brackets
-- [ ] full subshell support with partial expanding ie: ```mi$(echo ko)```
-- [ ] list expansion : ```mi{tko,la,rovene} -> mitko, mila, mirovene```
+What does not work yet: control flow, functions, here-documents, field splitting,
+pathname expansion, and most of parameter expansion. The single-pass parser that got
+lesh this far is being replaced — see
+[ADR-0002](docs/adr/0002-separate-stages-replace-single-pass-parser.md) for why.
 
+## What it is aiming at
+
+- **Full POSIX sh conformance** as the language floor, with a curated zsh-inspired
+  layer on top admitted one feature at a time.
+- **Its own line editor.** replxx is a stopgap behind an interface, expected to be
+  deleted rather than extended.
+- **A plugin API** in LuaJIT, over a flat C capability surface its FFI consumes directly.
+- **One self-contained binary.** Everything vendored and statically linked; no runtime
+  shared-library dependencies.
+
+## Documentation
+
+| Document | What it holds |
+|---|---|
+| [`CONTEXT.md`](CONTEXT.md) | The glossary. What the project's words mean, and which ones to avoid. |
+| [Scope and architecture](docs/superpowers/specs/2026-08-20-lesh-scope-design.md) | Scope boundaries, binding constraints, subsystem contracts, verification strategy, roadmap. |
+| [`docs/adr/`](docs/adr/) | The decisions with teeth, and why they were made. |
+
+Planned work lives on the issue tracker, not in this file. The current effort is
+charted as a [wayfinder map](https://github.com/nanov/lesh/issues/1); its open child
+issues are the decisions still to be made.
+
+## Building
+
+```sh
+git submodule update --init --recursive
+cmake -B build
+cmake --build build -j8
+./build/lesh
+```
+
+Tests: `./build/lesh_tests`
+
+## Reading
+
+- [zsh prompt expansion](https://zsh.sourceforge.io/Doc/Release/Prompt-Expansion.html#Prompt-Expansion)
+- [replxx](https://github.com/AmokHuginnsson/replxx) — line editing, done right
+- [mastering-zsh on aliases](https://github.com/rothgar/mastering-zsh/blob/master/docs/helpers/aliases.md)

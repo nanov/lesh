@@ -59,3 +59,27 @@ compile_commands.json
 .lesh_history
 
 
+
+# Serena tool state
+.serena/
+
+# yash suite scratch, regenerated on every run. The tmp.NNN directories are
+# per-test working copies the suite creates and cleans up itself - they were
+# committed once because a run was in flight when third_party/ was added.
+third_party/yash-tests/*.trs
+third_party/yash-tests/tmp.*/
+
+# Scratch a shell test leaves in the repo root. A snippet run with the repo as its
+# working directory creates directories named after whatever it failed to expand -
+# `for`, `in`, `do`, `;`, `[%s]` and friends turned up as twelve EMPTY directories,
+# which `git status` cannot see, which is how they survived. Ignoring them is not
+# enough on its own: prefer running probes under `tools/probe.py`, which works in a
+# temporary directory for exactly this reason.
+a:~root
+tmp.h
+
+# Personal, machine-specific Claude Code settings (absolute paths, account identity)
+.claude/settings.local.json
+.envrc
+.direnv/
+.claude/worktrees/
