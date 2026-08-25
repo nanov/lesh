@@ -647,6 +647,54 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				_field_started = true;
 			} break;
 
+			case token_kind::seg_dollar_single_quoted: {
+				// `$'...'` - ANSI-C quoting. THIS is where the decoded bytes live, and
+				// choosing here was the design question of #75.
+				//
+				// The decoded text is not in the source: `$'a\nb'` spans six bytes and
+				// means three, one of which is a newline that was never typed. The
+				// obvious home was tree::add_text_region, which exists precisely so a
+				// token can point at bytes that are not the input - but a region needs
+				// an OWNER that outlives the tree, and alias text has one (shell_state,
+				// ADR-0007) only because an alias is a named thing the shell already
+				// keeps. A decoded word is nobody's: it would have to be allocated per
+				// word, kept until the tree died, and freed by something - which is a
+				// lifetime the lexer cannot have, since it owns no memory.
+				//
+				// And a region would be answering the wrong question. A region gives a
+				// TOKEN somewhere real to point, for offsets, diagnostics and $LINENO.
+				// This token already points at real typed text, exactly where the user
+				// wrote it; only its VALUE differs from its spelling - which is true of
+				// every segment here. `'x'` spans three bytes and means one, `${x}`
+				// spans four and means whatever x holds. Turning spelling into value is
+				// what expansion IS, and the expander is already building the field in
+				// an arena buffer it owns, so a decoded byte is written exactly where a
+				// literal one would be and costs no allocation of its own.
+				//
+				// Quoting: the bytes go through append_quoted, which is where
+				// seg_single_quoted already sends its interior - so "not field-split"
+				// and "not pathname-expanded" both fall out of reusing that path. No
+				// new expand_context property and no new caller were needed, which is
+				// the question #42 and #54 leave open for anything that looks like a
+				// quoting form: #42 split the flag into six properties, #54 found the
+				// missing piece was a caller. Here it was neither.
+				if (body.size() >= 3) {
+					const std::string_view inner = body.substr(2, body.size() - 3);
+					for (size_t i = 0; i < inner.size();) {
+						const syntax::ansi_c_step step = syntax::decode_ansi_c_escape(inner, i);
+						if (step.truncates)
+							break;  // a NUL ends the string, as in bash
+						for (uint8_t k = 0; k < step.count; ++k) {
+							const char decoded = static_cast<char>(step.bytes[k]);
+							append_quoted(std::string_view(&decoded, 1), ctx);
+						}
+						i += step.consumed;
+					}
+				}
+				// An empty `$''` still starts a field, exactly as `''` does.
+				_field_started = true;
+			} break;
+
 			case token_kind::seg_double_quoted: {
 				// Expansion happens inside, field splitting does not - but whether a
 				// FIELD LIST is being built is the enclosing context's business, so

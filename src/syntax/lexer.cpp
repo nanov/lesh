@@ -107,6 +107,40 @@ bool here_doc_delimiter_matches(std::string_view raw, std::string_view line) noe
 			r += 2;
 			continue;
 		}
+		// `$'...'` is one more spelling of a QUOTED delimiter, beside `\END`,
+		// `'END'` and `"END"` - so `<<$'E\x4ED'` ends the body at a line reading
+		// `END` and the body is not expanded. bash and zsh both do this.
+		//
+		// Compared as it decodes, one step at a time, because this function exists
+		// to compare WITHOUT a buffer: it runs once per line of every here-document
+		// and has no business allocating to answer a question about equality.
+		if (c == '$' && r + 1 < raw.size() && raw[r + 1] == '\'') {
+			size_t b = r + 2;
+			for (;;) {
+				if (b >= raw.size())
+					return false;  // unterminated: it cannot match anything
+				if (raw[b] == '\'') {
+					r = b + 1;
+					break;
+				}
+				// `raw` itself is the body: the closing quote is found by the loop
+				// rather than bounded up front, and an escape that swallows the quote
+				// simply carries the scan past it to the `b >= raw.size()` above -
+				// which is what `$'a\'` should do, since it never closes.
+				const ansi_c_step step = decode_ansi_c_escape(raw, b);
+				if (step.truncates)
+					// A NUL ends the delimiter's VALUE, so nothing after it can
+					// contribute and the line must already be fully matched.
+					return l == line.size();
+				for (uint8_t i = 0; i < step.count; ++i) {
+					if (l >= line.size() || static_cast<uint8_t>(line[l]) != step.bytes[i])
+						return false;
+					++l;
+				}
+				b += step.consumed;
+			}
+			continue;
+		}
 		if (c == '\'') {
 			// Single quotes: everything up to the next one is literal, backslash
 			// included. An unterminated quote cannot match anything.
@@ -159,6 +193,153 @@ bool here_doc_delimiter_matches(std::string_view raw, std::string_view line) noe
 		++l;
 	}
 	return l == line.size();
+}
+
+ansi_c_step decode_ansi_c_escape(std::string_view body, size_t at) noexcept {
+	ansi_c_step step;
+	auto one = [&](uint8_t b, uint8_t used) {
+		// A decoded NUL ends the string rather than being emitted. Every escape that
+		// can produce zero - `\0`, `\x00`, an octal run that overflows a byte, and
+		// `\c@` - arrives here, so they get one answer in one place.
+		step.consumed = used;
+		if (b == 0) {
+			step.truncates = true;
+			return step;
+		}
+		step.bytes[0] = b;
+		step.count = 1;
+		return step;
+	};
+	auto two = [&](uint8_t a, uint8_t b) {
+		step.bytes[0] = a;
+		step.bytes[1] = b;
+		step.count = 2;
+		step.consumed = 2;
+		return step;
+	};
+
+	const auto c = static_cast<uint8_t>(body[at]);
+	// A trailing backslash escapes nothing: it is the last byte of the value, not
+	// the start of a step that reads past the end.
+	if (c != '\\' || at + 1 >= body.size())
+		return one(c, 1);
+
+	const auto e = static_cast<uint8_t>(body[at + 1]);
+	switch (e) {
+		case 'a': return one(0x07, 2);
+		case 'b': return one(0x08, 2);
+		case 'f': return one(0x0c, 2);
+		case 'n': return one(0x0a, 2);
+		case 'r': return one(0x0d, 2);
+		case 't': return one(0x09, 2);
+		case 'v': return one(0x0b, 2);
+		case '\\': return one('\\', 2);
+		case '\'': return one('\'', 2);
+		case '"': return one('"', 2);
+		// `\e` and `\E` are ESC. They are NOT in POSIX Issue 8's list of escapes,
+		// and this was left out on that reading until quote-p.tst:402 - the single
+		// assertion #75 exists to move - turned out to REQUIRE it: its expected
+		// bytes carry 033 for `\e`, and bash and zsh both produce it. A set the
+		// ticket's own measure rejects is the wrong set, so `\e` is in.
+		case 'e': case 'E': return one(0x1b, 2);
+		default: break;
+	}
+
+	// `\xHH`: at most TWO hex digits, which is what keeps it a BYTE escape -
+	// `\x414243` is 0x41 followed by the four text bytes `4243` in bash and zsh
+	// alike, not a wide character. One digit is enough, and the digits are
+	// case-insensitive though the `x` is not: `\XA` is not an escape.
+	if (e == 'x') {
+		// Through scan_digits, the one numeric reader the project has (#62, #63),
+		// rather than a hex table beside it. The DIGIT COUNT is expressed by handing
+		// it a bounded substring rather than by counting: scan_digits reads a run and
+		// stops at the first non-digit, so a two-byte window is exactly "at most two
+		// digits" - which is what leaves `4243` as text in `\x414243`.
+		const lesh::digit_run run = lesh::scan_digits(body.substr(at + 2, 2), 16, 0xff);
+		// No digit at all means this was never an escape. bash keeps both bytes,
+		// zsh emits a NUL; keeping them is the rule an unrecognised escape follows
+		// below, so there is ONE rule for "not an escape after all" and not two.
+		if (run.consumed == 0)
+			return two('\\', 'x');
+		return one(static_cast<uint8_t>(run.value), static_cast<uint8_t>(2 + run.consumed));
+	}
+
+	// `\NNN`: at most THREE octal digits. POSIX Issue 8 spells the escape `\0nnn`,
+	// which reads as a mandatory zero PLUS three digits - and no shell implements
+	// that. bash and zsh both take up to three digits with the leading zero merely
+	// one of them, so `\101` is 'A' and `\0101` is 0x08 followed by the text `1`.
+	// Two shells agreeing against a literal reading of the draft is the stronger
+	// evidence, so this is what they do. The value is masked to a byte, which is
+	// where `\400` becomes NUL and truncates.
+	if (e >= '0' && e <= '7') {
+		// A three-byte window, for the same reason: three octal digits at most. The
+		// limit is 0777 rather than 0377 because three digits CAN exceed a byte and
+		// the excess is masked rather than refused - `\400` is the NUL that
+		// truncates, which is bash's answer, and clamping at 0377 would have made it
+		// 0xff instead.
+		const lesh::digit_run run = lesh::scan_digits(body.substr(at + 1, 3), 8, 0777);
+		return one(static_cast<uint8_t>(run.value & 0xff),
+		           static_cast<uint8_t>(1 + run.consumed));
+	}
+
+	// `\cX`: toupper(X) XOR 0x40, which is why `\cA` and `\ca` are both 001, `\c?`
+	// is 0177 and `\c@` is the NUL that truncates. zsh does NOT implement `\cX` at
+	// all - it prints a literal `cA` - so this follows bash and POSIX Issue 8
+	// against zsh rather than with it. A `\c` at the very end is not an escape.
+	if (e == 'c') {
+		if (at + 2 >= body.size())
+			return two('\\', 'c');
+		auto x = static_cast<uint8_t>(body[at + 2]);
+		uint8_t used = 3;
+		// The character `\c` applies to is itself read as an escape first, so
+		// control-backslash is spelled `\c\\` and takes FOUR bytes. This is where
+		// lesh and BASH part company, deliberately: bash takes the raw byte after
+		// `\c`, so it reads `\c\` as control-backslash and then has `\c?` left over
+		// as three stray bytes - and it FAILS quote-p.tst:402 for exactly that,
+		// producing `1c 5c 63 3f` where the suite expects `1c 7f`. yash's reading is
+		// taken instead, for two reasons: it is what the POSIX conformance suite
+		// asserts, and it is the only one under which control-backslash can be
+		// written at all - under bash's there is no unambiguous spelling of it.
+		// zsh does not implement `\cX` and so casts no vote.
+		if (x == '\\' && at + 3 < body.size() && body[at + 3] == '\\') {
+			x = '\\';
+			used = 4;
+		}
+		if (x >= 'a' && x <= 'z')
+			x = static_cast<uint8_t>(x - ('a' - 'A'));
+		return one(static_cast<uint8_t>(x ^ 0x40), used);
+	}
+
+	// Anything else is not an escape and KEEPS ITS BACKSLASH, as in bash; zsh
+	// drops it. `\e`, `\u`, `\U` and `\E` reach here deliberately: they are bash
+	// extensions rather than POSIX Issue 8 escapes, and this implements the
+	// standard's set. A backslash-newline reaches here too - it is NOT a line
+	// continuation inside `$'...'`, so both bytes survive, which is again bash's
+	// answer and the one that falls out of having a single rule.
+	return two('\\', e);
+}
+
+uint32_t lexer::skip_dollar_single_quote(uint32_t at, bool* terminated) const noexcept {
+	if (terminated != nullptr)
+		*terminated = false;
+	uint32_t p = at + 2;  // past the `$` and the opening quote
+	while (p < _source.size() && _source[p] != '\'') {
+		// A backslash consumes the next byte for DELIMITING purposes whatever it
+		// turns out to mean, which is what makes `\'` not close the construct. This
+		// is the one way the extent differs from a plain `'...'`, and it is why
+		// three scans call this instead of the single-quote one.
+		if (_source[p] == '\\' && p + 1 < _source.size()) {
+			p += 2;
+			continue;
+		}
+		++p;
+	}
+	if (p < _source.size()) {
+		if (terminated != nullptr)
+			*terminated = true;
+		return p + 1;
+	}
+	return p;
 }
 
 uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
@@ -246,6 +427,10 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 	} else if (first == '`') {
 		open('`', 1, /*single_is_ordinary=*/false);
 	} else if (first == '$') {
+		// `$'...'` when a single quote is a quote here - the same run the loop below
+		// recognises, reached when a caller hands this function the `$` itself.
+		if (char_at(p + 1) == '\'' && !inside_double_quotes)
+			return skip_dollar_single_quote(p, terminated);
 		// The brace or paren may be separated from the `$` by line continuations,
 		// which POSIX removed before tokenising. Missing that returned `at`
 		// unchanged, and a caller that assigns the result to its own cursor then
@@ -315,6 +500,14 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 		}
 		if (c == '$') {
 			const uint32_t after_dollar = past_continuations(p + 1);
+			// `$'...'` is one quoted run, and a `}`, `)` or backquote inside it
+			// closes nothing. Without this the `'` below would open a plain
+			// single-quoted run, which ends at the quote in `\'` - so `${x-$'}'}`
+			// closed at the wrong brace and `$(echo $')')` at the wrong paren.
+			if (char_at(p + 1) == '\'' && !cur.ordinary_single) {
+				p = skip_dollar_single_quote(p);
+				continue;
+			}
 			if (char_at(after_dollar) == '{') {
 				p = after_dollar;
 				open('}', 1, cur.ordinary_single);
@@ -655,6 +848,22 @@ token lexer::lex_word(lex_mode mode) noexcept {
 		// Past line continuations, for the same reason the segment scan is: `(` is a
 		// word TERMINATOR, so `echo $\<newline>(\<newline>(1+2))` ended the word at
 		// the paren and parsed as a subshell.
+		// `$'...'` is part of the word, and its interior is DATA: a blank in it does
+		// not separate words, a newline does not end the command, and an operator
+		// byte is not an operator. Reaching the `'` handler above instead would end
+		// the run at the quote inside `\'` and split `$'a\'b c'` at the blank.
+		if (c == '$' && char_at(_position + 1) == '\'') {
+			literal = false;
+			const uint32_t opened_at = _position;
+			bool closed = false;
+			_position = skip_dollar_single_quote(opened_at, &closed);
+			if (!closed) {
+				_incomplete = true;
+				return finish(token_error::unterminated_single_quote, opened_at);
+			}
+			continue;
+		}
+
 		if (c == '$' && char_at(past_continuations(_position + 1)) == '{') {
 			literal = false;
 			const uint32_t opened_at = _position;
@@ -871,6 +1080,29 @@ token lexer::lex_word_segment(lex_mode mode) noexcept {
 		const uint32_t at_next = past_continuations(_position + 1);
 		const uint32_t at_next2 = past_continuations(at_next + 1);
 		const char next = char_at(at_next);
+		// `$'...'` - ANSI-C quoting. Recognised only where a single quote is a
+		// QUOTE: inside double quotes and in a here-document body it is an ordinary
+		// byte, so `"$'a\n'"` is literal text there, exactly as in bash and zsh.
+		// Guarded on the `$` and the quote being ADJACENT rather than looked at past
+		// continuations, because `$\<newline>'x'` is a lone dollar followed by an
+		// ordinary quoted run in bash - the construct is spelled with two characters
+		// and not with two tokens.
+		if (next == '\'' && !quotes_are_bytes && at_next == _position + 1) {
+			bool closed = false;
+			_position = skip_dollar_single_quote(start, &closed);
+			if (!closed) {
+				// Incomplete AND defective, the same pair an unterminated `'...'`
+				// carries: more input could finish it, and as it stands the word must
+				// not run. It reuses that error rather than adding one, because the
+				// diagnostic says "unterminated quoted string" either way and a second
+				// spelling of the same phrase is what token.h's error_phrase exists to
+				// prevent.
+				_incomplete = true;
+				return finish(token_kind::seg_dollar_single_quoted,
+				              token_error::unterminated_single_quote, start);
+			}
+			return finish(token_kind::seg_dollar_single_quoted);
+		}
 		// The three expansions below report the same defect the command-mode scan
 		// reports, on the same construct. Saying it in only one of the two scans is
 		// what let `echo $(` through: the word carried no error, so the tree the

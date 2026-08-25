@@ -564,3 +564,133 @@ TEST(Lexer, ADigitRunTooLargeToBeAFileDescriptorIsNotAnIoNumber) {
 	EXPECT_EQ(kinds_of("4294967298>x"), reads_as_a_word);
 	EXPECT_EQ(kinds_of("99999999999999999999>x"), reads_as_a_word);
 }
+
+// --- $'...' : ANSI-C quoting (#75) ------------------------------------------
+//
+// The lexer's whole job here is to DELIMIT the construct. It decodes nothing:
+// the decoded bytes are not in the source, and the lexer owns no memory. What
+// it has to get right is the extent, and the extent is not a single-quoted
+// run's - a backslash escapes the closing quote.
+
+TEST(LexerDollarSingleQuote, IsItsOwnSegmentKind) {
+	lexer lx{"$'a'"};
+	const token t = lx.next(lex_mode::word_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_dollar_single_quoted);
+	EXPECT_EQ(t.length, 4u) << "the `$` and both quotes belong to the segment";
+	EXPECT_EQ(t.error, token_error::none);
+}
+
+TEST(LexerDollarSingleQuote, AnEscapedQuoteDoesNotEndIt) {
+	// The reason this cannot reuse the single-quote scan: in `'...'` a backslash
+	// is an ordinary byte, so a scan for the next `'` would stop at the one in
+	// `\'` and leave `b'` outside the word.
+	lexer lx{"$'a\\'b'"};
+	const token t = lx.next(lex_mode::word_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_dollar_single_quoted);
+	EXPECT_EQ(t.length, 7u);
+	EXPECT_EQ(lx.text(t), "$'a\\'b'");
+}
+
+TEST(LexerDollarSingleQuote, ABlankInsideDoesNotEndTheWord) {
+	// The word-extent scan is a separate code path from the segment scan, and it
+	// has to know the construct too: a blank inside `$'a b'` is data, and a
+	// newline inside it is data as well.
+	EXPECT_EQ(kinds_of("echo $'a b'"),
+	          (std::vector{token_kind::word, token_kind::word}));
+	EXPECT_EQ(lex_all("echo $'a b'")[1].text, "$'a b'");
+	EXPECT_EQ(lex_all("echo $'a\nb'")[1].text, "$'a\nb'")
+		<< "a literal newline inside is data, not a command separator";
+	EXPECT_EQ(lex_all("echo x$'a b'y")[1].text, "x$'a b'y")
+		<< "it joins the word it is part of";
+	EXPECT_EQ(lex_all("echo $'a\\'b c'")[1].text, "$'a\\'b c'")
+		<< "the word scan honours the escape too, or the word would split at `b`";
+}
+
+TEST(LexerDollarSingleQuote, AnOperatorInsideIsData) {
+	// `$'|'` is a word, not a pipe. The word scan reaches the `|` only if it
+	// failed to step over the construct.
+	EXPECT_EQ(kinds_of("echo $'|;&'"),
+	          (std::vector{token_kind::word, token_kind::word}));
+	EXPECT_EQ(lex_all("echo $'|;&'")[1].text, "$'|;&'");
+}
+
+TEST(LexerDollarSingleQuote, UnterminatedIsBothIncompleteAndDefective) {
+	// The same shape as an unterminated `'...'`: more input could finish it, AND
+	// as it stands the word must not run. `echo $'abc` printed an empty line at
+	// status 0 before either channel was set.
+	lexer lx{"$'abc"};
+	const token t = lx.next(lex_mode::word_interior);
+	EXPECT_EQ(t.kind, token_kind::seg_dollar_single_quoted);
+	EXPECT_EQ(t.error, token_error::unterminated_single_quote);
+	EXPECT_TRUE(lx.incomplete());
+
+	lexer word{"$'abc"};
+	const token w = word.next(lex_mode::command);
+	EXPECT_EQ(w.error, token_error::unterminated_single_quote);
+	EXPECT_TRUE(word.incomplete());
+}
+
+TEST(LexerDollarSingleQuote, ATrailingBackslashDoesNotReadPastTheEnd) {
+	// `$'a\` ends with the backslash consuming a byte that is not there.
+	lexer lx{"$'a\\"};
+	const token t = lx.next(lex_mode::word_interior);
+	EXPECT_EQ(t.error, token_error::unterminated_single_quote);
+	EXPECT_TRUE(lx.incomplete());
+	EXPECT_EQ(t.length, 4u) << "the whole remaining input, and not a byte more";
+}
+
+TEST(LexerDollarSingleQuote, IsNotSpecialInsideDoubleQuotesOrAHereDocumentBody) {
+	// A single quote is an ordinary byte in both, so there is no `$'...'` to
+	// recognise - `"$'a\nb'"` is literal text in bash and zsh alike.
+	lexer dq{"$'a'"};
+	EXPECT_EQ(dq.next(lex_mode::double_quote_interior).kind, token_kind::seg_literal)
+		<< "inside double quotes the `$` is a lone dollar and the quotes are bytes";
+	lexer body{"$'a'"};
+	EXPECT_EQ(body.next(lex_mode::here_doc_body).kind, token_kind::seg_literal);
+}
+
+TEST(LexerDollarSingleQuote, ADollarQuoteInsideBracesDoesNotEndTheExpansion) {
+	// The brace counter steps over quoted runs so a `}` inside one closes
+	// nothing. `$'...'` is such a run, and a `}` in it is data.
+	EXPECT_EQ(lex_all("echo ${x-$'}'}")[1].text, "${x-$'}'}");
+	EXPECT_EQ(lex_all("echo $(echo $')')")[1].text, "$(echo $')')")
+		<< "and a paren in one does not close a command substitution";
+}
+
+TEST(LexerDollarSingleQuote, ADollarNotFollowedByAQuoteIsUnchanged) {
+	// The guard is narrow on purpose: `$x`, `${x}` and a lone `$` all still lex
+	// the way they did.
+	lexer p{"$x"};
+	EXPECT_EQ(p.next(lex_mode::word_interior).kind, token_kind::seg_parameter);
+	lexer lone{"$ "};
+	EXPECT_EQ(lone.next(lex_mode::word_interior).kind, token_kind::seg_literal);
+}
+
+TEST(LexerDollarSingleQuote, TheWordIsNotFlaggedLiteral) {
+	// flag_literal promises expansion and quote removal are provably no-ops, and
+	// a `$'...'` word is neither. `$` was already in the set that clears it; this
+	// asserts it rather than assuming it, because the flag is the expander's
+	// licence to skip the word entirely.
+	lexer lx{"$'a\\nb'"};
+	const token t = lx.next(lex_mode::command);
+	EXPECT_EQ(t.flags & flag_literal, 0);
+}
+
+// --- a here-document delimiter may be spelled $'...' too ---------------------
+
+TEST(HereDocDelimiter, DollarSingleQuoteIsDecodedAndQuotes) {
+	// POSIX applies quote removal to the delimiter word, and `$'...'` is one more
+	// spelling of a quoted one beside `\END`, `'END'` and `"END"`. bash and zsh
+	// both decode it.
+	EXPECT_TRUE(here_doc_delimiter_matches("$'END'", "END"));
+	EXPECT_TRUE(here_doc_delimiter_matches("$'E\\x4ED'", "END"));
+	EXPECT_TRUE(here_doc_delimiter_matches("$'E\\116D'", "END"));
+	EXPECT_TRUE(here_doc_delimiter_matches("$'a\\tb'", "a\tb"));
+	EXPECT_FALSE(here_doc_delimiter_matches("$'E\\x4ED'", "E\\x4ED"))
+		<< "the undecoded spelling must NOT match, or the body would never end";
+	EXPECT_FALSE(here_doc_delimiter_matches("$'END'", "ENDX"));
+	EXPECT_FALSE(here_doc_delimiter_matches("$'END", "END"))
+		<< "an unterminated one cannot match anything";
+	EXPECT_TRUE(here_doc_delimiter_matches("x$'E'y", "xEy"))
+		<< "and it composes with the rest of the word";
+}

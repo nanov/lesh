@@ -1102,3 +1102,164 @@ TEST_F(ExpanderTest, APositionalIndexTooLargeToBeOneIsUnsetRatherThanWrapped) {
 	EXPECT_EQ(expand("echo [${2}]"), (std::vector<std::string>{"echo", "[b]"}));
 	EXPECT_EQ(expand("echo [${4}]"), (std::vector<std::string>{"echo", "[]"}));
 }
+
+// --- $'...' : the decoding, which is the EXPANDER's job (#75) ---------------
+//
+// Where the decoded bytes live is the whole design question, and the answer is
+// "here". The lexer delimits and owns nothing; the expander already builds every
+// field into an arena buffer it owns, so a decoded byte is written exactly where
+// a literal byte would be and costs no allocation of its own. See the note in
+// expand_text's seg_dollar_single_quoted case.
+
+TEST_F(ExpanderTest, DollarSingleQuoteDecodesTheNamedEscapes) {
+	EXPECT_EQ(expand("echo $'a\\nb'"), (std::vector<std::string>{"echo", "a\nb"}));
+	EXPECT_EQ(expand("echo $'a\\tb'"), (std::vector<std::string>{"echo", "a\tb"}));
+	EXPECT_EQ(expand("echo $'\\a\\b\\f\\n\\r\\t\\v'"),
+	          (std::vector<std::string>{"echo", "\a\b\f\n\r\t\v"}));
+	EXPECT_EQ(expand("echo $'a\\\\b'"), (std::vector<std::string>{"echo", "a\\b"}));
+	EXPECT_EQ(expand("echo $'a\\'b'"), (std::vector<std::string>{"echo", "a'b"}));
+	EXPECT_EQ(expand("echo $'a\\\"b'"), (std::vector<std::string>{"echo", "a\"b"}));
+	EXPECT_EQ(expand("echo $'plain'"), (std::vector<std::string>{"echo", "plain"}));
+	EXPECT_EQ(expand("echo $''"), (std::vector<std::string>{"echo", ""}))
+		<< "an empty one still produces a field, exactly as '' does";
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteDecodesControlEscapes) {
+	// `\cX` is toupper(X) XOR 0x40, which is why `\cA` and `\ca` agree and `\c?`
+	// is DEL. zsh does not implement `\cX` at all; this follows bash and POSIX
+	// Issue 8.
+	EXPECT_EQ(expand("echo $'\\cA'"), (std::vector<std::string>{"echo", "\x01"}));
+	EXPECT_EQ(expand("echo $'\\ca'"), (std::vector<std::string>{"echo", "\x01"}));
+	EXPECT_EQ(expand("echo $'\\cM'"), (std::vector<std::string>{"echo", "\r"}));
+	EXPECT_EQ(expand("echo $'\\c?'"), (std::vector<std::string>{"echo", "\x7f"}));
+	EXPECT_EQ(expand("echo $'\\c^'"), (std::vector<std::string>{"echo", "\x1e"}));
+	EXPECT_EQ(expand("echo $'a\\c'"), (std::vector<std::string>{"echo", "a\\c"}))
+		<< "a `\\c` with nothing after it is not an escape";
+	// `\e` and `\E` are ESC. Not in POSIX Issue 8's list, and left out on that
+	// reading until quote-p.tst:402 - the assertion this ticket exists to move -
+	// turned out to require it. bash and zsh both produce 033 as well.
+	EXPECT_EQ(expand("echo $'\\e'"), (std::vector<std::string>{"echo", "\x1b"}));
+	EXPECT_EQ(expand("echo $'\\E'"), (std::vector<std::string>{"echo", "\x1b"}));
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteControlEscapeReadsItsArgumentAsAnEscape) {
+	// The character `\c` applies to is itself unescaped first, so
+	// control-backslash is `\c\\` and takes four bytes - leaving a following
+	// `\c?` intact.
+	//
+	// THIS IS A DELIBERATE DIFFERENCE FROM BASH, which takes the raw byte after
+	// `\c` and therefore prints `\c?` as three stray bytes here. bash FAILS
+	// quote-p.tst:402 for exactly this; yash's reading is the one the POSIX
+	// conformance suite asserts, and the only one under which control-backslash
+	// has an unambiguous spelling at all. zsh implements no `\cX` and casts no
+	// vote.
+	EXPECT_EQ(expand("echo $'\\cA\\ca\\c^\\c\\\\\\c?'"),
+	          (std::vector<std::string>{"echo", "\x01\x01\x1e\x1c\x7f"}));
+	EXPECT_EQ(expand("echo $'\\c\\\\'"), (std::vector<std::string>{"echo", "\x1c"}));
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteHexTakesAtMostTwoDigits) {
+	// `\x414243` is the byte 0x41 and then the TEXT `4243`, in bash and zsh
+	// alike - two digits at most, which is what keeps it a byte escape.
+	EXPECT_EQ(expand("echo $'\\x41'"), (std::vector<std::string>{"echo", "A"}));
+	EXPECT_EQ(expand("echo $'\\x4'"), (std::vector<std::string>{"echo", "\x04"}));
+	EXPECT_EQ(expand("echo $'\\xaF'"), (std::vector<std::string>{"echo", "\xaf"}));
+	EXPECT_EQ(expand("echo $'\\x414243'"), (std::vector<std::string>{"echo", "A4243"}));
+	// An incomplete `\x` keeps both bytes, which is bash's answer and the same
+	// rule an unrecognised escape follows. zsh emits a NUL here instead.
+	EXPECT_EQ(expand("echo $'\\xZ'"), (std::vector<std::string>{"echo", "\\xZ"}));
+	EXPECT_EQ(expand("echo $'a\\x'"), (std::vector<std::string>{"echo", "a\\x"}));
+	EXPECT_EQ(expand("echo $'\\XA'"), (std::vector<std::string>{"echo", "\\XA"}))
+		<< "an uppercase X is not the escape at all";
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteOctalTakesAtMostThreeDigits) {
+	// POSIX Issue 8 spells it `\0nnn`, which reads as a zero plus three digits.
+	// No shell implements that: bash AND zsh both take up to three octal digits
+	// after the backslash with the leading zero merely one of them, so `\0101` is
+	// 0x08 followed by the text `1`. Two shells agreeing beats a literal reading
+	// of the draft.
+	EXPECT_EQ(expand("echo $'\\101'"), (std::vector<std::string>{"echo", "A"}));
+	EXPECT_EQ(expand("echo $'\\0101'"), (std::vector<std::string>{"echo", "\b1"}));
+	EXPECT_EQ(expand("echo $'\\0377'"), (std::vector<std::string>{"echo", "\x1f" "7"}));
+	EXPECT_EQ(expand("echo $'\\377'"), (std::vector<std::string>{"echo", "\xff"}));
+	EXPECT_EQ(expand("echo $'\\7'"), (std::vector<std::string>{"echo", "\a"}));
+	EXPECT_EQ(expand("echo $'\\08'"), (std::vector<std::string>{"echo", ""}))
+		<< "`\\0` is the value zero, which truncates - `8` is not an octal digit";
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteTruncatesAtANulByte) {
+	// bash truncates; zsh embeds the NUL. lesh follows bash, because a field here
+	// is a view into an arena: an embedded NUL survives inside the shell and is
+	// then truncated by execve on the way out, so the same word would mean one
+	// thing to a builtin and another to an external command. Truncating at decode
+	// is the honest version of a limit that exists either way.
+	EXPECT_EQ(expand("echo $'a\\0bc'"), (std::vector<std::string>{"echo", "a"}));
+	EXPECT_EQ(expand("echo $'a\\x00bc'"), (std::vector<std::string>{"echo", "a"}));
+	EXPECT_EQ(expand("echo $'\\400'"), (std::vector<std::string>{"echo", ""}))
+		<< "an octal escape that overflows a byte to zero truncates too";
+	EXPECT_EQ(expand("echo $'x\\c@y'"), (std::vector<std::string>{"echo", "x"}));
+	// Truncation ends THE SEGMENT's contribution and nothing more - the word goes
+	// on. Measured against bash rather than assumed: the first guess here was that
+	// the whole word ended, and bash prints `xay`.
+	EXPECT_EQ(expand("echo x$'a\\0b'y"), (std::vector<std::string>{"echo", "xay"}));
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteKeepsAnUnrecognisedEscape) {
+	// bash keeps the backslash, zsh drops it. Keeping it is the rule an
+	// incomplete `\x` already follows, so there is one rule and not two.
+	EXPECT_EQ(expand("echo $'a\\qb'"), (std::vector<std::string>{"echo", "a\\qb"}));
+	// `\u` and `\U` are the escapes actually left out. They name a CODE POINT
+	// rather than a byte, so implementing them means choosing an encoding, and
+	// every other escape here is a byte escape that needs no such choice.
+	// quote-p.tst does not ask for them and neither does POSIX Issue 8.
+	EXPECT_EQ(expand("echo $'\\u0041'"), (std::vector<std::string>{"echo", "\\u0041"}));
+	EXPECT_EQ(expand("echo $'\\U00000041'"),
+	          (std::vector<std::string>{"echo", "\\U00000041"}));
+	// A backslash-newline is not a line continuation in here either: it is an
+	// unrecognised escape like any other and both bytes survive, as in bash.
+	EXPECT_EQ(expand("echo $'a\\\nb'"), (std::vector<std::string>{"echo", "a\\\nb"}));
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteIsAQuotingForm) {
+	// Not field-split and not pathname-expanded, exactly like '...'. This needed
+	// no new expand_context property and no new caller: the decoded bytes go
+	// through append_quoted, which is where seg_single_quoted already sends its
+	// interior, so both treatments fall out of reusing that path (#42, #54).
+	params.separators = " \t\n";
+	EXPECT_EQ(expand("echo $'a b'"), (std::vector<std::string>{"echo", "a b"}))
+		<< "one field, though the decoded bytes hold an IFS blank";
+	EXPECT_EQ(expand("echo $'a\\tb'"), (std::vector<std::string>{"echo", "a\tb"}))
+		<< "and a DECODED separator does not split either - the interesting half";
+	EXPECT_EQ(expand("echo $'*'"), (std::vector<std::string>{"echo", "*"}))
+		<< "a decoded metacharacter is data, so no pathname expansion is attempted";
+	EXPECT_EQ(expand("echo $'\\x2a'"), (std::vector<std::string>{"echo", "*"}));
+	EXPECT_EQ(expand("echo x$'a\\nb'y"), (std::vector<std::string>{"echo", "xa\nby"}))
+		<< "it joins the word around it rather than becoming a word of its own";
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteInAPatternKeepsItsQuoting) {
+	// The pattern side of the same property: quoting inside a pattern is
+	// TRANSLATED into backslash escapes rather than removed, so `$'*'` matches an
+	// asterisk and nothing else. If the decoding lost the quoting this would
+	// wildcard, and `case abc in $'*')` would match.
+	EXPECT_EQ(patterns("case x in $'*') ;; esac"),
+	          (std::vector<std::string>{"\\*"}));
+	EXPECT_EQ(patterns("case x in $'\\x2a') ;; esac"),
+	          (std::vector<std::string>{"\\*"}))
+		<< "a metacharacter arriving from an ESCAPE is data too";
+	EXPECT_EQ(patterns("case x in $'a\\tb') ;; esac"),
+	          (std::vector<std::string>{"a\tb"}))
+		<< "an ordinary decoded byte needs no escape and gets none";
+	EXPECT_EQ(patterns("case x in $'a'*) ;; esac"),
+	          (std::vector<std::string>{"a*"}))
+		<< "an UNQUOTED metacharacter beside it still wildcards";
+}
+
+TEST_F(ExpanderTest, DollarSingleQuoteIsLiteralInsideDoubleQuotes) {
+	// A single quote is an ordinary byte inside double quotes, so there is no
+	// construct to recognise - `"$'a\nb'"` is seven literal bytes in bash and
+	// zsh alike, and the same rule that makes `echo "it's"` print `it's`.
+	EXPECT_EQ(expand("echo \"$'a\\nb'\""),
+	          (std::vector<std::string>{"echo", "$'a\\nb'"}));
+}

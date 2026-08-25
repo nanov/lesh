@@ -129,6 +129,23 @@ private:
 	[[nodiscard]] uint32_t skip_quoted_or_expansion(
 		uint32_t at, bool inside_double_quotes = false,
 		bool* terminated = nullptr) const noexcept;
+	// Advances past a `$'...'` beginning at `at`, returning the position just after
+	// the closing quote - or the end of the input when it never closes, which
+	// `terminated` reports.
+	//
+	// `at` must be the `$`. The caller has already established that a `'` follows
+	// it and that a single quote is a QUOTE in this context; inside double quotes
+	// and in a here-document body it is an ordinary byte, so there is no construct
+	// there to step over at all.
+	//
+	// Its own helper because THREE scans need the same extent and none of them can
+	// borrow the single-quote one: in `'...'` a backslash is an ordinary byte, so a
+	// scan for the next `'` stops at the one in `\'`. The word scan would then end
+	// `$'a\'b c'` at `b` and split the word; the brace counter would let a `}`
+	// inside escape; the segment scan would emit a short token. One escape rule in
+	// one place is what keeps those three agreeing.
+	[[nodiscard]] uint32_t skip_dollar_single_quote(uint32_t at,
+	                                                bool* terminated = nullptr) const noexcept;
 	// True where a word could begin, which is where a `#` opens a comment.
 	[[nodiscard]] bool starts_a_word(uint32_t p, uint32_t begin) const noexcept;
 	// True where a COMMAND could begin, which is where `case` and `esac` are
@@ -170,6 +187,37 @@ private:
 // handed text the scan already ruled out.
 [[nodiscard]] bool here_doc_delimiter_matches(std::string_view raw,
                                               std::string_view line) noexcept;
+
+// ONE STEP of `$'...'` decoding: what the bytes at `at` mean, and how many of
+// them the step used.
+//
+// Returned rather than written, because the two callers have nowhere in common to
+// write TO. The expander appends into the arena buffer it is already building the
+// field in - which is the answer to where the decoded bytes live, since they are
+// not in the source and the lexer owns no memory (#75) - while
+// here_doc_delimiter_matches compares against a line and needs no buffer at all.
+// A shared decoder that allocated would force a buffer on the comparison, and two
+// copies of the escape table would drift the moment one grew an escape.
+//
+// At most TWO bytes out, because the widest thing a step yields is an
+// UNRECOGNISED escape, which keeps both of its bytes: `\q` is `\q` as in bash,
+// where zsh would give `q`. That is also what an incomplete `\x` does.
+struct ansi_c_step {
+	uint8_t bytes[2] = {0, 0};
+	uint8_t count = 0;      // how many of `bytes` are output
+	uint8_t consumed = 0;   // source bytes the step used; never 0, so a loop ends
+	// The decoded byte is NUL, so the STRING ENDS HERE and `count` is 0. bash
+	// truncates at a NUL and zsh embeds one; lesh follows bash, because a field is
+	// a view into an arena and an embedded NUL would survive inside the shell only
+	// to be truncated by execve on the way to an external command - the same word
+	// meaning one thing to a builtin and another to /bin/cat. Truncating at decode
+	// is the honest version of a limit that exists either way.
+	bool truncates = false;
+};
+
+// `body` is the text BETWEEN the quotes, `at` an index into it. Never returns a
+// zero `consumed`.
+[[nodiscard]] ansi_c_step decode_ansi_c_escape(std::string_view body, size_t at) noexcept;
 
 // True for bytes that end an unquoted word in command position.
 [[nodiscard]] constexpr bool is_word_terminator(char c) noexcept {

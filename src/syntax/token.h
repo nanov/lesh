@@ -46,6 +46,13 @@ enum class token_kind : uint16_t {
 	// parser for its line editor.
 	seg_literal,        // plain bytes, possibly containing backslash escapes
 	seg_single_quoted,  // '...' - no expansion inside, ever
+	// $'...' - ANSI-C quoting (POSIX.1-2024). Quoted like '...', but its escapes
+	// are DECODED, and the decoded bytes are not in the source text. That is the
+	// whole reason it is its own kind rather than a flag on seg_single_quoted: the
+	// lexer only delimits it - a backslash escapes the closing quote, which is
+	// already an extent `'...'` does not have - and the expander does the decoding
+	// as it writes the field, where the bytes have somewhere to live (#75).
+	seg_dollar_single_quoted,
 	seg_double_quoted,  // "..." - expansion inside, but no field splitting
 	seg_parameter,      // $name or ${...}
 	seg_command_sub,    // $(...) or `...`
