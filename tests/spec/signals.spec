@@ -400,3 +400,25 @@ echo before; trap '' INT 2>/dev/null <./_lesh_no_such_file_; echo notreached
 
 --- and a redirection failure on a REGULAR builtin still does not [xfail(legacy): legacy has no redirections]
 echo before; kill -l 2>/dev/null <./_lesh_no_such_file_; echo "st=$?"; echo reached
+
+# WHEN A PENDING TRAP ACTION RUNS, and it is between COMMANDS wherever the
+# commands are being read from. #52 put that in run_parsed, which is the top
+# level; `eval` and `.` read their own input through a second loop that did not
+# do it, so a trap set and raised inside one ran only once the construct had
+# ended. Nothing chose that, and nothing could see it until #67 had a command
+# substitution read its body through the same loop - at which point fifteen
+# signal files each lost three assertions. dash and bash both run the action in
+# place.
+
+--- a trap raised inside eval runs between eval's own commands [xfail(legacy): legacy has no trap builtin]
+eval 'trap "echo trapped" USR1
+kill -s USR1 $$
+echo after'
+
+--- a trap raised inside a dot script runs between the script's own commands [xfail(legacy): legacy has no trap builtin]
+d=$(mktemp -d); printf 'trap "echo trapped" USR1\nkill -s USR1 $$\necho after\n' > $d/lib; . $d/lib
+
+--- a trap raised inside a command substitution runs between the body's commands [xfail(legacy): legacy has no command substitution]
+x=$(trap 'echo trapped' USR1
+"$TESTEE" -c 'kill -s USR1 $PPID'
+echo after); echo "[$x]"

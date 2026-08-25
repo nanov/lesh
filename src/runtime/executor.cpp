@@ -1450,8 +1450,20 @@ int tree_walking_executor::run_source(std::string_view source, bool echo_as_read
 		for (uint32_t i = 0; i < program.children_count; ++i) {
 			status = run_node(parsed, parsed.child_of(program, i));
 			_state.set_last_status(status);
-			if (_flow != control_flow::normal || _exit_requested)
-				return status;
+			// BETWEEN commands, exactly as at the top level. A signal that arrives
+			// while an `eval` or a dot script is running has a trap action that is due
+			// NOW, not once the script ends: `. lib` where lib traps a signal and then
+			// sends it printed `after` and only then the trap body, where dash and bash
+			// both print the body first. run_parsed has done this since #52 and this
+			// loop never did, which is a difference nobody chose. It stayed invisible
+			// because only `eval` and `.` read through here; the moment a command
+			// substitution's body did too (#67), it cost fifteen signal files three
+			// assertions each.
+			run_pending_traps();
+			// The status is re-read rather than kept, for the reason run_parsed gives:
+			// when a TRAP BODY exited, the status the caller sees is the body's.
+			if (_exit_requested || _flow != control_flow::normal)
+				return _state.last_status();
 		}
 	}
 	return status;
