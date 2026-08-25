@@ -14,13 +14,15 @@ Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/
 
 ## Model tiers
 
-Owner's standing directive, repo-wide: **implementation task tickets are
-dispatched to subagents on faster/cheaper models** — Sonnet-class for
-implementation, Haiku-class for mechanical sweeps. The ticket brief plus the
-spec index is a task agent's whole context; briefs are written for that.
-Grilling, charting, review and merge judgment stay on the orchestrating
-session's model. A task agent that hits a genuine design question stops and
-returns it to the tracker rather than deciding on a cheap tier.
+Owner's standing directive, repo-wide: implementation task tickets are
+dispatched to subagents, and **Opus-class is the gate for implementation**.
+Drop to Sonnet-class only when the ticket is really clear — every decision
+made, the brief precise, nothing left to interpret; Haiku-class only for
+mechanical sweeps. The ticket brief plus the spec index is a task agent's
+whole context; briefs are written for that. Grilling, charting, review and
+merge judgment stay on the orchestrating session's model. A task agent that
+hits a genuine design question stops and returns it to the tracker rather
+than deciding on a cheaper tier.
 
 ## Measuring
 
