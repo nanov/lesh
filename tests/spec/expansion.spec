@@ -375,3 +375,30 @@ HOME=/foo; export "A"=~:~; a='x y'; export "B=$a"; printf '[%s][%s]\n' "$A" "$B"
 
 --- an ordinary utility's NAME=value argument is still a command argument [xfail(legacy): legacy has no field splitting]
 a='x y'; printf '[%s]\n' A=$a
+
+# yash's tilde-p.tst expects `~/foo` under HOME=/ to collapse to /foo, and `~/~`
+# under HOME=/foo/bar/ to give /foo/bar/~. POSIX 2.6.1 replaces the tilde-prefix
+# with the VALUE of HOME and says nothing about the slash that follows it, so the
+# doubled slash is literally what the rule produces. dash answers as lesh does,
+# and so does zsh: yash is the shell NORMALISING, and normalising is the change
+# that would need an argument, not keeping the replacement literal.
+#
+# Three of tilde-p.tst's assertions therefore stay unpassed by choice rather than
+# by omission. This is a plain case and not a `[divergence: ...]`: lesh and dash
+# agree, and a divergence case is the form for the one thing the differential
+# principle cannot express - lesh answering differently from its reference shell.
+# What the case pins is that neither shell's answer drifts, and that a later
+# reading of the suite does not mistake these three for a gap.
+#
+# The normalisation is not merely cosmetic and the counter-argument is recorded
+# rather than dismissed: POSIX leaves a pathname beginning with exactly two
+# slashes implementation-defined, so `//foo` may name something `/foo` does not.
+# That argues for collapsing at the point a PATHNAME is resolved, where the rule
+# would apply to every doubled slash however it arose, not inside tilde expansion,
+# where it would make one expansion's output disagree with the value of HOME it
+# was told to substitute.
+
+--- a tilde prefix is replaced by HOME exactly, doubled slash and all [xfail(legacy): legacy has no tilde expansion]
+HOME=/foo/bar/; printf '[%s][%s]\n' ~ ~/~
+HOME=/; printf '[%s][%s]\n' ~ ~/foo
+HOME=//; printf '[%s][%s]\n' ~ ~/foo
