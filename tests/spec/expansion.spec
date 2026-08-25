@@ -489,3 +489,266 @@ echo $((1<<2))
 echo $(echo $((1<<2)))
 echo $(( (1<<2) + 3 ))
 echo $(case a in a) echo $((1<<3));; esac)
+
+# --- $'...' : ANSI-C quoting (#75) -------------------------------------------
+#
+# EVERY case below is a divergence, and for one reason: dash has no `$'...'` at
+# all. It parses `$'a\nb'` as the parameter `$a` followed by the literal text
+# `\nb`, so it cannot be the expectation of a single one of them - the whole
+# content of the decision is that lesh answers differently.
+#
+# It is NOT the `;&`/`pipefail` shape of divergence, where lesh stands with the
+# standard against dash's age. Two things separate it:
+#
+#   - bash, zsh and yash all implement `$'...'`. Three shells to one, rather
+#     than lesh alone.
+#   - lesh used to fail it WORSE than dash. dash mis-parses and runs on; lesh
+#     raised `syntax error: unterminated quoted string` and refused the whole
+#     line. A script using `$'...'` ran (wrongly) under dash and did not run at
+#     all here. Refusing to parse an increasingly common construct is a worse
+#     answer than any of the four shells gives, which is the argument for
+#     implementing it rather than recording a gap.
+#
+# So the expectations below are BASH's, measured rather than remembered - with
+# exactly one deliberate exception, marked where it appears (`\e`).
+
+--- $'...' decodes the escapes POSIX Issue 8 names [divergence: dash has no $'...' and reads `$'\t'` as the parameter `$` followed by `\t`; bash, zsh and yash all decode it, and these are bash's bytes]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'plain'
+h $'\a\b\f\n\r\t\v'
+h $'a\\b'
+h $'a\'b'
+h $'a\"b'
+h $'\cA'
+h $'\ca'
+h $'\cM'
+h $'\c?'
+h $'\e'
+h $'\E'
+=== expect
+706c61696e.
+07080c0a0d090b.
+615c62.
+612762.
+612262.
+01.
+01.
+0d.
+7f.
+1b.
+1b.
+
+# `\cX` is `toupper(X) XOR 0x40`, which is why `\cA` and `\ca` are both 001 and
+# `\c?` is 0177. zsh does NOT implement `\cX` - it prints a literal `cA` - so
+# this one follows bash and POSIX Issue 8 against zsh rather than with it.
+#
+# `\e` and `\E` are NOT in POSIX Issue 8's list, and were left out on that
+# reading until quote-p.tst:402 - the one assertion this work exists to move -
+# turned out to require 033 for `\e`. A set the ticket's own measure rejects is
+# the wrong set. bash and zsh both agree with the suite here.
+
+--- $'\cX' reads its argument as an escape, so control-backslash is $'\c\\' [divergence: dash has no $'...'; this is also a deliberate difference from BASH, which fails quote-p.tst:402 for it - see below]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'\cA\ca\c^\c\\\c?'
+h $'\c\\'
+h $'a\c'
+=== expect
+01011e1c7f.
+1c.
+615c63.
+
+# These are quote-p.tst:402's own bytes, and the reason this is not simply
+# "follow bash": BASH FAILS THAT ASSERTION. It takes the RAW byte after `\c`, so
+# it reads `\c\` as control-backslash and is then left with `\c?` as three stray
+# bytes - `1c 5c 63 3f` where the suite expects `1c 7f`. Measured, both shells,
+# same machine.
+#
+# yash's reading is taken instead. The character `\c` applies to is itself
+# unescaped first, so control-backslash is spelled `\c\\` and takes four bytes.
+# Two reasons: it is what the POSIX conformance suite asserts, and it is the
+# only reading under which control-backslash has an unambiguous spelling at all.
+# zsh implements no `\cX` whatever and casts no vote.
+#
+# A `\c` with nothing after it is not an escape and keeps both bytes.
+
+--- $'\xHH' takes at most two hex digits and an incomplete one keeps its backslash [divergence: dash has no $'...'; bash's bytes, and zsh disagrees with bash on the incomplete form - see the comment below]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'\x41'
+h $'\x4'
+h $'\xaF'
+h $'\x414243'
+h $'\xZ'
+h $'a\x'
+h $'\XA'
+=== expect
+41.
+04.
+af.
+4134323433.
+5c785a.
+615c78.
+5c5841.
+
+# Two digits at most, which is what makes `\x414243` the byte 0x41 followed by
+# the four TEXT bytes `4243` and not a wide character. One digit is enough.
+# Case-insensitive in the digits, but `\X` is not an escape at all.
+#
+# An incomplete `\x` - no hex digit after it - is where bash and zsh part
+# company: bash keeps the two bytes `\x`, zsh emits a NUL. Bash's rule is the
+# one an unrecognised escape already follows below, so taking it keeps ONE rule
+# for "this was not an escape after all" instead of two.
+
+--- $'\0NNN' takes at most three octal digits, the leading zero among them [divergence: dash has no $'...'; bash and zsh agree exactly here, and these are their bytes]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'\101'
+h $'\0101'
+h $'\0377'
+h $'\377'
+h $'\7'
+=== expect
+41.
+0831.
+1f37.
+ff.
+07.
+
+# POSIX Issue 8 spells the escape `\0nnn`, which reads as a mandatory zero plus
+# three digits. It is not what any shell implements, and the difference is
+# visible: `\0101` is 0x08 followed by the text `1` in bash AND zsh, not 'A'.
+# The rule both implement is up to THREE octal digits after the backslash, with
+# the leading zero merely one of them - so `\101` is 'A' and `\0101` is `\010`
+# then `1`. Two shells agreeing against a literal reading of the draft is the
+# stronger evidence, so lesh implements what they do.
+
+--- a NUL byte truncates the decoded string [divergence: dash has no $'...'; bash truncates and zsh embeds the NUL - lesh follows bash, for the reason below]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'a\0bc'
+h $'a\x00bc'
+h $'\400'
+h $'x\c@y'
+=== expect
+61.
+61.
+.
+78.
+
+# `\0`, `\x00`, an octal escape that overflows a byte to zero, and `\c@` all
+# reach the same place, so they get one answer.
+#
+# bash truncates the string there; zsh keeps the NUL as a byte. lesh follows
+# bash because the alternative is a lie it cannot sustain: a field here is a
+# view into an arena, so an embedded NUL survives inside the shell and is then
+# truncated by execve on the way to an external command - the same word would
+# mean one thing to a builtin and another to /bin/cat. Truncating at decode is
+# the honest version of a limit that exists either way.
+
+--- an unrecognised escape keeps its backslash [divergence: dash has no $'...'; bash keeps the backslash and zsh drops it - lesh follows bash]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h $'a\qb'
+h $'plain'
+h $'\u0041'
+h $'\U00000041'
+h $'a\
+b'
+=== expect
+615c7162.
+706c61696e.
+5c7530303431.
+5c553030303030303431.
+615c0a62.
+
+# `\q` is `\q`, both bytes, as in bash; zsh would print `aqb`.
+#
+# `\u` and `\U` ARE THE ESCAPES THIS DELIBERATELY LEAVES OUT, so they fall
+# through the rule above and keep their backslashes where bash and zsh would
+# both print `A`. They name a CODE POINT rather than a byte, so implementing
+# them means choosing an ENCODING, and every other escape here is a byte escape
+# that needs no such choice. Neither POSIX Issue 8 nor quote-p.tst asks for
+# them. Recorded as an assertion rather than a claim in a commit message, so
+# that adding them later is a visible change to these lines.
+#
+# `\e` was in this list until quote-p.tst:402 - the one assertion this work
+# exists to move - turned out to REQUIRE it, carrying 033 in its expected bytes.
+# It is implemented; see the escape-set case above.
+#
+# A backslash-newline is NOT a line continuation inside `$'...'`: it is an
+# unrecognised escape like any other, so both bytes survive. That is bash's
+# answer and it is the one that falls out of having a single rule.
+
+--- $'...' is a quoting form: its result is neither field-split nor pathname-expanded [divergence: dash has no $'...'; bash's answers]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+set -- $'a b' c; echo "fields=$#"
+set -- $''; echo "empty=$#"
+d=$(mktemp -d); cd "$d" && touch aa ab; echo $'*'; echo *
+h x$'a\nb'y
+=== expect
+fields=2
+empty=1
+*
+aa ab
+78610a6279.
+
+# The point of the last two lines: `echo $'*'` prints an asterisk in a directory
+# where `echo *` prints two filenames, so the quoting really did survive into
+# pathname expansion rather than the bytes merely happening to be safe. And an
+# empty `$''` still STARTS a field, exactly as `''` does.
+#
+# `x$'a\nb'y` is one word with a newline in the middle of it - the case that
+# proves the decoded bytes join the word they are part of rather than becoming a
+# word of their own.
+
+--- $'...' is not special inside double quotes [divergence: dash has no $'...'; bash and zsh agree that inside double quotes it is literal text]
+h() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; echo .; }
+h "$'a\nb'"
+h "x$'\t'y"
+=== expect
+2427615c6e6227.
+7824275c742779.
+
+# Seven bytes and nine bytes: the `$`, the quotes and the backslash all survive.
+# A single quote is an ordinary byte inside double quotes, so there is no
+# `$'...'` there to recognise - the same rule that makes `echo "it's"` print
+# `it's`, applied one layer up.
+
+--- $'...' works as a case pattern, quoting included [divergence: dash has no $'...'; bash's answers]
+case abc in $'*') echo literal;; *) echo wildcard;; esac
+case '*' in $'*') echo literal;; *) echo wildcard;; esac
+case $'a\tb' in $'a\x09b') echo match;; *) echo no;; esac
+case $'a\tb' in a?b) echo qmark;; *) echo no;; esac
+=== expect
+wildcard
+literal
+match
+qmark
+
+# `$'*'` is a literal asterisk in a pattern and matches only an asterisk, which
+# is the pattern-side proof that this is a QUOTING form and not merely a decoder
+# - if the quoting were lost the first line would print `literal`. The third
+# line spells the same tab two different ways on the two sides and still
+# matches; the fourth shows an unquoted `?` still wildcarding beside it.
+
+--- $'...' works as a here-document delimiter, and quotes the body [divergence: dash has no $'...'; bash and zsh both decode the delimiter and treat the body as quoted]
+x=VALUE
+cat <<$'E\x4ED'
+body $x
+END
+cat <<$'END'
+second $x
+END
+=== expect
+body $x
+second $x
+
+# `$'E\x4ED'` is the delimiter `END`, so the body ends at a line reading END -
+# POSIX applies quote removal to the delimiter word, and this is one more
+# spelling of it beside `<<\END`, `<<'END'` and `<<"END"`. Because the delimiter
+# is QUOTED the body is not expanded, so `$x` stays four literal bytes even
+# though x is set.
+
+--- an unterminated $'...' is a syntax error [divergence: dash has no $'...' and prints an empty line at status 0, having read `$'abc` as the parameter `$` and some text; bash and zsh both refuse it]
+echo $'abc
+=== expect [status: 2] [stderr]
+
+# lesh refused this before the feature existed, for the wrong reason - it could
+# not parse `$'` at all. It refuses it now for the right one, and the case
+# distinguishes them by asserting the status rather than merely the failure.
