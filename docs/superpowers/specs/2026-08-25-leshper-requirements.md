@@ -63,10 +63,10 @@ Two kinds of behavior, strictly separated:
 
 ### 2.3 Contracts required from lesh
 
-lesh (bash-like syntax) provides the lexer and parser. leshper consumes them and imposes these contracts:
+lesh (POSIX sh with a curated layer — ADR-0001) provides the lexer and parser. leshper consumes them and imposes these contracts:
 
 - **C-1 Tolerant parsing.** The parser MUST accept arbitrary input prefixes without bailing: every keystroke state is parseable. (fish: `TOK_ACCEPT_UNFINISHED` + `parse_util`; adopt the idea.)
-- **C-2 Tristate verdict.** For a given buffer the parser reports **complete** / **incomplete** / **invalid**, distinctly. Drives F-35: incomplete → newline and keep editing; complete → accept; invalid → accept and let execution report, or highlight the error (F-21) — never silently swallow. Bash-specific incompleteness that MUST be detected: unterminated heredoc, open quote/`$(`/`{`, dangling pipe or `&&`/`||`, unclosed `if`/`for`/`while`/`case`.
+- **C-2 Tristate verdict.** For a given buffer the parser reports **complete** / **incomplete** / **invalid**, distinctly. Drives F-35: incomplete → newline and keep editing; complete → accept; invalid → accept and let execution report, or highlight the error (F-21) — never silently swallow. Shell-language incompleteness that MUST be detected: unterminated heredoc, open quote/`$(`/`{`, dangling pipe or `&&`/`||`, unclosed `if`/`for`/`while`/`case`.
 - **C-3 Source ranges.** Lexer and parser MUST attribute every token and error to buffer ranges (offsets leshper can map to grapheme positions) — decorations (F-20/F-21) are placed by range; no ranges, no highlighting.
 - **C-4 Thread-safe on snapshots.** Parser and lexer MUST be callable from workers on an immutable buffer snapshot (pure function of input, no global parser state) — otherwise A-4/F-22 collapse back to synchronous highlighting.
 - **C-5 One grammar.** The parse that highlights (F-20), the parse that judges completeness (C-2), and the parse that executes are the same code. Divergence here is the bug class F-20 exists to prevent.
@@ -166,7 +166,7 @@ lesh (bash-like syntax) provides the lexer and parser. leshper consumes them and
 - **NG-1** Not a standalone library. No external API, no separate artifact.
 - **NG-2** No readline compatibility (API or `.inputrc`).
 - **NG-3** No editor-owned config file or format, ever. leshper is configured through lesh's configuration surface. When lesh gains an rc mechanism (zsh-style; likely Lua — deferred, §8), leshper settings ride it. leshper itself never parses config.
-- **NG-4** No leshper-invented scripting language. Extension languages are lesh script (bash-like; v1, F-14) and Lua (later, §8). Hard consequence **now**: the internal action/reactor registration ABI MUST be language-neutral — an action is a callable plus a state-access contract. The lesh binding (state as shell variables, F-14) is one binding of that ABI; the Lua binding (state as an object/table API, neovim-style) is another, added later without ABI change. Do not bake shell-variable injection into the ABI itself.
+- **NG-4** No leshper-invented scripting language. Extension languages are lesh script (the shell language; v1, F-14) and Lua (later, §8). Hard consequence **now**: the internal action/reactor registration ABI MUST be language-neutral — an action is a callable plus a state-access contract. The lesh binding (state as shell variables, F-14) is one binding of that ABI; the Lua binding (state as an object/table API, neovim-style) is another, added later without ABI change. Do not bake shell-variable injection into the ABI itself.
 - **NG-5** Candidate generation, history persistence, and prompt rendering live in lesh — as pluggable providers (A-13), not sealed built-ins. leshper consumes the interface, never the implementation.
 
 ---
