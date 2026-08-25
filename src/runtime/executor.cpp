@@ -31,6 +31,29 @@ using syntax::tree;
 
 namespace {
 
+// Puts the shell's idea of WHERE IT IS back when a nested source finishes (#76).
+//
+// An `eval`, a dot script and a trap body each read a source of their own, so
+// `$LINENO` and any diagnostic inside one count that source's lines - which is
+// what dash, bash and zsh all do for a dot script. What must not survive is the
+// pointer: the nested trees die with run_source, and an offset left pointing into
+// one would be measured against a buffer that is gone.
+//
+// RAII rather than a restore at the end of run_source, because that function
+// returns from inside its loop for every unwind an `eval` can take.
+class origin_guard {
+public:
+	explicit origin_guard(shell_state& state) noexcept
+		: _state(state), _saved(state.command_origin_now()) {}
+	~origin_guard() { _state.restore_command_origin(_saved); }
+	origin_guard(const origin_guard&) = delete;
+	origin_guard& operator=(const origin_guard&) = delete;
+
+private:
+	shell_state& _state;
+	shell_state::command_origin _saved;
+};
+
 // Turns a wait(2) status into the value POSIX defines for `$?`.
 int status_from_wait(int wait_status) noexcept {
 	if (WIFEXITED(wait_status))
@@ -1053,6 +1076,18 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 	// Cleared on the way IN so that whatever runs deepest decides. Only a
 	// short-circuited and-or list and a `!` pipeline set it, on the way out.
 	_status_tested = false;
+	// WHERE THE SHELL IS, for `$LINENO` and for every runtime diagnostic (#76).
+	//
+	// Set on the way IN and never restored, so the innermost command that started
+	// wins: `while ...; do echo $LINENO; done` reports the body's line, not the
+	// loop's, because the body ran later. That is what POSIX asks for - the line of
+	// the command CURRENTLY executing - and it is also why this is here rather than
+	// in run_simple_command: a compound command that fails in its own machinery,
+	// before any simple command inside it runs, still has a line to name.
+	//
+	// Two stores. The line itself is a scan, and it happens only when something
+	// asks - see shell_state::set_command_origin.
+	_state.set_command_origin(t, t.span_of(t[n]).offset);
 	switch (t[n].kind) {
 		case node_kind::simple_command: return run_simple_command(t, n);
 		case node_kind::pipeline:       return run_pipeline(t, n);
@@ -1429,6 +1464,9 @@ int tree_walking_executor::run_source(std::string_view source, bool echo_as_read
 	// stand while any of them runs: a function defined by one is a node in it.
 	buffer_pool nested{BUFFER_POOL_SIZE};
 	std::deque<tree> trees;
+	// The trees below die with this call, so where the shell says it is has to go
+	// back to the caller's source before they do. See origin_guard.
+	const origin_guard origin{_state};
 	// ZERO, not `$?`. POSIX gives both `eval` and `.` an exit status of zero when
 	// no command is executed, and starting from the caller's status reported the
 	// status of whatever ran BEFORE instead: `false; eval '' '' ''` reported 1 and

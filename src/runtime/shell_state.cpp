@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstring>
 #include <cstdlib>
 #include <string>
@@ -122,12 +123,13 @@ shell_state::shell_state() {
 	}
 
 	//
-	// LINENO is deliberately NOT here. It is not a constant to seed but a variable
-	// the shell must keep current as it reads, and a token's offset can land in an
-	// alias text region rather than in the input (#47), so the mapping from offset
-	// to line number is entangled with alias substitution. Seeding it with 1 would
-	// be a stub that succeeds: `echo $LINENO` on line 9 would print 1 and look
-	// implemented. lineno-p.tst stays 0/3 and says why.
+	// LINENO is still deliberately NOT here, and now for a reason it can be proud
+	// of rather than a deferral. It is not a constant to seed but a QUESTION about
+	// where the shell is, answered in lookup() from the offset of the command
+	// running - see set_command_origin. Seeding a value would need a write per
+	// command, and lineno-p.tst's third assertion says why that write cannot be a
+	// per-line counter: a multi-line expansion has to advance the number by the
+	// lines it spans, which only a lookup from an offset can do (#76).
 }
 
 shell_state::~shell_state() = default;
@@ -185,10 +187,39 @@ bool shell_state::lookup(std::string_view name, std::string_view& value) const {
 	// An entry that holds nothing but a readonly flag - `readonly x` on an unset x -
 	// is ABSENT to every reader: `${x-unset}` says unset in dash too, and reporting
 	// it as an empty string would make `set -u` accept it.
-	if (it == _vars.end() || !it->second.assigned)
-		return false;
-	value = it->second.value;
-	return true;
+	if (it != _vars.end() && it->second.assigned) {
+		value = it->second.value;
+		return true;
+	}
+	// `LINENO` LAST, so an explicit assignment wins (#76). POSIX says the shell
+	// sets it, not that the shell owns it, and dash agrees: `LINENO=99; echo
+	// $LINENO` prints 99. Answering it before the map would make the variable
+	// writable and the write invisible, which is worse than either answer.
+	//
+	// Answered HERE rather than seeded at startup because it is not a value, it is
+	// a QUESTION about where the shell is - see set_command_origin. Seeding it
+	// would need a write per command for a number almost no script reads, and the
+	// yash file's third assertion says why a per-line counter cannot be that write.
+	//
+	// Not in the map also means NOT EXPORTED, which is what dash does: `env` in a
+	// dash script lists no LINENO.
+	if (name == "LINENO") {
+		const uint32_t line = where().line;
+		// Zero means no command is running - startup, or the shell's own command
+		// line. POSIX leaves LINENO unspecified outside a script or function, and
+		// reporting ABSENT there is what lets `${LINENO-x}` say so.
+		if (line == 0)
+			return false;
+		const auto [end, ec] = std::to_chars(_lineno_digits.data(),
+		                                     _lineno_digits.data() + _lineno_digits.size(),
+		                                     line);
+		if (ec != std::errc{})
+			return false;
+		value = std::string_view{_lineno_digits.data(),
+		                         static_cast<size_t>(end - _lineno_digits.data())};
+		return true;
+	}
+	return false;
 }
 
 std::string_view shell_state::home_directory() const {

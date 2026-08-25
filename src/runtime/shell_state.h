@@ -3,6 +3,7 @@
 #include "runtime/expander.h"
 #include "runtime/signals.h"
 #include "syntax/parser.h"
+#include "syntax/source_map.h"
 #include "substrate/traits.h"
 
 #include <array>
@@ -207,6 +208,64 @@ public:
 	void set_script_name(std::string name) { _script_name = std::move(name); }
 	[[nodiscard]] std::string_view script_name() const noexcept { return _script_name; }
 
+	// --- where the shell is (#76) ----------------------------------------------
+	//
+	// WHICH COMMAND IS RUNNING, as a tree and a byte offset into it. `$LINENO`
+	// reads it, and so does every runtime diagnostic.
+	//
+	// AN OFFSET, NOT A LINE NUMBER, and that is the whole reason this is cheap
+	// enough to maintain per command: recording the offset is two stores, where
+	// recording the line would be a scan for a number almost no script ever reads.
+	// The scan happens when the number is ASKED FOR, which is when a script writes
+	// `$LINENO` or when the shell has already failed.
+	//
+	// The tree travels with the offset because a tree carries the SOURCE it was
+	// parsed from, and the shell runs trees from more than one: a function body
+	// belongs to the tree its definition was parsed from, and it may be called
+	// from inside an `eval` whose own source is a different string entirely.
+	// Keeping only an offset would measure a script offset against an eval string.
+	void set_command_origin(const syntax::tree& t, uint32_t offset) noexcept {
+		// The mapper is re-seated only when the SOURCE changes, so its memo survives
+		// a whole script. Comparing the data pointer rather than the text: two
+		// sources may hold equal bytes and still be different buffers.
+		if (_lines.source().data() != t.source().data())
+			_lines = syntax::source_map{t.source()};
+		_origin = &t;
+		_origin_offset = offset;
+	}
+
+	// Save and restore around a nested source - an `eval`, a dot script, a trap
+	// body. Returning the old value rather than keeping a stack: the nesting IS the
+	// C++ call stack, and a second stack would be a second thing to get wrong.
+	struct command_origin {
+		const syntax::tree* tree = nullptr;
+		uint32_t offset = 0;
+	};
+	[[nodiscard]] command_origin command_origin_now() const noexcept {
+		return {_origin, _origin_offset};
+	}
+	void restore_command_origin(const command_origin& saved) noexcept {
+		if (saved.tree != nullptr)
+			set_command_origin(*saved.tree, saved.offset);
+		else
+			_origin = nullptr;
+	}
+
+	// Where the running command sits in the text the user typed, as 1-based line
+	// and column. An offset inside an ALIAS BODY has no such place, so it resolves
+	// to the invocation site and the aliases crossed come back in `site`.
+	//
+	// Line zero means the shell is not running a command - startup, or a diagnostic
+	// about the command line itself. A caller printing a position must test it.
+	[[nodiscard]] syntax::source_position where(syntax::invocation_site* site = nullptr) const noexcept {
+		if (_origin == nullptr)
+			return {0, 0};
+		const syntax::invocation_site at = _origin->invocation_of(_origin_offset);
+		if (site != nullptr)
+			*site = at;
+		return _lines.at(at.offset);
+	}
+
 	// POSIX: `shift n` discards the first n, and is an error if n exceeds $#.
 	[[nodiscard]] bool shift_positional(size_t n);
 
@@ -389,6 +448,15 @@ private:
 	// this literal is never what a running shell reports. It WAS, for every
 	// invocation that named no command_file, which is issue #43.
 	std::string _script_name = "lesh";
+	// Where the running command begins. See set_command_origin.
+	const syntax::tree* _origin = nullptr;
+	uint32_t _origin_offset = 0;
+	syntax::source_map _lines{{}};
+	// `$LINENO`'s digits. A member because lookup() hands back a view and has
+	// nowhere else to put them; 12 bytes holds every uint32_t and its NUL. Mutable
+	// because writing them changes nothing an observer can see - the same offset
+	// gives the same digits - which is what keeps lookup() const.
+	mutable std::array<char, 12> _lineno_digits{};
 	int _pid = 0;
 	std::string _own_path;
 	signal_state _signals;

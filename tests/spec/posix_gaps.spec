@@ -1728,3 +1728,107 @@ f() { eval 'return 7'; echo notreached; }; f; echo "st=$? after=yes"
 printf 'return 7\necho notreached\n' >script
 . ./script
 echo "st=$? after=yes"
+
+# ISSUE #76. `LINENO` - the last POSIX shell variable lesh did not set, and the
+# only file in the yash suite scoring zero. dash implements it and agrees with
+# lesh everywhere below except inside a FUNCTION, where no two shells agree at
+# all; see the divergence at the end.
+#
+# The line comes from the OFFSET of the command being run, through the mapper in
+# src/syntax/source_map.h. That is what makes the multi-line-expansion cases
+# work: a counter would have to be told how many physical lines a `$(...)`
+# swallowed, where a lookup never has to be told anything.
+
+--- LINENO starts from one [stdin] [xfail(legacy): legacy does not set LINENO]
+echo $LINENO
+
+--- LINENO counts physical lines, blank ones included [stdin] [xfail(legacy): legacy does not set LINENO]
+echo $LINENO
+echo $LINENO
+
+echo $LINENO
+
+--- LINENO counts the physical lines a multi-line command substitution spans [stdin] [xfail(legacy): legacy does not set LINENO]
+: $(echo foo
+echo \
+baz)
+echo $LINENO
+
+--- LINENO counts the physical lines a multi-line parameter expansion spans [stdin] [xfail(legacy): legacy does not set LINENO]
+: ${foo#
+bar \
+baz}
+echo $LINENO
+
+--- LINENO counts the physical lines a multi-line arithmetic expansion spans [stdin] [xfail(legacy): legacy does not set LINENO]
+: $((1
++ \
+2))
+echo $LINENO
+
+--- LINENO in a -c string counts that string's lines [xfail(legacy): legacy does not set LINENO]
+echo $LINENO
+echo $LINENO
+
+--- LINENO in a loop body reports the physical line on every iteration [stdin] [xfail(legacy): legacy does not set LINENO]
+for i in 1 2 3
+do
+echo $LINENO
+done
+
+--- LINENO counts the lines a here-document body occupies [stdin] [xfail(legacy): legacy does not set LINENO]
+cat <<END
+one
+two
+END
+echo $LINENO
+
+--- LINENO through an alias reports the line the alias was invoked on [stdin] [xfail(legacy): legacy substitutes aliases in its own way]
+alias a='echo $LINENO'
+a
+
+--- an explicit assignment to LINENO wins over the shell's own value [stdin] [xfail(legacy): legacy does not set LINENO]
+LINENO=99
+echo $LINENO
+
+--- LINENO is readable from arithmetic [stdin] [xfail(legacy): legacy does not set LINENO]
+echo $((LINENO))
+echo $((LINENO))
+
+--- LINENO is not exported to a child [stdin] [xfail(legacy): legacy does not set LINENO]
+echo $LINENO
+env | grep -c '^LINENO=' || echo none
+
+--- LINENO inside a command substitution counts the outer script's lines [stdin] [xfail(legacy): legacy does not set LINENO]
+echo $(echo $LINENO)
+echo $LINENO
+
+# The one case the yash file deliberately does not assert, and says why:
+# "existing shells disagree as to how line numbers are counted within functions".
+# Measured on a body whose one line is line 4 of the script:
+#
+#   dash  2   relative to the definition, counting the `f() {` line as one
+#   zsh   1   relative to the body, counting its first line as one
+#   bash  4   the absolute line in the script
+#
+# Three shells, three answers. lesh reports the ABSOLUTE line, with bash, for two
+# reasons that are lesh's own rather than borrowed. It falls straight out of the
+# mapper - a function body is a node in the tree its DEFINITION was parsed from,
+# so its offset is already a real offset into the script and no separate origin
+# has to be carried on the function. And it is the number that AGREES WITH THE
+# DIAGNOSTIC: a fault on that line prints `file:LINE:col`, and a shell whose
+# `$LINENO` and whose error message named different lines for the same physical
+# line would be indefensible. dash's and zsh's answers buy a number no two shells
+# and no test agree on, at the cost of state to carry it.
+
+--- LINENO inside a function body is the absolute line in the script [stdin] [divergence: dash reports it relative to the definition (2) and zsh relative to the body (1); the yash suite declines to assert any answer because no two shells agree]
+echo one
+echo two
+f() {
+echo $LINENO
+}
+f
+=== expect
+one
+two
+4
