@@ -32,10 +32,21 @@ struct allocation_counters {
 	void reset() noexcept { *this = {}; }
 };
 
-// One process-wide instance. Not thread-safe by intent - lesh has no threads, and
-// an atomic here would cost more than the counter measures.
+// ONE INSTANCE PER THREAD (#90). lesh has threads now - leshper's workers, each
+// with an arena of its own (#126) - and the alternative to thread_local was an
+// atomic, which would cost more than the counter measures.
+//
+// Per-thread is also the only shape that keeps the gate meaning what
+// tests/unit/allocation_tests.cpp asserts it means: those tests count the
+// COMMAND PATH's allocations on the thread running them, and a worker parsing a
+// snapshot at the same instant would otherwise land in the same number. A
+// worker's own counts are still there, on the worker's own thread, for anyone
+// who wants to assert about a worker.
+//
+// Compiled out of Release along with the macros below, so the cost is a
+// debug-build one.
 inline allocation_counters& allocations() noexcept {
-	static allocation_counters counters;
+	static thread_local allocation_counters counters;
 	return counters;
 }
 
