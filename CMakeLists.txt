@@ -119,6 +119,7 @@ add_library(lesh_substrate STATIC
 	src/substrate/arena.h
 	src/substrate/assert.h
 	src/substrate/char_utils.h
+	src/substrate/fork_guard.h
 	src/substrate/grapheme.h
 	src/substrate/log.cpp
 	src/substrate/log.h
@@ -197,6 +198,12 @@ add_library(lesh_leshper STATIC
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/sgr.h
+	src/leshper/loop.cpp
+	src/leshper/loop.h
+	src/leshper/shell_actor.cpp
+	src/leshper/shell_actor.h
+	src/leshper/tty.cpp
+	src/leshper/tty.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
 	src/leshper/event.h
@@ -231,6 +238,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_replay_tests.cpp
 	tests/unit/log_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
+	tests/unit/leshper_loop_tests.cpp
 	tests/unit/leshper_workers_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp

@@ -40,9 +40,19 @@ request_snapshot snapshot_of(const state& target, std::uint32_t event_kind) {
 	request_snapshot taken;
 	taken.buffer.assign(target.buffer.text());
 	taken.cursor = target.cursor.byte_offset();
-	// Selection stays inactive until #96 lands the model; spec §6.1 already
-	// names it as part of the snapshot, so the fields are here and empty rather
-	// than absent.
+	// The derived region, exactly as `loop_harness::react` takes it (#116 landed
+	// the model after this function was written, and a snapshot that reported
+	// every selection as inactive would make #129's `selection_changed` fan-out
+	// wake reactors with nothing to look at). Reported even when inactive, on
+	// the reasoning `lesh_selection_get` gives: the anchor outlives
+	// deactivation and the flag is the separate question.
+	{
+		const std::size_t anchor = target.selection_anchor().byte_offset();
+		const std::size_t head = taken.cursor;
+		taken.selection_start = anchor < head ? anchor : head;
+		taken.selection_end = anchor < head ? head : anchor;
+		taken.selection_active = target.selection_active();
+	}
 	taken.computed_against = target.gen;
 	taken.event_kind = event_kind;
 	return taken;
