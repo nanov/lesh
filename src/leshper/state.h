@@ -4,12 +4,21 @@
 #include "leshper/undo.h"
 #include "substrate/assert.h"
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 namespace lesh::leshper {
+
+// The action and keymap registries dispatch runs through, owned outside `state`
+// and reached from it. Defined in keymap.h; forward-declared here because a
+// state is copied and compared without ever needing to know what is in one.
+class editing_context;
 
 // The counter that makes a stale async result droppable (spec §1, N-4).
 //
@@ -84,25 +93,106 @@ struct region {
 };
 
 // ---------------------------------------------------------------------------
-// Placeholders.
+// The keymap stack, and what is still a placeholder beside it.
 //
-// Each of the four below is a NAMED type with no behaviour, so that A-1's state
-// struct already has the field the spec says it has and its ticket fills a type
-// in rather than threading a new member through every signature. Each says
-// which ticket fills it. Nothing reads them, and the editor does not get to
-// grow a use for one before its ticket lands.
+// The two below that are still placeholders are NAMED types with no behaviour,
+// so that A-1's state struct already has the field the spec says it has and its
+// ticket fills a type in rather than threading a new member through every
+// signature. Each says which ticket fills it. Nothing reads them, and the editor
+// does not get to grow a use for one before its ticket lands. The keymap stack
+// was the third and is one no longer (#118).
 // ---------------------------------------------------------------------------
 
-// The stack of keymaps dispatch runs against (A-8, F-8 to F-12). Fills with
-// #93, which decides the language-neutral action ABI a keymap binds to.
+// The stack of keymaps dispatch runs against (A-8, F-8 to F-12, spec §6.4).
 //
-// Until then the editor dispatches from the hardcoded table in editor.cpp. That
-// table is not a small keymap - it is a placeholder standing where the stack
-// goes, and the action enum it dispatches to is not the action registry either.
+// NOT a placeholder any more (#118). The mode is the BASE of this stack and the
+// enum that used to be a mode never existed: `set_mode` swaps `layers.front()`,
+// sub-modes - visual, operator-pending, the pager, history search - are pushes
+// above it, and dispatch walks top-down.
+//
+// It holds NAMES, not keymaps. Three things follow, and each of them is why:
+// the tables themselves live in the keymap registry, which is environment
+// rather than editor state; a state stays copyable and comparable for N-3's
+// replay, which a pointer into a registry would not survive; and `bind`
+// replacing `emacs` re-points every stack that names it, with no stack able to
+// outlive the table it points into.
+//
+// It holds ENCODED KEY BYTES for the held prefix, not key events, which is what
+// lets this type live here rather than in keymap.h: event.h includes this file,
+// so a member of type `std::vector<key_event>` would close a cycle. The
+// encoding is keymap.h's `encode_key` - a canonical six bytes per symbolic key
+// event, not a terminal's bytes.
 struct keymap_stack {
-	friend constexpr bool operator==(const keymap_stack&, const keymap_stack&) noexcept {
+	// Base first. `layers.front()` is the mode; everything above it is a push.
+	// Default-constructed to emacs, which is what every state in leshper meant
+	// before there was anything else to mean.
+	std::vector<std::string> layers{std::string(default_mode)};
+
+	// The prefix being held while something longer might still arrive (F-5).
+	// Encoded key events, empty when nothing is held.
+	std::string pending;
+
+	// WHEN the hold resolves, and the whole of F-5's "take a deadline, do not own
+	// a clock" in one member. leshper never calls a clock: the loop, which read
+	// the bytes and therefore knows when they arrived, hands the instant in and
+	// asks for it back to arm its poll timeout. The same steady_clock instant
+	// decode.h calls `input_instant`, spelled out so this header need not include
+	// the decoder. Unset when nothing is held, or when a hold began on a path
+	// that had no instant to give (a test, or the replay harness - both of which
+	// resolve the hold by pressing the next key instead).
+	std::optional<std::chrono::steady_clock::time_point> hold_deadline;
+
+	// zle's `viopp`, written down (#117 decision 6): the verb stores itself here
+	// and pushes the operator-pending keymap; the next motion runs with extend
+	// semantics; dispatch pops, invokes this, and clears. Empty means none.
+	// Helix mode never sets it - its verbs read the always-present selection.
+	std::string pending_operator;
+
+	// The mode every state starts in.
+	static constexpr std::string_view default_mode = "emacs";
+
+	[[nodiscard]] std::string_view mode() const noexcept {
+		return layers.empty() ? std::string_view{} : std::string_view{layers.front()};
+	}
+
+	// A full mode switch: the base is replaced and everything pushed above it
+	// goes with it.
+	//
+	// Dropping the pushes is the decision. A sub-mode is a modifier ON a mode -
+	// visual over vi_command, operator-pending over the map whose verb pushed it -
+	// and leaving one stranded over a base it was never pushed onto would shadow
+	// the new mode with bindings that no longer mean anything. `i` from visual
+	// mode lands in insert mode, not in visual-over-insert.
+	void set_mode(std::string_view name) {
+		layers.assign(1, std::string(name));
+		clear_hold();
+		pending_operator.clear();
+	}
+
+	// A sub-mode arrives (visual, operator-pending, the pager, history search).
+	void push(std::string_view name) {
+		layers.emplace_back(name);
+		clear_hold();
+	}
+
+	// Pops the topmost sub-mode. False - and nothing happens - at the base: a
+	// mode is not something one can pop out of, only something one swaps.
+	bool pop() {
+		if (layers.size() <= 1)
+			return false;
+		layers.pop_back();
+		clear_hold();
 		return true;
 	}
+
+	[[nodiscard]] bool holding() const noexcept { return !pending.empty(); }
+
+	void clear_hold() noexcept {
+		pending.clear();
+		hold_deadline.reset();
+	}
+
+	friend bool operator==(const keymap_stack&, const keymap_stack&) noexcept = default;
 };
 
 // Namespaced annotations anchored to buffer positions (A-7). Fills with #93,
@@ -158,8 +248,8 @@ struct pending_input {
 struct state {
 	text_buffer buffer;
 	position cursor;
-	keymap_stack keymaps; // #93
-	decorations marks;    // #93
+	keymap_stack keymaps;
+	decorations marks; // #93
 	pending_input pending;
 	pager_state pager; // #94
 	generation gen;
@@ -171,6 +261,18 @@ struct state {
 	// the renderer, which does not exist yet.
 	uint16_t columns = 0;
 	uint16_t rows = 0;
+
+	// The environment dispatch runs through: the action registry (#110), the
+	// keymap registry (#118), and the loop-side dispatcher over both.
+	//
+	// SHARED, not owned by value, and not a global. A registry is what the user
+	// has bound and registered - environment, not editor state - so copying a
+	// state must not fork it and N-3's equality must not compare it. Shared
+	// rather than borrowed so that ADR-0007's "everything has an owner that frees
+	// it" holds with no wiring: the last state referring to a context frees it.
+	// Null until the first dispatch, which builds the default environment; the
+	// real loop constructs one explicitly and hands it to the states it owns.
+	std::shared_ptr<editing_context> context;
 
 	// --- The selection (spec §6.3) ------------------------------------------
 	//

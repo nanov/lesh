@@ -14,6 +14,7 @@
 #include <string>
 #include <tuple>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <vector>
 #include <algorithm>
@@ -2006,6 +2007,150 @@ builtin_result builtin_alias(shell_state& state, char** argv) {
 	return {status};
 }
 
+// --- `bind` ----------------------------------------------------------------
+//
+// zsh's `bindkey`, spelled the way #117 decided: `-l` lists keymaps, `-N`
+// creates one (optionally as a copy), `-m` selects which keymap the operands
+// apply to. There is no map-vs-noremap pair, because a binding names an ACTION
+// and never a key sequence, so there is nothing for a second form to
+// distinguish - the whole of vim's `:map` family collapses to one verb here.
+//
+// It reaches the keymap registry through `binding_console` and by no other
+// route; see the note in builtins.h for why that indirection exists rather than
+// a direct call.
+builtin_result bind_without_an_editor() {
+	// Not a usage error: the command line was right and there was nowhere to
+	// apply it. `failure_kind::operational` keeps `bind ... || true` from ending
+	// a non-interactive script, which is the shape an rc file guarded for both
+	// kinds of shell is written in.
+	report("bind: no line editor in this shell");
+	return {1, control_flow::normal, 1, failure_kind::operational};
+}
+
+int report_bind_outcome(binding_console::outcome what, std::string_view subject) {
+	switch (what) {
+	case binding_console::outcome::ok:
+		return 0;
+	case binding_console::outcome::no_such_keymap:
+		report("bind: %.*s: no such keymap",
+		       static_cast<int>(subject.size()), subject.data());
+		return 1;
+	case binding_console::outcome::no_such_action:
+		report("bind: %.*s: no such action",
+		       static_cast<int>(subject.size()), subject.data());
+		return 1;
+	case binding_console::outcome::bad_notation:
+		report("bind: %.*s: not a key sequence",
+		       static_cast<int>(subject.size()), subject.data());
+		return 1;
+	}
+	return 1;
+}
+
+builtin_result builtin_bind(shell_state&, char** argv) {
+	binding_console* console = installed_binding_console();
+
+	// Options first, POSIX-style, and `--` ends them. Read before the console is
+	// consulted so that a malformed command line is a malformed command line in
+	// every shell, interactive or not.
+	std::string_view keymap;
+	bool list_keymaps = false;
+	std::string_view create;
+	size_t at = 1;
+	for (; argv[at] != nullptr; ++at) {
+		const std::string_view arg{argv[at]};
+		if (arg == "--") {
+			++at;
+			break;
+		}
+		if (arg.size() < 2 || arg[0] != '-')
+			break;
+		if (arg == "-l") {
+			list_keymaps = true;
+			continue;
+		}
+		if (arg == "-m" || arg == "-N") {
+			if (argv[at + 1] == nullptr) {
+				report("bind: %.*s: option requires an argument",
+				       static_cast<int>(arg.size()), arg.data());
+				return {2};
+			}
+			(arg == "-m" ? keymap : create) = argv[++at];
+			continue;
+		}
+		report("bind: %.*s: unknown option", static_cast<int>(arg.size()), arg.data());
+		return {2};
+	}
+
+	if (list_keymaps && (!create.empty() || argv[at] != nullptr)) {
+		report("bind: -l takes no operands");
+		return {2};
+	}
+	if (console == nullptr)
+		return bind_without_an_editor();
+
+	if (list_keymaps) {
+		std::vector<std::string> names;
+		console->keymap_names(names);
+		for (const std::string& one : names)
+			std::printf("%s\n", one.c_str());
+		return {0};
+	}
+
+	if (!create.empty()) {
+		// `bind -N new [from]`: the copy operand is optional, and a second one is
+		// a mistake rather than something silently ignored.
+		const std::string_view from = argv[at] != nullptr ? std::string_view{argv[at]}
+		                                                  : std::string_view{};
+		if (argv[at] != nullptr && argv[at + 1] != nullptr) {
+			report("bind: -N takes at most one keymap to copy");
+			return {2};
+		}
+		const binding_console::outcome what = console->create_keymap(create, from);
+		return {report_bind_outcome(what, from)};
+	}
+
+	// No operands: list what the keymap holds, the way `alias` with no operands
+	// lists every alias - and in the same re-inputtable shape, so that
+	// `bind -m emacs > f` and reading `f` back rebuilds the table.
+	if (argv[at] == nullptr) {
+		std::vector<std::pair<std::string, std::string>> bindings;
+		const binding_console::outcome what = console->list_bindings(keymap, bindings);
+		if (what != binding_console::outcome::ok)
+			return {report_bind_outcome(what, keymap)};
+		for (const auto& [keys, action] : bindings)
+			std::printf("%s %s\n", keys.c_str(), action.c_str());
+		return {0};
+	}
+
+	const std::string_view keys{argv[at]};
+	if (argv[at + 1] == nullptr) {
+		// One operand: a query. Prints nothing for an unbound sequence and
+		// answers 1, so `bind '<C-w>' > /dev/null` is a test.
+		std::string action;
+		const binding_console::outcome what = console->lookup_key(keymap, keys, action);
+		if (what != binding_console::outcome::ok)
+			return {report_bind_outcome(what, what == binding_console::outcome::no_such_keymap
+			                                      ? keymap : keys)};
+		if (action.empty())
+			return {1};
+		std::printf("%.*s %s\n", static_cast<int>(keys.size()), keys.data(), action.c_str());
+		return {0};
+	}
+
+	if (argv[at + 2] != nullptr) {
+		report("bind: too many operands");
+		return {2};
+	}
+	const std::string_view action{argv[at + 1]};
+	const binding_console::outcome what = console->bind_key(keymap, keys, action);
+	if (what == binding_console::outcome::no_such_keymap)
+		return {report_bind_outcome(what, keymap)};
+	if (what == binding_console::outcome::no_such_action)
+		return {report_bind_outcome(what, action)};
+	return {report_bind_outcome(what, keys)};
+}
+
 builtin_result builtin_unalias(shell_state& state, char** argv) {
 	// `-a` removes every alias. It used to be looked up as the NAME `-a`, which
 	// removed nothing and reported nothing - and the case that asserts it passed
@@ -2185,6 +2330,7 @@ constexpr entry kBuiltins[] = {
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
+	{"bind", builtin_bind},
 	{"read", builtin_read}, {"times", builtin_times},
 	{"trap", builtin_trap}, {"kill", builtin_kill}, {"getopts", builtin_getopts},
 	{"readonly", builtin_readonly},
@@ -2235,6 +2381,22 @@ static_assert(registry_agrees_with_handlers(),
               "builtin_home::executor. See issue #35.");
 
 } // namespace
+
+// The one seam between the shell's `bind` and leshper's keymap registry.
+//
+// A file-scope pointer, and it is deliberately NOT an owner: the loop owns the
+// editing context and lends this view of it, so ADR-0007's "everything has an
+// owner that frees it" is answered on the other side of the boundary. The
+// registry itself is reached from `state` and is owned there (spec §6.4).
+binding_console* g_binding_console = nullptr;
+
+binding_console::~binding_console() = default;
+
+void install_binding_console(binding_console* console) noexcept {
+	g_binding_console = console;
+}
+
+binding_console* installed_binding_console() noexcept { return g_binding_console; }
 
 int report_bad_number(std::string_view builtin, std::string_view operand,
                       numeric_parse why) {

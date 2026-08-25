@@ -210,6 +210,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/event.h
 	src/leshper/history_search.cpp
 	src/leshper/history_search.h
+	src/leshper/keymap.cpp
+	src/leshper/keymap.h
 	src/leshper/state.h
 	src/leshper/surface.cpp
 	src/leshper/surface.h
@@ -247,6 +249,7 @@ add_executable(lesh_tests
 	tests/unit/grapheme_tests.cpp
 	tests/unit/history_store_tests.cpp
 	tests/unit/leshper_history_search_tests.cpp
+	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/leshper_knowledge_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
