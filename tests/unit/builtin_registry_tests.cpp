@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -38,13 +39,17 @@ namespace {
 class BuiltinRegistryTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
+	// Every snippet run here, kept alive: a tree's spans are views into its source,
+	// and shell state holds the tree a function body is a node in (#106). Declared
+	// between `pool` and `state` so the three die in the order that points at.
+	std::deque<std::string> sources;
 	shell_state state;
 	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
-		const tree t = parse(pool, src);
+		const std::string& source = sources.emplace_back(src);
 		tree_walking_executor ex{pool, state};
-		return ex.run(t);
+		return ex.run(state.retain_tree(parse(pool, source)));
 	}
 
 	std::string capture(std::string_view src) {

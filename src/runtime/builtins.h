@@ -168,8 +168,9 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	{"shift", builtin_kind::special, builtin_home::table},
 	{"times", builtin_kind::special, builtin_home::table},
 	{"trap", builtin_kind::special, builtin_home::table},
-	// `unset` is here, but the `-f` FORM is intercepted by the executor: removing
-	// a function means reaching the function table, which lives there.
+	// `unset` is here for BOTH forms. The `-f` form used to be intercepted by the
+	// executor, because the function table was the executor's; #106 moved it to
+	// shell state, which is what try_run_builtin is handed.
 	{"unset", builtin_kind::special, builtin_home::table},
 	// The regular builtins lesh implements. `builtin_report` splits them: the ones
 	// that exist only to change the shell it runs in are reported by name, and the
@@ -178,8 +179,9 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	// group because none of them could do its job in a separate process at all.
 	{"alias", builtin_kind::regular, builtin_home::table},
 	{"cd", builtin_kind::regular, builtin_home::table},
-	// `command` is the executor's: the RUNNING form has to bypass the function
-	// table and the DESCRIBING form has to read it, and the table lives there.
+	// `command` is the executor's: the RUNNING form has to bypass function lookup
+	// on its way to a command the executor alone knows how to run, and the
+	// DESCRIBING form needs the reserved words the parser holds.
 	{"command", builtin_kind::regular, builtin_home::executor},
 	{"echo", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"false", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
@@ -254,9 +256,9 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 // no arguments blocks on standard input and `cd` would move the test process.
 [[nodiscard]] bool builtin_has_handler(std::string_view name) noexcept;
 
-// True when `unset`'s options select FUNCTIONS rather than variables. One parser,
-// because the executor decides whether to intercept the call and the builtin
-// decides what to do with the operands, and two readings of `-fv` would disagree.
+// True when `unset`'s options select FUNCTIONS rather than variables. Exposed
+// rather than file-local because it is the one reading of `-fv` the builtin makes,
+// and a second reading anywhere would be free to disagree with it.
 [[nodiscard]] bool unset_selects_functions(char** argv) noexcept;
 
 // Where the registry says this name is implemented. `builtin_home::table` for a

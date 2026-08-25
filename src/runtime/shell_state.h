@@ -7,6 +7,7 @@
 #include "substrate/traits.h"
 
 #include <array>
+#include <deque>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -411,6 +412,57 @@ public:
 	};
 	[[nodiscard]] std::vector<alias_row> aliases() const;
 
+	// --- functions --------------------------------------------------------------
+	//
+	// Shell functions, by name. Here rather than in the executor because that is
+	// where the glossary puts them, and because the executor is an INTERFACE: a
+	// function table living inside one back end vanishes when the back end is
+	// replaced, while functions are shell state in exactly the way variables and
+	// aliases are (#106).
+	//
+	// A body is A NODE IN THE TREE its definition was parsed from, so the state
+	// that holds the function has to hold the tree too - see retain_tree. That
+	// works for one invocation - `-c 'f() {...}; f'` is a single parse - and is
+	// the ONLY case that works today: a function defined inside an `eval` or a dot
+	// script points into a tree that dies with the call. Persisting a function
+	// past the input it was defined in, which an interactive shell needs, requires
+	// copying the body into storage the function owns; that is ADR-0007 work and
+	// lands with the line editor. Recorded rather than pretended.
+	struct function_definition {
+		const syntax::tree* tree = nullptr;
+		syntax::node_index body = syntax::no_node;
+	};
+
+	// A redefinition replaces the previous body, which is what POSIX requires and
+	// what makes reloading an rc file work.
+	void define_function(std::string_view name, const syntax::tree& t,
+	                     syntax::node_index body);
+	// nullptr when there is no such function. The result is a POINTER INTO the
+	// table, so a caller that runs the body must take a copy first: the body may
+	// redefine the function, and an insertion rehashes.
+	[[nodiscard]] const function_definition* lookup_function(std::string_view name) const;
+	[[nodiscard]] bool has_function(std::string_view name) const {
+		return lookup_function(name) != nullptr;
+	}
+	// POSIX: `unset -f` on a name that is not a function is not an error, so there
+	// is nothing to report and nothing to return.
+	void unset_function(std::string_view name);
+
+	// Keeps a parsed tree alive for as long as this state, and hands back the copy
+	// it now owns. The read loop calls it for every command it parses, because the
+	// command may define a function whose body is a node in that tree - and the
+	// next command may call it (ADR-0007: state owns its values).
+	//
+	// A DEQUE, not a vector: a function_definition points INTO these trees, and a
+	// vector reallocating would move them out from under it. Reading one command at
+	// a time is what makes this necessary - a whole-input parse had exactly one
+	// tree and the question never came up.
+	//
+	// The trees' own nodes live in the CALLER's buffer_pool, which must therefore
+	// outlive this object. main builds the pool before the state for that reason,
+	// and every test fixture declares it first for the same one.
+	syntax::tree& retain_tree(syntax::tree t);
+
 	// What a SUBSHELL changes about the state it was forked from, in ONE place.
 	//
 	// The traps reset to default (except those set to ignore, which stay ignored),
@@ -461,6 +513,11 @@ private:
 	mutable std::unordered_map<std::string, std::string, lesh::transparent_string_hash,
 	                           std::equal_to<>> _user_homes;
 	std::unordered_map<std::string, std::string, lesh::transparent_string_hash, std::equal_to<>> _aliases;
+	std::unordered_map<std::string, function_definition, lesh::transparent_string_hash,
+	                   std::equal_to<>> _functions;
+	// The trees the function bodies point into. See retain_tree for why it is a
+	// deque and why the pool has to outlive this object.
+	std::deque<syntax::tree> _retained_trees;
 	std::vector<std::string> _positional;
 	// $0 for a state nobody invoked - a unit test's, chiefly. A real shell always
 	// overrides it: parse_invocation names $0 from an operand or from argv[0], so

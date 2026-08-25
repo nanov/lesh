@@ -812,17 +812,20 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 	size_t at = 0;
 	while (at < source.size()) {
 		const size_t from = at;
-		// The trees are kept, not dropped: a function defined by one command is a
-		// node in the tree that command was parsed from, and the next command may
-		// call it. Reading a command at a time is what makes that lifetime visible -
-		// with one whole-input parse it held for free.
-		_input_trees.push_back(syntax::parse_next_command(_pool, source, at, &_state));
+		// The tree is handed to SHELL STATE, not dropped: a function defined by one
+		// command is a node in the tree that command was parsed from, and the next
+		// command may call it. Reading a command at a time is what makes that
+		// lifetime visible - with one whole-input parse it held for free. The state
+		// owns it because the state owns the function (#106, ADR-0007); the executor
+		// is a replaceable back end and outlives nothing.
+		const tree& parsed =
+			_state.retain_tree(syntax::parse_next_command(_pool, source, at, &_state));
 		echo_if_verbose(source.substr(from, at - from), echo_when_verbose);
 		// BEFORE the command runs, not after: the whole point is that a command
 		// reading fd 0 finds it positioned at the byte after itself (#67).
 		if (input != nullptr)
 			input->hand_back(at);
-		status = run_parsed(_input_trees.back());
+		status = run_parsed(parsed);
 		// THIS is the prompt an interrupted command returns to (#52). Clearing the
 		// unwind here and not in run_parsed is what makes the interrupt travel out of
 		// a function, an `eval` and a `.` script the same way it travels out of a
@@ -1700,17 +1703,21 @@ int tree_walking_executor::run_function_definition(const tree& t, node_index n) 
 	// backslash and a newline, so calling `func` reported "No such file or
 	// directory" (quote-p.tst's 'line continuation in function definition').
 	const std::string name{joined_text(t.text_of_token(name_token))};
-	// A redefinition replaces the previous body, which is what POSIX requires and
-	// what makes reloading an rc file work.
-	_functions[name] = {&t, t.child_of(self, 0)};
+	// Recorded in SHELL STATE, which owns the tree this body is a node in - see
+	// shell_state::retain_tree. A redefinition replaces the previous body there.
+	_state.define_function(name, t, t.child_of(self, 0));
 	return 0;
 }
 
 bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& argv,
                                              int& status) {
-	const auto it = _functions.find(argv[0]);
-	if (it == _functions.end())
+	const shell_state::function_definition* found = _state.lookup_function(argv[0]);
+	if (found == nullptr)
 		return false;
+	// A COPY, taken before the body runs: the body may define a function, and an
+	// insertion rehashes the table the pointer above points into. `f() { g() { :; }; }`
+	// is that case, and the tree pointer read afterwards would be a dead one.
+	const shell_state::function_definition target = *found;
 
 	if (_function_depth >= kMaxFunctionDepth) {
 		report("%s: recursion too deep", argv[0]);
@@ -1740,7 +1747,7 @@ bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& ar
 	// would think it was outermost.
 	const int caller_loops = _loop_depth;
 	_loop_depth = 0;
-	status = run_node(*it->second.tree, it->second.body);
+	status = run_node(*target.tree, target.body);
 	_loop_depth = caller_loops;
 	--_function_depth;
 
@@ -2268,28 +2275,6 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 	return status;
 }
 
-// `unset -f name...` removes functions. It lives here rather than in builtins.cpp
-// for the same reason `eval` does: the function table is the executor's, and
-// try_run_builtin is handed nothing but shell state.
-//
-// POSIX: unsetting a name that is not a function is NOT an error, which is why
-// there is no diagnostic and no status but zero.
-builtin_result tree_walking_executor::run_unset_functions(char** argv) {
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			for (; argv[i] != nullptr; ++i)
-				_functions.erase(std::string{argv[i]});
-			break;
-		}
-		if (arg.size() >= 2 && arg[0] == '-')
-			continue;  // an option word; unset_selects_functions has read them
-		_functions.erase(std::string{arg});
-	}
-	return {0};
-}
-
 tree_walking_executor::command_prefix
 tree_walking_executor::read_command_options(char* const* argv) noexcept {
 	command_prefix opts;
@@ -2336,7 +2321,7 @@ tree_walking_executor::take_command_prefix(arena_array<char*>& argv) {
 		//
 		// Only the FIRST prefix is subject to it. Once one has been stripped,
 		// function lookup is bypassed for everything after it - `command` included.
-		if (!opts.present && _functions.contains("command"))
+		if (!opts.present && _state.has_function("command"))
 			return opts;
 		const command_prefix here = read_command_options(argv.data());
 		opts.standard_path = opts.standard_path || here.standard_path;
@@ -2397,10 +2382,10 @@ bool tree_walking_executor::search_path_for(std::string_view name, bool standard
 // without running it.
 //
 // In the executor rather than in builtins.cpp because the answer needs the
-// FUNCTION table, which lives here - the same reason `unset -f` does. It also
-// needs the reserved words, which live in the parser and are reached through
-// syntax::is_reserved_word, and the aliases and the registry, which it shares
-// with everything else.
+// RESERVED WORDS, which live in the parser and are reached through
+// syntax::is_reserved_word, and because `command` is already the executor's for
+// its running form. The functions it consults are shell state's now (#106), which
+// is the one ingredient this no longer has to be here for.
 //
 // THE ORDER is the one dash reports: a reserved word beats everything, then an
 // alias, then a function, then a builtin, then PATH. Verified - `alias if=xyz;
@@ -2444,7 +2429,7 @@ int tree_walking_executor::describe_command(const command_prefix& opts,
 		}
 		return 0;
 	}
-	if (_functions.find(std::string{name}) != _functions.end()) {
+	if (_state.has_function(name)) {
 		std::printf(verbose ? "%.*s is a shell function\n" : "%.*s\n", width, name.data());
 		return 0;
 	}
@@ -2841,7 +2826,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// already gone, so `echo foo >fifo & cat fifo` lost its output and
 	// `cat fifo & echo foo >fifo` hung outright - a deadlock built out of a lookup.
 	if (!cmd.present && classify_builtin(argv[0]) != builtin_kind::special &&
-	    _functions.find(argv[0]) != _functions.end()) {
+	    _state.has_function(argv[0])) {
 		arena_array<saved_fd> saved{_pool, 4};
 		int status = 0;
 		std::fflush(nullptr);
@@ -2927,14 +2912,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		if (ok)
 			refused = !apply_prefix(assignments, persist, restore_vars);
 		if (ok && !refused) {
-			// `unset -f` removes a FUNCTION, and the function table lives here rather
-			// than in shell state. Only this FORM is intercepted - the variable form
-			// is builtins.cpp's - and it is done inside this block so the
-			// redirections around it are still applied and restored.
-			if (std::string_view{argv[0]} == "unset" &&
-			    unset_selects_functions(argv.data())) {
-				result = run_unset_functions(argv.data());
-			} else if (!try_run_builtin(_state, argv.data(), result, cmd.present)) {
+			if (!try_run_builtin(_state, argv.data(), result, cmd.present)) {
 				// A CLASSIFIED name with no implementation. The registry guard in
 				// builtins.cpp makes this a compile error, and this branch is what
 				// happens if the guard is ever removed: 127 and a diagnostic rather
@@ -3076,7 +3054,7 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 	// A `command` prefix takes the FUNCTION table out of the question, so a stage
 	// written `command f` where f is only a function is an external command that
 	// will not be found - which is what dash reports for it.
-	const bool in_process = (!cmd.present && _functions.contains(argv[0])) ||
+	const bool in_process = (!cmd.present && _state.has_function(argv[0])) ||
 	                        classify_builtin(argv[0]) != builtin_kind::none;
 	if (in_process) {
 		// The executor's own builtins are dispatched here rather than through

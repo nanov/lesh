@@ -172,6 +172,31 @@ bool shell_state::lookup_alias(std::string_view name, std::string_view& value) c
 	return true;
 }
 
+void shell_state::define_function(std::string_view name, const syntax::tree& t,
+                                  syntax::node_index body) {
+	if (const auto it = _functions.find(name); it != _functions.end()) {
+		it->second = {&t, body};
+		return;
+	}
+	_functions.emplace(std::string(name), function_definition{&t, body});
+}
+
+const shell_state::function_definition*
+shell_state::lookup_function(std::string_view name) const {
+	const auto it = _functions.find(name);
+	return it == _functions.end() ? nullptr : &it->second;
+}
+
+void shell_state::unset_function(std::string_view name) {
+	if (const auto it = _functions.find(name); it != _functions.end())
+		_functions.erase(it);
+}
+
+syntax::tree& shell_state::retain_tree(syntax::tree t) {
+	_retained_trees.push_back(std::move(t));
+	return _retained_trees.back();
+}
+
 bool shell_state::positional_at(size_t index, std::string_view& out) const {
 	if (index == 0 || index > _positional.size())
 		return false;

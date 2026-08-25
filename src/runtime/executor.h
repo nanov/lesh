@@ -5,9 +5,7 @@
 #include "runtime/shell_state.h"
 #include "syntax/ast.h"
 
-#include <deque>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <sys/types.h>
@@ -270,8 +268,6 @@ private:
 		int& status);
 	// `wait`, which needs the executor's record of background jobs.
 	int run_wait(char* const* argv);
-	// `unset -f`: the function form, which needs the function table.
-	builtin_result run_unset_functions(char** argv);
 	int run_negation(const syntax::tree& t, syntax::node_index n);
 
 	// Builds an expander wired to this executor AND to this shell's options.
@@ -533,28 +529,6 @@ private:
 	// A FUNCTION CALL resets it - see try_run_function - and `.` and `eval` do
 	// not, which is dash's answer for all three.
 	int _loop_depth = 0;
-
-	// Defined functions, by name.
-	//
-	// A body is stored as a node in the tree it was parsed from, so the tree must
-	// outlive the definition. That holds for one invocation - `-c 'f() {...}; f'`
-	// is a single parse - and is the ONLY case that works today. Persisting a
-	// function across invocations, which an interactive shell needs, requires
-	// copying the body into storage the function owns; that is ADR-0007 work and
-	// lands with the line editor. Recorded rather than pretended.
-	struct defined_function {
-		const syntax::tree* tree;
-		syntax::node_index body;
-	};
-	std::unordered_map<std::string, defined_function> _functions;
-
-	// Every tree run_input has parsed, kept alive for the whole run.
-	//
-	// A deque, not a vector: _functions points INTO these trees, and a vector
-	// reallocating would move them out from under it. Reading one command at a time
-	// is what makes this necessary - a whole-input parse had exactly one tree and
-	// the question never came up.
-	std::deque<syntax::tree> _input_trees;
 
 	// Guards runaway recursion. A shell function that calls itself unconditionally
 	// would otherwise exhaust the stack rather than reporting anything.
