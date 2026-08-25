@@ -183,9 +183,9 @@ Each open question is a ticket on [the leshper map](https://github.com/nanov/les
 
 Still open:
 
-- **Q-3** `vared`-equivalent entry point at v1 or later → [#102](https://github.com/nanov/lesh/issues/102) — unblocked by #94; the interfaces it tests are frozen
-
 Resolved:
+
+- **Q-3** `vared` at v1 or later → [#102](https://github.com/nanov/lesh/issues/102): v1, as `vared`; an ordinary client with a null bundle; the nested read is the port's mirror — architecture spec §6.8
 
 - **Q-2** Selection semantics → [#96](https://github.com/nanov/lesh/issues/96): anchor + active flag, the cursor is the head; shape is the mode's projection — architecture spec §6.3
 - **Q-1** Vi depth at v1 → [#99](https://github.com/nanov/lesh/issues/99): zle's repertoire + counts + text objects, one keyed kill store, minimal `.` — architecture spec §6.5
