@@ -198,6 +198,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/layout.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
+	src/leshper/shell_knowledge.h
 	src/leshper/event.h
 	src/leshper/history_search.cpp
 	src/leshper/history_search.h
