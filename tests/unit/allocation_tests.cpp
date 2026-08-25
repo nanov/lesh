@@ -1,4 +1,5 @@
 #include "leshper/editor.h"
+#include "leshper/loop.h"
 #include "leshper/event.h"
 #include "leshper/state.h"
 #include "runtime/expander.h"
@@ -11,6 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <fcntl.h>
+#include <memory>
 #include <cstddef>
 #include <string>
 #include <tuple>
@@ -174,12 +177,22 @@ void note_malloc(const volatile void*, size_t) noexcept {
 }
 void note_free(const volatile void*) noexcept {}
 
+// ONE INSTALL FOR THE WHOLE FILE, and it has to be one.
+//
+// ASan keeps a FIXED-SIZE array of malloc hooks - five, in compiler-rt - and
+// `__sanitizer_install_malloc_and_free_hooks` APPENDS to it rather than
+// replacing. A `static` inside the template below is per-INSTANTIATION, so it
+// burned one slot per call site, and the sixth `mallocs_during` in the file
+// silently got a zero back and then measured nothing at all. Found by adding
+// the loop's two numbers below and watching them pass alone and fail in the
+// full binary (#129).
+const bool g_hooks_installed =
+	__sanitizer_install_malloc_and_free_hooks(note_malloc, note_free) != 0;
+
 // Every malloc the process makes while `work` runs.
 template <typename Work>
 size_t mallocs_during(Work&& work) {
-	static const bool installed =
-		__sanitizer_install_malloc_and_free_hooks(note_malloc, note_free) != 0;
-	EXPECT_TRUE(installed) << "the sanitizer allocator hook is what this measures with";
+	EXPECT_TRUE(g_hooks_installed) << "the sanitizer allocator hook is what this measures with";
 	g_mallocs.store(0, std::memory_order_relaxed);
 	g_counting.store(true, std::memory_order_relaxed);
 	work();
@@ -284,5 +297,109 @@ TEST_F(AllocationTest, EvenLoggingOnFormatsWithoutTheHeap) {
 	EXPECT_EQ(counted, 0u) << "formatting a log line reached the heap";
 
 	log::shutdown();
+}
+
+// --- The event loop (#129) -------------------------------------------------
+//
+// HERE RATHER THAN IN leshper_loop_tests.cpp, and the reason is the instrument:
+// ASan permits ONE malloc-hook pair per process, and this file claims it. A
+// second `__sanitizer_install_malloc_and_free_hooks` in another translation
+// unit does not fail loudly, it just never counts - which would be a green
+// allocation test measuring nothing. So the loop's two numbers live beside
+// every other number the gate asserts.
+
+namespace {
+
+// A pipe standing in for a terminal, the way leshper_loop_tests.cpp drives the
+// loop everywhere: never the process's own tty.
+class loop_over_a_pipe {
+public:
+	loop_over_a_pipe() {
+		[&] { ASSERT_EQ(::pipe(_in), 0); }();
+		[&] { ASSERT_EQ(::pipe(_out), 0); }();
+		::fcntl(_in[0], F_SETFL, O_NONBLOCK);
+		::fcntl(_out[0], F_SETFL, O_NONBLOCK);
+		leshper::loop_options options;
+		options.manage_terminal = false;
+		options.prompt = "> ";
+		_loop = std::make_unique<leshper::event_loop>(leshper::loop_fds{_in[0], _out[1]},
+		                                             std::move(options));
+		_loop->enter_read();
+	}
+	~loop_over_a_pipe() {
+		_loop.reset();
+		for (int fd : {_in[0], _in[1], _out[0], _out[1]})
+			::close(fd);
+	}
+
+	loop_over_a_pipe(const loop_over_a_pipe&) = delete;
+	loop_over_a_pipe& operator=(const loop_over_a_pipe&) = delete;
+
+	[[nodiscard]] leshper::event_loop& loop() const { return *_loop; }
+
+	void drain_output() const {
+		char chunk[4096];
+		while (::read(_out[0], chunk, sizeof(chunk)) > 0) {
+		}
+	}
+
+private:
+	int _in[2]{-1, -1};
+	int _out[2]{-1, -1};
+	std::unique_ptr<leshper::event_loop> _loop;
+};
+
+} // namespace
+
+TEST_F(AllocationTest, AWarmIdleLoopTurnCostsNoHeap) {
+	// N-2 for the loop's OWN machinery: the pollfd array, the read buffer, the
+	// event vector, the signal-number vector and the blitter's output string are
+	// all members with capacity taken in the constructor, and this is what says
+	// so.
+	//
+	// It measures THE LOOP, not the editor. A keystroke turn still allocates,
+	// for reasons belonging to two other files: `step` returns `effects` by
+	// value (effect.h: the small-buffer answer waits on the N-1 latency gate map
+	// #82 carries as fog) and `apply_edit` records an undo entry. Widening this
+	// to a keystroke is that ticket's work, not something to fake here.
+	loop_over_a_pipe driven;
+	for (int i = 0; i < 4; ++i)
+		driven.loop().turn(0);
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 100; ++i)
+			driven.loop().turn(0);
+	});
+	EXPECT_EQ(counted, 0u) << "an idle loop turn reached the heap";
+}
+
+TEST_F(AllocationTest, ALoopRepaintCostsAConstantThatDoesNotGrow) {
+	// The repaint path is not zero, and claiming it were would be a lie:
+	// `lay_out` mints a fresh `surface` on every call, which is #123's
+	// layout-as-value - two calls with equal inputs produce equal layouts
+	// precisely because nothing is carried between them.
+	//
+	// What IS assertable, and what a regression would break, is that the cost is
+	// CONSTANT PER REPAINT. Everything the loop contributes is reused: the
+	// cluster pool is warm, the previous layout is held in the loop, the blitter
+	// writes into a member string. So three times the repaints must be three
+	// times the allocations and not one more; a term that grew with the count
+	// would be state accumulating on the render path.
+	loop_over_a_pipe driven;
+	for (int i = 0; i < 4; ++i)
+		driven.loop().render();
+	driven.drain_output();
+
+	const auto repaints = [&](int times) {
+		return mallocs_during([&] {
+			for (int i = 0; i < times; ++i)
+				driven.loop().render();
+		});
+	};
+	const size_t fifty = repaints(50);
+	const size_t hundred_and_fifty = repaints(150);
+
+	EXPECT_GT(fifty, 0u) << "a zero here would mean the hook, not the loop, is broken";
+	EXPECT_EQ(hundred_and_fifty, fifty * 3) << "the per-repaint cost is a constant";
 }
 #endif
