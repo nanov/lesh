@@ -42,3 +42,38 @@ before and after in the same environment and quote the delta, never a remembered
 baseline. Four tickets on this map have opened with a headline number that was
 already stale, so re-measure before working one. Under parallel agents, quote
 per-file numbers only - a total measured under load is worthless.
+
+## Tool routing
+
+Serena and the built-ins overlap; each capability has one owner. Numbers below
+were measured on this repo - see `serena-evaluation.md`.
+
+**Serena's context prompt says Read and Edit are FORBIDDEN. That is wrong here,
+and this file overrides it.** For a one-line change `Edit` sends 14 bytes where
+`replace_symbol_body` sends the whole 1,035-byte body. The crossover is around
+**15 lines**: below it use `Edit`, at or above it use `replace_symbol_body`,
+which sends only the new text where `Edit` must quote old and new (~2x at 77
+lines). Neither is forbidden.
+
+**Serena owns symbol identity.** `find_symbol`, `find_referencing_symbols`,
+`find_declaration`, `rename_symbol`. It is the only side that knows a
+translation unit: renaming one of the two same-named `FakeVars` test classes
+touched the right 2 sites, while a correct word-boundary regex silently
+corrupted an unrelated file. Use `rename_symbol` whenever a name might be
+ambiguous.
+
+**Grep owns distinctive names.** Renaming `has_pattern_characters` across 5
+files produced a byte-identical diff via `rename_symbol` and via
+`grep -rlw | xargs perl -pi`. Reach for Serena when the identifier is also an
+English word - "who uses `executor`" is 2 semantic hits against 106 grep hits.
+
+**`get_diagnostics_for_file` before you build.** It agreed with
+`clang++ -fsyntax-only` on every file tested. Cheaper than a build for
+type errors; it is not a substitute for `ctest --preset debug`, which is still
+the gate.
+
+**Serena has no move, inline, or supertype lookup** on the LSP backend - those
+are JetBrains-only. Use `git mv` plus perl, and read the class declaration.
+
+**Serena line numbers are 0-based; `Read` and grep are 1-based.** Add one when
+crossing over, or the closing brace goes missing.

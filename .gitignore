@@ -54,14 +54,16 @@ cmake-debug-build/
 cmake-build-debug/
 .cache/
 .DS_Store
-compile_commands.json
 
 .lesh_history
 
 
 
-# Serena tool state
-.serena/
+# Serena tool state. project.yml is shared - it carries the vendored-tree
+# ignore list and the non-duplicating tool set. The cache is a rebuildable
+# clangd/symbol index, and project.local.yml is per-machine by design.
+.serena/cache/
+.serena/project.local.yml
 
 # yash suite scratch, regenerated on every run. The tmp.NNN directories are
 # per-test working copies the suite creates and cleans up itself - they were
