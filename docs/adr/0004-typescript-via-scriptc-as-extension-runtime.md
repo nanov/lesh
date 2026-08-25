@@ -5,7 +5,7 @@
 
 ## Context
 
-lesh needs plugins: widgets, key bindings, hooks, and completion functions authorable
+lesh needs plugins: actions, key bindings, hooks, and completion functions authorable
 without recompiling the shell. Candidates considered were Lua/LuaJIT, C compiled at load
 time (CJIT/TinyCC), WebAssembly, and TypeScript compiled to native via ScriptC.
 
@@ -36,7 +36,7 @@ boundary, no pointers into the arena handed to plugins, no callbacks capturing l
   way a scripting binding can. Additive-only discipline and a version field from day one.
 - Native plugins can crash the shell. WASM remains the answer if isolation becomes
   necessary; the surface design is what keeps that option open.
-- Sandboxing addresses crashes, not hangs. An infinite loop in a widget freezes the
+- Sandboxing addresses crashes, not hangs. An infinite loop in an action freezes the
   keystroke loop regardless of tier, so execution limits are needed either way.
 - **Pending spike:** whether ScriptC can emit a loadable shared library and consume a
   C ABI. It is pitched as producing executables. If it cannot, the mechanism changes;

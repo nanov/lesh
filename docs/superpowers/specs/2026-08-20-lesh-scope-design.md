@@ -40,7 +40,7 @@ A zsh feature is in scope when it is written down here. Not before.
 
 lesh owns its terminal rather than renting it: termios raw mode, input decoding
 (escape sequences, UTF-8, bracketed paste), an editing buffer with its own undo model,
-keymaps with modal bindings, widgets as the unit of editing behavior, syntax
+keymaps with modal bindings, actions as the unit of editing behavior, syntax
 highlighting, completion UI, multi-line editing, and prompt rendering.
 
 replxx is a stopgap behind an interface. It is expected to be deleted, not extended.
@@ -50,7 +50,7 @@ keymaps set from `.leshrc`). It does not depend on the extension runtime existin
 
 ### 2.4 In scope: an extension runtime
 
-A plugin API for widgets, key bindings, hooks, and completion functions, authorable
+A plugin API for actions, key bindings, hooks, and completion functions, authorable
 without recompiling lesh. **LuaJIT is the first and primary runtime** (ADR-0006),
 shipped with `jit.off()` as the default; scripts opt into compilation when they are
 doing real work in a loop.
@@ -71,7 +71,7 @@ These are the boundary that makes the rest finite. They are not "later".
 ### 2.6 Deferred, with a seam held open
 
 - **The executor back end.** Tree-walking, an own bytecode VM, or lowering to the
-  extension runtime. Decided once the front end is solid. The executor is an
+  extension runtime. Decided once the syntax layer is solid. The executor is an
   interface so this stays a real choice (ADR-0002).
 - **Job control.** `fg`, `bg`, `jobs`, `%1`, process groups, terminal ownership.
   POSIX places these in the User Portability option, not the mandatory core.
@@ -124,7 +124,7 @@ constraints 1 and 3, not an end. It is being replaced (ADR-0002).
   Line Editor --uses--> Lexer, Parser, State      (never the Executor)
        |
        v
-  Extension runtime --- flat C ABI ---> widgets, hooks, completion
+  Extension runtime --- flat C ABI ---> actions, hooks, completion
 ```
 
 ### 4.2 The four contracts
@@ -212,10 +212,10 @@ That is why it is Phase 0 work.
 | 1 | **Substrate hardening.** Prove the arena and containers before anything is built on them | Leak-free under ASan and UBSan; copy and move semantics verified; no accidental copies |
 | 2 | Lexer, parser, expander, tree-walking executor to POSIX conformance; delete `zsh_parser_plus.h` | POSIX suite green; unit tests at every seam |
 | 3 | The curated zsh layer re-landed on the new core | Differential vs zsh at 100% on the committed subset |
-| 4 | Own line editor replaces replxx; `bindkey` and widget builtins; highlighting via the real lexer; completion via the error-tolerant parser | Keystroke latency benchmarked and gated |
+| 4 | Own line editor replaces replxx; `bindkey` and action builtins; highlighting via the real lexer; completion via the error-tolerant parser | Keystroke latency benchmarked and gated |
 | 5 | Extension runtime over the flat C surface | Plugin API frozen and versioned |
 
-Migration is by strangler: the new front end is built beside the old parser and driven
+Migration is by strangler: the new implementation is built beside the old parser and driven
 to parity by the differential harness. There is a working shell at every point.
 
 ### Phase 0 detail
@@ -241,7 +241,7 @@ to parity by the differential harness. There is a working shell at every point.
 ### Phase 1 detail
 
 The substrate is the one layer every other subsystem sits on, and it is currently
-unverified. Building the front end on top of it before it is proven means any leak or
+unverified. Building the syntax layer on top of it before it is proven means any leak or
 silent copy found later is indistinguishable from a bug in the thing above it.
 
 What has to be established:

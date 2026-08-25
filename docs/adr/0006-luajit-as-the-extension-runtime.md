@@ -67,7 +67,7 @@ constructing the environment — global tables, metatables, bindings.
   a POSIX shell configured by POSIX shell remains more coherent than one that boots an
   interpreter to configure itself.
 - **The line editor stays configurable from the shell language** (`bindkey`-style
-  builtins). The extension runtime is an additional way to register widgets, never the
+  builtins). The extension runtime is an additional way to register actions, never the
   only way.
 - **The zygote option brushes against job control.** A resident supervisor holding a
   warmed state is close to what job control and history want anyway. Job control is

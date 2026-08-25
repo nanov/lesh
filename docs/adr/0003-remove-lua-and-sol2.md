@@ -29,6 +29,6 @@ language is its own configuration language: `.leshrc` is shell.
   interpreter to configure itself.
 - Between now and the extension runtime landing, the line editor has no scripting layer.
   It must therefore be configurable from the shell language itself: `bindkey`-style
-  builtins, widgets registered natively, keymaps set from `.leshrc`. This is how zsh
+  builtins, actions registered natively, keymaps set from `.leshrc`. This is how zsh
   works, and it keeps the editor useful the moment it exists.
 - Last session's CMake work to vendor and pin Lua 5.4.8 is superseded.

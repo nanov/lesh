@@ -129,7 +129,7 @@ _Avoid_: word, child, parameter, command part — all four are used for this tod
 **Pipeline** _[floor]_:
 Commands joined by `|`, output to input.
 _Avoid_: using "pipeline" for lesh's own lexer/parser/executor architecture — see
-**Front end** below. Also avoid "pipe", which names the `|` operator and the syscall.
+**Syntax layer** below. Also avoid "pipe", which names the `|` operator and the syscall.
 
 **List** _[floor]_:
 Pipelines joined by `;`, `&`, `&&`, or `||`. An **AND-OR list** is the `&&`/`||` case.
@@ -177,7 +177,7 @@ Turns one word plus the shell state into fields. Called by the executor per comm
 at execution time. Re-entrant — a parameter default, an assignment value and
 arithmetic's inner text all re-enter it — and therefore depth-limited.
 
-Still the last line of defence against a **defect** the front end could not see,
+Still the last line of defence against a **defect** the syntax layer could not see,
 but a narrower one than #48 recorded: the word scan followed nothing but braces
 then, so an unterminated construct inside `${x-...}` was only lexed when the
 default was expanded. The scan now follows quoting and nesting (#42), so the word
@@ -199,9 +199,28 @@ _Avoid_: "quoted", which named two of these at once and then three.
 **Executor** _[lesh]_:
 Runs a tree. An interface, so the back end stays replaceable.
 
-**Front end** _[lesh]_:
-The lexer and parser together. Use this, or name the components individually, when
-you would otherwise reach for "pipeline" — that word belongs to POSIX.
+**Syntax layer** _[lesh]_:
+The lexer and parser together — what `src/syntax/` holds. Use this, or name
+the components individually, when you would otherwise reach for "pipeline" —
+that word belongs to POSIX.
+_Avoid_: front end.
+
+**Language** _[lesh]_:
+What the syntax layer reads — today the shell language. The axis along which
+a second language would someday be added.
+_Avoid_: front end, dialect.
+
+**UI** _[lesh]_:
+The interactive layer as a whole: leshper, prompts, rendering — what
+`src/ui/` holds. The shell proper is everything else.
+
+**Front end** _[retired]_:
+A word that carried three meanings at once and now carries none. What it
+named: the lexer and parser together is the **syntax layer**; the interactive
+side is the **UI**; the legacy-or-next axis lives on only in the
+`LESH_FRONTEND` environment variable and `spec_run.py --frontend`, live
+interfaces that die with legacy.
+_Avoid_: the word itself, in every sense.
 
 **Shell state** _[lesh]_:
 Variables, scopes, functions, aliases, options, working directory, and `$?`. Read by
@@ -245,17 +264,64 @@ a trailing backslash is incomplete without being defective. A reader answers
 incomplete with a continuation prompt; an executor holding the whole input has
 nothing to continue and answers the defect with a diagnostic.
 
-**LLE** _[lesh]_:
-The Lesh Line Editor. lesh's own terminal input layer, named after zsh's ZLE.
-_Avoid_: the reader, readline.
+**leshper** _[lesh]_:
+lesh Prompt Editing & Reading — the shell's own line editor, the largest
+resident of the UI. Integrated: compiled into the lesh binary, not a library.
+_Avoid_: LLE, the retired earlier name; the reader; readline.
 
-**Widget** _[curated]_:
-A unit of editing behaviour in LLE, bindable to a key. Borrowed from zsh.
+**Widget** _[lesh]_:
+Reserved for a future UI surface a plugin can draw into — panels, pickers,
+floating surfaces. Nothing ships under this name yet.
+_Avoid_: using "widget" for an **action**, which is zsh's usage and was this
+glossary's until #84.
 
-**Keymap** _[curated]_:
-A table binding keys to widgets.
+**Action** _[lesh]_:
+A named, invocable, rebindable unit of editing behaviour. Built-in actions are
+native code; user actions are lesh functions. The only thing that mutates
+buffer, cursor or selection, and it runs synchronously, only when invoked.
+_Avoid_: widget, zsh's word for this — reserved here for future UI surfaces.
 
-**Autosuggestion** _[curated]_:
+**Mode** _[lesh]_:
+A named keymap set defining an editing paradigm — emacs, vi-insert,
+vi-command. Not an enum anywhere: adding a mode is defining keymaps and
+actions.
+
+**Reactor** _[lesh]_:
+A subscriber to editor state-change events that computes derived state —
+decorations and proposals — asynchronously on a worker. Never mutates buffer,
+cursor or selection. The highlighter and the autosuggester are reactors.
+_Avoid_: calling a reactor's work an effect; an **effect** is synchronous and
+the loop's own.
+
+**Proposal** _[lesh]_:
+Derived state offered to the user — an autosuggestion, a candidate list. It
+becomes a buffer edit only through an accepting action; it never auto-applies.
+
+**Decoration** _[lesh]_:
+A namespaced annotation anchored to buffer positions: a highlight span or
+virtual text. Survives edits. The one system highlighting and autosuggestions
+both render through.
+
+**Effect** _[lesh]_:
+What one turn of the editor's state machine emits alongside the new state:
+render output and worker requests. Synchronous, owned by the loop.
+_Avoid_: using it for a reactor's output, which is a decoration or proposal
+arriving later as an event.
+
+**Surface** _[lesh]_:
+The grid of styled cells leshper renders into. A blitter turns surfaces into
+terminal output; tests assert cell grids, never escape sequences.
+
+**Generation** _[lesh]_:
+A counter bumped on every buffer mutation. An async result carries the
+generation it was computed against; a stale result is dropped, structurally.
+
+**Keymap** _[lesh]_:
+A table binding key sequences to action names. First-class data: created,
+copied, modified, pushed and popped at runtime — modal input is a stack of
+keymaps, never a second dispatch system.
+
+**Autosuggestion** _[lesh]_:
 The greyed-out completion of the current line drawn from history.
 _Avoid_: hint, which is replxx's word and leaves with replxx.
 
@@ -289,5 +355,5 @@ _Avoid_: "testee" on its own, which does not say under test of what; and "the sh
 in a case that re-invokes, where it names two different processes.
 
 **Strangler** _[lesh]_:
-The migration in which the new front end is built beside the old parser and driven to
-parity before the old one is deleted.
+The migration in which the new implementation is built beside the old parser
+and driven to parity before the old one is deleted.

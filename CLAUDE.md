@@ -29,11 +29,11 @@ cmake --build --preset release -j8`. The tool refuses and tells you how if the
 binary is absent, rather than quietly measuring the wrong thing.
 
 **`spec_run.py` needs `--frontend next`.** With no flag it runs the *legacy*
-front end and reports about 35 passes instead of ~690. Legacy is the old
+implementation and reports about 35 passes instead of ~690. Legacy is the old
 implementation being replaced; it is not the shell under development.
 
 **Never invoke `third_party/yash-tests/run-test.sh` directly.** It does not set
-`LESH_FRONTEND`, so it measures the *legacy* front end and scores near zero.
+`LESH_FRONTEND`, so it measures the *legacy* implementation and scores near zero.
 `tools/conformance.py` sets it. Six times on this map a runner defect has
 masqueraded as a shell bug, and this is the cheapest one to fall into.
 

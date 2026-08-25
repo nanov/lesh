@@ -166,14 +166,14 @@ lesh (bash-like syntax) provides the lexer and parser. leshper consumes them and
 - **NG-1** Not a standalone library. No external API, no separate artifact.
 - **NG-2** No readline compatibility (API or `.inputrc`).
 - **NG-3** No editor-owned config file or format, ever. leshper is configured through lesh's configuration surface. When lesh gains an rc mechanism (zsh-style; likely Lua — deferred, §8), leshper settings ride it. leshper itself never parses config.
-- **NG-4** No leshper-invented scripting language. Extension languages are lesh script (bash-like; v1, F-14) and Lua (later, §8). Hard consequence **now**: the internal action/reactor registration ABI MUST be language-neutral — an action is a callable plus a state-access contract. The lesh binding (state as shell variables, F-14) is one frontend to that ABI; the Lua binding (state as an object/table API, neovim-style) is another, added later without ABI change. Do not bake shell-variable injection into the ABI itself.
+- **NG-4** No leshper-invented scripting language. Extension languages are lesh script (bash-like; v1, F-14) and Lua (later, §8). Hard consequence **now**: the internal action/reactor registration ABI MUST be language-neutral — an action is a callable plus a state-access contract. The lesh binding (state as shell variables, F-14) is one binding of that ABI; the Lua binding (state as an object/table API, neovim-style) is another, added later without ABI change. Do not bake shell-variable injection into the ABI itself.
 - **NG-5** Candidate generation, history persistence, and prompt rendering live in lesh — as pluggable providers (A-13), not sealed built-ins. leshper consumes the interface, never the implementation.
 
 ---
 
 ## 8. Deferred: UI platform
 
-Later extension, neovim tradition: **widgets** (panels/floating surfaces for plugins), **plugin reactors** (the A-11 subscription interface made public: inline git-blame, live linting, custom suggesters), hook table (buffer-changed, cursor-moved, pre-prompt, timers, fd-readable), async jobs delivering output as events, namespaced plugin state, async user actions (F-19), **Lua bindings** (second frontend to the NG-4 language-neutral ABI: Lua actions, Lua reactors, Lua providers for A-13, and the lesh rc/config mechanism per NG-3). Core ships primitives, never features.
+Later extension, neovim tradition: **widgets** (panels/floating surfaces for plugins), **plugin reactors** (the A-11 subscription interface made public: inline git-blame, live linting, custom suggesters), hook table (buffer-changed, cursor-moved, pre-prompt, timers, fd-readable), async jobs delivering output as events, namespaced plugin state, async user actions (F-19), **Lua bindings** (second binding of the NG-4 language-neutral ABI: Lua actions, Lua reactors, Lua providers for A-13, and the lesh rc/config mechanism per NG-3). Core ships primitives, never features.
 
 Enabled by A-6…A-12. When it lands: pager's internal surface API gets formalized, pager becomes its first client. Plugin-facing API freezes only then; until then all internals refactor freely.
 
