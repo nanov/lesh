@@ -20,8 +20,9 @@ using namespace lesh::syntax;
 
 namespace {
 
-// `cd`: -L and -P, CDPATH, and the failure status. See issue #46. The startup value
-// of PWD joined them in #51, because it is the value `cd` extends onto.
+// `cd`: -L and -P, CDPATH, and the failure status. See issue #46. `pwd` and the
+// startup value of PWD joined them in #51, because -L and -P mean one thing across
+// the two builtins and the shell decides it once.
 //
 // The shape of the scratch tree is cd-p.tst's, because the interesting cases all
 // need a SYMLINK to a directory: -L and -P differ nowhere else, and `cd link` then
@@ -253,6 +254,62 @@ TEST_F(CdTest, ReadonlyPwdFailsAfterTheDirectoryHasChanged) {
 	EXPECT_EQ(run("readonly PWD; cd real 2>/dev/null"), 2);
 	EXPECT_EQ(value_of("PWD"), root) << "the refused assignment left PWD alone";
 	EXPECT_EQ(std::filesystem::current_path(), root + "/real") << "the chdir stands";
+}
+
+// --- `pwd`, and the logical/physical rule it shares with `cd` (#51) ----------
+//
+// These live beside `cd`'s because they are the same question: `pwd -L` reports the
+// working directory `cd -L` maintains, and a shell whose two builtins disagree about
+// which directory it is in is worse than one that is wrong in both. The scratch tree
+// is already the one the question needs - a symlink is the only place -L and -P
+// differ.
+
+TEST_F(CdTest, PwdReportsTheLogicalDirectoryAndDashPTheRealOne) {
+	EXPECT_EQ(run("cd link/inner"), 0);
+	EXPECT_EQ(capture("pwd"), root + "/link/inner\n") << "the default is -L";
+	EXPECT_EQ(capture("pwd -L"), root + "/link/inner\n");
+	EXPECT_EQ(capture("pwd -P"), root + "/real/inner\n");
+}
+
+TEST_F(CdTest, TheLastOfPwdsLAndPWins) {
+	// The same rule `cd` has, because it is the same option pair - a group as well
+	// as a sequence, so the scan cannot stop at the first letter.
+	EXPECT_EQ(run("cd link"), 0);
+	EXPECT_EQ(capture("pwd -P -L"), root + "/link\n");
+	EXPECT_EQ(capture("pwd -L -P"), root + "/real\n");
+	EXPECT_EQ(capture("pwd -LP"), root + "/real\n");
+}
+
+TEST_F(CdTest, PwdFallsBackToTheRealDirectoryWhenPwdHasGoneStale) {
+	// `readonly PWD` then a cd is the one state that produces a stale PWD without
+	// the script having written a wrong one: the directory changed and the variable
+	// could not follow. POSIX `pwd -L` falls back when PWD does not name the current
+	// directory, and printing the stored value there is a wrong answer a user acts on.
+	EXPECT_EQ(run("readonly PWD; cd real 2>/dev/null"), 2);
+	EXPECT_EQ(value_of("PWD"), root) << "the refused assignment left PWD alone";
+	EXPECT_EQ(capture("pwd"), root + "/real\n");
+	EXPECT_EQ(capture("pwd -P"), root + "/real\n");
+}
+
+TEST_F(CdTest, AStalePwdDoesNotSteerALaterRelativeCd) {
+	// The other half of the same fallback, and the reason it is one rule rather than
+	// two: `cd` extends a relative operand onto the logical directory, so believing
+	// a stale PWD would resolve `inner` against a directory the shell has left.
+	EXPECT_EQ(run("readonly PWD; cd real 2>/dev/null"), 2);
+	EXPECT_EQ(run("cd inner 2>/dev/null"), 2) << "readonly PWD still refuses the write";
+	EXPECT_EQ(std::filesystem::current_path(), root + "/real/inner")
+		<< "but the cd resolved against where the shell actually is";
+}
+
+TEST_F(CdTest, PwdRejectsAnIllegalOptionAndIgnoresOperands) {
+	EXPECT_EQ(run("pwd -x 2>/dev/null"), 2);
+	EXPECT_NE(capture("pwd -x 2>&1"), "") << "and it says so";
+	// Operands are IGNORED rather than diagnosed, which is dash's answer and where
+	// `pwd` differs from `cd`: #46 diagnoses `cd a b` because taking the first
+	// operand silently lands the shell somewhere the user did not name. An extra
+	// operand to `pwd` changes no answer, so refusing it would be a divergence that
+	// buys nothing.
+	EXPECT_EQ(capture("pwd extra"), root + "\n");
 }
 
 // --- what a shell BELIEVES about where it is when it starts (#51) ------------

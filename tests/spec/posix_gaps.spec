@@ -153,6 +153,24 @@ d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p a/b; out=$(PWD=/etc "$TESTEE" -c 'c
 --- an inherited PWD reached through a symlink is kept [xfail(legacy): legacy has no command substitution]
 d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir real; ln -s real link; cd link; out=$(PWD="$d/link" "$TESTEE" -c 'printf %s "$PWD"'); echo "${out#$d}"
 
+--- pwd -P reports the physical directory and -L the logical one [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir real; ln -s real link; cd link; l=$(pwd -L); p=$(pwd -P); echo "L=${l#$d} P=${p#$d}"
+
+--- pwd with no option is pwd -L [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir real; ln -s real link; cd link; w=$(pwd); echo "${w#$d}"
+
+--- the last of pwd -L and pwd -P wins [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir real; ln -s real link; cd link; a=$(pwd -P -L); b=$(pwd -L -P); echo "${a#$d} ${b#$d}"
+
+--- pwd falls back to the physical directory when PWD has gone stale [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir sub; readonly PWD; cd sub 2>/dev/null; w=$(pwd); echo "${w#$d}"
+
+--- a stale PWD does not steer a later relative cd either [xfail(legacy): legacy has no command substitution]
+d=$(mktemp -d); cd -P "$d"; d=$PWD; mkdir -p sub/deeper; readonly PWD; cd sub 2>/dev/null; cd deeper 2>/dev/null; w=$(pwd); echo "${w#$d}"
+
+--- an illegal pwd option is status 2 [xfail(legacy): legacy has no parameter expansion beyond $name]
+pwd -x 2>/dev/null; echo "status=$?"
+
 --- export makes a variable visible to a child [xfail(legacy): legacy's export path is incomplete]
 export EXPORTED_VAR=visible; /usr/bin/env | /usr/bin/grep '^EXPORTED_VAR='
 

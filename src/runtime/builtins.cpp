@@ -60,31 +60,98 @@ builtin_result builtin_echo(shell_state&, char** argv) {
 	return {0};
 }
 
-builtin_result builtin_pwd(shell_state& state, char**) {
-	std::string_view pwd;
-	if (state.lookup("PWD", pwd) && !pwd.empty()) {
-		std::printf("%.*s\n", static_cast<int>(pwd.size()), pwd.data());
-		return {0};
+// `cd`'s two modes, POSIX XCU `cd` - and `pwd`'s, which are the same two. -L is the
+// DEFAULT: `..` is resolved against the LOGICAL working directory, so a symlink
+// followed on the way in is unfollowed on the way out. -P hands the path to chdir
+// and reads the answer back, so PWD holds a physical path. #24 chose the logical PWD
+// deliberately and this does not disturb it - -P is a second mode BESIDE it, not a
+// rework of it.
+//
+// Which directory each mode NAMES is decided in shell_state, not here: `cd` and
+// `pwd` are two views of one working directory and a shell whose two builtins
+// disagree about where it is would be worse than one that is wrong in both (#51).
+enum class cd_mode {
+	logical,
+	physical,
+};
+
+// The option scan the two share. POSIX gives both utilities the same pair and the
+// same tie-break: the LAST of -L and -P wins, inside an option group as well as
+// across them, so `-P -L -PL` is -L for either. Returns the index of the first
+// argument that is not an option.
+//
+// `accept_e` is `cd`'s POSIX -e and is null for `pwd`, which has no such option -
+// dash reports `pwd -e` as illegal and so does this. `unknown` names the offending
+// letter so the caller can prefix the diagnostic with its own name, which is dash's
+// wording and the reason this reports rather than prints.
+size_t scan_directory_options(char** argv, cd_mode& mode, bool* accept_e, char& unknown) {
+	size_t at = 1;
+	for (; argv[at] != nullptr; ++at) {
+		const std::string_view arg{argv[at]};
+		if (arg == "--") {
+			++at;
+			break;
+		}
+		// A lone `-` is cd's OLDPWD OPERAND, not an option, so the scan stops at it
+		// rather than reading it as an empty option group.
+		if (arg.size() < 2 || arg[0] != '-')
+			break;
+		for (const char option : arg.substr(1)) {
+			if (option == 'L') {
+				mode = cd_mode::logical;
+			} else if (option == 'P') {
+				mode = cd_mode::physical;
+			} else if (option == 'e' && accept_e != nullptr) {
+				// POSIX -e: with -P, say so when the new working directory cannot be
+				// determined. It has no meaning under -L, where PWD is COMPUTED rather
+				// than read back and therefore always known, and POSIX leaves that
+				// combination unspecified - so it is accepted and has no effect. dash
+				// rejects -e outright, which is what fails it cd-p.tst's 'exit status of
+				// success with -e'; the divergence is deliberate and recorded in #46.
+				*accept_e = true;
+			} else {
+				unknown = option;
+				return at;
+			}
+		}
 	}
-	std::error_code ec;
-	const auto here = std::filesystem::current_path(ec);
-	if (ec) {
-		std::fprintf(stderr, "lesh: pwd: %s\n", ec.message().c_str());
+	return at;
+}
+
+// POSIX `pwd`. -L reports the LOGICAL working directory - $PWD, but only while it
+// still names the directory the shell is in - and -P reports the physical one.
+//
+// Both halves were missing. The options were not read at all, so `pwd -P` printed
+// the logical answer; and the stored value was never verified, so after `readonly
+// PWD; cd sub` - a cd that moved the shell and could not record it - `pwd` kept
+// printing the directory the shell had left (#51).
+builtin_result builtin_pwd(shell_state& state, char** argv) {
+	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
+	char unknown = '\0';
+	std::ignore = scan_directory_options(argv, mode, nullptr, unknown);
+	if (unknown != '\0') {
+		std::fprintf(stderr, "lesh: pwd: Illegal option -%c\n", unknown);
+		return {2};
+	}
+	// Operands are IGNORED rather than diagnosed, which is where `pwd` parts from
+	// `cd`: #46 diagnoses `cd a b` because taking the first operand and dropping the
+	// rest lands the shell somewhere the user did not name. An extra operand to `pwd`
+	// changes no answer, so refusing it would be a divergence from dash that buys
+	// nothing.
+
+	const std::string here = mode == cd_mode::logical
+		? state.logical_working_directory()
+		: shell_state::physical_working_directory();
+	if (here.empty()) {
+		// getcwd could not answer: the directory has been removed under the shell.
+		// dash reports and fails here too, and printing nothing at status zero would
+		// be a wrong answer a script would act on.
+		std::fprintf(stderr, "lesh: pwd: %s\n", std::strerror(errno));
 		return {1};
 	}
 	std::printf("%s\n", here.c_str());
 	return {0};
 }
-
-// `cd`'s two modes, POSIX XCU `cd`. -L is the DEFAULT: `..` is resolved against
-// the LOGICAL working directory, so a symlink followed on the way in is unfollowed
-// on the way out. -P hands the path to chdir and reads the answer back, so PWD
-// holds a physical path. #24 chose the logical PWD deliberately and this does not
-// disturb it - -P is a second mode BESIDE it, not a rework of it.
-enum class cd_mode {
-	logical,
-	physical,
-};
 
 // POSIX `cd` step 10's canonicalization: a `.` component is deleted and a `..`
 // deletes the component before it, LEXICALLY - the filesystem is not consulted for
@@ -154,21 +221,6 @@ bool canonicalize_logical(std::string_view path, std::string& out, std::string& 
 	return true;
 }
 
-// The logical working directory `cd` starts from: $PWD, or the real one when PWD
-// cannot be believed.
-//
-// PWD not being absolute is not a curiosity - `PWD=foo` is a plain assignment any
-// script may make - and joining a relative operand onto it would produce a path
-// with no relation to where the shell is. POSIX 2.5.3 describes PWD as an absolute
-// pathname, so anything else is treated as absent.
-std::string current_logical_pwd(const shell_state& state) {
-	std::string_view pwd;
-	if (state.lookup("PWD", pwd) && !pwd.empty() && pwd[0] == '/')
-		return std::string{pwd};
-	std::error_code ec;
-	return std::filesystem::current_path(ec).string();
-}
-
 // POSIX `cd` step 5: a relative operand whose first component is neither `.` nor
 // `..` is looked up in $CDPATH, left to right, and the FIRST entry under which it
 // names a directory wins.
@@ -219,37 +271,13 @@ bool search_cdpath(const shell_state& state, std::string_view operand,
 builtin_result builtin_cd(shell_state& state, char** argv) {
 	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
 	bool require_pwd = false;          // -e
-	size_t at = 1;
-	for (; argv[at] != nullptr; ++at) {
-		const std::string_view arg{argv[at]};
-		if (arg == "--") {
-			++at;
-			break;
-		}
-		// A lone `-` is cd's OLDPWD OPERAND, not an option, so the scan stops at it
-		// rather than reading it as an empty option group.
-		if (arg.size() < 2 || arg[0] != '-')
-			break;
-		for (const char option : arg.substr(1)) {
-			// The LAST of -L and -P wins, inside a group as well as across them:
-			// cd-p.tst's 'the last option wins' is `cd -P -L -PL`, whose answer is -L.
-			if (option == 'L') {
-				mode = cd_mode::logical;
-			} else if (option == 'P') {
-				mode = cd_mode::physical;
-			} else if (option == 'e') {
-				// POSIX -e: with -P, say so when the new working directory cannot be
-				// determined. It has no meaning under -L, where PWD is COMPUTED rather
-				// than read back and therefore always known, and POSIX leaves that
-				// combination unspecified - so it is accepted and has no effect. dash
-				// rejects -e outright, which is what fails it cd-p.tst's 'exit status of
-				// success with -e'; the divergence is deliberate and recorded in #46.
-				require_pwd = true;
-			} else {
-				std::fprintf(stderr, "lesh: cd: Illegal option -%c\n", option);
-				return {2};
-			}
-		}
+	char unknown = '\0';
+	// cd-p.tst's 'the last option wins' is `cd -P -L -PL`, whose answer is -L; the
+	// scan is shared with `pwd`, which has the same pair and the same tie-break.
+	const size_t at = scan_directory_options(argv, mode, &require_pwd, unknown);
+	if (unknown != '\0') {
+		std::fprintf(stderr, "lesh: cd: Illegal option -%c\n", unknown);
+		return {2};
 	}
 
 	// At most ONE operand. dash takes the first and ignores the rest in silence,
@@ -307,7 +335,13 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	// it becomes OLDPWD, and it is what a relative curpath extends. Step 8 joins
 	// onto the LOGICAL PWD rather than onto the real path, which is what makes `cd
 	// link` then `cd ..` return where the user came from.
-	const std::string previous_pwd = current_logical_pwd(state);
+	//
+	// It is shell_state's answer rather than a reading of $PWD, and #51 is why: a
+	// $PWD that no longer names the current directory - what `readonly PWD; cd sub`
+	// leaves behind, and what a lie in the environment used to leave at startup -
+	// would make every relative operand resolve against a directory the shell is not
+	// in. `pwd` falls back by the same rule, so the two cannot disagree.
+	const std::string previous_pwd = state.logical_working_directory();
 	if (curpath.empty() || curpath[0] != '/') {
 		std::string joined = previous_pwd;
 		joined += '/';
@@ -329,9 +363,8 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 			std::fprintf(stderr, "lesh: cd: %s: %s\n", operand.c_str(), ec.message().c_str());
 			return {2};
 		}
-		std::error_code where;
-		next_pwd = std::filesystem::current_path(where).string();
-		if (where || next_pwd.empty()) {
+		next_pwd = shell_state::physical_working_directory();
+		if (next_pwd.empty()) {
 			// The directory DID change and only its name is unknown, so this is not a
 			// failed cd: PWD gets the best answer available and the status is decided at
 			// the end, where -e is honoured.
