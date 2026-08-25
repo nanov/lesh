@@ -179,12 +179,19 @@ Enabled by A-6…A-12. When it lands: pager's internal surface API gets formaliz
 
 ## 9. Open questions
 
-Each open question is a ticket on [the leshper map](https://github.com/nanov/lesh/issues/82); the ticket holds the reasoning, this section holds only the pointer.
+Each open question is a ticket on [the leshper map](https://github.com/nanov/lesh/issues/82); the ticket holds the reasoning, this section holds only the pointer. Resolved questions move to the list below; the decisions themselves are indexed in the [architecture spec](2026-08-25-leshper-architecture.md).
+
+Still open:
 
 - **Q-1** Vi depth at v1 → [#99](https://github.com/nanov/lesh/issues/99)
 - **Q-2** Selection semantics → [#96](https://github.com/nanov/lesh/issues/96)
-- **Q-3** `vared`-equivalent entry point at v1 or later → [#102](https://github.com/nanov/lesh/issues/102)
-- **Q-4** Terminal floor → [#97](https://github.com/nanov/lesh/issues/97)
+- **Q-3** `vared`-equivalent entry point at v1 or later → [#102](https://github.com/nanov/lesh/issues/102) — unblocked by #94; the interfaces it tests are frozen
+
+Resolved:
+
+- **Q-4** Terminal floor → [#97](https://github.com/nanov/lesh/issues/97): ANSI + 256 colors + bracketed paste required, truecolor opportunistic, never terminfo, no startup queries — architecture spec §7
+- The NG-4 language-neutral action/reactor ABI → [#93](https://github.com/nanov/lesh/issues/93): one C-shaped registry, results only through a generation-bound request token — ADR-0008, architecture spec §6.1
+- The A-5/A-13 provider interfaces and their failure contracts → [#94](https://github.com/nanov/lesh/issues/94): four providers, syntax layer sealed, user overrides run as killable spawned children — architecture spec §6.2
 
 ## 10. Reference index
 
