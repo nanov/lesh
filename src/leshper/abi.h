@@ -356,6 +356,8 @@ int32_t lesh_emit_virtual_text(lesh_request* request, size_t at,
  * action; it never auto-applies). */
 #define LESH_PROPOSAL_AUTOSUGGESTION 0u
 #define LESH_PROPOSAL_COMPLETION 1u
+/* A history entry matching the query (F-32); the search UI's kind. */
+#define LESH_PROPOSAL_HISTORY_MATCH 2u
 
 int32_t lesh_propose(lesh_request* request, uint32_t kind, const char* bytes, size_t length);
 

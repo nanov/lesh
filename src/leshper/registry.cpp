@@ -657,7 +657,8 @@ int32_t lesh_propose(lesh_request* request, uint32_t kind, const char* bytes, si
 		return LESH_ERR_INVAL;
 	if (bytes == nullptr && length != 0)
 		return LESH_ERR_INVAL;
-	if (kind != LESH_PROPOSAL_AUTOSUGGESTION && kind != LESH_PROPOSAL_COMPLETION)
+	if (kind != LESH_PROPOSAL_AUTOSUGGESTION && kind != LESH_PROPOSAL_COMPLETION &&
+	    kind != LESH_PROPOSAL_HISTORY_MATCH)
 		return LESH_ERR_INVAL;
 	request->proposals->push_back(
 		proposal{kind, std::string(bytes == nullptr ? "" : bytes, length)});

@@ -436,7 +436,7 @@ TEST(LeshperHistorySearch, TheProviderEmitsMatchesAsProposalsNewestFirst) {
 	ASSERT_EQ(batches[0].proposals.size(), 2u);
 	EXPECT_EQ(batches[0].proposals[0].bytes, "git commit");
 	EXPECT_EQ(batches[0].proposals[1].bytes, "git status");
-	EXPECT_EQ(batches[0].proposals[0].kind, LESH_PROPOSAL_AUTOSUGGESTION);
+	EXPECT_EQ(batches[0].proposals[0].kind, LESH_PROPOSAL_HISTORY_MATCH);
 }
 
 TEST(LeshperHistorySearch, TheQueryIsTheSnapshotsTypedPrefix) {

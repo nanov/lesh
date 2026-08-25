@@ -1059,9 +1059,9 @@ TEST(LeshperDecodeReplay, ChunkingDoesNotChangeTheEvents) {
 
 TEST(LeshperDecodeReplay, DecodedKeysDriveTheEditorWithNoTerminalAnywhere) {
 	// The seam #111 exists to close: bytes in one end, buffer text out the
-	// other, and not a file descriptor in the process. Paste is deliberately
-	// absent - the editor's handling of paste_event is the keymap ticket's
-	// (#93/#96), and this asserts only what the decoder promises.
+	// other, and not a file descriptor in the process. Paste is absent here
+	// because leshper_paste_tests.cpp (#121) drives it end to end; this asserts
+	// only what the decoder promises.
 	driver d;
 	d.feed("echo \xE4\xB8\xAD\x1B[D" "x");
 
@@ -2415,10 +2415,10 @@ TEST(LeshperAbiReactors, OnlyTheReactorsSubscribedToTheEventRun) {
 
 	state s;
 	loop_harness loop(reg);
-	loop.react(s, LESH_EVENT_CURSOR_MOVED);
+	(void)loop.react(s, LESH_EVENT_CURSOR_MOVED);
 	EXPECT_EQ(buffer_runs, 0);
 	EXPECT_EQ(cursor_runs, 1);
-	loop.react(s, LESH_EVENT_BUFFER_CHANGED | LESH_EVENT_CURSOR_MOVED);
+	(void)loop.react(s, LESH_EVENT_BUFFER_CHANGED | LESH_EVENT_CURSOR_MOVED);
 	EXPECT_EQ(buffer_runs, 1);
 	EXPECT_EQ(cursor_runs, 2);
 }

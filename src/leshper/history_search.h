@@ -274,18 +274,12 @@ struct history_search_provider {
 	const history_source* source = nullptr;
 	history_search::options options{};
 
-	// The kind each match is proposed under.
-	//
-	// A history match is neither an autosuggestion nor a completion, and there
-	// is no `LESH_PROPOSAL_HISTORY_MATCH` to name it with. Inventing one here
-	// is not this file's to do - abi.h is a frozen surface that grows additively
-	// and by its owners - so the kind is a PARAMETER, defaulting to the kind the
-	// first named consumer wants: the autosuggester (F-24) draws the newest
-	// match as greyed-out virtual text, and for that consumer this kind is
-	// exactly right. When the search UI (#118) lands and wants its own kind, it
-	// is one enumerator in abi.h plus one arm in `lesh_propose`'s validation,
-	// and this struct already carries it.
-	std::uint32_t proposal_kind = LESH_PROPOSAL_AUTOSUGGESTION;
+	// The kind each match is proposed under. A PARAMETER rather than a fixed
+	// value because the same computation serves two consumers: the search UI
+	// (#118) wants history matches as themselves, and the autosuggester (F-24)
+	// draws the newest match as greyed-out virtual text and asks for it under
+	// its own kind.
+	std::uint32_t proposal_kind = LESH_PROPOSAL_HISTORY_MATCH;
 };
 
 // A `lesh_reactor_fn`. `userdata` is a `history_search_provider*`.
