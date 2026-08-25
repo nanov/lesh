@@ -1,5 +1,6 @@
 #include "leshper/blit.h"
 #include "leshper/layout.h"
+#include "leshper/sgr.h"
 #include "leshper/state.h"
 #include "leshper/surface.h"
 #include "leshper/text.h"
@@ -624,4 +625,345 @@ TEST(LeshperLayout, TheStateIsWhereTheInputComesFrom) {
 	EXPECT_EQ(glyphs_of(pool, made.screen, 0), padded("$ ls -l", 10));
 	EXPECT_EQ(made.cursor_column, 7);
 	EXPECT_EQ(made.screen.cursor().column, 7);
+}
+
+// ---------------------------------------------------------------------------
+// A prompt's SGR is a pen (#131).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The pen a terminal reading `bytes` would hold when it reached the first byte
+// that is not part of an escape sequence. Written the way `sgr.h` is meant to
+// be driven - every recognized escape fed to it, SGR or not - so the round-trip
+// test below reads the blitter's real output rather than a hand-picked slice.
+style pen_at_first_glyph(std::string_view bytes) {
+	style pen;
+	std::size_t i = 0;
+	while (i < bytes.size()) {
+		if (static_cast<unsigned char>(bytes[i]) != 0x1B)
+			break;
+		const std::size_t length = lesh::grapheme::measure_detail::escape_length(bytes, i);
+		if (length == 0)
+			break;
+		pen = apply_sgr(bytes.substr(i, length), pen);
+		i += length;
+	}
+	return pen;
+}
+
+// Somewhere for a test to start from that is not the default, so "unchanged"
+// and "reset" cannot pass for each other.
+const style STYLED{color::of_index(5), color::of_rgb(9, 9, 9),
+                   attribute::bold | attribute::italic};
+
+} // namespace
+
+TEST(LeshperLayoutSgr, ZeroIsTheTerminalDefaultAndSoIsAnEmptyParameter) {
+	// The blitter's `reset_pen` writes exactly these bytes for exactly this
+	// style. A reader whose `0` meant "back to the caller's prompt_pen" would
+	// not be the inverse of that, it would be a second dialect.
+	EXPECT_TRUE(apply_sgr("\x1B[0m", STYLED) == style{});
+	EXPECT_TRUE(apply_sgr("\x1B[m", STYLED) == style{});
+	EXPECT_TRUE(apply_sgr("\x1B[0;0m", STYLED) == style{});
+}
+
+TEST(LeshperLayoutSgr, ThePaletteIsSpelledInFourRangesAndStaysIndexed) {
+	// Indexed and NOT resolved to RGB: the user may have redefined slot 2, and
+	// picking a green here would be `surface.h`'s quantization mistake made at
+	// the other end.
+	EXPECT_TRUE(apply_sgr("\x1B[32m", style{}).fg == color::of_index(2));
+	EXPECT_TRUE(apply_sgr("\x1B[92m", style{}).fg == color::of_index(10));
+	EXPECT_TRUE(apply_sgr("\x1B[41m", style{}).bg == color::of_index(1));
+	EXPECT_TRUE(apply_sgr("\x1B[101m", style{}).bg == color::of_index(9));
+	EXPECT_TRUE(apply_sgr("\x1B[30m", style{}).fg == color::of_index(0));
+	EXPECT_TRUE(apply_sgr("\x1B[47m", style{}).bg == color::of_index(7));
+
+	// 39 and 49 are one channel each, and leave the other alone.
+	const style both = apply_sgr("\x1B[32;41m", style{});
+	EXPECT_TRUE(apply_sgr("\x1B[39m", both).fg == color::of_default());
+	EXPECT_TRUE(apply_sgr("\x1B[39m", both).bg == color::of_index(1));
+	EXPECT_TRUE(apply_sgr("\x1B[49m", both).bg == color::of_default());
+	EXPECT_TRUE(apply_sgr("\x1B[49m", both).fg == color::of_index(2));
+}
+
+TEST(LeshperLayoutSgr, EveryAttributeAndItsOff) {
+	const style all = apply_sgr("\x1B[1;2;3;4;7;9m", style{});
+	EXPECT_TRUE(all.attrs == (attribute::bold | attribute::dim | attribute::italic
+	                          | attribute::underline | attribute::reverse
+	                          | attribute::strikethrough));
+
+	// 22 clears bold AND dim, which is not this reader being lossy - it is why
+	// the blitter resets and restates rather than turning one attribute off.
+	EXPECT_FALSE(has(apply_sgr("\x1B[22m", all).attrs, attribute::bold));
+	EXPECT_FALSE(has(apply_sgr("\x1B[22m", all).attrs, attribute::dim));
+	EXPECT_TRUE(has(apply_sgr("\x1B[22m", all).attrs, attribute::italic));
+
+	EXPECT_FALSE(has(apply_sgr("\x1B[23m", all).attrs, attribute::italic));
+	EXPECT_FALSE(has(apply_sgr("\x1B[24m", all).attrs, attribute::underline));
+	EXPECT_FALSE(has(apply_sgr("\x1B[27m", all).attrs, attribute::reverse));
+	EXPECT_FALSE(has(apply_sgr("\x1B[29m", all).attrs, attribute::strikethrough));
+
+	// The colours are not attributes and an attribute off does not touch them.
+	EXPECT_TRUE(apply_sgr("\x1B[22;23;24;27;29m", STYLED).fg == STYLED.fg);
+	EXPECT_TRUE(apply_sgr("\x1B[22;23;24;27;29m", STYLED).attrs == attribute::none);
+}
+
+TEST(LeshperLayoutSgr, UndercurlIsTheBlittersOwnColonSpelling) {
+	// #97's one opportunistic attribute, and the blitter writes it as `4:3`. A
+	// reader that only knew `ESC[4m` would round-trip an undercurl into a plain
+	// underline every time the two directions met.
+	const style curly = apply_sgr("\x1B[4:3m", style{});
+	EXPECT_TRUE(has(curly.attrs, attribute::undercurl));
+	EXPECT_FALSE(has(curly.attrs, attribute::underline));
+
+	// One attribute at the terminal, so a plain 4 REPLACES it rather than
+	// joining it - holding both would emit `4:3` for a prompt that asked for 4.
+	EXPECT_TRUE(apply_sgr("\x1B[4m", curly).attrs == attribute::underline);
+	// 24 clears whichever of the two is in force.
+	EXPECT_TRUE(apply_sgr("\x1B[24m", curly).attrs == attribute::none);
+	EXPECT_TRUE(apply_sgr("\x1B[4:0m", curly).attrs == attribute::none);
+	// Double, dotted and dashed have no cell to live in and degrade to a plain
+	// underline, which is what the surface can hold.
+	EXPECT_TRUE(apply_sgr("\x1B[4:2m", style{}).attrs == attribute::underline);
+	EXPECT_TRUE(apply_sgr("\x1B[4:5m", style{}).attrs == attribute::underline);
+}
+
+TEST(LeshperLayoutSgr, IndexedAndTruecolorInBothSpellings) {
+	EXPECT_TRUE(apply_sgr("\x1B[38;5;196m", style{}).fg == color::of_index(196));
+	EXPECT_TRUE(apply_sgr("\x1B[48;5;17m", style{}).bg == color::of_index(17));
+	EXPECT_TRUE(apply_sgr("\x1B[38;2;10;20;30m", style{}).fg == color::of_rgb(10, 20, 30));
+	EXPECT_TRUE(apply_sgr("\x1B[48;2;0;0;255m", style{}).bg == color::of_rgb(0, 0, 255));
+
+	// The colon form is the same statement; terminals emit both and the
+	// blitter's own `4:3` already proves the separator is in the vocabulary.
+	EXPECT_TRUE(apply_sgr("\x1B[38:5:196m", style{}).fg == color::of_index(196));
+	EXPECT_TRUE(apply_sgr("\x1B[48:2:10:20:30m", style{}).bg == color::of_rgb(10, 20, 30));
+
+	// An indexed colour is not a truecolour that has not been converted yet -
+	// they are different statements and both survive the read.
+	EXPECT_TRUE(apply_sgr("\x1B[38;5;4m", style{}).fg != apply_sgr("\x1B[38;2;0;0;128m",
+	                                                               style{}).fg);
+}
+
+TEST(LeshperLayoutSgr, AnUnknownOrMalformedParameterIsDroppedAndTheRestStillParses) {
+	// 5 is blink and 53 is overline; neither has a cell to live in. Abandoning
+	// the sequence at one would make a prompt's colours depend on whether an
+	// unrelated terminal feature appeared earlier in the same ESC[...m.
+	const style kept = apply_sgr("\x1B[1;5;53;31m", style{});
+	EXPECT_TRUE(has(kept.attrs, attribute::bold));
+	EXPECT_TRUE(kept.fg == color::of_index(1));
+
+	// A parameter past what a CSI parameter can hold clamps at the numeric
+	// policy's limit and lands in the ignored range, which is where it belongs.
+	EXPECT_TRUE(apply_sgr("\x1B[99999999999999999999;31m", style{}).fg
+	            == color::of_index(1));
+
+	// An out-of-range or truncated extended colour drops THAT colour and
+	// nothing else. The parameters it consumed were the colour's either way.
+	EXPECT_TRUE(apply_sgr("\x1B[38;5;999;1m", style{}).fg == color::of_default());
+	EXPECT_TRUE(has(apply_sgr("\x1B[38;5;999;1m", style{}).attrs, attribute::bold));
+	EXPECT_TRUE(apply_sgr("\x1B[38;5m", STYLED).fg == STYLED.fg);
+	EXPECT_TRUE(apply_sgr("\x1B[38;2;1;2m", STYLED).fg == STYLED.fg);
+	// A T.416 form the cell cannot hold - transparent, CMY, CMYK.
+	EXPECT_TRUE(apply_sgr("\x1B[38;1m", STYLED).fg == STYLED.fg);
+}
+
+TEST(LeshperLayoutSgr, EverythingThatIsNotSGRLeavesThePenExactlyAsItWas) {
+	// #114 recognizes CSI, OSC and SS3; only one of the three is a pen, and the
+	// other two keep the treatment they already had - consumed whole, zero
+	// width, no colour.
+	EXPECT_TRUE(apply_sgr("\x1B]0;a title\x07", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("\x1BOA", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("\x1B[2C", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("\x1B[K", STYLED) == STYLED);
+	// A private-mode string is somebody else's grammar even when it ends in 'm'.
+	EXPECT_TRUE(apply_sgr("\x1B[?1m", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("\x1B[>4m", STYLED) == STYLED);
+	// An intermediate byte says the same thing.
+	EXPECT_TRUE(apply_sgr("\x1B[1 m", STYLED) == STYLED);
+	// And so does anything that is not an escape at all.
+	EXPECT_TRUE(apply_sgr("", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("\x1B", STYLED) == STYLED);
+	EXPECT_TRUE(apply_sgr("31m", STYLED) == STYLED);
+}
+
+TEST(LeshperLayoutSgr, TheBlittersOwnBytesReadBackAsTheStyleThatWroteThem) {
+	// The whole argument for this file: it is the blitter's emit vocabulary
+	// read backwards, so the two directions have to agree on every style the
+	// cell can hold, or one of them is a dialect. Truecolor and undercurl are
+	// on so nothing is quantized or downgraded on the way out - what is being
+	// checked is the vocabulary, not the capability ladder.
+	cluster_pool pool;
+	terminal_capabilities caps;
+	caps.colors = color_depth::truecolor;
+	caps.undercurl = true;
+	const blitter to_bytes{pool, caps};
+
+	const std::vector<style> wanted{
+		style{},
+		style{color::of_index(2), color::of_default(), attribute::none},
+		style{color::of_index(9), color::of_index(4), attribute::bold | attribute::italic},
+		style{color::of_rgb(1, 2, 3), color::of_rgb(250, 128, 0), attribute::underline},
+		style{color::of_default(), color::of_rgb(0, 0, 0), attribute::undercurl},
+		style{color::of_index(255), color::of_index(0),
+		      attribute::bold | attribute::dim | attribute::italic | attribute::underline
+		          | attribute::reverse | attribute::strikethrough},
+	};
+	for (const style& want : wanted) {
+		surface one{4, 1};
+		one.write(pool, 0, 0, "x", want);
+		EXPECT_TRUE(pen_at_first_glyph(to_bytes.paint(one)) == want);
+	}
+}
+
+TEST(LeshperLayout, AnSGRInThePromptColoursTheCellsAfterIt) {
+	// The ticket's headline: `ESC[32m$ ESC[0m` used to render a plain `$`.
+	cluster_pool pool;
+	layout_input in = sized(10, 2);
+	const std::string prompt = "\x1B[32m$ \x1B[0m";
+	in.prompt = prompt;
+	in.buffer = "ls";
+	in.cursor = at(2);
+	in.text_pen = style{color::of_index(7), color::of_default(), attribute::none};
+
+	const layout made = lay_out(pool, in);
+	const style green{color::of_index(2), color::of_default(), attribute::none};
+	EXPECT_TRUE(made.screen.at(0, 0).pen == green);
+	EXPECT_TRUE(made.screen.at(0, 1).pen == green);
+	EXPECT_TRUE(made.screen.at(0, 2).pen == in.text_pen);
+
+	// And #114's invariant, which is what the pen had to ride rather than
+	// replace: the glyphs and the width are exactly what they were.
+	EXPECT_EQ(glyphs_of(pool, made.screen, 0), padded("$ ls", 10));
+	EXPECT_EQ(made.cursor_column, lesh::grapheme::display_width(prompt) + 2);
+}
+
+TEST(LeshperLayout, ThePenChangesAtTheSGRAndNotBeforeIt) {
+	cluster_pool pool;
+	layout_input in = sized(12, 2);
+	const std::string prompt = "ab\x1B[31mcd\x1B[1;4mef";
+	in.prompt = prompt;
+
+	const layout made = lay_out(pool, in);
+	EXPECT_EQ(glyphs_of(pool, made.screen, 0), padded("abcdef", 12));
+	EXPECT_EQ(made.cursor_column, lesh::grapheme::display_width(prompt));
+
+	const style plain{};
+	const style red{color::of_index(1), color::of_default(), attribute::none};
+	const style loud{color::of_index(1), color::of_default(),
+	                 attribute::bold | attribute::underline};
+	EXPECT_TRUE(made.screen.at(0, 1).pen == plain);
+	EXPECT_TRUE(made.screen.at(0, 2).pen == red);
+	EXPECT_TRUE(made.screen.at(0, 3).pen == red);
+	EXPECT_TRUE(made.screen.at(0, 4).pen == loud);
+	// Cumulative: the second SGR added to the first rather than replacing it.
+	EXPECT_TRUE(made.screen.at(0, 5).pen == loud);
+}
+
+TEST(LeshperLayout, ThePromptStartsFromThePromptPenAndItsSGRTakesItFromThere) {
+	// `prompt_pen` is where the prompt STARTS. An SGR modifies it - a prompt
+	// that only sets a colour keeps the caller's bold - and an `ESC[0m` means
+	// the terminal's default, because that is what the blitter means by the
+	// same bytes.
+	cluster_pool pool;
+	layout_input in = sized(12, 2);
+	in.prompt = "a\x1B[31mb\x1B[0mc";
+	in.prompt_pen = style{color::of_index(4), color::of_default(), attribute::bold};
+
+	const layout made = lay_out(pool, in);
+	EXPECT_TRUE(made.screen.at(0, 0).pen == in.prompt_pen);
+	EXPECT_TRUE(made.screen.at(0, 1).pen
+	            == (style{color::of_index(1), color::of_default(), attribute::bold}));
+	EXPECT_TRUE(made.screen.at(0, 2).pen == style{});
+}
+
+TEST(LeshperLayout, ThePromptsPenNeverBleedsIntoTheBuffer) {
+	// A prompt that forgets its reset is a theme author's bug, not the user's
+	// text turning red. The buffer's pen is an input and its walk starts from
+	// it, so there is no state for a missing `ESC[0m` to leak through.
+	cluster_pool pool;
+	layout_input in = sized(12, 2);
+	in.prompt = "\x1B[31;1m$ ";
+	in.buffer = "ls";
+	in.cursor = at(2);
+	in.text_pen = style{color::of_index(7), color::of_default(), attribute::none};
+
+	const layout made = lay_out(pool, in);
+	EXPECT_TRUE(made.screen.at(0, 0).pen
+	            == (style{color::of_index(1), color::of_default(), attribute::bold}));
+	EXPECT_TRUE(made.screen.at(0, 2).pen == in.text_pen);
+	EXPECT_TRUE(made.screen.at(0, 3).pen == in.text_pen);
+}
+
+TEST(LeshperLayout, AContinuationPromptsSGRStartsFreshOnEveryLogicalLine) {
+	cluster_pool pool;
+	layout_input in = sized(10, 4);
+	in.prompt = "$ ";
+	in.continuation = "\x1B[33m> \x1B[0m";
+	in.buffer = "a\nb\nc";
+	in.cursor = at(5);
+	in.text_pen = style{color::of_index(7), color::of_default(), attribute::none};
+
+	const layout made = lay_out(pool, in);
+	EXPECT_EQ(rows_of(pool, made.screen),
+	          (std::vector<std::string>{padded("$ a", 10), padded("> b", 10),
+	                                    padded("> c", 10)}));
+	const style yellow{color::of_index(3), color::of_default(), attribute::none};
+	// Both continuations are coloured, not just the first: each logical line
+	// gets its own walk of the continuation bytes from `prompt_pen`.
+	EXPECT_TRUE(made.screen.at(1, 0).pen == yellow);
+	EXPECT_TRUE(made.screen.at(2, 0).pen == yellow);
+	// And the buffer after it is still the buffer's.
+	EXPECT_TRUE(made.screen.at(1, 2).pen == in.text_pen);
+	EXPECT_TRUE(made.screen.at(2, 2).pen == in.text_pen);
+}
+
+TEST(LeshperLayout, APenCarriesAcrossASoftWrapAndAcrossAPromptsOwnNewline) {
+	cluster_pool pool;
+	layout_input in = sized(4, 4);
+	in.prompt = "\x1B[36mabcdef";
+
+	const layout made = lay_out(pool, in);
+	EXPECT_EQ(rows_of(pool, made.screen),
+	          (std::vector<std::string>{padded("abcd", 4), padded("ef", 4)}));
+	const style cyan{color::of_index(6), color::of_default(), attribute::none};
+	EXPECT_TRUE(made.screen.at(0, 0).pen == cyan);
+	EXPECT_TRUE(made.screen.at(1, 0).pen == cyan);
+	EXPECT_TRUE(made.screen.at(1, 1).pen == cyan);
+
+	// A newline inside the prompt is a row break, not a pen break.
+	layout_input lines = sized(6, 4);
+	lines.prompt = "\x1B[36mtop\n> ";
+	const layout two = lay_out(pool, lines);
+	EXPECT_EQ(rows_of(pool, two.screen),
+	          (std::vector<std::string>{padded("top", 6), padded("> ", 6)}));
+	EXPECT_TRUE(two.screen.at(0, 0).pen == cyan);
+	EXPECT_TRUE(two.screen.at(1, 0).pen == cyan);
+}
+
+TEST(LeshperLayout, TheWidthInvariantSurvivesEveryEscapeForm) {
+	// The one thing #131 was not allowed to break, at every shape #114
+	// recognizes plus the malformed ones N-4 says must degrade rather than
+	// abort: what layout PAINTS is exactly what `display_width` MEASURES.
+	cluster_pool pool;
+	const std::string prompts[] = {
+		"\x1B[32m$ \x1B[0m",
+		"\x1B[1;38;2;255;0;0m" + std::string(CJK_MIDDLE) + "\x1B[m ",
+		"\x1B]0;a title\x07\x1B[4:3m$\x1B[24m ",
+		"\x1BOA\x1B[2C\x1B[31mx",
+		"\x1B[38;5;m$ ",              // truncated extended colour
+		"\x1B[38;2;1;2m$ ",           // truncated truecolour
+		"\x1B[999999999999m$ ",       // a parameter no site can hold
+		"\x1B[$ ",                    // an unterminated CSI: not an escape at all
+		"\x1B$ ",                     // a lone ESC: a control, dropped by the surface
+		"\x1B]0;never terminated",    // an unterminated OSC
+	};
+	for (const std::string& prompt : prompts) {
+		layout_input in = sized(40, 4);
+		in.prompt = prompt;
+		const layout made = lay_out(pool, in);
+		EXPECT_EQ(made.cursor_row, 0) << prompt;
+		EXPECT_EQ(made.cursor_column, lesh::grapheme::display_width(prompt)) << prompt;
+	}
 }

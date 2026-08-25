@@ -73,20 +73,33 @@ namespace lesh::leshper {
 //      one row per one-row cursor move, so it reads as scrolling rather than as
 //      jumping, and it always shows context on both sides of the cursor.
 //
+//   5. A PROMPT'S SGR IS A PEN, NOT A DECORATION (#131). Escape sequences in
+//      prompt bytes are recognized by #114's measurer and contribute no width
+//      and no cells - and an SGR among them now moves the pen the clusters
+//      AFTER it are painted with, through `sgr.h`, so `ESC[32m$ ESC[0m` renders
+//      as the theme author wrote it instead of as a plain `$`. Every other form
+//      - OSC, SS3, a CSI that is not SGR - is skipped exactly as before.
+//
+//      THE WIDTH INVARIANT SURVIVES IT and is the reason the pen rides the same
+//      recognition point rather than a second scan: what this file paints for a
+//      prompt is still exactly `grapheme::display_width(prompt)`, a debug
+//      assertion in the walk and a test at every shape. The pen does not
+//      outlive the text it belongs to - the prompt's colours never bleed into
+//      the buffer, which starts from `text_pen` again, and a continuation
+//      prompt starts from `prompt_pen` on every logical line.
+//
 // WHAT IT DOES NOT DECIDE. The right prompt (F-40 declares widths first), the
-// pager (completion-engine fog), and how a prompt's SGR becomes a cell's pen.
-// That last one is a seam, not an omission: escape sequences in prompt bytes
-// are recognized by #114's measurer and contribute no width and no cells, so
-// the width this file paints is exactly `grapheme::display_width(prompt)` - the
-// invariant a test asserts. An SGR interpreter is the blitter's emit vocabulary
-// read backwards; it belongs with whoever decides prompt expansion (#94 left it
-// lesh-side and undecided) and slots in at that one recognition point.
+// pager (completion-engine fog), prompt expansion (#94 left it lesh-side and
+// undecided), and any mapping from a theme's NAMES to colours - `sgr.h` reads
+// the literal colours a prompt's bytes carry, where #93's interned semantic
+// styles are a different path and stay one.
 
 // Everything the picture depends on. Inputs only - no output parameters, no
 // handles, nothing this function may mutate.
 struct layout_input {
 	// The left prompt (F-40), opaque bytes from a `Prompt` provider (#94). May
-	// carry SGR/OSC/SS3, which is measured and skipped, never painted (#114).
+	// carry SGR/OSC/SS3, which is measured and skipped, never painted (#114) -
+	// and an SGR among them sets the pen of the cells that follow (#131).
 	// A U+000A in it starts a new row at column 0: multi-line prompts are
 	// ordinary here rather than a feature.
 	std::string_view prompt;
@@ -115,6 +128,11 @@ struct layout_input {
 	// The pens. Two, not a theme: theming is configuration (#101) and no
 	// ticket has decided it. Defaults are the terminal's own colours, which is
 	// what a shell prompt looks like before anyone styles it.
+	//
+	// `prompt_pen` is where the prompt STARTS, not where every span of it
+	// stays: its own SGR takes it from there, and an `ESC[0m` in it means the
+	// terminal's default - which is what the same bytes mean coming out of the
+	// blitter, and a reader that meant something else would be a dialect.
 	style prompt_pen{};
 	style text_pen{};
 
