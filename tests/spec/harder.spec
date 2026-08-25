@@ -263,6 +263,42 @@ unalias nosuch; echo "[$?]"
 --- alias reports an operand it cannot find and still defines the others [xfail(legacy): legacy has no alias listing]
 alias nosuch x=1; echo "[$?]"; alias x
 
+# --- reserved words are recognised BY POSITION, and only a word that is reserved
+# --- WHERE IT STANDS blocks substitution (alias-p.tst:298) ---------------------
+#
+# `A RESERVED WORD is never substituted, whatever its position` was too strong.
+# POSIX 2.4 recognises a reserved word only where the grammar can accept one, so
+# the word after `for` is a NAME and `in` is not reserved there - dash substitutes
+# it, and so must lesh. The converse still holds and is asserted below: in a
+# position where the word IS reserved, the alias table is never consulted.
+
+--- the for-loop NAME position is not a reserved-word position, so `in` is an alias there [stdin] [xfail(legacy): legacy's alias model differs]
+alias f=' for ' w=' in ' in=' x '
+f w in 1 2; do echo "[$x]"; done
+
+--- but `in` where the grammar really does expect it stays the keyword [stdin] [xfail(legacy): legacy's alias model differs]
+alias forx='for x ' in='in 9'
+forx in a; do echo "[$x]"; done
+
+# yash substitutes an alias for a word that spells a reserved word whenever the
+# grammar cannot accept that reserved word there - `alias forx='for x ' for='in 2'`
+# makes `forx for a` a loop over 2. NO OTHER SHELL DOES: dash, bash and zsh all
+# recognise the keyword first and report a syntax error, and lesh follows them.
+# These are not divergences - lesh answers exactly what dash answers - so they are
+# asserted against dash like any other case, to pin the behaviour down against a
+# later change made in the belief that yash is the oracle here.
+
+--- a keyword the grammar cannot accept where it stands is still a keyword, not an alias [stdin] [xfail(legacy): legacy's alias model differs]
+alias forx='for x ' for='in 2'
+forx for a; do echo "[$x]"; done
+echo "st=$?"
+
+--- the same in the `in` position of a case statement [stdin] [xfail(legacy): legacy has no case statements]
+alias c='case a ' case='
+ in a) :'
+c case X; echo A; esac
+echo "st=$?"
+
 --- a newline after a pipe continues the pipeline [stdin] [xfail(legacy): beyond legacy's single-pass parser]
 echo foo |
 cat

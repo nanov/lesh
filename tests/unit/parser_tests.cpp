@@ -893,6 +893,41 @@ TEST_F(ParserTest, TheCommandWordAfterAnAssignmentPrefixIsSubstituted) {
 	EXPECT_EQ(t.text_of(t[t.child_of(t[command], 1)]), "sh");
 }
 
+TEST_F(ParserTest, TheForLoopNameIsNotAReservedWordPosition) {
+	// POSIX 2.4 recognises a reserved word only where the grammar accepts one, and
+	// the word after `for` is a NAME. So an alias called `in` really does apply
+	// there, while the `in` the loop itself needs is still the keyword.
+	fake_aliases aliases;
+	aliases.define("f", " for ");
+	aliases.define("w", " in ");
+	aliases.define("in", " x ");
+	const tree t = parse(pool, "f w in 1; do :; done", &aliases);
+	node_index loop = no_node;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::for_loop)
+			loop = n;
+	ASSERT_NE(loop, no_node);
+	// aux packs the name token with the has_in flag in the top bit.
+	EXPECT_NE(t[loop].aux & 0x80000000u, 0u) << "the loop must have an `in` clause";
+	EXPECT_EQ(t.text_of_token(t.token_at(t[loop].aux & 0x7FFFFFFFu)), "x");
+}
+
+TEST_F(ParserTest, AKeywordTheGrammarCannotAcceptIsStillNotAnAlias) {
+	// The converse, and the limit of the rule above: in a position where the word
+	// IS reserved, the alias table is not consulted at all. yash substitutes here
+	// and no other shell does - see the cases in tests/spec/harder.spec.
+	fake_aliases aliases;
+	aliases.define("forx", "for x ");
+	aliases.define("do", ";");
+	const tree t = parse(pool, "forx do echo $x; done", &aliases);
+	node_index loop = no_node;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		if (t[n].kind == node_kind::for_loop)
+			loop = n;
+	ASSERT_NE(loop, no_node);
+	EXPECT_EQ(t[loop].aux & 0x80000000u, 0u) << "`do` stayed the keyword, so no `in`";
+}
+
 TEST_F(ParserTest, ANewlineAfterAPipeContinuesThePipeline) {
 	// POSIX spells it `linebreak` in the grammar. Without it, reading one command
 	// at a time ended the unit at the newline and the right-hand side was lost.

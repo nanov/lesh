@@ -501,7 +501,13 @@ private:
 	node_index parse_for() noexcept {
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
+		// The word this advance DRAWS is the loop's name, and no reserved word is
+		// accepted there - so an alias named `in` or `do` applies to it. Cleared
+		// immediately: the word after the name is read by the next advance, and there
+		// `in` and `do` really are keywords (alias-p.tst:351).
+		_plain_word_position = true;
 		advance();  // `for`
+		_plain_word_position = false;
 		parse_error defect = parse_error::none;
 
 		// `for name` - the one compound command whose operand is a WORD rather than a
@@ -1165,7 +1171,9 @@ private:
 		for (int guard = 0; guard < kMaxAliasDepth; ++guard) {
 			if (peek().kind != token_kind::word || peek().is_error())
 				return;
-			if (peek_reserved() != reserved::none)
+			// A reserved word blocks substitution only where the grammar could accept
+			// one. See _plain_word_position: `in` after `for` is a NAME, not a keyword.
+			if (!_plain_word_position && peek_reserved() != reserved::none)
 				return;
 			// A quoted word is never an alias: `\ls` and `'ls'` are how you bypass
 			// one, and flag_literal is exactly that test - with one exception, a LINE
@@ -1357,6 +1365,18 @@ private:
 	std::vector<pending_here_doc> _pending_here_docs;
 	std::vector<alias_frame> _alias_stack;
 	const alias_source* _aliases = nullptr;
+	// The word about to be drawn stands where the grammar accepts NO reserved word,
+	// so the alias table applies to it even if it spells one. POSIX 2.4 recognises a
+	// reserved word only where one can appear, and the `for` NAME is the position
+	// where that distinction is observable: `alias f=' for ' w=' in ' in=' x '` makes
+	// `f w in 1` a loop over `x`, because the `in` from `w`'s body is a name there
+	// rather than the keyword (alias-p.tst:298, which dash also passes).
+	//
+	// A flag on the parser rather than an argument to try_substitute_alias, because
+	// substitution happens when the token is READ - inside the advance() that
+	// consumes `for` - and the reading is several frames below the parse function
+	// that knows which position it is filling.
+	bool _plain_word_position = false;
 	size_t _alias_depth = 0;
 	static constexpr int kMaxAliasDepth = 16;
 	std::vector<uint32_t> _strip_tabs_for;
