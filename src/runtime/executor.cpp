@@ -178,6 +178,18 @@ constexpr int kExpansionError = 2;
 // requires non-zero, so this follows the reference shell.
 constexpr int kDotNotFound = 2;
 
+// What run_redirections_only's forked child reports back about the ONE thing its
+// exit status cannot carry alone (#70): whether it performed a command
+// substitution while expanding a redirection operand, and if so, what that
+// substitution's status was. The exit status already means "did the redirection
+// itself succeed" (0 or kRedirectionError), and a substitution can legitimately
+// report the very same 2 - `>file$(exit 2)` - so the two questions need separate
+// channels, and this is the one a pipe carries.
+struct redirection_substitution {
+	bool happened;
+	int status;
+};
+
 // A redirection's default fd when none was written: `>` means 1, `<` means 0.
 int default_fd_for(token_kind op) noexcept {
 	switch (op) {
@@ -568,25 +580,78 @@ bool tree_walking_executor::has_redirections(const tree& t, node_index command) 
 //
 // Doing nothing at all - which is what lesh did - meant `>file` never created the
 // file, `<missing` never failed, and `1>&- 2>&1` never closed anything.
+//
+// POSIX 2.9.1 also makes this command's exit status the LAST command
+// substitution it performed (#39, for the assignment prefix; #50, for the same
+// case on a pipeline stage) - and a substitution in the redirection OPERAND runs
+// inside the fork above, so `_substitutions` and `_state.last_status()` are
+// updated in a process whose memory never rejoins the caller's. The child reports
+// what it saw over `result_pipe`, and the caller folds it into ITS OWN
+// `_substitutions`/`_state` exactly as if the substitution had run here - which
+// is what lets the existing `_substitutions != substitutions_before` check in
+// run_simple_command see it, and what lets a LATER assignment's substitution
+// still win over it, the way #50 already lets a later one win inside a stage.
 int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
+	int result_pipe[2];
+	if (pipe(result_pipe) == -1) {
+		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		return kRedirectionError;
+	}
+	// Moved to 10 or above, same as save_fd and for the same reason: pipe(2)
+	// hands back the LOWEST free descriptors, and the command's OWN redirections
+	// - applied below, in the child - can name any fd explicitly. `4>&2
+	// >/dev/null$(exit 7)` landed the write end on fd 4 here and `>&2` duped
+	// stdout onto it, so the result never reached this function and `>&2`
+	// silently wrote binary noise to stderr instead.
+	for (int* end : {&result_pipe[0], &result_pipe[1]}) {
+		const int moved = fcntl(*end, F_DUPFD_CLOEXEC, 10);
+		if (moved != -1) {
+			close(*end);
+			*end = moved;
+		}
+	}
+	const uint64_t substitutions_before = _substitutions;
 	std::fflush(nullptr);
 	const pid_t pid = fork();
 	if (pid == -1) {
 		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		close(result_pipe[0]);
+		close(result_pipe[1]);
 		return kRedirectionError;
 	}
 	if (pid == 0) {
+		close(result_pipe[0]);
 		setpgid(0, 0);
 		const bool ok = apply_redirections(t, n, nullptr);
+		if (ok) {
+			// A struct this small is far under PIPE_BUF, so POSIX makes the write
+			// atomic and it cannot short-write; a failed write only means the parent
+			// falls back to "no substitution", the same default it starts from.
+			const redirection_substitution result{
+				_substitutions != substitutions_before, _state.last_status()};
+			(void)write(result_pipe[1], &result, sizeof(result));
+		}
+		close(result_pipe[1]);
 		std::fflush(nullptr);
 		// _exit, not exit: no EXIT trap and no buffers, because this subshell is
 		// implicit and never ran a command of its own.
 		_exit(ok ? 0 : kRedirectionError);
 	}
+	close(result_pipe[1]);
 	setpgid(pid, pid);
+	redirection_substitution result{false, 0};
+	const ssize_t got = read(result_pipe[0], &result, sizeof(result));
+	close(result_pipe[0]);
 	int wait_status = 0;
 	waitpid(pid, &wait_status, 0);
-	return status_from_wait(wait_status);
+	const int status = status_from_wait(wait_status);
+	if (status != 0)
+		return status;
+	if (got == static_cast<ssize_t>(sizeof(result)) && result.happened) {
+		_state.set_last_status(result.status);
+		++_substitutions;
+	}
+	return 0;
 }
 
 // A builtin runs in this process and writes through stdio, so a fd that a

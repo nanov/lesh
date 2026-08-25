@@ -534,6 +534,76 @@ TEST_F(ExecutorTest, RedirectionsWithNoCommandNameRunInASubshell) {
 		<< "the operand was expanded in the shell rather than in a subshell";
 }
 
+// ISSUE #70. POSIX 2.9.1: a command with no command name completes with the
+// status of the LAST command substitution it performed - #39's rule, established
+// for an assignment - applies just the same to a substitution inside a
+// REDIRECTION'S OPERAND. The operand is expanded inside the fork that gives
+// redirections-only their subshell environment (the test above), and that fork is
+// exactly why the status went missing: `run_command_substitution`'s increment to
+// `_substitutions` and its write to `_state.last_status()` happened in a process
+// whose memory never rejoins this one, so `>file$(exit 17)` reported 0 rather
+// than 17. A substitution in a WORD BEFORE the redirection is unaffected by this
+// bug - that word is expanded in build_argv, in this process, before the fork -
+// so the first case here is already correct and stays that way.
+TEST_F(ExecutorTest, ASubstitutionInAWordAheadOfABareRedirectionAlreadyWorked) {
+	const std::string path = scratch.file("bare_redirect_word_before.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("$(exit 5) > " + path), 5);
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ABareRedirectionWithNoSubstitutionIsZero) {
+	const std::string path = scratch.file("bare_redirect_no_sub.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path), 0);
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ABareRedirectionReportsItsOperandsSubstitutionStatus) {
+	const std::string path = scratch.file("bare_redirect_operand_sub.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path + "$(exit 17)"), 17);
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ABareRedirectionWithSeveralOperandSubstitutionsTakesTheLast) {
+	// Two redirections, each with its own substitution in the operand: the LAST
+	// one PERFORMED - left to right, the order every redirection is applied in -
+	// decides the status, not the first and not whichever happened to succeed.
+	const std::string path = scratch.file("bare_redirect_last_sub.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path + "$(exit 3) > " + path + "$(exit 9)"), 9);
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ABareRedirectionsSubstitutionYieldsToALaterAssignments) {
+	// Redirections are performed before assignments (POSIX 2.9.1's order, and
+	// #50's own reading of it), so an assignment's substitution AFTER a
+	// redirection's is the one that wins - and the assignment itself must still
+	// land, exactly as #39 left it.
+	const std::string path = scratch.file("bare_redirect_then_assign.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path + "$(exit 17) x=$(exit 3)"), 3);
+	std::string_view value;
+	EXPECT_TRUE(state.lookup("x", value));
+	EXPECT_EQ(value, "");
+	std::remove(path.c_str());
+}
+
+TEST_F(ExecutorTest, ABareRedirectionsSubstitutionSurvivesAPlainAssignment) {
+	// The inverse of the case above: an assignment that performs NO substitution
+	// of its own must not erase the redirection operand's status - before the
+	// fix this reported 0, because the operand's substitution never reached this
+	// process at all.
+	const std::string path = scratch.file("bare_redirect_then_plain_assign.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(run("> " + path + "$(exit 17) x=1"), 17);
+	std::string_view value;
+	EXPECT_TRUE(state.lookup("x", value));
+	EXPECT_EQ(value, "1");
+	std::remove(path.c_str());
+}
+
 TEST_F(ExecutorTest, AnAssignmentIsSkippedWhenItsRedirectionFails) {
 	// dash leaves the variable unset after `x=1 </missing` and sets it after
 	// `x=1 </dev/null`, so the redirection gates the assignment.

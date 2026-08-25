@@ -597,6 +597,28 @@ rm -f /tmp/lesh_spec_bare; >/tmp/lesh_spec_bare; echo "st=$?"; test -f /tmp/lesh
 --- an assignment is skipped when its redirection fails [xfail(legacy): legacy ignores redirect nodes entirely]
 x=set < /_lesh_no_such_file_; echo "status=$? x=$x"
 
+# ISSUE #70. #50 gave a pipeline stage with no command name this rule already;
+# these four give it to the plain no-command-name case, which is `run_simple_command`
+# forking to give the redirection OPERAND a subshell environment
+# (RedirectionsWithNoCommandNameRunInASubshell's own case) - and that fork is
+# exactly why the substitution's status went missing: it happened in a process
+# whose memory never rejoined the shell's.
+
+--- a bare redirection with no substitution in its operand reports zero [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_p70_a; >/tmp/lesh_spec_p70_a; echo "st=$?"; rm -f /tmp/lesh_spec_p70_a
+
+--- a bare redirection reports its operand's command substitution status [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_p70_b; >/tmp/lesh_spec_p70_b$(exit 17); echo "st=$?"; rm -f /tmp/lesh_spec_p70_b
+
+--- a bare redirection takes the last of several operand substitutions [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_p70_c; >/tmp/lesh_spec_p70_c$(exit 3) >/tmp/lesh_spec_p70_c$(exit 9); echo "st=$?"; rm -f /tmp/lesh_spec_p70_c
+
+--- a bare redirection's substitution survives a later plain assignment [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_p70_d; >/tmp/lesh_spec_p70_d$(exit 17) x=1; echo "st=$? x=$x"; rm -f /tmp/lesh_spec_p70_d
+
+--- a bare redirection's substitution yields to a later assignment's [xfail(legacy): legacy ignores redirect nodes entirely]
+rm -f /tmp/lesh_spec_p70_e; >/tmp/lesh_spec_p70_e$(exit 17) x=$(exit 3); echo "st=$? x=[$x]"; rm -f /tmp/lesh_spec_p70_e
+
 --- a here-document can be fed to a descriptor other than stdin [xfail(legacy): legacy ignores redirect nodes entirely]
 cat 3<<END <&3
 foo
