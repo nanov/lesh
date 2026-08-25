@@ -370,6 +370,18 @@ _Avoid_: treating a width as a constant, which is how a redraw drifts.
 A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
+**Topic** _[lesh]_:
+A source of loop events — `tty`, `signal`, `worker`, `timer`. The loop polls
+topics and drains each into events; a topic's file descriptor or deadline
+is its implementation detail. A plugin's fd-readable hook is one more topic.
+_Avoid_: naming the fd; the topic is what the editor sees.
+
+**Quiesce** _[lesh]_:
+Parking every worker at a known-idle point, holding no lock, before the
+loop thread forks — the only thing that makes `fork()` safe in a threaded
+shell, since the child inherits every other thread's held locks frozen.
+Like fish's drain before fork. Resumed after the command is reaped.
+
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,
 signals, worker results with generation and timing — written by the logger's
