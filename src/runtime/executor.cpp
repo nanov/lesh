@@ -67,15 +67,13 @@ std::string_view standard_path() {
 std::string absolute_pathname(const shell_state& state, std::string_view path) {
 	if (!path.empty() && path[0] == '/')
 		return std::string{path};
-	std::string base;
-	if (std::string_view pwd; state.lookup("PWD", pwd) && !pwd.empty() && pwd[0] == '/') {
-		base.assign(pwd);
-	} else {
-		char buffer[PATH_MAX];
-		if (getcwd(buffer, sizeof(buffer)) == nullptr)
-			return std::string{path};
-		base.assign(buffer);
-	}
+	// The FOURTH copy of this rule, and the comment above was already claiming to
+	// follow it while doing something weaker: `$PWD` was taken on the strength of
+	// being absolute alone, so a stale or inherited-and-wrong one was believed here
+	// after #51 had stopped believing it in `cd` and `pwd`. One caller of one rule.
+	std::string base = state.logical_working_directory();
+	if (base.empty())
+		return std::string{path};
 	if (base.empty() || base.back() != '/')
 		base += '/';
 	base.append(path);
