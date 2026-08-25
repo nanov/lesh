@@ -165,9 +165,13 @@ add_library(lesh_leshper STATIC
 	src/leshper/decode.h
 	src/leshper/blit.cpp
 	src/leshper/blit.h
+	src/leshper/abi.h
+	src/leshper/builtin_actions.cpp
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
+	src/leshper/registry.cpp
+	src/leshper/registry.h
 	src/leshper/event.h
 	src/leshper/state.h
 	src/leshper/surface.cpp

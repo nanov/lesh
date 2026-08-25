@@ -77,23 +77,6 @@ constexpr bool is_blank(char byte) noexcept {
 	return byte == ' ' || byte == '\t' || byte == '\n';
 }
 
-// Applies one edit and does the three things that must never be done separately
-// (F-1, F-4, A-10): change the buffer, record how to undo it, bump the
-// generation. Every buffer mutation in this file goes through here, which is
-// what makes "exactly one generation bump per mutating action" a property of
-// the code rather than of the author's memory.
-void apply_edit(state& current, position from, position to, std::string_view with) {
-	edit_record edit;
-	edit.at = from;
-	edit.removed = std::string(current.buffer.slice(from, to));
-	edit.inserted = std::string(with);
-	edit.cursor_before = current.cursor;
-	current.cursor = current.buffer.replace(from, to, with);
-	edit.cursor_after = current.cursor;
-	current.undo.record(std::move(edit));
-	current.gen.bump();
-}
-
 // The start of the line the position is on (F-2: the buffer is a 2D text object,
 // so `beginning-of-line` means this line rather than the whole buffer).
 position line_start(const text_buffer& buffer, position at) {
@@ -262,6 +245,23 @@ void drain_pending(state& current, effects& out) {
 }
 
 } // namespace
+
+// The one buffer mutation. See the note in editor.h for why it is declared
+// there: #93's ABI commit is its second caller, and a second copy of these
+// eight lines would be a second mutation path.
+void apply_edit(state& current, position from, position to, std::string_view with,
+                const position* cursor_after) {
+	edit_record edit;
+	edit.at = from;
+	edit.removed = std::string(current.buffer.slice(from, to));
+	edit.inserted = std::string(with);
+	edit.cursor_before = current.cursor;
+	const position landed = current.buffer.replace(from, to, with);
+	current.cursor = cursor_after != nullptr ? *cursor_after : landed;
+	edit.cursor_after = current.cursor;
+	current.undo.record(std::move(edit));
+	current.gen.bump();
+}
 
 const char* name_of(action a) noexcept {
 	switch (a) {

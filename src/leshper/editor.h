@@ -5,6 +5,7 @@
 #include "leshper/state.h"
 
 #include <cstdint>
+#include <string_view>
 
 namespace lesh::leshper {
 
@@ -43,6 +44,26 @@ enum class action : uint8_t {
 // assert the binding separately from the behaviour, which is the seam #93 will
 // cut along.
 [[nodiscard]] action binding_for(const key_event& key) noexcept;
+
+// The one buffer mutation (F-1, F-4, A-10).
+//
+// Does the three things that must never be done separately: change the buffer,
+// record how to undo it, bump the generation. Every buffer mutation in leshper
+// goes through here, which is what makes "exactly one generation bump per
+// mutating action" a property of the code rather than of the author's memory.
+//
+// Declared rather than kept private because it has a second caller: #93's ABI
+// commit (registry.cpp), which diffs an action's staged writes into one
+// replacement and lands it here. A private copy over there would be a second
+// mutation path, and a second mutation path is the whole thing this function
+// exists to prevent.
+//
+// `cursor_after` is where the cursor ends up, and it is recorded on the undo
+// entry so F-4's "undo restores text AND cursor" survives. Null means the
+// natural landing - the end of the replacement - which is what every caller on
+// the keymap path wants; the ABI commit passes the cursor the action asked for.
+void apply_edit(state& current, position from, position to, std::string_view with,
+                const position* cursor_after = nullptr);
 
 // One turn of the state machine (A-2).
 //
