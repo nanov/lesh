@@ -1196,3 +1196,96 @@ TEST_F(ExecutorTest, ARedirectionTargetFdTooLargeToBeOneIsRefused) {
 	EXPECT_EQ(run("echo hi >&99999999999999999999 2>/dev/null"), 2);
 	EXPECT_EQ(run("echo hi >&x 2>/dev/null"), 2);
 }
+
+// --- one numeric-operand parser: the four `std::atoi` sites (issue #63) ------
+//
+// Each of these was a WRONG ANSWER rather than a missing feature, which is why
+// the conformance suite caught none of them: `exit notanumber` reported success,
+// `shift notanumber` shifted nothing and reported success, `return <huge>`
+// reported -1, and `wait notanumber` reached waitpid(2) as pid 0 - "any child in
+// my process group", the wrong-syscall half of #45 in the path that ticket did
+// not fix. dash refuses all four with `Illegal number` at status 2.
+//
+// Run inside a subshell where the builtin is SPECIAL, because a special builtin's
+// usage error ends a non-interactive shell - in dash exactly as here - and the
+// subshell is what lets the status be observed instead of taken.
+
+TEST_F(ExecutorTest, ExitRefusesAnOperandThatIsNotANumber) {
+	// The worst of the four: a script's exit status is what its caller branches on,
+	// and std::atoi answered 0 for `notanumber`, so the shell reported SUCCESS.
+	EXPECT_EQ(run("( exit notanumber ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( exit 3x ) 2>/dev/null"), 2) << "atoi truncated `3x` to 3";
+	EXPECT_EQ(run("( exit 99999999999999999999 ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( exit 3 ) 2>/dev/null"), 3);
+}
+
+TEST_F(ExecutorTest, AnExitStatusIsTakenModulo256RatherThanRefused) {
+	// THE TRAP THIS TICKET NAMES. `exit 256` is 0 and `exit 300` is 44 because only
+	// the LOW BYTE of a status survives waitpid, not because either is out of
+	// range - both are perfectly representable ints. Conflating the modulo with the
+	// range check is how `return 99999999999999999999` came to report -1, so the
+	// two are asserted apart: everything here is in range and none of it is
+	// refused.
+	EXPECT_EQ(run("( exit 256 ) 2>/dev/null"), 0);
+	EXPECT_EQ(run("( exit 300 ) 2>/dev/null"), 44);
+	EXPECT_EQ(run("( exit 255 ) 2>/dev/null"), 255);
+}
+
+TEST_F(ExecutorTest, ShiftRefusesAnOperandThatIsNotANumber) {
+	EXPECT_EQ(run("( set -- a b c; shift notanumber ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( set -- a b c; shift 99999999999999999999 ) 2>/dev/null"), 2);
+	// A shift count takes no sign, so `-1` is malformed rather than negative.
+	EXPECT_EQ(run("( set -- a b c; shift -1 ) 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, ShiftSilentlyShiftedNothingForABadOperand) {
+	// The failure mode, asserted directly: atoi's 0 asked to shift ZERO parameters,
+	// which succeeds, so the script carried on with its arguments untouched and no
+	// way to know. This is the stub-that-succeeds shape #24's resolution warned
+	// about and the seventh time this project has met it.
+	EXPECT_EQ(capture("set -- a b c; shift notanumber 2>/dev/null; echo \"[$#]\""), "");
+}
+
+TEST_F(ExecutorTest, ShiftTakesItsOperandAfterASeparator) {
+	// POSIX XCU 1.4: `--` ends the options for a utility that takes operands and no
+	// options, and `shift` was the sixth of that shape reading argv[1] directly. It
+	// sent `--` itself to atoi, got 0, and shifted NOTHING while reporting success.
+	// bash, zsh and ksh all shift by the operand after the separator; dash refuses
+	// the separator, which is the divergence ADR-0001 records.
+	EXPECT_EQ(capture("set -- a b c d e; shift -- 2; echo \"[$#][$1]\""), "[3][c]\n");
+	EXPECT_EQ(capture("set -- a b c; shift --; echo \"[$#][$1]\""), "[2][b]\n");
+}
+
+TEST_F(ExecutorTest, ReturnRefusesAnOperandThatIsNotANumber) {
+	EXPECT_EQ(run("( f() { return notanumber; }; f ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( f() { return 99999999999999999999; }; f ) 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, AReturnStatusThatFitsIsPassedThroughUnchanged) {
+	// The other half of the modulo separation. dash and zsh mask neither end -
+	// `return 300` is 300 and `return -1` is -1 - while bash and ksh mask both.
+	// Masking only one end would agree with nobody, so a status that FITS is passed
+	// through whole and only a number too large to be an int is refused.
+	EXPECT_EQ(capture("f() { return 300; }; f; echo \"$?\""), "300\n");
+	EXPECT_EQ(capture("f() { return 3; }; f; echo \"$?\""), "3\n");
+}
+
+TEST_F(ExecutorTest, WaitRefusesAPidOperandThatIsNotANumber) {
+	// waitpid(0, ...) is ANY CHILD IN THE PROCESS GROUP, so this was never a
+	// missing diagnostic - it was the wrong system call, made with an argument the
+	// script did not write. #45 found the identical shape in `kill` and fixed only
+	// that one.
+	EXPECT_EQ(run("( wait notanumber ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( wait 99999999999999999999 ) 2>/dev/null"), 2);
+	EXPECT_EQ(run("( wait %1 ) 2>/dev/null"), 2);
+	// `--` ends the options here too: pid 1 is no child of this shell, which POSIX
+	// answers with 127 rather than a usage error.
+	EXPECT_EQ(run("( wait -- 1 ) 2>/dev/null"), 127);
+}
+
+TEST_F(ExecutorTest, UnaliasTakesItsOperandAfterASeparator) {
+	// The same `--` question at a seventh builtin, and the one where all four
+	// reference shells agree lesh was wrong: it looked for an alias named `--`.
+	EXPECT_EQ(run("alias foo=bar; unalias -- foo"), 0);
+	EXPECT_EQ(run("alias foo=bar; unalias -- foo; alias foo 2>/dev/null"), 1);
+}

@@ -812,10 +812,25 @@ builtin_result builtin_exit(shell_state& state, char** argv) {
 	// that ran immediately BEFORE the trap action. So `trap '(exit 2); exit' INT`
 	// exits with the status of the command the signal interrupted and not with 2,
 	// which is exit-p.tst's 'default exit status in signal trap' and dash's answer.
-	const int status = argv[operand] != nullptr
-		? std::atoi(argv[operand])
-		: state.trap_entry_status().value_or(state.last_status());
-	return {status, control_flow::exit_shell};
+	if (argv[operand] == nullptr)
+		return {state.trap_entry_status().value_or(state.last_status()),
+		        control_flow::exit_shell};
+
+	// THE WORST OF THE FOUR `std::atoi` SITES, because a script's exit status is
+	// what its caller branches on: atoi answered 0 for `notanumber`, so
+	// `lesh -c 'exit notanumber'` REPORTED SUCCESS, and truncated `3x` to 3. dash
+	// refuses both with `Illegal number` at 2 and so does this now (#63).
+	//
+	// THE MODULO 256 POSIX APPLIES TO A STATUS IS A SEPARATE RULE AND STAYS ONE.
+	// `exit 256` is 0 and `exit 300` is 44 because only the low byte of a status
+	// survives waitpid, not because 256 is out of range - it is a perfectly
+	// representable int, and it is the KERNEL that truncates it. Conflating the two
+	// is how `return 99999999999999999999` came to report -1: a number too large to
+	// be an int is refused here, and a number that fits is passed through whole.
+	const numeric_result parsed = parse_integer(argv[operand], numeric_site::exit_status);
+	if (parsed.status != numeric_parse::ok)
+		return {report_bad_number("exit", argv[operand], parsed.status)};
+	return {static_cast<int>(parsed.value), control_flow::exit_shell};
 }
 
 // One `export NAME='VALUE'` or `readonly NAME='VALUE'` line, quoted so the shell
@@ -1888,7 +1903,11 @@ builtin_result builtin_unalias(shell_state& state, char** argv) {
 		return {0};
 	}
 	int status = 0;
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
+	// AFTER the `-a` check above and not before it: POSIX puts the options first
+	// and `--` after them, so `unalias -a` is an option and `unalias -- -a` removes
+	// an alias whose name is `-a`. dash, bash, zsh and ksh all discard the
+	// separator here and lesh looked for an alias literally called `--` (#63).
+	for (size_t i = first_operand(argv); argv[i] != nullptr; ++i) {
 		// POSIX: removing an alias that does not exist is an ERROR. Returning 0 made
 		// `unalias true; unalias true` succeed twice.
 		if (!state.unset_alias(argv[i])) {
@@ -1900,8 +1919,29 @@ builtin_result builtin_unalias(shell_state& state, char** argv) {
 }
 
 builtin_result builtin_shift(shell_state& state, char** argv) {
-	const size_t n = argv[1] != nullptr ? static_cast<size_t>(std::atoi(argv[1])) : 1;
-	if (!state.shift_positional(n)) {
+	// `shift` IS THE SIXTH UTILITY OF THE `first_operand` SHAPE and was reading
+	// argv[1] directly, which is two defects in one line. `shift notanumber` went
+	// through std::atoi as 0 and shifted NOTHING while reporting success; and
+	// `shift -- 2` sent the separator itself to atoi, got 0, and did the same -
+	// where POSIX XCU 1.4 discards a leading `--` for any utility that takes
+	// operands and no options (#44's precedent, and shift-p.tst's 'separator
+	// preceding operand', which bash, zsh and ksh all pass).
+	const size_t operand = first_operand(argv);
+	size_t count = 1;
+	if (argv[operand] != nullptr) {
+		// A shift count is a POSITIVE decimal integer, so the `shift_count` row takes
+		// no sign: `shift -1` is a malformed operand rather than a negative count,
+		// which is dash's reading and bash's and zsh's alike. Refused rather than
+		// clamped, because a count is not an index into anything - there is nothing
+		// for a saturated one to land on that `can't shift that many` does not
+		// already say better.
+		const numeric_result parsed =
+			parse_integer(argv[operand], numeric_site::shift_count);
+		if (parsed.status != numeric_parse::ok)
+			return {report_bad_number("shift", argv[operand], parsed.status)};
+		count = static_cast<size_t>(parsed.value);
+	}
+	if (!state.shift_positional(count)) {
 		std::fprintf(stderr, "lesh: shift: can't shift that many\n");
 		return {1};
 	}
@@ -1983,10 +2023,23 @@ builtin_result builtin_return(shell_state& state, char** argv) {
 	// cases in exit-p.tst agree with the conformance suite - and dash itself
 	// applies the rule to `exit`. A shell whose `exit` and `return` answer the same
 	// question differently would be the real defect.
-	return {argv[operand] != nullptr
-	        ? std::atoi(argv[operand])
-	        : state.trap_entry_status().value_or(state.last_status()),
-	        control_flow::return_from};
+	if (argv[operand] == nullptr)
+		return {state.trap_entry_status().value_or(state.last_status()),
+		        control_flow::return_from};
+
+	// `return 99999999999999999999` REPORTED -1 through std::atoi, which is not a
+	// status any shell can produce and not a number atoi is defined on. Refused
+	// now, as dash refuses it, at 2 (#63).
+	//
+	// A status that FITS is passed through unchanged, negative or over 255 alike:
+	// `return 300` is 300 and `return -1` is -1 here, which is what dash and zsh
+	// both answer. That is the modulo-256 question and not this one - bash and ksh
+	// mask both, dash and zsh mask neither, and masking only the negative half
+	// would agree with nobody.
+	const numeric_result parsed = parse_integer(argv[operand], numeric_site::return_status);
+	if (parsed.status != numeric_parse::ok)
+		return {report_bad_number("return", argv[operand], parsed.status)};
+	return {static_cast<int>(parsed.value), control_flow::return_from};
 }
 
 // The handler table. Names, kinds and the executor's share of the work all live
@@ -2054,6 +2107,21 @@ static_assert(registry_agrees_with_handlers(),
               "builtin_home::executor. See issue #35.");
 
 } // namespace
+
+int report_bad_number(std::string_view builtin, std::string_view operand,
+                      numeric_parse why) {
+	// Worded the way lesh's other builtins word an operand they refuse -
+	// `lesh: kill: notanumber: not a process id` - rather than copied from dash,
+	// which prefixes a line number lesh does not track. The two failures are named
+	// apart because they are different mistakes to make: `exit 3x` is a typo in the
+	// operand and `exit 99999999999999999999` is a number the shell cannot hold.
+	std::fprintf(stderr, "lesh: %.*s: %.*s: %s\n",
+	             static_cast<int>(builtin.size()), builtin.data(),
+	             static_cast<int>(operand.size()), operand.data(),
+	             why == numeric_parse::out_of_range ? "number out of range"
+	                                                : "not a number");
+	return 2;
+}
 
 void print_alias(std::string_view name, std::string_view value) {
 	std::printf("%.*s=", static_cast<int>(name.size()), name.data());

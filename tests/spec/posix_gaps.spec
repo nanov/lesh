@@ -813,6 +813,61 @@ F=/tmp/lesh_spec_p50_out; rm -f $F; echo a | > $F; echo "rc=$?"; ls $F; rm -f $F
 --- a stage with no command name reports its last command substitution [xfail(legacy): beyond legacy's single-pass parser]
 echo a | x=$(exit 3); echo "rc=$?"
 
+# ONE NUMERIC-OPERAND PARSER (#63). Four builtins read their operand with
+# `std::atoi`, which cannot report failure at all: it answers 0 for `notanumber`,
+# for `--` and for `0x10`, and truncates `3x` to 3. Three of the four turned that
+# into a wrong ANSWER a script branches on - `exit notanumber` reported SUCCESS -
+# and the fourth reached waitpid(2) as pid 0, which means ANY CHILD IN THE PROCESS
+# GROUP: the wrong-syscall half of #45, in the one path that ticket did not fix.
+#
+# Each case runs in a subshell. `exit`, `shift` and `return` are SPECIAL builtins,
+# so a usage error ends a non-interactive shell - in dash as in lesh - and the
+# subshell is what keeps the rest of the case running to report it. stderr goes to
+# /dev/null because only the wording differs: dash writes `Illegal number` and
+# lesh names the operand the way its other builtins do.
+
+--- exit refuses an operand that is not a number [xfail(legacy): legacy has no subshells or command lists, so the whole line reaches it as one command]
+( exit notanumber ) 2>/dev/null; echo "a=$?"
+( exit 3x ) 2>/dev/null; echo "b=$?"
+( exit 99999999999999999999 ) 2>/dev/null; echo "c=$?"
+( exit 3 ) 2>/dev/null; echo "d=$?"
+
+# `exit 256` is 0 and `exit 300` is 44 because POSIX takes the status MODULO 256,
+# which is a separate rule from the range check above and stays separate: 300 is a
+# perfectly representable number, and only the low byte survives a waitpid.
+
+--- an exit status is taken modulo 256 rather than refused [xfail(legacy): legacy has no subshells or command lists]
+( exit 256 ) 2>/dev/null; echo "a=$?"
+( exit 300 ) 2>/dev/null; echo "b=$?"
+( exit 255 ) 2>/dev/null; echo "c=$?"
+
+--- shift refuses an operand that is not a number [xfail(legacy): legacy has no subshells, command lists or positional parameters]
+( set -- a b c; shift notanumber; echo "shifted" ) 2>/dev/null; echo "a=$?"
+( set -- a b c; shift 99999999999999999999 ) 2>/dev/null; echo "b=$?"
+( set -- a b c; shift 2; echo "n=$#" ) 2>/dev/null; echo "c=$?"
+
+--- return refuses an operand that is not a number [xfail(legacy): legacy has no functions, subshells or command lists]
+( f() { return notanumber; }; f; echo "reached" ) 2>/dev/null; echo "a=$?"
+( f() { return 99999999999999999999; }; f; echo "reached" ) 2>/dev/null; echo "b=$?"
+( f() { return 3; }; f; echo "s=$?" ) 2>/dev/null; echo "c=$?"
+
+# `wait <not a pid>` is the one that reached a SYSCALL with the wrong argument
+# rather than merely reporting the wrong status: waitpid(0, ...) waits for any
+# child in the process group, so `wait notanumber` reaped a job the script did not
+# name. Refused before the call, as #45 made `kill` refuse a non-numeric pid.
+
+--- wait refuses a pid operand that is not a number [xfail(legacy): legacy has no subshells or command lists, and no wait builtin]
+( wait notanumber ) 2>/dev/null; echo "a=$?"
+( wait 99999999999999999999 ) 2>/dev/null; echo "b=$?"
+( wait -- 1 ) 2>/dev/null; echo "c=$?"
+
+# `--` ENDS THE OPTIONS at every utility POSIX gives operands and no options
+# (XCU 1.4), and `unalias` is one: all four reference shells discard it and remove
+# the alias named after it, where lesh looked for an alias called `--`.
+
+--- unalias takes its operand after a `--` separator [xfail(legacy): legacy has no aliases or command lists]
+alias foo=bar; unalias -- foo; echo "a=$?"; alias foo 2>/dev/null; echo "b=$?"
+
 # DELIBERATE divergences from dash, recorded rather than chosen quietly
 # (handoff.md: where dash is behind the standard, say so in writing). Each is an
 # assertion dash itself fails in the yash suite, so each is a place lesh is ahead.
@@ -1388,3 +1443,17 @@ case i in
 esac
 === expect
 1
+
+# `--` before a NUMERIC operand is the same question one layer out: where do the
+# options stop and the operand begin. #44 answered it for the command line and
+# `first_operand` answers it for the five builtins POSIX gives operands and no
+# options; `shift` was the sixth and read argv[1] directly, so `shift -- 2` sent
+# `--` to std::atoi, got 0, and shifted NOTHING while reporting success.
+
+--- shift takes its operand after a `--` separator [divergence: dash reports `Illegal number: --` and exits 2, failing shift-p.tst's 'separator preceding operand'; bash, zsh and ksh all shift by the operand after the separator, which is POSIX XCU 1.4 - and lesh already discards `--` this way for exit, return, break, continue, eval and dot]
+set -- a b c d e
+shift -- 2 && echo "[$#][$1]"
+shift -- && echo "[$#][$1]"
+=== expect
+[3][c]
+[2][d]

@@ -2362,7 +2362,12 @@ bool tree_walking_executor::try_run_executor_builtin(
 // `wait` needs the executor's record of background jobs, so it lives here
 // alongside eval and . rather than in builtins.cpp.
 int tree_walking_executor::run_wait(char* const* argv) {
-	if (argv[1] == nullptr) {
+	// `--` ends the options here too, and `wait` is the seventh utility of that
+	// shape: POSIX gives it operands and no options, so `wait -- 1` waits for pid 1
+	// and `wait --` waits for everything (#63). Reading argv[1] directly sent the
+	// separator itself to std::atoi.
+	const size_t first = first_operand(argv);
+	if (argv[first] == nullptr) {
 		// POSIX: with no operands, `wait` waits for ALL known children and its
 		// status is ZERO - not the last child's. Reporting the last one made
 		// `false & wait` fail, and under `set -e` that would exit the shell.
@@ -2376,8 +2381,25 @@ int tree_walking_executor::run_wait(char* const* argv) {
 	// With operands the status is the LAST operand's, and a child killed by a
 	// signal reports 128 + the signal number.
 	int status = 0;
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const pid_t target = static_cast<pid_t>(std::atoi(argv[i]));
+	for (size_t i = first; argv[i] != nullptr; ++i) {
+		// THE WRONG-SYSCALL HALF OF #45, VERBATIM, IN THE PATH THAT TICKET DID NOT
+		// FIX. std::atoi answers 0 for `notanumber`, for `--` and for `%1`, and
+		// waitpid(0, ...) waits for ANY CHILD IN THE PROCESS GROUP - so
+		// `wait notanumber` reaped a job the script never named and reported its
+		// status as though it had. #45 found exactly this in `kill`, where atoi's 0
+		// became kill(0, sig) and signalled the whole group; it fixed the pid path in
+		// `kill` and left the identical one here.
+		//
+		// Refused before the call, as `kill` refuses it, at dash's status 2. A pid is
+		// not clamped for the same reason a signal number is not: every value a
+		// clamp could land on names a REAL PROCESS, and waiting on the wrong one is
+		// the defect rather than the diagnosis.
+		const numeric_result parsed = parse_integer(argv[i], numeric_site::wait_pid_operand);
+		if (parsed.status != numeric_parse::ok) {
+			status = report_bad_number("wait", argv[i], parsed.status);
+			continue;
+		}
+		const pid_t target = static_cast<pid_t>(parsed.value);
 		int wait_status = 0;
 		if (waitpid(target, &wait_status, 0) > 0) {
 			status = status_from_wait(wait_status);

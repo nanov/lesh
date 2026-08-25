@@ -1,4 +1,5 @@
 #pragma once
+#include "substrate/numeric.h"
 
 #include "runtime/shell_state.h"
 
@@ -165,6 +166,19 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 [[nodiscard]] constexpr size_t first_operand(char* const* argv) noexcept {
 	return argv[1] != nullptr && std::string_view{argv[1]} == "--" ? 2 : 1;
 }
+
+// A NUMERIC OPERAND A BUILTIN WILL NOT TAKE. Reports it and answers the status to
+// return - 2, as for any other builtin's usage error, and what dash answers for
+// all four of the sites that use it. `exit`, `shift` and `return` are SPECIAL, so
+// the executor turns that into an exit for a non-interactive shell, which is what
+// dash does too; `wait` is regular and merely reports.
+//
+// ONE WORDING for the four, because four wordings for one refusal is how four
+// calls to `std::atoi` came to answer four different ways to begin with. dash
+// writes `Illegal number` for both failures; saying WHICH WAY it failed is the
+// whole content of numeric_parse, so the two are told apart here.
+[[nodiscard]] int report_bad_number(std::string_view builtin, std::string_view operand,
+                                    numeric_parse why);
 
 // argv is NUL-terminated, as for exec. Returns false when the name is not
 // implemented HERE - either it is no builtin at all, or the registry says the
