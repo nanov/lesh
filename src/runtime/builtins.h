@@ -5,7 +5,10 @@
 
 #include <array>
 #include <cstddef>
+#include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace lesh::runtime {
 
@@ -150,7 +153,7 @@ struct builtin_descriptor {
 // `getopts` is regular and not special: POSIX 2.14 lists it nowhere in the
 // special set, so its failure must not exit a non-interactive shell - `getopts`
 // with too few operands has to report and carry on, the way dash does.
-constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
+constexpr std::array<builtin_descriptor, 30> kBuiltinRegistry = {{
 	// POSIX XCU 2.14, the special builtins. The list is closed and the membership
 	// matters: a failure in one of these exits a non-interactive shell, and
 	// assignments preceding one persist.
@@ -178,6 +181,10 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	// `cd`, `command`, `getopts`, `read`, `unalias` and `wait` are in the first
 	// group because none of them could do its job in a separate process at all.
 	{"alias", builtin_kind::regular, builtin_home::table},
+	// `bind` is the rc surface for the keymap registry (#117). Reported by name
+	// and never by pathname: there is no `/usr/bin/bind` it could stand in for,
+	// and its whole purpose is to change the shell it runs in.
+	{"bind", builtin_kind::regular, builtin_home::table},
 	{"cd", builtin_kind::regular, builtin_home::table},
 	// `command` is the executor's: the RUNNING form has to bypass function lookup
 	// on its way to a command the executor alone knows how to run, and the
@@ -195,6 +202,80 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 	{"unalias", builtin_kind::regular, builtin_home::table},
 	{"wait", builtin_kind::regular, builtin_home::executor},
 }};
+
+// ---------------------------------------------------------------------------
+// `bind`, and the link boundary it sits on (#117 decision 7, #118).
+//
+// THE PROBLEM, stated once so nobody re-discovers it: the keymap registry lives
+// in leshper (spec §6.4) and `lesh_runtime` does not link `lesh_leshper` -
+// CMakeLists puts `lesh` on `lesh_runtime lesh_syntax lesh_ui` and nothing else,
+// which is the rule that keeps the editor out of the shell's dependency graph.
+// A builtin in this file therefore CANNOT call a keymap function directly, and
+// making it able to would mean linking the whole editor into every
+// non-interactive `lesh -c` invocation.
+//
+// THE SHAPE, and it is the one A-5 already uses in the other direction: an
+// interface declared on the side that needs it, implemented at the wiring site
+// that links both. `history_source` is leshper's version - leshper declares the
+// shape and the runtime's history store is adapted onto it where the two meet.
+// This is the mirror image: the runtime declares what `bind` needs to say, and
+// the loop hands it a leshper-backed implementation when it starts an
+// interactive session.
+//
+// Until that wiring exists there is no console installed, and `bind` says so
+// rather than pretending: a non-interactive shell has no line editor, exactly as
+// bash's `bind` warns when line editing is off.
+class binding_console {
+public:
+	virtual ~binding_console();
+
+	binding_console(const binding_console&) = delete;
+	binding_console& operator=(const binding_console&) = delete;
+
+	// How an operation ended. One space for all four verbs, because `bind`'s job
+	// is to turn each into a message and a status, and a per-verb enum would make
+	// that four switches that drift.
+	enum class outcome {
+		ok,
+		no_such_keymap,
+		no_such_action,
+		bad_notation,
+	};
+
+	// `bind -l`: every keymap's name, sorted.
+	virtual void keymap_names(std::vector<std::string>& into) const = 0;
+
+	// `bind -N name [from]`: creates, optionally as a copy. `from` empty means an
+	// empty keymap.
+	virtual outcome create_keymap(std::string_view name, std::string_view from) = 0;
+
+	// `bind [-m map] keys action`: binds `keys`, written in vim notation, to the
+	// named action. An empty action unbinds.
+	virtual outcome bind_key(std::string_view keymap, std::string_view notation,
+	                         std::string_view action) = 0;
+
+	// `bind [-m map] keys`: what those keys run, empty when nothing.
+	virtual outcome lookup_key(std::string_view keymap, std::string_view notation,
+	                           std::string& action_out) const = 0;
+
+	// `bind [-m map]`: every binding, as notation and action, in table order.
+	virtual outcome list_bindings(std::string_view keymap,
+	                              std::vector<std::pair<std::string, std::string>>& into) const = 0;
+
+protected:
+	binding_console() = default;
+};
+
+// Installs the console `bind` reaches, or clears it with a null pointer.
+//
+// NON-OWNING, and the installer outlives the shell's use of it - the loop owns
+// the editing context (ADR-0007) and simply lends this view of it. A pointer
+// here rather than a member of `shell_state` only because `shell_state` is not
+// this ticket's to change; the seam moves there when the loop is wired up, and
+// nothing but these two functions has to change when it does.
+void install_binding_console(binding_console* console) noexcept;
+
+[[nodiscard]] binding_console* installed_binding_console() noexcept;
 
 // Where a utility's OPERANDS begin, having discarded a leading `--`.
 //
