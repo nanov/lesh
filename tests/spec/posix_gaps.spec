@@ -1596,6 +1596,29 @@ echo before; export 1bad=x 2>/dev/null; echo notreached
 --- and in `readonly` [xfail(legacy): legacy has no readonly builtin]
 echo before; readonly 1bad=x 2>/dev/null; echo notreached
 
+# `trap`'s option loop used to BREAK on anything it did not recognise, so `-Z`
+# became the ACTION STRING and the signal operand was read as a condition. A
+# utility syntax error under POSIX XCU 2.8.1, which for a special builtin is
+# fatal - and `failure_kind` defaults to `usage`, so it gets that for free.
+
+--- an unknown option still ends the shell in `trap` [xfail(legacy): legacy has no trap builtin, so it runs `trap` as a command name]
+echo before; trap -Z x INT 2>/dev/null; echo notreached
+
+# The same case with stderr LEFT ALONE, so that a diagnostic is asserted to exist
+# rather than only a status. The harness compares stderr for emptiness, which is
+# exactly the question here: lesh reported `x: bad signal` - about the wrong
+# operand entirely - where it now reports the option.
+
+--- and says so on stderr [xfail(legacy): legacy has no trap builtin, so it runs `trap` as a command name]
+echo before; trap -Z x INT; echo notreached
+
+# The two things that must NOT become usage errors. A bare `-` is the RESET
+# ACTION and not an option, and everything after `--` is an operand however many
+# hyphens it starts with - which is the whole reason the separator is there.
+
+--- a bare hyphen is still the reset action [xfail(legacy): legacy has no trap builtin, so it runs `trap` as a command name]
+trap 'echo caught' USR1; trap - USR1; trap -- '- trapped' USR1; trap; echo "st=$?"
+
 --- a variable assignment error through `export` still ends the shell [xfail(legacy): legacy has no export builtin]
 readonly r=1; echo before; export r=2 2>/dev/null; echo notreached
 

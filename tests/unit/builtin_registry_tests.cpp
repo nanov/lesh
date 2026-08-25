@@ -178,6 +178,34 @@ TEST_F(BuiltinRegistryTest, AnInvalidSignalNameIsReportedRatherThanFatal) {
 	EXPECT_EQ(run("trap '' NOSUCHSIG 2>/dev/null"), 1);
 }
 
+TEST_F(BuiltinRegistryTest, TrapRefusesAnOptionItDoesNotHave) {
+	// The option loop used to BREAK on anything unrecognised, so `-Z` became the
+	// ACTION STRING and `trap -Z x INT` went on to read `x` as a condition -
+	// reporting `x: bad signal` at 1, a diagnostic about the wrong operand. dash
+	// and yash both report a usage error (#73).
+	//
+	// 2 AND FATAL, unlike the bad-condition case above: POSIX XCU 2.8.1 makes an
+	// unknown option a UTILITY SYNTAX ERROR, and `trap` is a special builtin. The
+	// two rows of that table sit side by side here on purpose - a condition this
+	// platform lacks is not a malformed command line, and an option that does not
+	// exist is.
+	EXPECT_EQ(run("trap -Z x INT 2>/dev/null"), 2);
+	EXPECT_EQ(capture("trap -Z x INT 2>/dev/null; echo not reached"), "");
+	// That a diagnostic is actually WRITTEN is asserted in the differential corpus,
+	// where the case leaves stderr unredirected and dash is the oracle for it.
+}
+
+TEST_F(BuiltinRegistryTest, TrapStillTakesABareHyphenAndTheSeparator) {
+	// The two things the check above must not swallow. A bare `-` is the RESET
+	// ACTION - every `trap - SIG` in both test suites depends on it - and after
+	// `--` an operand may start with as many hyphens as it likes.
+	EXPECT_EQ(capture("trap 'echo x' USR1; trap - USR1; echo reached"), "reached\n");
+	EXPECT_EQ(capture("trap -- '- trapped' USR1; echo reached"), "reached\n");
+	// `-p` is lesh's own, and stays. dash has no `-p` and reports `Illegal option`
+	// for it, so this is asserted here rather than in the differential corpus.
+	EXPECT_EQ(capture("trap -p INT >/dev/null; echo reached"), "reached\n");
+}
+
 TEST_F(BuiltinRegistryTest, ABadConditionDoesNotStopTrapReadingTheRest) {
 	// The loop reports and continues, so a condition after the bad one is still
 	// set. SIGURG because its default action is to discard, which keeps a case that

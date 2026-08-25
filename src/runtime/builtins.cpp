@@ -1197,6 +1197,24 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 			include_default = true;
 			continue;
 		}
+		// AN OPTION `trap` DOES NOT HAVE (#73). The loop used to break here, so `-Z`
+		// silently became the ACTION STRING and `trap -Z x INT` went on to read `x`
+		// as a condition and report `x: bad signal` at status 1 - a diagnostic about
+		// the wrong operand, and not fatal. dash and yash both report a usage error.
+		//
+		// POSIX XCU 2.8.1 makes that a UTILITY SYNTAX ERROR, which in a SPECIAL
+		// builtin exits a non-interactive shell; `failure_kind` defaults to `usage`,
+		// so returning 2 is the whole of it. Same wording and same status as the
+		// `unset` and `export` loops, which is the shape this one was missing.
+		//
+		// `arg.size() >= 2` is what keeps a BARE HYPHEN out of it: `-` is `trap`'s
+		// reset ACTION, not an option, and every `trap - SIG` in both test suites
+		// depends on it. Anything after `--` never reaches here at all.
+		if (arg.size() >= 2 && arg[0] == '-') {
+			std::fprintf(stderr, "lesh: trap: Illegal option %.*s\n",
+			             static_cast<int>(arg.size()), arg.data());
+			return {2};
+		}
 		break;
 	}
 
