@@ -714,28 +714,87 @@ private:
 	// probe over the source saw whatever happened to sit at a virtual offset past
 	// the end of it. Copies, because a probe must consume nothing - a lexer owns no
 	// input and copying one is three words.
+	// The alias a PROBED word names, if it names one. Separate from
+	// try_substitute_alias because a probed token is not in the tree: its offsets are
+	// relative to the body it was lexed from, so the text comes in as an argument
+	// rather than through text_of_token.
+	[[nodiscard]] bool probe_alias_value(const token& t, std::string_view from,
+	                                     std::string_view& value) const noexcept {
+		if (_aliases == nullptr || t.kind != token_kind::word || t.is_error())
+			return false;
+		if (static_cast<size_t>(t.offset) + t.length > from.size())
+			return false;
+		const std::string_view raw = from.substr(t.offset, t.length);
+		char joined[64];
+		std::string_view name;
+		if ((t.flags & syntax::flag_literal) != 0)
+			name = raw;
+		else if (!name_across_line_continuations(raw, joined, sizeof joined, name))
+			return false;
+		// The same rule the real substitution applies: a reserved word is not an
+		// alias. There is no plain-word position to except here, because a function
+		// definition's name is never a keyword.
+		if (reserved_of(name) != reserved::none)
+			return false;
+		return _aliases->lookup_alias(name, value);
+	}
+
 	void probe_ahead(token* out, size_t count) noexcept {
 		// Text and position rather than lexer copies, so nothing here needs a lexer
 		// that can be default-constructed. A lexer owns neither, which is what makes
 		// resuming one at a recorded position the same operation as starting it.
-		struct probe_frame { std::string_view text; uint32_t at; };
+		//
+		// trailing_blank travels with the frame for the same reason it does on
+		// alias_frame: the eligible word is the one drawn once the body RUNS OUT, and
+		// a probe that ignored it could not see a lookahead token that does not exist
+		// until an alias is substituted. `alias f='f ' p='()'` is exactly that - the
+		// name ends one body and both parentheses are a second alias the trailing
+		// blank makes eligible (alias-p.tst:439).
+		struct probe_frame { std::string_view text; uint32_t at; bool trailing_blank; };
 		probe_frame bodies[kMaxAliasDepth];
 		size_t depth = 0;
 		for (const auto& frame : _alias_stack) {
 			if (depth == static_cast<size_t>(kMaxAliasDepth))
 				break;
-			bodies[depth++] = {frame.lex.source(), frame.lex.position()};
+			bodies[depth++] = {frame.lex.source(), frame.lex.position(),
+			                   frame.trailing_blank};
 		}
-		probe_frame input{_tree.source(), _lexer.position()};
+		probe_frame input{_tree.source(), _lexer.position(), false};
 		for (size_t i = 0; i < count; ++i) {
-			for (;;) {
+			bool eligible = false;
+			// Bounded rather than `for (;;)`: each round either draws the token or
+			// pushes a body, and the depth ceiling is what stops `alias a=b; alias b=a`
+			// from spinning here as well as in try_substitute_alias.
+			for (int guard = 0; guard <= kMaxAliasDepth; ++guard) {
 				probe_frame& from = depth == 0 ? input : bodies[depth - 1];
 				lexer probe{from.text, from.at};
 				out[i] = probe.next(lex_mode::command);
+				if (out[i].kind == token_kind::end && depth != 0) {
+					eligible = eligible || from.trailing_blank;
+					--depth;
+					continue;
+				}
 				from.at = probe.position();
-				if (out[i].kind != token_kind::end || depth == 0)
+				if (!eligible)
 					break;
-				--depth;
+				std::string_view value;
+				if (!probe_alias_value(out[i], from.text, value) ||
+				    depth == static_cast<size_t>(kMaxAliasDepth))
+					break;
+				// A body already being probed is not re-entered, which is the cycle
+				// guard try_substitute_alias states over the real stack.
+				bool cycle = false;
+				for (size_t d = 0; d < depth; ++d)
+					cycle = cycle || bodies[d].text == value;
+				for (const auto& frame : _alias_stack)
+					cycle = cycle || frame.text == value;
+				if (cycle)
+					break;
+				bodies[depth++] = {value, 0,
+				                   !value.empty() &&
+				                       (value.back() == ' ' || value.back() == '\t')};
+				// The head of the replacement is itself subject to substitution, as in
+				// try_substitute_alias, so eligibility carries into the new body.
 			}
 		}
 	}

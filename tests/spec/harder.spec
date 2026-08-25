@@ -299,6 +299,26 @@ alias c='case a ' case='
 c case X; echo A; esac
 echo "st=$?"
 
+# --- a function definition's parentheses may come from a DIFFERENT alias body
+# --- than its name (alias-p.tst:439) ------------------------------------------
+#
+# `alias def='f()'` already worked, because one body carried the whole shape. Here
+# the name ends one body and `()` is a second alias made eligible by its trailing
+# blank, so the two-token lookahead has to cross the boundary AND substitute as it
+# goes.
+
+--- a name from one alias and `()` from another still define a function [stdin] [xfail(legacy): legacy has no function definitions]
+alias f='f ' p='()'
+f p
+{ echo F; }
+f
+
+--- the same when the opening parenthesis is inside the first body [stdin] [xfail(legacy): legacy has no function definitions]
+alias g='g( ' q=')'
+g q
+{ echo G; }
+\g
+
 --- a newline after a pipe continues the pipeline [stdin] [xfail(legacy): beyond legacy's single-pass parser]
 echo foo |
 cat

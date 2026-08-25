@@ -928,6 +928,20 @@ TEST_F(ParserTest, AKeywordTheGrammarCannotAcceptIsStillNotAnAlias) {
 	EXPECT_EQ(t[loop].aux & 0x80000000u, 0u) << "`do` stayed the keyword, so no `in`";
 }
 
+TEST_F(ParserTest, AFunctionDefinitionMayTakeItsParenthesesFromAnotherAlias) {
+	// The name ends one body and `()` is a second alias the trailing blank makes
+	// eligible, so the two-token lookahead has to cross the boundary AND substitute
+	// as it goes. Probing the raw input saw the word `p` and refused the shape.
+	fake_aliases aliases;
+	aliases.define("f", "f ");
+	aliases.define("p", "()");
+	const tree t = parse(pool, "f p\n{ :; }\n", &aliases);
+	bool found = false;
+	for (node_index n = 0; n < t.node_count(); ++n)
+		found = found || t[n].kind == node_kind::function_definition;
+	EXPECT_TRUE(found) << "`f p` followed by a brace group defines a function";
+}
+
 TEST_F(ParserTest, ANewlineAfterAPipeContinuesThePipeline) {
 	// POSIX spells it `linebreak` in the grammar. Without it, reading one command
 	// at a time ended the unit at the newline and the right-hand side was lost.
