@@ -1605,6 +1605,23 @@ readonly r=1; echo before; readonly r=2 2>/dev/null; echo notreached
 --- unsetting a readonly variable still ends the shell [xfail(legacy): legacy has no unset builtin]
 readonly r=1; echo before; unset r 2>/dev/null; echo notreached
 
+# And an operand that is not a NAME, which `unset` accepted at status 0 while
+# `export` and `readonly` two functions away refused the same word. dash reports
+# and exits 2 for all three.
+
+--- an operand that is not a NAME still ends the shell in `unset` [xfail(legacy): legacy has no unset builtin]
+echo before; unset 1bad 2>/dev/null; echo notreached
+
+--- and a NAME with a character that cannot be in one [xfail(legacy): legacy has no unset builtin]
+echo before; unset a.b 2>/dev/null; echo notreached
+
+# The `-f` FORM IS NOT VALIDATED, and that is dash's answer rather than an
+# oversight: `unset -f 1bad` reports nothing and succeeds there. A fix that
+# validated every operand of every form would have broken this.
+
+--- unsetting a FUNCTION by a name that is not a NAME is not an error [xfail(legacy): legacy has no unset builtin]
+unset -f 1bad; echo "st=$?"; echo reached
+
 --- a shell language syntax error inside `eval` still ends the shell [xfail(legacy): legacy has no eval builtin]
 echo before; eval 'if' 2>/dev/null; echo notreached
 

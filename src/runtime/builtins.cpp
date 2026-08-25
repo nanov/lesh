@@ -952,6 +952,26 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 	}
 	int status = 0;
 	for (; argv[i] != nullptr; ++i) {
+		// AN OPERAND THAT IS NOT A NAME, refused before anything is unset (#73).
+		//
+		// `unset 1bad` reported 0 and said nothing - accepted, and silently
+		// achieving nothing, which is the stub-that-succeeds shape this project has
+		// now paid for seven times. dash reports and exits 2; bash, zsh and yash all
+		// diagnose it too.
+		//
+		// THE RULE WAS ALREADY WRITTEN TWO FUNCTIONS ABOVE. run_declaration refuses
+		// exactly this word for `export` and `readonly`, with is_name and this
+		// wording, and `unset` is the third utility whose operand POSIX spells NAME.
+		// Sharing the predicate is the whole of the fix; a second spelling of "is
+		// this a name" is what #63 was opened to end.
+		//
+		// The `-f` form never reaches here - the executor intercepts it - and it is
+		// deliberately NOT validated: `unset -f 1bad` succeeds silently in dash, so
+		// a check on every operand of every form would have been a fix past the bug.
+		if (!is_name(argv[i])) {
+			std::fprintf(stderr, "lesh: unset: %s: bad variable name\n", argv[i]);
+			return {2};
+		}
 		// POSIX: unsetting a readonly variable is an error, and `unset` is a special
 		// builtin, so it takes a non-interactive shell down with it. Two cases in
 		// unset-p.tst check that, and both were passing silently.

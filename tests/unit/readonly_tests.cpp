@@ -152,6 +152,28 @@ TEST_F(ReadonlyTest, UnsetRefusesAReadonlyVariable) {
 	EXPECT_EQ(capture("v=1; unset -v v; echo \"[${v-unset}]\""), "[unset]\n");
 }
 
+TEST_F(ReadonlyTest, UnsetRefusesAnOperandThatIsNotAName) {
+	// `unset 1bad` reported 0 and said nothing, where `export 1bad` and
+	// `readonly 1bad` - the same NAME operand, the same is_name predicate, two
+	// functions away in the same file - both refused it. dash reports and exits 2
+	// for all three (#73).
+	EXPECT_EQ(capture("unset 1bad; echo not reached"), "");
+	EXPECT_NE(capture_stderr("unset 1bad"), "");
+	EXPECT_EQ(capture("unset a.b; echo not reached"), "");
+	EXPECT_EQ(capture("unset -v 1bad; echo not reached"), "");
+	// Nothing is unset before the refusal: the operand list is not applied
+	// half-way, which is what a per-operand check after the fact would have done.
+	EXPECT_EQ(capture("v=1; unset 1bad v 2>/dev/null; echo x") , "");
+}
+
+TEST_F(ReadonlyTest, UnsetDoesNotValidateTheFunctionForm) {
+	// dash succeeds silently for `unset -f 1bad`, so the NAME check belongs to the
+	// VARIABLE form alone. Asserted so a later tidy-up cannot "make it consistent"
+	// and diverge instead.
+	EXPECT_EQ(capture("unset -f 1bad; echo reached"), "reached\n");
+	EXPECT_EQ(capture_stderr("unset -f 1bad"), "");
+}
+
 TEST_F(ReadonlyTest, ExportInteractsWithoutAssigning) {
 	// `export name` is not an assignment, so POSIX and dash both allow it on a
 	// readonly variable. `export name=value` is one, and is refused.
