@@ -102,6 +102,7 @@ enum class numeric_site : uint8_t {
 	redirection_target_fd,        // `>&3`                          executor.cpp
 	redirection_word_fd,          // `3>file`               parser.cpp/lexer.cpp
 	positional_parameter_index,   // `${12}`                        expander.cpp
+	csi_parameter,                // `ESC [ 1 ; 5 C`                  decode.cpp
 	count_,                       // must stay last
 };
 
@@ -130,6 +131,7 @@ struct numeric_policy {
 // table of bare literals is a table nobody reads.
 inline constexpr int64_t kNumericIntMax = 2147483647;
 inline constexpr int64_t kNumericIntMin = -2147483647 - 1;
+inline constexpr int64_t kNumericUnsignedMax = 4294967295;
 
 inline constexpr numeric_policy kNumericPolicies[] = {
 	// An arithmetic literal has no sign: `-1` is unary minus applied to `1`, which
@@ -160,6 +162,9 @@ inline constexpr numeric_policy kNumericPolicies[] = {
 	// An index past the end is an UNSET parameter, which is what the clamp lands
 	// on: `${18446744073709551617}` used to wrap a size_t onto `$1`.
 	{numeric_site::positional_parameter_index, 0,              INT64_MAX,      false, numeric_blanks::none},
+	// A CSI parameter is held in an `unsigned`. That no key at the terminal floor
+	// sends one above 201 is the decoder's knowledge, not this table's.
+	{numeric_site::csi_parameter,              0,              kNumericUnsignedMax, false, numeric_blanks::none},
 };
 
 // The registry guard, in #35's shape. The first catches a site added to the enum

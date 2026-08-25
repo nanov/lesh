@@ -1,6 +1,9 @@
 #include "leshper/decode.h"
 
+#include "substrate/numeric.h"
+
 #include <algorithm>
+#include <cstdint>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -175,25 +178,42 @@ csi_parameters parse_parameters(std::string_view text) noexcept {
 		}
 	};
 
-	for (const char raw : text) {
+	// The digits are the one numeric parser's (substrate/numeric.h), like every
+	// other site that reads a number from input: `scan_digits` takes the whole
+	// run, saturating at the policy's limit rather than wrapping.
+	const uint64_t limit =
+	    static_cast<uint64_t>(policy_for(numeric_site::csi_parameter).high);
+
+	for (size_t i = 0; i < text.size();) {
+		const char raw = text[i];
 		const unsigned char value_byte = static_cast<unsigned char>(raw);
 		if (value_byte >= '<' && value_byte <= '?') {
 			parsed.private_use = true;
+			++i;
 		} else if (raw == ';') {
 			store();
 			++field;
 			value = 0;
 			seen = false;
 			in_sub_parameter = false;
+			++i;
 		} else if (raw == ':') {
 			// Sub-parameters (ECMA-48's colon form) carry nothing the floor
 			// reads; skip the digits after one rather than folding them into the
 			// parameter they qualify.
 			in_sub_parameter = true;
-		} else if (raw >= '0' && raw <= '9' && !in_sub_parameter) {
-			if (value < 100000) // a bound, not a limit: no floor parameter exceeds 201
-				value = value * 10 + static_cast<unsigned>(raw - '0');
-			seen = true;
+			++i;
+		} else if (raw >= '0' && raw <= '9') {
+			const digit_run run = scan_digits(text.substr(i), 10, limit);
+			// A second digit run in one field (`1?2`) is not a form any terminal
+			// sends; the first run is the parameter and the rest is ignored.
+			if (!in_sub_parameter && !seen) {
+				value = static_cast<unsigned>(run.value);
+				seen = true;
+			}
+			i += run.consumed;
+		} else {
+			++i;
 		}
 	}
 	store();
