@@ -232,7 +232,15 @@ token lexer::lex_operator() noexcept {
 	switch (c) {
 		case '|': return c1 == '|' ? emit(token_kind::or_if, at2) : emit(token_kind::pipe, at1);
 		case '&': return c1 == '&' ? emit(token_kind::and_if, at2) : emit(token_kind::amp, at1);
-		case ';': return c1 == ';' ? emit(token_kind::dsemi, at2) : emit(token_kind::semi, at1);
+		// `;&` is its own token rather than `semi` followed by `amp`: a lexer that
+		// owns no memory and mutates nothing cannot glue two tokens back together
+		// downstream, so a two-character operator has to be recognised HERE or not
+		// at all. Read as two tokens, `case i in i) foo;& bar` parsed as `foo;`
+		// then a background `& bar` - silently wrong rather than a syntax error.
+		case ';':
+			if (c1 == ';') return emit(token_kind::dsemi, at2);
+			if (c1 == '&') return emit(token_kind::semi_and, at2);
+			return emit(token_kind::semi, at1);
 		case '(': return emit(token_kind::lparen, at1);
 		case ')': return emit(token_kind::rparen, at1);
 		case '<':

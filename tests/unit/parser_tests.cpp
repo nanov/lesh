@@ -317,6 +317,51 @@ TEST_F(ParserTest, ACaseClauseGivesItsWordsTheirRoles) {
 	}
 }
 
+// The high bit of a case_item's `aux` records whether `;&` closed it, the same
+// packing for_loop uses for its name token and `in` flag (#64).
+constexpr uint32_t kCaseItemFallsThrough = 0x80000000u;
+constexpr uint32_t kCaseItemPatternMask = 0x7FFFFFFFu;
+
+TEST_F(ParserTest, ASemicolonAmpersandMarksTheItemItCloses) {
+	// POSIX.1-2024 fallthrough: `;&` runs the NEXT item's body without testing
+	// its pattern, so the executor needs to know which terminator closed this
+	// item. `;;` must leave the flag clear - it is the case the plain pattern
+	// count assertion above already covers, and this pins down the opposite.
+	const tree t = parse_it("case i in i) ;& j) echo x;; esac");
+	EXPECT_FALSE(t.has_errors());
+	const node& clause = t[t.child_of(t[t.root()], 0)];
+	ASSERT_EQ(clause.children_count, 3u) << "subject plus two items";
+
+	const node& first = t[t.child_of(clause, 1)];
+	EXPECT_EQ(first.aux & kCaseItemPatternMask, 1u);
+	EXPECT_TRUE(first.aux & kCaseItemFallsThrough) << "closed by ;&";
+
+	const node& second = t[t.child_of(clause, 2)];
+	EXPECT_EQ(second.aux & kCaseItemPatternMask, 1u);
+	EXPECT_FALSE(second.aux & kCaseItemFallsThrough) << "closed by ;;, not ;&";
+}
+
+TEST_F(ParserTest, ASemicolonAmpersandOnTheLastItemIsStillValid) {
+	// `;&` with no item after it is legal - POSIX only says the NEXT item's body
+	// runs if there is one - and case-p.tst:203 ends exactly this way.
+	const tree t = parse_it("case i in i) echo x;& esac");
+	EXPECT_FALSE(t.has_errors());
+	const node& clause = t[t.child_of(t[t.root()], 0)];
+	const node& item = t[t.child_of(clause, 1)];
+	EXPECT_TRUE(item.aux & kCaseItemFallsThrough);
+}
+
+TEST_F(ParserTest, SemicolonAmpersandDoesNotDisturbOrdinaryAmpersandUses) {
+	// A new token for `;&` must not change how `;` and `&` behave on their own -
+	// a background command before `;;`, or a bare `&` list separator, are
+	// unrelated constructs that happen to share bytes with the new operator.
+	for (const std::string_view src : {"case x in x) foo &;; esac", "a & b",
+	                                   "case x in x) foo&;;esac"}) {
+		const tree t = parse_it(src);
+		EXPECT_FALSE(t.has_errors()) << src;
+	}
+}
+
 TEST_F(ParserTest, AnUnterminatedCompoundCommandStillEndsTheReadUnit) {
 	// The progress guarantee, for the parser's channel this time: the incremental
 	// reader calls parse_next_command in a loop until the cursor reaches the end,

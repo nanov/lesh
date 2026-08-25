@@ -1311,3 +1311,22 @@ echo hi >&99999999999999999999
 
 --- an input redirection fd too large to be one is refused [xfail(legacy): legacy has no redirections, so cat reads the script's own stdin]
 cat <&99999999999999999999
+
+--- case executes the next item after ;& without re-testing its pattern [divergence: dash predates ;& and refuses it with a syntax error - POSIX.1-2024 adds it]
+case 1 in
+    0) echo not reached 0;;
+    1) echo matched 1;&
+    2) echo matched 2; (exit 42);&
+esac
+=== expect [status: 42]
+matched 1
+matched 2
+
+--- exit status after an empty ;& item leaves $? untouched [divergence: dash predates ;& and refuses it with a syntax error - POSIX.1-2024 adds it, and no shell answers this one: zsh resets $? to 0 for an empty ;& item and bash 3.2 rejects an empty item before ;& outright, so the yash test file is the only oracle]
+(exit 1)
+case i in
+    i) ;&
+    j) echo $?
+esac
+=== expect
+1

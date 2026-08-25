@@ -176,6 +176,9 @@ constexpr bool ends_command(token_kind k) noexcept {
 		case token_kind::end: case token_kind::newline: case token_kind::semi:
 		case token_kind::amp: case token_kind::pipe: case token_kind::and_if:
 		case token_kind::or_if: case token_kind::dsemi: case token_kind::rparen:
+		// `;&` ends a case item's compound_list exactly as `;;` does; the only
+		// difference is what happens AFTER the item, which is run_case's concern.
+		case token_kind::semi_and:
 			return true;
 		default:
 			return false;
@@ -468,9 +471,10 @@ private:
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
 
-		// `)` closes a subshell or a case pattern, and `;;` ends a case item. Both
-		// end a compound list without being reserved words, and without them the
-		// list loops making no progress and error-nodes the closer.
+		// `)` closes a subshell or a case pattern, and `;;` or `;&` ends a case
+		// item. All three end a compound list without being reserved words, and
+		// without them the list loops making no progress and error-nodes the
+		// closer.
 		for (;;) {
 			if (is_separator(peek().kind)) {
 				advance();
@@ -490,6 +494,7 @@ private:
 			if (peek().kind == token_kind::end ||
 			    peek().kind == token_kind::rparen ||
 			    peek().kind == token_kind::dsemi ||
+			    peek().kind == token_kind::semi_and ||
 			    at_list_terminator())
 				break;
 			const uint32_t before = _index;
@@ -671,16 +676,24 @@ private:
 			// and dash runs them. The other exception is `program` itself (#58).
 			_scratch.push(parse_compound_list());
 
+			// Read before the terminator is consumed, so the node records which one
+			// closed IT rather than whatever follows.
+			const bool falls_through = peek().kind == token_kind::semi_and;
+
 			node item;
 			item.kind = node_kind::case_item;
 			item.error = item_defect;
 			item.first_token = item_first;
 			item.last_token = _index > item_first ? _index - 1 : item_first;
-			item.aux = patterns;
+			// The high bit says `;&` (POSIX.1-2024) closed this item rather than
+			// `;;` or `esac` directly - the same packing for_loop uses for its name
+			// token and `in` flag. run_case reads it to decide whether to keep
+			// running into the NEXT item's body without testing its pattern.
+			item.aux = patterns | (falls_through ? 0x80000000u : 0u);
 			commit_children(item, item_mark);
 			_scratch.push(_tree.add_node(item));
 
-			if (peek().kind == token_kind::dsemi)
+			if (peek().kind == token_kind::dsemi || peek().kind == token_kind::semi_and)
 				advance();
 			while (is_separator(peek().kind))
 				advance();

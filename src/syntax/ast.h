@@ -52,7 +52,13 @@ enum class node_kind : uint16_t {
 	// variable's name; the body is always the last child.
 	for_loop,
 	case_clause,     // children: [subject, case_item, case_item, ...]
-	case_item,       // children: [pattern, pattern, ..., body]; `aux` = pattern count
+	// children: [pattern, pattern, ..., body]. `aux` packs the pattern count in
+	// its low bits and, in the top bit, whether the item was closed by `;&`
+	// rather than `;;` or `esac` - the same shape for_loop uses for its name
+	// token and `in` flag. `;&` (POSIX.1-2024) runs the NEXT item's body
+	// without testing its pattern, so the executor has to know which terminator
+	// closed this item to decide whether to keep going.
+	case_item,
 	subshell,        // children: [compound_list] - runs in its own environment
 	brace_group,     // children: [compound_list] - runs in this one
 	// A here-document. `aux` packs the body's source range, recorded separately

@@ -1219,18 +1219,49 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 
 	for (uint32_t i = 1; i < self.children_count; ++i) {
 		const node& item = t[t.child_of(self, i)];
-		for (uint32_t p = 0; p < item.aux; ++p) {
+		// Low 31 bits: pattern count. High bit: the item was closed by `;&`
+		// (POSIX.1-2024) rather than `;;` or `esac` - see case_item in ast.h.
+		const uint32_t pattern_count = item.aux & 0x7FFFFFFFu;
+		bool matched = false;
+		for (uint32_t p = 0; p < pattern_count; ++p) {
 			arena_array<std::string_view> pattern{_pool, 2};
 			ex.expand_word(t, t.child_of(item, p), pattern);
-			if (pattern.empty())
-				continue;
-			// The shared matcher from #23. period_is_special is false here: the
-			// filename rule does not apply to `case`.
+			// pattern is never empty here: since #54 a pattern word is ONE VALUE
+			// rather than a field list (word_role::pattern in expand_word), so an
+			// empty pattern pushes an empty string rather than nothing at all. The
+			// old `continue` on an empty pattern skipped the item entirely for
+			// having what it read as NO pattern, which hid case-p.tst:369 - a
+			// subject and pattern that both expand to empty via command
+			// substitution - behind an executor bug rather than the redirection
+			// triage first blamed it on.
 			if (pattern_match(pattern[0], text, /*period_is_special=*/false)) {
-				if (item.children_count > item.aux)
-					return run_node(t, t.child_of(item, item.aux));
-				return 0;
+				matched = true;
+				break;
 			}
+		}
+		if (!matched)
+			continue;
+
+		// Matched: run this item's body, then keep running successive items'
+		// bodies WITHOUT re-testing their patterns for as long as `;&` chains
+		// them together - POSIX.1-2024 fallthrough (case-p.tst:203). Only the
+		// LAST body run in the chain becomes the case command's exit status; an
+		// intermediate one is discarded rather than returned, which is what
+		// keeps an EMPTY `;&` item from resetting $?: run_node on a body with no
+		// commands returns 0 locally without ever calling set_last_status, so
+		// discarding that 0 here leaves $? exactly where the command before the
+		// whole `case` left it, for the NEXT item's body to read
+		// (case-p.tst:214 - there is no shell oracle for this, so the choice is
+		// the yash test file's).
+		for (uint32_t cur = i;; ++cur) {
+			const node& cur_item = t[t.child_of(self, cur)];
+			const uint32_t cur_patterns = cur_item.aux & 0x7FFFFFFFu;
+			const int status = cur_item.children_count > cur_patterns
+				? run_node(t, t.child_of(cur_item, cur_patterns))
+				: 0;
+			const bool falls_through = (cur_item.aux & 0x80000000u) != 0;
+			if (!falls_through || cur + 1 >= self.children_count)
+				return status;
 		}
 	}
 	return 0;  // POSIX: no matching pattern is status zero

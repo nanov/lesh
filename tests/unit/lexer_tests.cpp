@@ -90,6 +90,30 @@ TEST(Lexer, RecognisesMultiCharacterOperatorsGreedily) {
 	          (std::vector{token_kind::word, token_kind::dsemi, token_kind::word}));
 }
 
+// POSIX.1-2024's case fallthrough. Before this it lexed as `semi` then `amp`,
+// which is indistinguishable from `foo; &bar` at the token level - the parser
+// would have had to glue two tokens back together to tell them apart, and the
+// lexer owns no memory to do that with.
+TEST(Lexer, SemicolonAmpersandIsItsOwnToken) {
+	EXPECT_EQ(kinds_of("a ;& b"),
+	          (std::vector{token_kind::word, token_kind::semi_and, token_kind::word}));
+	EXPECT_EQ(kinds_of("a;&b"),
+	          (std::vector{token_kind::word, token_kind::semi_and, token_kind::word}));
+}
+
+// A `;&` token must not eat an ordinary `;` followed by a background command,
+// nor a plain `;;`. The two other separators near it - `;` alone and `&`
+// alone - have to keep meaning what they meant before this token existed.
+TEST(Lexer, SemicolonAmpersandDoesNotSwallowOrdinarySeparators) {
+	EXPECT_EQ(kinds_of("a; &b"),
+	          (std::vector{token_kind::word, token_kind::semi, token_kind::amp,
+	                       token_kind::word}));
+	EXPECT_EQ(kinds_of("a & b"),
+	          (std::vector{token_kind::word, token_kind::amp, token_kind::word}));
+	EXPECT_EQ(kinds_of("a;;b"),
+	          (std::vector{token_kind::word, token_kind::dsemi, token_kind::word}));
+}
+
 TEST(Lexer, OperatorsSplitWordsWithoutBlanks) {
 	EXPECT_EQ(kinds_of("a|b"),
 	          (std::vector{token_kind::word, token_kind::pipe, token_kind::word}));
@@ -239,6 +263,7 @@ TEST(Lexer, AnOperatorMayBeSplitByLineContinuations) {
 		{"&\\\n&", token_kind::and_if},
 		{"|\\\n|", token_kind::or_if},
 		{";\\\n;", token_kind::dsemi},
+		{";\\\n&", token_kind::semi_and},
 	};
 	for (const auto& [src, kind] : cases) {
 		lexer lx{src};

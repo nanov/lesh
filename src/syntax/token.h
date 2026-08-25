@@ -22,6 +22,7 @@ enum class token_kind : uint16_t {
 	or_if,        // ||
 	semi,         // ;
 	dsemi,        // ;;
+	semi_and,     // ;& - POSIX.1-2024 case fallthrough, distinct from `;` `&`
 	amp,          // &
 	lparen,       // (
 	rparen,       // )
