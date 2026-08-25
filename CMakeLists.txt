@@ -64,6 +64,23 @@ target_link_options(lesh_options INTERFACE
 target_compile_definitions(lesh_options INTERFACE
 	$<$<NOT:$<CONFIG:Release>>:LESH_ENABLE_ASSERTS>)
 
+# ---------------------------------------------------------------------------
+# trace-level logging.
+#
+# #109's cost rule: the other four levels are runtime-gated and their call sites
+# ship, but `trace` is not compiled at all unless this is on - "N-1 never sees
+# logging in release", literally. The debug and bench presets turn it on and the
+# release preset turns it off, which is where the decision is meant to be read.
+#
+# OFF is the default rather than ON so that a build configured WITHOUT a preset
+# also ships no trace call sites. Presets are this project's supported way to
+# configure (see the toolchain policy above), and a default that quietly puts
+# keystroke logging into an unattended release build is the wrong way round.
+# ---------------------------------------------------------------------------
+option(LESH_TRACE_LOGGING "Compile trace-level log call sites into the binary" OFF)
+target_compile_definitions(lesh_options INTERFACE
+	$<$<BOOL:${LESH_TRACE_LOGGING}>:LESH_ENABLE_TRACE_LOGGING>)
+
 # testing
 add_subdirectory("include/googletest")
 enable_testing()
@@ -91,18 +108,24 @@ enable_testing()
 # linked any of them, so nothing here inherits a dependency by accident.
 # ---------------------------------------------------------------------------
 
-# substrate: arena, containers, assertions, character classification.
-# Depends on nothing. Header-only, so an INTERFACE target.
-add_library(lesh_substrate INTERFACE)
-target_link_libraries(lesh_substrate INTERFACE lesh_options)
-target_sources(lesh_substrate INTERFACE
+# substrate: arena, containers, assertions, character classification, the logger.
+# Depends on nothing.
+#
+# STATIC rather than INTERFACE since #120: the logger owns two descriptors and a
+# gate word, and one translation unit has to own them or every linked target
+# would get its own copy of the state and the gate a keystroke checks would not
+# be the gate `configure` armed. Everything else here is still header-only.
+add_library(lesh_substrate STATIC
 	src/substrate/arena.h
 	src/substrate/assert.h
 	src/substrate/char_utils.h
 	src/substrate/grapheme.h
+	src/substrate/log.cpp
+	src/substrate/log.h
 	src/substrate/measure.h
 	src/substrate/traits.h
 	src/substrate/unicode_tables.h)
+target_link_libraries(lesh_substrate PUBLIC lesh_options)
 
 # ui: terminal presentation. Depends only on the substrate.
 add_library(lesh_ui STATIC
@@ -196,6 +219,8 @@ add_executable(lesh_tests
 	tests/unit/leshper_selection_tests.cpp
 	tests/unit/leshper_tests.cpp
 	tests/unit/leshper_paste_tests.cpp
+	tests/unit/leshper_replay_tests.cpp
+	tests/unit/log_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp

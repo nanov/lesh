@@ -3,6 +3,7 @@
 #include "leshper/text.h"
 #include "leshper/undo.h"
 #include "substrate/assert.h"
+#include "substrate/log.h"
 
 #include <string>
 #include <string_view>
@@ -11,6 +12,81 @@
 
 namespace lesh::leshper {
 namespace {
+
+// THE EVENT HOOK (#109, #120), and the only logging call site in the editor.
+//
+// Every loop input passes through here on its way into `step()`, which is what
+// makes the replay file complete: N-3 asks that a recorded sequence reproduce an
+// identical state, and a sequence missing the events some branch forgot to
+// record reproduces something else. Recording at the ENTRANCE rather than in the
+// branches is the structure that buys that - an eighth kind of event cannot be
+// added without passing this line.
+//
+// TWO SINKS, ONE RECORD. The jsonl object is what the harness replays; the text
+// line is what a human reads. They are built from the same `incoming` and there
+// is no second event serialization anywhere, which is the bug #109 named.
+//
+// REDACTION LIVES HERE. `debug` says what KIND of event arrived and how big it
+// was; the codepoint a user typed and the text they pasted appear only at
+// `trace`, which is compiled out of release entirely. So a `debug` log is safe
+// to attach to a bug report and a `trace` log is not, and the difference is
+// visible in one place rather than asserted in prose. The replay file is the
+// deliberate exception - it necessarily holds the full input, which is what it
+// is for, and it is opt-in through its own variable.
+//
+// The named keys go in as their enumerator's NUMBER rather than a name. There is
+// no name table for `named_key` yet and inventing one here would be a second
+// vocabulary for keys; #93 brings the keymap's own, and the reader on the far
+// side of this file changes with it.
+void log_event(const event& incoming) {
+	// ONE relaxed atomic load for both questions - see substrate/log.h. This is
+	// the keystroke path, and the whole cost of logging being off is this line.
+	if (!log::enabled_or_recording(log::level::debug, log::category::event))
+		return;
+
+	log::record entry{log::category::event};
+	if (const auto* key = std::get_if<key_event>(&incoming)) {
+		entry.text("kind", "key")
+			.number("cp", static_cast<uint64_t>(key->codepoint))
+			.flag("named", key->named)
+			.number("key", static_cast<uint64_t>(key->key))
+			.flag("shift", key->modifiers.shift)
+			.flag("alt", key->modifiers.alt)
+			.flag("ctrl", key->modifiers.ctrl);
+		LESH_LOG(log::level::debug, log::category::event, "key named=%d modifiers=%d",
+		         static_cast<int>(key->named), static_cast<int>(key->modifiers.any()));
+		LESH_LOG_TRACE(log::category::event, "key codepoint=U+%04X", static_cast<unsigned>(key->codepoint));
+	} else if (const auto* resize = std::get_if<resize_event>(&incoming)) {
+		entry.text("kind", "resize")
+			.number("columns", static_cast<uint64_t>(resize->columns))
+			.number("rows", static_cast<uint64_t>(resize->rows));
+		LESH_LOG(log::level::debug, log::category::event, "resize %ux%u",
+		         static_cast<unsigned>(resize->columns), static_cast<unsigned>(resize->rows));
+	} else if (const auto* result = std::get_if<worker_result>(&incoming)) {
+		entry.text("kind", "worker_result").number("gen", result->computed_against.value());
+		LESH_LOG(log::level::debug, log::category::event, "worker_result gen=%llu",
+		         static_cast<unsigned long long>(result->computed_against.value()));
+	} else if (const auto* job = std::get_if<job_notice>(&incoming)) {
+		entry.text("kind", "job")
+			.number("pid", static_cast<int64_t>(job->pid))
+			.number("status", static_cast<int64_t>(job->status));
+		LESH_LOG(log::level::debug, log::category::event, "job pid=%d status=%d", job->pid, job->status);
+	} else if (const auto* injected = std::get_if<injected_input>(&incoming)) {
+		entry.text("kind", "injected").text("text", injected->text);
+		LESH_LOG(log::level::debug, log::category::event, "injected %zu bytes", injected->text.size());
+		LESH_LOG_TRACE(log::category::event, "injected text=%.*s",
+		               static_cast<int>(injected->text.size()), injected->text.data());
+	} else if (const auto* signal = std::get_if<signal_event>(&incoming)) {
+		entry.text("kind", "signal").number("signal", static_cast<int64_t>(signal->signal_number));
+		LESH_LOG(log::level::debug, log::category::event, "signal %d", signal->signal_number);
+	} else if (const auto* paste = std::get_if<paste_event>(&incoming)) {
+		entry.text("kind", "paste").text("text", paste->text);
+		LESH_LOG(log::level::debug, log::category::event, "paste %zu bytes", paste->text.size());
+		LESH_LOG_TRACE(log::category::event, "paste text=%.*s",
+		               static_cast<int>(paste->text.size()), paste->text.data());
+	}
+	entry.commit();
+}
 
 constexpr char32_t control_w = 0x17;  // Ctrl-W
 constexpr char32_t control_a = 0x01;  // Ctrl-A
@@ -405,6 +481,7 @@ action binding_for(const key_event& key) noexcept {
 }
 
 effects step(state& current, const event& incoming) {
+	log_event(incoming);   // #109's `event` category, and N-3's replay file
 	effects out;
 
 	if (const auto* key = std::get_if<key_event>(&incoming)) {

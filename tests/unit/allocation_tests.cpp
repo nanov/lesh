@@ -1,12 +1,31 @@
+#include "leshper/editor.h"
+#include "leshper/event.h"
+#include "leshper/state.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
+#include "substrate/log.h"
 #include "syntax/parser.h"
+
+#include "temp_path.h"
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <cstddef>
 #include <string>
 #include <tuple>
+#include <unistd.h>
 #include <vector>
+
+// Whether this build can count REAL mallocs. Only an ASan build can, which is
+// the build the gate runs (`ctest --preset debug`), so the logger's cost rule is
+// asserted exactly where it is asserted at all.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define LESH_COUNTS_REAL_MALLOCS 1
+#include <sanitizer/allocator_interface.h>
+#endif
+#endif
 
 using namespace lesh;
 
@@ -122,3 +141,148 @@ TEST_F(AllocationTest, LexingAllocatesNothingWhatsoever) {
 	EXPECT_EQ(pooled(), 0u);
 	EXPECT_EQ(heap(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// The logger's half of the constraint (#109's cost rule, #120).
+//
+// The counters above see the ARENA - they answer "did the pool overflow into
+// malloc". The logger allocates from neither: its buffers are thread-local
+// arrays and its sinks are raw descriptors, so an accidental `std::string` on
+// the logging path would be invisible to `heap()` and would still be exactly the
+// defect the cost rule forbids.
+//
+// So this section counts REAL mallocs, through the sanitizer's own hook. That
+// buys two things a replaced `operator new` would have cost: ASan keeps its
+// allocator semantics intact for every other test in this binary, and the count
+// includes allocations from inside libc++ rather than only the ones our code
+// spells with `new`.
+//
+// The hook is process-wide once installed, and its cost outside a measured
+// window is a relaxed load and a not-taken branch per allocation.
+// ---------------------------------------------------------------------------
+
+#ifdef LESH_COUNTS_REAL_MALLOCS
+
+namespace {
+
+std::atomic<size_t> g_mallocs{0};
+std::atomic<bool> g_counting{false};
+
+void note_malloc(const volatile void*, size_t) noexcept {
+	if (g_counting.load(std::memory_order_relaxed))
+		g_mallocs.fetch_add(1, std::memory_order_relaxed);
+}
+void note_free(const volatile void*) noexcept {}
+
+// Every malloc the process makes while `work` runs.
+template <typename Work>
+size_t mallocs_during(Work&& work) {
+	static const bool installed =
+		__sanitizer_install_malloc_and_free_hooks(note_malloc, note_free) != 0;
+	EXPECT_TRUE(installed) << "the sanitizer allocator hook is what this measures with";
+	g_mallocs.store(0, std::memory_order_relaxed);
+	g_counting.store(true, std::memory_order_relaxed);
+	work();
+	g_counting.store(false, std::memory_order_relaxed);
+	return g_mallocs.load(std::memory_order_relaxed);
+}
+
+} // namespace
+
+TEST_F(AllocationTest, TheMallocCounterCountsAMallocWhenThereIsOne) {
+	// The positive control, and it is not optional: every assertion below is a
+	// ZERO, and a broken instrument reports zero for everything. No gtest macro
+	// inside the window - an assertion that allocated would be measuring itself.
+	size_t observed = 0;
+	const size_t counted = mallocs_during([&observed] {
+		const std::string big(4096, 'x');
+		observed = big.size();
+	});
+	EXPECT_EQ(observed, 4096u);
+	EXPECT_GT(counted, 0u);
+}
+
+TEST_F(AllocationTest, LoggingOffAllocatesNothingAndEvaluatesNothing) {
+	// #109's cost rule, as the number it is stated in. Every level times every
+	// category, with an argument that both allocates and counts itself - so the
+	// two ways this can go wrong, evaluating early and formatting early, are told
+	// apart by which of the two expectations below fails.
+	log::shutdown();
+
+	int evaluations = 0;
+	std::string held;
+	const auto expensive = [&evaluations, &held]() -> const char* {
+		++evaluations;
+		held = std::string(4096, 'x');
+		return held.c_str();
+	};
+
+	const size_t counted = mallocs_during([&] {
+		for (int in = 0; in < static_cast<int>(log::category::count_); ++in) {
+			for (int of = 1; of < static_cast<int>(log::level::count_); ++of) {
+				LESH_LOG(static_cast<log::level>(of), static_cast<log::category>(in), "%s",
+				         expensive());
+			}
+		}
+	});
+
+	EXPECT_EQ(counted, 0u) << "a disabled log allocated";
+	EXPECT_EQ(evaluations, 0) << "a disabled log evaluated its arguments";
+}
+
+TEST_F(AllocationTest, LoggingOffCostsTheCommandPathNoHeapAllocation) {
+	// THE ASSERTION THE TICKET ASKS FOR, isolated so it can only be about the
+	// hook. A signal event is the one input the editor deliberately does nothing
+	// with - no buffer change, no effect pushed, no pending input drained - so
+	// every allocation this counts belongs to `log_event` and to nothing else.
+	//
+	// It goes non-zero the moment somebody builds a record, formats a message, or
+	// copies a string on the way to the gate check instead of past it.
+	using namespace lesh::leshper;
+	log::shutdown();
+
+	state s;
+	step(s, signal_event{28});   // warm: the first turn touches lazily-built state
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 1000; ++i)
+			step(s, signal_event{28});
+	});
+	EXPECT_EQ(counted, 0u) << "the event hook allocates with logging off";
+}
+
+TEST_F(AllocationTest, EvenLoggingOnFormatsWithoutTheHeap) {
+	// Not required by the cost rule - a user who turned logging on has accepted
+	// its cost - but it is the property the fixed thread-local buffers exist to
+	// have, and "a log line that reallocates is an allocation-gate suspect" is
+	// only checkable here.
+	// A private scratch directory rather than a fixed name in the shared one:
+	// parallel agents run this binary at the same time (#60).
+	const lesh::testing::temp_path scratch;
+	const std::string text = scratch.file("log");
+	const std::string replay = scratch.file("replay.jsonl");
+	ASSERT_TRUE(log::configure(
+		log::settings_from_env("trace", text.c_str(), replay.c_str(), nullptr, nullptr), {}));
+	ASSERT_TRUE(log::enabled(log::level::info, log::category::exec));
+	ASSERT_TRUE(log::recording());
+
+	// Warm what initialises once: the timezone database `localtime_r` reads, and
+	// this thread's cached id.
+	LESH_LOG(log::level::info, log::category::exec, "warm %d", 0);
+	log::record{log::category::event}.text("kind", "warm").commit();
+
+	const size_t counted = mallocs_during([] {
+		for (int i = 0; i < 200; ++i)
+			LESH_LOG(log::level::info, log::category::exec, "line %d of %s", i, "a session");
+		for (int i = 0; i < 200; ++i)
+			log::record{log::category::event}
+				.text("kind", "key")
+				.number("cp", int64_t{97})
+				.flag("named", false)
+				.commit();
+	});
+	EXPECT_EQ(counted, 0u) << "formatting a log line reached the heap";
+
+	log::shutdown();
+}
+#endif
