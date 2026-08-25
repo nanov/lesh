@@ -6,6 +6,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 namespace lesh::runtime {
@@ -76,11 +77,32 @@ bool expand_pathnames(buffer_pool& pool, std::string_view word,
 				if (has_pattern_characters(component)) {
 					expand_component(dir, component, is_last, next);
 				} else {
-					// A literal component: extend without a directory scan.
+					// A literal component: extend without a directory scan - a
+					// non-last one gets its existence check for free, because the
+					// NEXT component's opendir() on a path that isn't there fails
+					// and drops this branch. The last component has no next step
+					// to catch it, so it is confirmed here with lstat (not stat:
+					// a dangling symlink still names a real directory entry and
+					// must still expand).
+					//
+					// A failed lstat must not be read as "does not exist". ENOENT
+					// means that; EACCES means an ancestor directory could not be
+					// searched, so existence could not be checked AT ALL. POSIX
+					// leaves an unconfirmable pattern unexpanded rather than
+					// asserting a file exists that lesh was never permitted to
+					// look for, so both failures are handled the same way here:
+					// this candidate is dropped, and - if nothing else in
+					// `current` survives - the word falls through to the
+					// unmatched-pattern case below.
 					std::string full = dir;
 					if (!full.empty() && full.back() != '/')
 						full += '/';
 					full.append(component);
+					if (is_last) {
+						struct stat st;
+						if (::lstat(full.c_str(), &st) != 0)
+							continue;
+					}
 					next.push_back(std::move(full));
 				}
 			}

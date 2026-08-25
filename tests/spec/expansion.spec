@@ -402,3 +402,26 @@ a='x y'; printf '[%s]\n' A=$a
 HOME=/foo/bar/; printf '[%s][%s]\n' ~ ~/~
 HOME=/; printf '[%s][%s]\n' ~ ~/foo
 HOME=//; printf '[%s][%s]\n' ~ ~/foo
+
+# #69: `path-p.tst`'s one failure was NOT the pattern matcher #23 built - matching
+# is right - it was the filesystem walk in glob.cpp that turns a match into a
+# pathname. A literal component after a matched wildcard directory was appended
+# unconditionally, with no existence check at all: the walk could tell "matched"
+# from "did not match" for a wildcard component (readdir just does not return an
+# entry), but had no way to tell "confirmed" from "could not check" for a literal
+# trailing one.
+#
+# Without search (`x`) permission on `no_search_dir`, resolving `no_search_dir/file`
+# by name fails with EACCES - not ENOENT. That is the same shape as #34's sentinel
+# bug in `apply_redirection`, which could not tell "nothing to save" from "the fd
+# was closed": here, "the file does not exist" and "existence could not be checked"
+# were the same case standing in for two different truths, and the walk had chosen
+# the wrong one. lesh was asserting a file existed that it was never permitted to
+# look for. This case runs identically whether or not it is root: a real kernel
+# permission check underneath is what makes dash and lesh agree either way, not a
+# fixed expected value asserted here.
+
+--- a literal component past a directory the walk cannot search is not confirmed [xfail(legacy): legacy has no pathname expansion]
+mkdir -p foo/no_search_dir; >foo/no_search_dir/file; chmod a-x foo/no_search_dir
+echo foo/no_search_d*r/file
+chmod a+x foo/no_search_dir

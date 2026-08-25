@@ -1,6 +1,15 @@
 #include "runtime/pattern.h"
 
+#include "runtime/glob.h"
+
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
+
+#include <fstream>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace lesh::runtime;
 
@@ -195,4 +204,44 @@ TEST(Pattern, NoMatchIsDistinctFromAnEmptyMatch) {
 	// needs its own value rather than being conflated with length zero.
 	EXPECT_EQ(match_prefix("x", "abc", false), no_match);
 	EXPECT_EQ(match_prefix("*", "abc", false), 0u);
+}
+
+// --- the filesystem walk (#69) -----------------------------------------------
+//
+// The matcher above is not what #69 was about: pattern_match is right, and the
+// walk in glob.cpp that turns matches into pathnames is what asserted a file
+// existed without being permitted to check. See issue #69.
+
+TEST(Pattern, ALiteralComponentPastAnUnsearchableDirectoryIsNotConfirmed) {
+	// Root bypasses directory search permission entirely, so this would pass for
+	// the wrong reason - the walk would never even attempt the check this test
+	// exists to exercise.
+	if (::geteuid() == 0)
+		GTEST_SKIP() << "root ignores search permission; the check under test never runs";
+
+	lesh::testing::temp_path scratch;
+	const std::string dir = scratch.file("no_search_dir");
+	ASSERT_EQ(::mkdir(dir.c_str(), 0755), 0);
+	{
+		std::ofstream touch(dir + "/file");
+		ASSERT_TRUE(touch.good());
+	}
+	// Read but not search: readdir() can still list `file`, but resolving
+	// `dir/file` by name needs the `x` bit this removes.
+	ASSERT_EQ(::chmod(dir.c_str(), 0644), 0);
+
+	lesh::buffer_pool pool{1024 * 32};
+	lesh::arena_array<std::string_view> out{pool, 4};
+	const std::string word = scratch.dir() + "/no_search_d*r/file";
+
+	EXPECT_TRUE(expand_pathnames(pool, word, out));
+	// A literal `file` after a directory the walk cannot search is unconfirmable,
+	// not confirmed: POSIX leaves the whole pattern alone rather than have lesh
+	// assert a file exists that it was never permitted to look for.
+	ASSERT_EQ(out.size(), 1u);
+	EXPECT_EQ(out[0], word);
+
+	// Restore before temp_path's destructor tries to remove this directory's
+	// contents, or the scratch tree is left behind for every run after this one.
+	ASSERT_EQ(::chmod(dir.c_str(), 0755), 0);
 }
