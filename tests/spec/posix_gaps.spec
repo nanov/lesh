@@ -1628,14 +1628,41 @@ echo before; eval 'if' 2>/dev/null; echo notreached
 --- a dot script that cannot be found still ends the shell [xfail(legacy): legacy has no dot builtin]
 echo before; . ./_lesh_no_such_file_ 2>/dev/null; echo notreached
 
-# The `2>/dev/null` is on the GROUP rather than on `:` itself, and that is not
-# incidental: dash reports a refused assignment prefix through the command's own
-# redirections and lesh reports it before them, so with `r=2 : 2>/dev/null` the two
-# shells agree about the shell's fate and differ about where the diagnostic went.
-# That is a separate defect and this case is not the place to assert it.
+# The `2>/dev/null` is on the GROUP rather than on `:` itself. It had to be while
+# lesh reported a refused assignment prefix BEFORE the command's own redirections
+# and dash reported it through them: the two shells agreed about the shell's fate
+# and differed about where the diagnostic went. #73 moved the report, and the case
+# below now asserts the difference this one was written to avoid.
 
 --- an assignment prefix refused before a special builtin still ends the shell [xfail(legacy): legacy has no assignment prefixes]
 readonly r=1; echo before; { r=2 : ; } 2>/dev/null; echo notreached
+
+# A refused prefix is diagnosed through the COMMAND'S OWN redirections, which is
+# the rule `command`'s bad-option path already states in executor.cpp: reported
+# where the command runs and not where the prefix was read.
+
+--- a refused assignment prefix is reported through the command's own redirections [xfail(legacy): legacy has no assignment prefixes]
+readonly r=1; echo before; r=2 : 2>/dev/null; echo notreached
+
+--- and through them for an EXTERNAL command too [xfail(legacy): legacy has no assignment prefixes]
+readonly r=1; echo before; r=2 /bin/echo hi 2>/dev/null; echo notreached
+
+# The redirections are really PERFORMED, not merely consulted: dash creates and
+# truncates the file before it reports. `readonly` goes INSIDE the invoked shell -
+# the prefix has to be refused in the shell that does the redirecting, and a
+# `$TESTEE -c` that only inherited the value would find r perfectly writable and
+# assert nothing.
+
+--- the refused command's redirections are performed before the diagnostic [xfail(legacy): legacy has no assignment prefixes]
+d=$(mktemp -d); ("$TESTEE" -c "readonly r=1; r=2 : > $d/made") 2>/dev/null; test -f "$d/made"; echo "made=$?"
+
+# And a redirection that CANNOT be performed leaves the shell's fate unchanged:
+# dash reports the redirection error instead of the read-only one and still dies.
+# Which of the two messages was written is NOT asserted - the harness compares
+# stderr for emptiness alone - so this pins the fate and the status.
+
+--- a redirection error on the refused command still ends the shell [xfail(legacy): legacy has no assignment prefixes]
+readonly r=1; echo before; r=2 : 2>/_lesh_no_such_dir_/x; echo notreached
 
 --- a redirection failure on a special builtin still ends the shell [xfail(legacy): legacy has no redirections]
 echo before; : 2>/dev/null <./_lesh_no_such_file_; echo notreached

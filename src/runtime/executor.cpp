@@ -2655,10 +2655,36 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// longer exit the shell, and a regular builtin's not at all yet.
 	for (const auto& a : assignments) {
 		const size_t eq = a.find('=');
-		if (eq != std::string_view::npos && _state.is_readonly(a.substr(0, eq))) {
+		if (eq == std::string_view::npos || !_state.is_readonly(a.substr(0, eq)))
+			continue;
+		// REPORTED THROUGH THIS COMMAND'S OWN REDIRECTIONS, which is the rule
+		// `command`'s bad-option path states thirty lines up: reported where the
+		// command runs, not where the prefix was read. `readonly r=1;
+		// r=2 : 2>/dev/null` leaked `r: is read only` to the terminal, where dash is
+		// silent because the message goes through the `2>/dev/null` (#73). One rule,
+		// two places, and only one of them had it.
+		//
+		// The redirections are PERFORMED and not merely consulted - dash creates and
+		// truncates the file before it reports - and then put straight back, because
+		// this command is not going to run. The speculative-open hazard the function
+		// lookup below documents does not apply: there is no second, real open
+		// afterwards for a FIFO's reader to have gone away before.
+		arena_array<saved_fd> saved{_pool, 4};
+		const bool redirected = apply_redirections(t, n, &saved);
+		// A redirection that FAILED has already said so, and dash reports that and
+		// never mentions the variable. Reporting both would invent a second
+		// diagnostic the reference shell does not write - and fd 2 is in an unknown
+		// state at that point anyway.
+		if (redirected)
 			shell_state::report_readonly({}, a.substr(0, eq));
-			return assignment_error();
-		}
+		// Before restore_fds, or the message sits in the FILE* buffer and is flushed
+		// after the fds are back - onto the terminal, which is the leak this fixes.
+		std::fflush(nullptr);
+		restore_fds(saved);
+		// Either way the shell's fate is the same and so is the status: an
+		// assignment error and a redirection error are both 2, and both are fatal
+		// to a non-interactive shell.
+		return assignment_error();
 	}
 
 	// `command`, `command -p` and `command --` with nothing after them are commands

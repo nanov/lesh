@@ -94,6 +94,48 @@ TEST_F(ReadonlyTest, AssignmentToAReadonlyVariableIsFatalToANonInteractiveShell)
 	EXPECT_EQ(capture("readonly e; echo $((e=1)); echo not reached"), "");
 }
 
+TEST_F(ReadonlyTest, ARefusedPrefixIsReportedThroughTheCommandsRedirections) {
+	// The rule `command`'s bad-option path already states in executor.cpp:
+	// reported where the command RUNS, not where the prefix was read. lesh checked
+	// the prefix before apply_redirections, so `readonly r=1; r=2 : 2>/dev/null`
+	// leaked `r: is read only` to the terminal where dash is silent (#73).
+	// A NAME OF ITS OWN PER ASSERTION: the fixture's shell state is shared, and a
+	// second `readonly r=1` is itself an error, so re-using the name would assert
+	// the diagnostic of the setup line rather than of the prefix.
+	EXPECT_EQ(capture_stderr("readonly ra=1; ra=2 : 2>/dev/null"), "");
+	EXPECT_EQ(capture_stderr("readonly rb=1; rb=2 /bin/echo hi 2>/dev/null"), "");
+	// Without the redirection it is still reported - the message moved, it did not
+	// go away, which is the failure mode a "just silence it" fix would have had.
+	EXPECT_NE(capture_stderr("readonly rc=1; rc=2 :"), "");
+	// And the shell's FATE is untouched by where the message went.
+	EXPECT_EQ(capture("readonly rd=1; rd=2 : 2>/dev/null; echo not reached"), "");
+	EXPECT_EQ(run("readonly re=1; re=2 : 2>/dev/null"), 2);
+}
+
+TEST_F(ReadonlyTest, ARefusedPrefixPerformsTheRedirectionsFirst) {
+	// dash CREATES and truncates the file before it reports, so the redirections
+	// are performed rather than merely consulted. The fds are then put straight
+	// back: this command never runs.
+	const std::string path = scratch.file("refused_prefix.txt");
+	std::remove(path.c_str());
+	EXPECT_EQ(capture("readonly r=1; r=2 : > " + path + " 2>/dev/null"), "");
+	{
+		std::ifstream made{path};
+		EXPECT_TRUE(made.good());
+	}
+	std::remove(path.c_str());
+}
+
+TEST_F(ReadonlyTest, ARefusedPrefixPutsTheRedirectionsBack) {
+	// The fds are RESTORED, not left applied - which only a shell that survives the
+	// refusal can show, so this is the interactive half of the same rule. Without
+	// the restore, `echo after` would still be writing into /dev/null.
+	const lesh::testing::interactive_disposition_guard dispositions;
+	state.set_interactive(true);
+	EXPECT_EQ(capture("readonly r=1; r=2 : >/dev/null 2>/dev/null; echo after"),
+	          "after\n");
+}
+
 TEST_F(ReadonlyTest, AnInteractiveShellReportsAndCarriesOn) {
 	// The other half of the same POSIX sentence, and the reason the fatality lives
 	// in one place rather than in each writer.
