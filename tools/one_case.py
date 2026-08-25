@@ -12,13 +12,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("case")
 ap.add_argument("--suite", default="third_party/yash-tests")
 ap.add_argument("--shell", default="./build/debug/lesh")
-ap.add_argument("--frontend", default="next")
 ap.add_argument("--timeout", type=float, default=20.0)
 a = ap.parse_args()
 
 suite = Path(a.suite)
 case = suite / a.case
-os.environ["LESH_FRONTEND"] = a.frontend
 opts = [o for o in os.environ.get("ASAN_OPTIONS", "").split(":")
         if o and not o.startswith("detect_leaks")]
 os.environ["ASAN_OPTIONS"] = ":".join(opts + ["detect_leaks=0"])

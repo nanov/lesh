@@ -472,8 +472,8 @@ TEST_F(BuiltinRegistryTest, KillRefusesEXITBecauseItIsATrapConditionAndNotASigna
 //
 // Kept as a test rather than a lint script because a lint script is a thing
 // someone has to remember to run, and #35's lesson is that the guard which works
-// is the one in the build. src/legacy/ is exempt: ADR-0002 deletes it and nothing
-// new may be added there anyway.
+// is the one in the build. src/legacy/ used to be exempt from it; #28 deleted the
+// directory, so the guard now covers every line of src/ with no carve-out.
 
 namespace {
 
@@ -535,7 +535,6 @@ TEST(NumericParserGuard, TheSourceTreeItScansIsActuallyThere) {
 
 TEST(NumericParserGuard, NoSiteReadsANumberWithoutTheOneParser) {
 	const std::filesystem::path root = repository_root();
-	const std::filesystem::path legacy = root / "src" / "legacy";
 	const std::filesystem::path mechanism = root / "src" / "substrate" / "numeric.h";
 
 	std::vector<std::string> offences;
@@ -545,12 +544,8 @@ TEST(NumericParserGuard, NoSiteReadsANumberWithoutTheOneParser) {
 		const std::filesystem::path& path = entry.path();
 		if (path.extension() != ".cpp" && path.extension() != ".h")
 			continue;
-		// The mechanism itself is where these idioms are allowed to live, and
-		// src/legacy/ is the quarantine ADR-0002 deletes.
+		// The mechanism itself is the one place these idioms are allowed to live.
 		if (path == mechanism)
-			continue;
-		if (std::mismatch(legacy.begin(), legacy.end(), path.begin(), path.end()).first
-		    == legacy.end())
 			continue;
 
 		std::ifstream in{path};

@@ -21,7 +21,7 @@ timeout = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
 work = Path(tempfile.mkdtemp(prefix="probe."))
 (work / "script").write_text(code)
 out_path = work / "out"
-env = dict(os.environ, LESH_FRONTEND=os.environ.get("LESH_FRONTEND", "next"))
+env = dict(os.environ)
 with out_path.open("wb") as sink:
     proc = subprocess.Popen([shell, "script"], cwd=work, env=env,
                             stdout=sink, stderr=subprocess.STDOUT,

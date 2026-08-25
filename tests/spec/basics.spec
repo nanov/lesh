@@ -27,13 +27,13 @@ false | true
 --- single quotes suppress expansion
 echo 'literal $HOME'
 
---- double quotes allow expansion [xfail(legacy): quote handling strips the brackets but never runs expansion on the contents]
+--- double quotes allow expansion
 echo "quoted $HOME"
 
 --- command substitution
 echo $(echo inner)
 
---- command substitution with a prefix [xfail(legacy): partial expansion around $() is unfinished]
+--- command substitution with a prefix
 echo pre$(echo inner)
 
 --- expansion of an argument inside a pipeline

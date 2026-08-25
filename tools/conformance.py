@@ -155,7 +155,6 @@ def main() -> int:
     # Release by default: see the module docstring. Debug is 14x slower AND scores
     # six lower, because ASan intercepts the signals kill2-p.tst asserts.
     ap.add_argument("--shell", default="./build/release/lesh")
-    ap.add_argument("--frontend", choices=["legacy", "next"], default="next")
     # 10 seconds was the original default, and it was WRONG: a signal file holds 180
     # cases, each spawning several processes, and takes a few seconds on an idle
     # machine. Anything else running pushed it past the line, so six files dropped out
@@ -191,7 +190,6 @@ def main() -> int:
                   file=sys.stderr)
         return 2
 
-    os.environ["LESH_FRONTEND"] = args.frontend
     # Leak detection off: this measures CONFORMANCE, and leaks are a separate
     # gate with its own expected result.
     opts = [o for o in os.environ.get("ASAN_OPTIONS", "").split(":")
@@ -231,7 +229,7 @@ def main() -> int:
         print(f"  slow     {name} took {elapsed:.1f}s of a {args.timeout:.0f}s limit")
 
     pct = (100.0 * assertions_passed / assertions_total) if assertions_total else 0.0
-    print(f"\nyash POSIX subset, front end '{args.frontend}': "
+    print(f"\nyash POSIX subset: "
           f"{assertions_passed}/{assertions_total} assertions pass ({pct:.1f}%) "
           f"across {files['counted']} files; "
           f"{files['timeout']} timed out, {files['error']} errored, "
