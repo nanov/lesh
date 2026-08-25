@@ -202,6 +202,28 @@ add_library(lesh_runtime STATIC
 	src/runtime/shell_state.h)
 target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 
+# leshper: the line editor's state machine, its events and its effects.
+#
+# Links syntax and the substrate, and NOT lesh_runtime. That is spec §4.4's rule
+# made enforceable the same way every other one here is: the editor may depend on
+# the lexer, the parser and shell state, never on the executor - so a call into
+# execution does not compile rather than being caught in review. Running user
+# code goes through the port #92 shaped, whose lane-2 half is a spawn_request
+# effect the loop carries out; nothing in this target executes anything.
+#
+# syntax is linked ahead of its first use: C-1 to C-6 froze as leshper's public
+# API when #104 landed, and the highlighter reactor is the client that will call
+# it. Nothing here calls it yet.
+add_library(lesh_leshper STATIC
+	src/leshper/editor.cpp
+	src/leshper/editor.h
+	src/leshper/effect.h
+	src/leshper/event.h
+	src/leshper/state.h
+	src/leshper/text.h
+	src/leshper/undo.h)
+target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
+
 add_subdirectory("tools")
 
 add_executable(lesh src/main.cpp)
@@ -216,6 +238,7 @@ add_executable(lesh_tests
 	tests/unit/cd_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
+	tests/unit/leshper_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/invocation_tests.cpp
@@ -228,7 +251,7 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
+target_link_libraries(lesh_tests PRIVATE lesh_legacy lesh_leshper lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
@@ -246,6 +269,7 @@ file(GLOB_RECURSE LESH_PUBLIC_HEADERS
 	RELATIVE ${PROJECT_SOURCE_DIR}/src
 	${PROJECT_SOURCE_DIR}/src/substrate/*.h
 	${PROJECT_SOURCE_DIR}/src/syntax/*.h
+	${PROJECT_SOURCE_DIR}/src/leshper/*.h
 	${PROJECT_SOURCE_DIR}/src/runtime/*.h)
 set(SELF_CONTAINMENT_DIR ${CMAKE_CURRENT_BINARY_DIR}/self_containment)
 file(MAKE_DIRECTORY ${SELF_CONTAINMENT_DIR})
@@ -258,7 +282,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE lesh_runtime lesh_substrate lesh_syntax)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshper lesh_runtime lesh_substrate lesh_syntax)
 
 find_program(DASH_EXECUTABLE dash)
 find_package(Python3 COMPONENTS Interpreter)
