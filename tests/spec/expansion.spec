@@ -752,3 +752,26 @@ echo $'abc
 # lesh refused this before the feature existed, for the wrong reason - it could
 # not parse `$'` at all. It refuses it now for the right one, and the case
 # distinguishes them by asserting the status rather than merely the failure.
+
+# The comma operator, decided on #61. It arrived by ACCIDENT rather than by
+# admission: #30 built arithmetic as a separate mini-parser with C's precedence,
+# and C's precedence table has a comma operator in it. POSIX's arithmetic grammar
+# does not, and dash refuses it.
+#
+# Kept, because the alternative is worse for no gain: bash and zsh both accept it,
+# nothing in either suite asserts it either way, and removing a working operator
+# to match dash's strictness buys nothing a script would notice. Recording it is
+# what converts a leftover into a decision - the project's shape is a POSIX floor
+# with a curated layer above it, and a layer nobody wrote down is indistinguishable
+# from a bug.
+
+--- the comma operator evaluates both operands and yields the right one [divergence: dash refuses it - `arithmetic expression: expecting EOF` - because POSIX's arithmetic grammar has no comma operator. bash and zsh both yield 5, as lesh does. It reached lesh through C's precedence table in #30 rather than by decision, and #61 decided to keep it]
+echo $(( 1, 5 ))
+=== expect
+5
+
+--- a comma operator's left operand still takes effect [divergence: same decision as above; bash and zsh agree with lesh, dash refuses the expression outright]
+x=0; echo $(( (x = 7), x + 1 )); echo "x=$x"
+=== expect
+8
+x=7

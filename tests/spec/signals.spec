@@ -422,3 +422,24 @@ d=$(mktemp -d); printf 'trap "echo trapped" USR1\nkill -s USR1 $$\necho after\n'
 x=$(trap 'echo trapped' USR1
 "$TESTEE" -c 'kill -s USR1 $PPID'
 echo after); echo "[$x]"
+
+# `trap -p`, decided on #61. lesh implements it; dash has no such option and
+# answers `Illegal option -p`, so dash cannot be the oracle for a flag it does not
+# have. bash implements it too, which is why this is a feature rather than an
+# invention.
+#
+# Note lesh prints the POSIX signal name (`INT`) where bash prints `SIGINT`. The
+# unprefixed spelling is the one POSIX lists and the one `trap` itself accepts, so
+# lesh's listing is re-inputtable and bash's relies on its own acceptance of the
+# SIG prefix - the same re-inputtability property #33 established for the listing
+# and #40 for `alias`.
+
+--- trap -p prints one condition's action, re-inputtably [divergence: dash has no -p at all and answers `Illegal option -p`; bash prints the same line but spells the condition `SIGINT`, where lesh uses the unprefixed POSIX name that `trap` itself accepts]
+trap "echo x" INT; trap -p INT
+=== expect
+trap -- 'echo x' INT
+
+--- trap -p prints defaulted conditions too, so the listing can reset one [divergence: dash has no -p; bash prints ONLY the conditions whose action has changed, so its listing cannot reset a trap back to the default. trap-p.tst:254 - 'with -p, all traps are printed' - requires lesh's reading: it resets USR1, captures `trap -p`, and needs the captured file to reset USR1 when sourced]
+trap "echo a" INT; trap -p | grep -c "^trap -- - USR1$"
+=== expect
+1

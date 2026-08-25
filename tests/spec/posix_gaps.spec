@@ -2068,3 +2068,24 @@ set -e; { false; } || echo handled; echo after
 
 --- an empty case item body answers zero and not the previous status [xfail(legacy): legacy has no compound commands]
 (exit 9); case a in a) ;; esac; echo "st=$?"
+
+# `echo` and `pwd` are builtins whether or not $PATH could find them. Decided on
+# #61, and recorded as ORDINARY CASES rather than divergences - which is the whole
+# point of writing them down.
+#
+# simple-p.tst:172 and :207 assert that `PATH=; echo hi` FAILS at 127. That is true
+# in yash, because yash implements almost nothing as an unconditional builtin. It is
+# false in lesh, dash, bash and zsh alike - all four run the command and answer 0.
+#
+# A divergence in this project means LESH DIFFERS FROM DASH (see ADR-0001). Here
+# lesh agrees with dash, so recording these as divergences would be a category
+# error - the same one #40 avoided for its four yash-only alias assertions. They are
+# pinned as ordinary differential cases so a later reader cannot "fix" them toward
+# yash on the belief that the conformance suite is the oracle. It is not: it is one
+# shell's tests, and where it encodes that shell's architecture it settles nothing.
+
+--- a PATH search does not decide whether echo is a builtin [xfail(legacy): legacy has no shell options and no $PATH handling]
+PATH=; echo hi; echo "st=$?"
+
+--- a PATH search does not decide whether pwd is a builtin [xfail(legacy): legacy has no shell options and no $PATH handling]
+PATH=./nowhere; pwd > /dev/null; echo "st=$?"
