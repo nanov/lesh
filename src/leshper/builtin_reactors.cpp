@@ -37,9 +37,6 @@
 #include "syntax/lexer.h"
 #include "syntax/parser.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -57,10 +54,6 @@ using namespace lesh::syntax;
 // so the cost of a huge line is heap traffic, which the allocation gate sees,
 // rather than a wrong answer.
 constexpr std::size_t kHighlightArenaBytes = 512u * 1024u;
-
-// Longer than any PATH_MAX this runs on, and a candidate that would not fit is
-// declined rather than truncated - a truncated path names a different file.
-constexpr std::size_t kPathBytes = 4096;
 
 // How far the segment painter follows quoting inside quoting. A double-quoted
 // run holds expansions, and an expansion's interior is its own sub-parse handled
@@ -92,6 +85,9 @@ struct highlighter {
 	// property of the design rather than a promise.
 	std::uint32_t command_unknown = LESH_STYLE_NONE;
 	std::uint32_t command_path = LESH_STYLE_NONE;
+	std::uint32_t command_builtin = LESH_STYLE_NONE;
+	std::uint32_t command_function = LESH_STYLE_NONE;
+	std::uint32_t command_alias = LESH_STYLE_NONE;
 	std::uint32_t keyword = LESH_STYLE_NONE;
 	std::uint32_t comment = LESH_STYLE_NONE;
 	std::uint32_t string_single = LESH_STYLE_NONE;
@@ -136,20 +132,6 @@ private:
 	char* _data = nullptr;
 	bool _pooled = true;
 };
-
-// --- The one filesystem question F-22 exists to keep off the input path ------
-
-bool is_executable_file(const char* path) noexcept {
-	struct stat info;
-	if (::stat(path, &info) != 0)
-		return false;
-	// access(X_OK) alone says yes for a DIRECTORY, so `echo /tmp` would paint
-	// green as a command. The mode test is what makes the answer mean "this is a
-	// thing exec would run".
-	if (!S_ISREG(info.st_mode))
-		return false;
-	return ::access(path, X_OK) == 0;
-}
 
 // --- The painter ------------------------------------------------------------
 //
@@ -380,9 +362,14 @@ private:
 			if (at.end() > _source.size())
 				continue;
 			switch (static_cast<word_role>(n.aux)) {
-				case word_role::command_name:
-					emit(at.offset, at.end(), classify_command(n));
+				case word_role::command_name: {
+					std::uint32_t style = LESH_STYLE_NONE;
+					const std::int32_t status = classify_command(n, style);
+					if (status != LESH_OK)
+						return status;
+					emit(at.offset, at.end(), style);
 					break;
+				}
 				case word_role::redirect_target:
 					emit(at.offset, at.end(), _styles->redirect_target);
 					break;
@@ -439,7 +426,7 @@ private:
 		return false;
 	}
 
-	// F-21's command-name classes, minus the one this ABI cannot answer.
+	// F-21's command-name classes - all five of them, since #135 (ADR-0009).
 	//
 	// A word that is not provably literal is not classified at all. `$cmd`,
 	// `'ls'` and `l\s` all name a command only after expansion and quote removal,
@@ -448,59 +435,55 @@ private:
 	// has anything to do (#9), so it is exactly the right question, and the
 	// word's expansion segments still paint - which is the honest answer.
 	//
-	// WHAT IS MISSING, and it is missing by decision rather than by omission:
-	// builtin, function and alias. Answering those needs the builtin table, the
-	// function registry (#106) and the alias table, none of which the ABI can
-	// reach - and reaching around it would be exactly the native side door A-11
-	// forbids. So an unresolvable name is command.unknown, and the additive door
-	// (a provider query on the token, #94) is recorded rather than invented here.
-	// The same door owes this a PATH: `getenv` reads the process environment,
-	// which is the shell's $PATH only until someone assigns to it.
-	[[nodiscard]] std::uint32_t classify_command(const node& n) const noexcept {
+	// WHAT USED TO BE MISSING. builtin, function and alias need the builtin
+	// table, the function registry (#106) and the alias table, and this file
+	// sees `abi.h` and nothing else from leshper - reaching around that would be
+	// the native side door A-11 forbids. #124 recorded the gap and #130 opened
+	// the door: `lesh_request_command_kind`, one additive verb on the token,
+	// which also carries the SHELL's `$PATH` instead of the process
+	// environment's. `getenv` was the shell's $PATH only until someone assigned
+	// to it, and `PATH=/opt/bin` on the line the user is typing is exactly when
+	// the two disagree.
+	//
+	// THE POLL COMES FIRST, and per lookup rather than per command. A lookup can
+	// be a stat per `$PATH` directory (F-22, and ADR-0009's cost: a stat storm
+	// delays the next highlight, never a keystroke). The node pass already polls
+	// at each simple_command; this makes the poll immediately adjacent to the
+	// filesystem, which is what the ADR asks for.
+	[[nodiscard]] std::int32_t classify_command(const node& n,
+	                                            std::uint32_t& style) const noexcept {
+		style = LESH_STYLE_NONE;
 		const token& first = _tree->token_at(n.first_token);
 		if ((first.flags & flag_literal) == 0)
-			return LESH_STYLE_NONE;
+			return LESH_OK;
 		const span at = _tree->span_of(n);
 		const std::string_view name = _source.substr(at.offset, at.length);
 		if (name.empty())
-			return LESH_STYLE_NONE;
-		return resolves(name) ? _styles->command_path : _styles->command_unknown;
+			return LESH_OK;
+		if (superseded())
+			return LESH_ERR_SUPERSEDED;
+		std::uint32_t kind = LESH_COMMAND_UNKNOWN;
+		if (lesh_request_command_kind(_request, name.data(), name.size(), &kind) != LESH_OK)
+			kind = LESH_COMMAND_UNKNOWN;
+		style = style_of_command(kind);
+		return LESH_OK;
 	}
 
-	[[nodiscard]] static bool resolves(std::string_view name) noexcept {
-		char candidate[kPathBytes];
-		// A name with a slash is a path, not a PATH lookup - POSIX 2.9.1.1.
-		if (name.find('/') != std::string_view::npos) {
-			if (name.size() >= sizeof(candidate))
-				return false;
-			std::memcpy(candidate, name.data(), name.size());
-			candidate[name.size()] = '\0';
-			return is_executable_file(candidate);
+	// `external` paints `command.path` - the name the vocabulary already had for
+	// "the filesystem has a thing exec would run", interned since #124 and used
+	// by every test that has ever asserted on it. A second name for one class
+	// would be churn in the theme for no new meaning.
+	[[nodiscard]] std::uint32_t style_of_command(std::uint32_t kind) const noexcept {
+		switch (kind) {
+			case LESH_COMMAND_ALIAS:    return _styles->command_alias;
+			case LESH_COMMAND_FUNCTION: return _styles->command_function;
+			case LESH_COMMAND_BUILTIN:  return _styles->command_builtin;
+			case LESH_COMMAND_EXTERNAL: return _styles->command_path;
+			// Including a kind this build does not know: the enumerated space is
+			// additive (ADR-0008), so an unrecognised number is a name this
+			// highlighter cannot classify, which is what command.unknown means.
+			default:                    return _styles->command_unknown;
 		}
-		const char* path = ::getenv("PATH");
-		if (path == nullptr)
-			return false;
-		std::string_view rest{path};
-		for (;;) {
-			const std::size_t colon = rest.find(':');
-			std::string_view dir =
-				colon == std::string_view::npos ? rest : rest.substr(0, colon);
-			// POSIX: an empty PATH element means the current directory.
-			if (dir.empty())
-				dir = std::string_view{"."};
-			if (dir.size() + name.size() + 2 <= sizeof(candidate)) {
-				std::memcpy(candidate, dir.data(), dir.size());
-				candidate[dir.size()] = '/';
-				std::memcpy(candidate + dir.size() + 1, name.data(), name.size());
-				candidate[dir.size() + 1 + name.size()] = '\0';
-				if (is_executable_file(candidate))
-					return true;
-			}
-			if (colon == std::string_view::npos)
-				break;
-			rest.remove_prefix(colon + 1);
-		}
-		return false;
 	}
 };
 
@@ -560,6 +543,9 @@ struct style_slot {
 constexpr style_slot kStyles[] = {
 	{"command.unknown", &highlighter::command_unknown},
 	{"command.path", &highlighter::command_path},
+	{"command.builtin", &highlighter::command_builtin},
+	{"command.function", &highlighter::command_function},
+	{"command.alias", &highlighter::command_alias},
 	{"keyword", &highlighter::keyword},
 	{"comment", &highlighter::comment},
 	{"string.single", &highlighter::string_single},
