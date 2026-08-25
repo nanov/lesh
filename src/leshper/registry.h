@@ -29,6 +29,7 @@
 
 #include "leshper/abi.h"
 #include "leshper/effect.h"
+#include "leshper/shell_knowledge.h"
 #include "leshper/state.h"
 
 #include <atomic>
@@ -46,6 +47,45 @@ namespace lesh::leshper {
 struct decoration_span;
 struct virtual_text;
 struct proposal;
+
+// The memo behind lesh_request_command_kind (#135), one per request.
+//
+// A $PATH walk is a stat per directory, and a line repeats command names -
+// `git log | git shortlog`, or the same name in a loop body. Memoizing the whole
+// answer means a repeat costs a comparison against at most `capacity` short
+// names instead of a second sweep of the filesystem.
+//
+// FIXED AND INLINE, which is a departure from #130's "memoized in the request's
+// arena" and stronger than it: a token minted on the loop thread has no arena at
+// all (`current_worker_arena()` is null off a worker, which is every test that
+// drives a reactor through `loop_harness`), and an array inside the token
+// allocates nothing anywhere rather than allocating cheaply in one of the two
+// places. Its life is exactly the request's, which is what "per request" asked
+// for.
+//
+// A name too long to store, or one arriving at a full table, is simply not
+// memoized. THE MEMO CAN NEVER CHANGE AN ANSWER, only the cost of asking twice -
+// which is what lets both fallbacks be "walk again" rather than a growth policy.
+struct command_kind_memo {
+	// Long enough for a command name that is not really a command name; a
+	// pathname argument to `stat` is bounded elsewhere.
+	static constexpr std::size_t name_capacity = 48;
+	// Deeper than any line's distinct command names, shallow enough that a miss
+	// is a handful of length-compares.
+	static constexpr std::size_t capacity = 32;
+
+	struct entry {
+		std::uint32_t kind;
+		std::uint16_t length;
+		char name[name_capacity];
+	};
+
+	// Deliberately without a member initializer: entries at or past `used` are
+	// never read, and zeroing 1.8 KB per request would be work done for nothing
+	// on the path this memo exists to make cheap.
+	entry entries[capacity];
+	std::uint32_t used = 0;
+};
 
 } // namespace lesh::leshper
 
@@ -151,6 +191,20 @@ struct lesh_request {
 
 	// Cooperative cancellation. Points at the loop's flag; never owned.
 	const std::atomic<bool>* superseded = nullptr;
+
+	// What the shell knows (#135). Never owned, and read-only by construction:
+	// ADR-0009 makes the shell thread the sole owner of `shell_state`, and a
+	// highlight, a port call and an execution are serialized on it.
+	//
+	// Null is "no shell attached", and it is not an error: the tables read empty
+	// and `$PATH` comes from the process environment, which is exactly what the
+	// highlighter did before this door existed. The wiring site fills it in.
+	const lesh::leshper::shell_knowledge* knowledge = nullptr;
+
+	// Mutable because classifying is a QUERY - `lesh_request_command_kind` takes
+	// a `const lesh_request*` beside every other reader on this token - and the
+	// memo is the cost of asking, not part of the answer.
+	mutable lesh::leshper::command_kind_memo command_kinds;
 
 	// The batch under construction. Emit-only from C's side - abi.h has no
 	// function that reads any of this back.
@@ -289,11 +343,19 @@ public:
 	// to be the only evidence that handle validity is enforced.
 	[[nodiscard]] const editor_handle* handle() const noexcept { return &_handle; }
 
+	// The shell's tables, put on every token this mints (#135). Null - the
+	// default - is "no shell attached"; see the field on the token. `knowledge`
+	// must outlive this harness.
+	void set_shell_knowledge(const shell_knowledge* knowledge) noexcept {
+		_knowledge = knowledge;
+	}
+
 private:
 	registry* _registry;
 	editor_handle _handle;
 	std::atomic<bool> _superseded{false};
 	std::vector<reactor_batch> _applied;
+	const shell_knowledge* _knowledge = nullptr;
 };
 
 // True when the handle is one a call is currently allowed to use. The predicate
