@@ -376,11 +376,36 @@ private:
 
 	// Consumes a reserved word if it is next. Recovery depends on this returning
 	// false rather than throwing: `if x; then y` with no `fi` must still parse.
+	//
+	// Every keyword position that CONTINUES or CLOSES a construct arrives here:
+	// `then`, `elif`, `else`, `fi`, `do`, `done`, `in`, `esac`, `}` and the `!` of a
+	// negation, the last six of those through require(). Accepting the word is the
+	// moment it becomes a keyword, so it is also where that is recorded (#105).
+	//
+	// Recorded on ACCEPTANCE and not at the sites that merely LOOK: at_list_terminator
+	// and the `esac` test in parse_case peek at a word they leave for a later accept
+	// to consume, and a mark on the peek would flag words no construct ever takes.
+	// `if a; then b; fi fi` is where that shows - both peeks see the second `fi` and
+	// neither takes it, so the construct is closed by the first and the second is a
+	// stray the parse refuses. Only the one a construct actually took is a keyword.
 	bool accept(reserved want) noexcept {
 		if (peek_reserved() != want)
 			return false;
-		advance();
+		accept_keyword();
 		return true;
+	}
+
+	// Consumes the keyword the parser is looking at, which it has already recognised.
+	//
+	// The OPENING keyword of a compound command comes through here rather than
+	// through accept(): parse_command_or_compound dispatches on peek_reserved() and
+	// each parse_ function then steps over the word it was chosen for, so there is
+	// nothing left to test. One helper for both so the recording lives in one place
+	// - a keyword the parser consumed and did not mark is a keyword the painter
+	// cannot see, and that is the whole failure mode this bit exists to close.
+	uint32_t accept_keyword() noexcept {
+		_tree.mark_keyword(_index);
+		return advance();
 	}
 
 	// Records that a construct is missing a piece the grammar requires: a
@@ -503,7 +528,7 @@ private:
 	node_index parse_if() noexcept {
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
-		advance();  // `if`
+		accept_keyword();  // `if`
 		uint32_t pairs = 0;
 		parse_error defect = parse_error::none;
 
@@ -537,7 +562,7 @@ private:
 	node_index parse_while_or_until(bool is_until) noexcept {
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
-		advance();  // `while` / `until`
+		accept_keyword();  // `while` / `until`
 		parse_error defect = parse_error::none;
 
 		// THE HANG. An empty condition runs to status 0, and 0 is exactly what keeps a
@@ -570,7 +595,7 @@ private:
 		// immediately: the word after the name is read by the next advance, and there
 		// `in` and `do` really are keywords (alias-p.tst:351).
 		_plain_word_position = true;
-		advance();  // `for`
+		accept_keyword();  // `for`
 		_plain_word_position = false;
 		parse_error defect = parse_error::none;
 
@@ -640,7 +665,7 @@ private:
 	node_index parse_case() noexcept {
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
-		advance();  // `case`
+		accept_keyword();  // `case`
 		parse_error defect = parse_error::none;
 
 		if (peek().kind == token_kind::word)    // the subject
@@ -719,7 +744,7 @@ private:
 	node_index parse_brace_group() noexcept {
 		const uint32_t first = _index;
 		const uint32_t mark = mark_scratch();
-		advance();  // `{`
+		accept_keyword();  // `{`
 		parse_error defect = parse_error::none;
 		// `{ }` and `f() { }` both ran to status 0; dash refuses both, because the
 		// grammar is `{ compound_list }` and a compound_list holds at least one

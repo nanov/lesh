@@ -1383,3 +1383,109 @@ TEST_F(ParserTest, TheInteriorExtentIsAskedOfTheLexerDirectly) {
 	ASSERT_TRUE(command_sub_interior(src, seg, begin, end));
 	EXPECT_EQ(src.substr(begin, end - begin), "ls");
 }
+
+// --- #105: keyword tokens are marked where the parser recognises them --------
+
+namespace {
+
+// The text of every token the parser accepted as a reserved word, in the order
+// the tokens were recorded. Source order for a top-level parse; a command
+// substitution's interior is parsed afterwards, so its keywords come last.
+std::vector<std::string_view> keywords_of(const tree& t) {
+	std::vector<std::string_view> out;
+	for (uint32_t i = 0; i < static_cast<uint32_t>(t.token_count()); ++i)
+		if ((t.token_at(i).flags & flag_keyword) != 0)
+			out.push_back(t.text_of_token(t.token_at(i)));
+	return out;
+}
+
+} // namespace
+
+TEST_F(ParserTest, EveryKeywordPositionIsFlagged) {
+	EXPECT_EQ(keywords_of(parse_it("if a; then b; elif c; then d; else e; fi")),
+	          (std::vector<std::string_view>{"if", "then", "elif", "then", "else", "fi"}));
+	EXPECT_EQ(keywords_of(parse_it("while a; do b; done")),
+	          (std::vector<std::string_view>{"while", "do", "done"}));
+	EXPECT_EQ(keywords_of(parse_it("until a; do b; done")),
+	          (std::vector<std::string_view>{"until", "do", "done"}));
+	EXPECT_EQ(keywords_of(parse_it("for i in 1; do :; done")),
+	          (std::vector<std::string_view>{"for", "in", "do", "done"}));
+	EXPECT_EQ(keywords_of(parse_it("{ :; }")),
+	          (std::vector<std::string_view>{"{", "}"}));
+	EXPECT_EQ(keywords_of(parse_it("f() { :; }")),
+	          (std::vector<std::string_view>{"{", "}"})) << "the name is not one";
+}
+
+TEST_F(ParserTest, AReservedWordUsedAsAnArgumentIsNotFlagged) {
+	// The whole reason this is a flag and not a token kind: `echo done` prints
+	// `done`, and the lexer cannot tell the two apart because the bytes are the
+	// same. Only position decides, which is knowledge the parser has and nobody
+	// downstream of it does.
+	EXPECT_TRUE(keywords_of(parse_it("echo done")).empty());
+	EXPECT_TRUE(keywords_of(parse_it("echo if then else fi esac do")).empty());
+	EXPECT_TRUE(keywords_of(parse_it("echo { }")).empty());
+	// A quoted word in COMMAND position is not a keyword either - it is a command
+	// called `if`, which is what peek_reserved's flag_literal test already says.
+	EXPECT_TRUE(keywords_of(parse_it("\"if\" true")).empty());
+}
+
+TEST_F(ParserTest, ACaseClauseFlagsItsCaseInAndEsac) {
+	EXPECT_EQ(keywords_of(parse_it("case x in a) ;; esac")),
+	          (std::vector<std::string_view>{"case", "in", "esac"}));
+	// A subject and a pattern are WORDS wherever they sit: `case in in in) ;; esac`
+	// spells `in` three times and only the middle one is the grammar's.
+	EXPECT_EQ(keywords_of(parse_it("case in in in) ;; esac")),
+	          (std::vector<std::string_view>{"case", "in", "esac"}));
+	// A body puts its words back in command position, so a keyword there is one.
+	EXPECT_EQ(keywords_of(parse_it("case x in a) if b; then c; fi ;; esac")),
+	          (std::vector<std::string_view>{"case", "in", "if", "then", "fi", "esac"}));
+}
+
+TEST_F(ParserTest, AForLoopsWordListHoldsWordsAndNotKeywords) {
+	// `for i in in do done` names three words; the `do` that follows is the loop's.
+	EXPECT_EQ(keywords_of(parse_it("for i in in do done; do :; done")),
+	          (std::vector<std::string_view>{"for", "in", "do", "done"}));
+}
+
+TEST_F(ParserTest, TheNegationWordIsAKeyword) {
+	EXPECT_EQ(keywords_of(parse_it("! true")),
+	          (std::vector<std::string_view>{"!"}));
+	EXPECT_EQ(keywords_of(parse_it("! a | b")),
+	          (std::vector<std::string_view>{"!"})) << "one Bang, on the pipeline";
+	EXPECT_TRUE(keywords_of(parse_it("echo !")).empty());
+}
+
+TEST_F(ParserTest, KeywordsInsideACommandSubstitutionAreFlaggedToo) {
+	// #104 parses an interior with the same code, so this costs nothing - but it is
+	// the case a painter of `$(...)` needs, and the one a second mechanism bolted
+	// on beside the parser would have missed.
+	EXPECT_EQ(keywords_of(parse_it("echo $(if a; then b; fi)")),
+	          (std::vector<std::string_view>{"if", "then", "fi"}));
+	EXPECT_EQ(keywords_of(parse_it("x=$(while a; do b; done)")),
+	          (std::vector<std::string_view>{"while", "do", "done"}));
+	EXPECT_TRUE(keywords_of(parse_it("echo $(echo done)")).empty());
+	// Nesting: the top-level parse is recorded first, the interiors after it.
+	EXPECT_EQ(keywords_of(parse_it("if a; then echo $(until b; do c; done); fi")),
+	          (std::vector<std::string_view>{"if", "then", "fi", "until", "do", "done"}));
+}
+
+TEST_F(ParserTest, AWordTheParserNeverAcceptedIsNotFlagged) {
+	// at_list_terminator and parse_case's `esac` test both PEEK at a keyword and
+	// leave it for a later accept to take. A defective construct is where that
+	// distinction shows: nothing accepts the second `fi`, so nothing marks it.
+	EXPECT_EQ(keywords_of(parse_it("if a; then b; fi fi")),
+	          (std::vector<std::string_view>{"if", "then", "fi"}));
+	EXPECT_TRUE(keywords_of(parse_it("esac")).empty())
+		<< "a bare `esac` is a command called esac, as dash runs it";
+}
+
+TEST_F(ParserTest, TheKeywordFlagIsAdditiveAndLeavesTheOtherBitsAlone) {
+	// A new bit must not disturb the two the lexer sets - every read of `flags` in
+	// the tree is a masked test, and this pins that it stays that way.
+	const tree t = parse_it("if a; then b; fi");
+	const token& kw = t.token_at(0);
+	EXPECT_EQ(t.text_of_token(kw), "if");
+	EXPECT_NE(kw.flags & flag_keyword, 0);
+	EXPECT_NE(kw.flags & flag_literal, 0) << "still a plain literal word";
+	EXPECT_EQ(sizeof(token), 16u);
+}
