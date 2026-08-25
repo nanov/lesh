@@ -202,16 +202,21 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 // Runs input through the replacement front end: read, parse, execute, one
 // complete command at a time.
 //
-// The read loop lives in the executor, not here: it owns the trees, and a
+// The read loop lives in the executor, not here. The TREES it parses do not: a
 // function defined by one command is a node in the tree that command was parsed
-// from. See tree_walking_executor::run_input.
+// from, and shell state owns the function, so shell state holds the tree (#106).
+// See tree_walking_executor::run_input and shell_state::retain_tree.
+//
+// THE POOL IS THE CALLER'S, and that is the whole reason it is a parameter. Those
+// trees' nodes live in it, so it has to outlive the state that holds them - which
+// it cannot do when it is a local here and the state is main's.
 //
 // `echo_when_verbose` is false for `-c`: POSIX makes `set -v` a property of
 // reading INPUT, and dash prints nothing for `dash -v -c 'echo hi'`.
-int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state,
+int run_next_front_end(std::string_view source, lesh::buffer_pool& pool,
+                       lesh::runtime::shell_state& state,
                        bool echo_when_verbose = true,
                        lesh::runtime::script_input* input = nullptr) {
-	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
 	lesh::runtime::tree_walking_executor executor{pool, state};
 	return executor.run_input(source, echo_when_verbose, input);
 }
@@ -268,6 +273,9 @@ int main(int argc, char **argv, char **envp) {
 	// 14 bytes leaked from a front end it was not even using. ADR-0007 expects
 	// exactly zero.
 	if (use_next) {
+		// BEFORE the state, so it outlives it: the state holds the trees a function
+		// body is a node in, and those nodes are allocated here (#106).
+		lesh::buffer_pool pool{BUFFER_POOL_SIZE};
 		// The new front end handles every non-interactive form. Interactive is the
 		// line editor's business and stays on legacy until Phase 4.
 		lesh::runtime::shell_state next_state;
@@ -288,7 +296,7 @@ int main(int argc, char **argv, char **envp) {
 
 		if (command_string)
 			// `-c` does not echo under `set -v`; see run_next_front_end.
-			return run_next_front_end(command_string, next_state, false);
+			return run_next_front_end(command_string, pool, next_state, false);
 		if (script_path) {
 			std::ifstream script{script_path};
 			if (!script) {
@@ -296,7 +304,7 @@ int main(int argc, char **argv, char **envp) {
 				return 127;
 			}
 			const std::string source = read_all(script);
-			return run_next_front_end(source, next_state);
+			return run_next_front_end(source, pool, next_state);
 		}
 		// `-i` with input that is not a terminal is an ordinary POSIX invocation:
 		// interactive is about SEMANTICS - which signals are fatal, whether an error
@@ -311,7 +319,7 @@ int main(int argc, char **argv, char **envp) {
 			// A pipe or a terminal leaves it inert and nothing below changes (#67).
 			lesh::runtime::script_input input{STDIN_FILENO};
 			const std::string source = read_all(std::cin);
-			return run_next_front_end(source, next_state, true, &input);
+			return run_next_front_end(source, pool, next_state, true, &input);
 		}
 		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
 		return 2;

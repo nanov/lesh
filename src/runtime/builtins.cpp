@@ -931,7 +931,36 @@ builtin_result builtin_readonly(shell_state& state, char** argv) {
 	return run_declaration(state, argv, /*make_readonly=*/true);
 }
 
+// `unset -f name...` removes FUNCTIONS. It used to live in the executor, because
+// the function table did; #106 moved the table to shell state, and try_run_builtin
+// is handed shell state, so the interception the executor kept for this one form
+// has nothing left to do.
+//
+// POSIX: unsetting a name that is not a function is NOT an error, which is why
+// there is no diagnostic and no status but zero. The operands are deliberately NOT
+// validated as names either - `unset -f 1bad` succeeds silently in dash.
+builtin_result unset_functions(shell_state& state, char** argv) {
+	for (size_t i = 1; argv[i] != nullptr; ++i) {
+		const std::string_view arg{argv[i]};
+		if (arg == "--") {
+			++i;
+			for (; argv[i] != nullptr; ++i)
+				state.unset_function(argv[i]);
+			break;
+		}
+		if (arg.size() >= 2 && arg[0] == '-')
+			continue;  // an option word; unset_selects_functions has read them
+		state.unset_function(arg);
+	}
+	return {0};
+}
+
 builtin_result builtin_unset(shell_state& state, char** argv) {
+	// The two forms share a name and nothing else: `-f` reaches the function table,
+	// takes any word as an operand, and cannot fail. One option reading for both,
+	// so `-fv` cannot mean one thing here and another there.
+	if (unset_selects_functions(argv))
+		return unset_functions(state, argv);
 	size_t i = 1;
 	for (; argv[i] != nullptr; ++i) {
 		const std::string_view arg{argv[i]};
@@ -940,8 +969,7 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 			break;
 		}
 		// `-v` is the default and selects variables. `-f` never reaches here: the
-		// executor intercepts that form, because removing a function means reaching
-		// the function table, which lives there.
+		// function form returned above, before a single operand was read.
 		if (arg == "-v")
 			continue;
 		if (arg.size() >= 2 && arg[0] == '-') {
@@ -966,7 +994,7 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 		// Sharing the predicate is the whole of the fix; a second spelling of "is
 		// this a name" is what #63 was opened to end.
 		//
-		// The `-f` form never reaches here - the executor intercepts it - and it is
+		// The `-f` form never reaches here - unset_functions took it - and it is
 		// deliberately NOT validated: `unset -f 1bad` succeeds silently in dash, so
 		// a check on every operand of every form would have been a fix past the bug.
 		if (!is_name(argv[i])) {

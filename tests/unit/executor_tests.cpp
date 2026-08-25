@@ -10,6 +10,7 @@
 
 #include <csignal>
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -27,13 +28,21 @@ namespace {
 class ExecutorTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
+	// Every snippet this fixture has run, kept alive. A tree's spans are VIEWS into
+	// its source, and the state keeps the tree a function body is a node in (#106) -
+	// so a snippet that defines a function outlives the call that ran it. Declared
+	// between `pool` and `state` so the three die in the order that points at:
+	// state first, then these, then the arena their nodes live in.
+	std::deque<std::string> sources;
 	shell_state state;
 	lesh::testing::temp_path scratch;
 
+	// Handed to SHELL STATE, the way run_input hands it: the state owns the trees
+	// now, so a function defined by one snippet is still callable from the next.
 	int run(std::string_view src) {
-		const tree t = parse(pool, src);
+		const std::string& source = sources.emplace_back(src);
 		tree_walking_executor ex{pool, state};
-		return ex.run(t);
+		return ex.run(state.retain_tree(parse(pool, source)));
 	}
 
 	// The standard output of `src`, taken through a FILE rather than a pipe: an
@@ -1203,6 +1212,55 @@ TEST_F(ExecutorTest, ReturnInsideAFunctionStillReturnsFromTheFunction) {
 	// win, or every `return` would end the script.
 	EXPECT_EQ(capture("f() { return 5; }; f; echo after=$?"), "after=5\n");
 	EXPECT_EQ(capture("f() { return; echo not reached; }; f; echo after"), "after\n");
+}
+
+// --- the function registry is shell state (#106) -------------------------------
+//
+// These reach through `state`, not through the executor. That is the whole of the
+// change: the table used to be a private member of tree_walking_executor, so the
+// only way to ask whether a definition took was to run something that called it,
+// and nothing outside one back end could ask at all.
+
+TEST_F(ExecutorTest, ADefinitionIsVisibleInShellState) {
+	EXPECT_FALSE(state.has_function("f"));
+	EXPECT_EQ(run("f() { echo hi; }"), 0);
+	EXPECT_TRUE(state.has_function("f"));
+	// And the body is reachable from the state, not just its name: a definition
+	// that recorded a null tree would still answer this question with `true`.
+	const shell_state::function_definition* found = state.lookup_function("f");
+	ASSERT_NE(found, nullptr);
+	EXPECT_NE(found->tree, nullptr);
+	EXPECT_NE(found->body, lesh::syntax::no_node);
+	EXPECT_EQ(state.lookup_function("nosuchfunction"), nullptr);
+}
+
+TEST_F(ExecutorTest, AFunctionOUTLIVESTheExecutorThatDefinedIt) {
+	// The point of the move. Each `run` builds its own tree_walking_executor over
+	// one shell state, so this is a function defined by one back end and called by
+	// the NEXT - which found nothing at all while the table was the executor's.
+	EXPECT_EQ(run("f() { echo hi; }"), 0);
+	EXPECT_EQ(capture("f"), "hi\n");
+}
+
+TEST_F(ExecutorTest, ARedefinitionReplacesTheBody) {
+	// POSIX requires it, and it is what makes reloading an rc file work. Split
+	// across two runs as well as within one, because the second spelling is the one
+	// that reaches an entry the state was already holding.
+	EXPECT_EQ(capture("f() { echo one; }; f() { echo two; }; f"), "two\n");
+	EXPECT_EQ(run("f() { echo three; }"), 0);
+	EXPECT_EQ(capture("f"), "three\n");
+}
+
+TEST_F(ExecutorTest, UnsetMinusFRemovesTheFunctionFromShellState) {
+	EXPECT_EQ(run("f() { echo hi; }"), 0);
+	ASSERT_TRUE(state.has_function("f"));
+	EXPECT_EQ(run("unset -f f"), 0);
+	EXPECT_FALSE(state.has_function("f"));
+	// POSIX: unsetting a name that is not a function is not an error, and `unset -v`
+	// leaves functions alone - the two forms select different tables.
+	EXPECT_EQ(run("unset -f nosuchfunction"), 0);
+	EXPECT_EQ(run("g() { echo g; }; unset -v g"), 0);
+	EXPECT_TRUE(state.has_function("g"));
 }
 
 // --- break and continue outside a loop ---------------------------------------

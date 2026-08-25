@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -29,6 +30,10 @@ namespace {
 class GetoptsTest : public ::testing::Test {
 protected:
 	lesh::buffer_pool pool{1024 * 64};
+	// Every snippet run here, kept alive: a tree's spans are views into its source,
+	// and shell state holds the tree a function body is a node in (#106). Declared
+	// between `pool` and `state` so the three die in the order that points at.
+	std::deque<std::string> sources;
 	// One state for the whole test, because getopts' state PERSISTS between calls -
 	// that is the entire builtin. A test that runs more than one snippet therefore
 	// says `OPTIND=1` to start a fresh parse, exactly as a script would.
@@ -36,9 +41,9 @@ protected:
 	lesh::testing::temp_path scratch;
 
 	int run(std::string_view src) {
-		const tree t = parse(pool, src);
+		const std::string& source = sources.emplace_back(src);
 		tree_walking_executor ex{pool, state};
-		return ex.run(t);
+		return ex.run(state.retain_tree(parse(pool, source)));
 	}
 
 	// Runs `src` with its standard output in a file and returns what it wrote. A
