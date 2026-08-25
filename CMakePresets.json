@@ -20,26 +20,29 @@
     {
       "name": "debug",
       "inherits": "base",
-      "displayName": "Debug - ASan + UBSan + LSan, assertions live",
+      "displayName": "Debug - ASan + UBSan + LSan, assertions live, trace logging compiled in",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LESH_TRACE_LOGGING": "ON"
       }
     },
     {
       "name": "bench",
       "inherits": "base",
-      "displayName": "RelWithDebInfo - benchmarks and profiling, assertions live",
+      "displayName": "RelWithDebInfo - benchmarks and profiling, assertions live, trace logging compiled in",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LESH_TRACE_LOGGING": "ON"
       }
     },
     {
       "name": "release",
       "inherits": "base",
-      "displayName": "Release - O3, ThinLTO, warnings are errors",
+      "displayName": "Release - O3, ThinLTO, warnings are errors, no trace logging",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
+        "LESH_TRACE_LOGGING": "OFF"
       }
     }
   ],
