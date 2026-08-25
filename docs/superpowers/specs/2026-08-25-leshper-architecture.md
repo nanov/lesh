@@ -64,6 +64,12 @@ One `int32_t` status space (0 ok, negatives ABI, positives domain). Action names
 
 **vared is an ordinary client**: leshper's entry is `read(providers)`; command-line editing passes the default bundle, F-17 passes a different one (null completer/history, trivially-complete syntax). Recorded as the acceptance test [#102](https://github.com/nanov/lesh/issues/102) runs against these interfaces.
 
+### 6.3 The selection model ([#96](https://github.com/nanov/lesh/issues/96))
+
+**One pair, three paradigms: anchor + active flag, and the cursor is the head.** The region is derived — `active ? [min(anchor,cursor), max(anchor,cursor)) : none` — exclusive half-open, endpoints always on grapheme-cluster boundaries (debug-asserted; #93's clamp-and-snap already enforces it at the ABI). Emacs projects mark/point onto it; vi visual projects inclusiveness (+1 grapheme) in its mode's operators and rendering; helix uses it raw — a helix-mode motion writes `anchor := old head`, making noun-then-verb a keymap behavior, not a core variant. **Shape lives in the mode**: linewise and blockwise are act/render-time projections (zle stores linewise as `REGION_ACTIVE=2`; the lesh binding can synthesize that from the mode for compatibility). Blockwise is out of v1 and arrives as a projection, non-breaking.
+
+Under every edit, the anchor follows the marker rules in `apply_edit` — before → shift, after → unchanged, inside → clamp to edit start — `active` survives, and undo records carry anchor + active. Multi-cursor is future-proofed by access discipline, not a vector of one: scalar primary, all access through state methods, ABI accessors singular now and plural additively later. Select-then-act sequencing (F-10) is recorded as a keymap-machinery constraint: operator-pending is a keymap-stack push. Owner's scope note: v1 shape, reworked in v2 if needed.
+
 ## 7. The terminal floor and the cell
 
 [#97](https://github.com/nanov/lesh/issues/97): required — ANSI + 256 colors + bracketed paste; opportunistic — truecolor, undercurl. Assume-first detection (trivial env reads), fish-style heuristics only when a real terminal misbehaves, **never terminfo, no startup queries**. Below the floor leshper never starts: one-line refusal (exit 2), message-then-`exec /bin/sh` held open. The cell is a small POD — grapheme ref + width + two tagged colors + attribute bits — always truecolor-valued; **quantization is the blitter's job**. All runtime, one binary.
@@ -78,4 +84,4 @@ One `int32_t` status space (0 ok, negatives ABI, positives domain). Action names
 
 ## 10. What was deliberately not decided
 
-Open on the map, in dependency order: the **selection model** ([#96](https://github.com/nanov/lesh/issues/96)) and behind it vi depth ([#99](https://github.com/nanov/lesh/issues/99)); a `vared` entry point ([#102](https://github.com/nanov/lesh/issues/102)); the event-loop implementation (benchmark, §4); the scope-chain question inherited from map #17; job-control UI; everything in requirements §8.
+Open on the map, in dependency order: vi depth ([#99](https://github.com/nanov/lesh/issues/99), unblocked by the selection model); a `vared` entry point ([#102](https://github.com/nanov/lesh/issues/102)); the event-loop implementation (benchmark, §4); the scope-chain question inherited from map #17; job-control UI; everything in requirements §8.

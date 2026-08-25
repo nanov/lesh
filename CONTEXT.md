@@ -316,6 +316,14 @@ A provider whose default implementation user code may replace or wrap.
 Native implementations run as trusted threads; user-supplied ones run as
 killable spawned processes, so a broken override cannot wedge the editor.
 
+**Selection** _[lesh]_:
+An anchor position plus an active flag; **the cursor is the head**. The
+region is derived — exclusive half-open between anchor and cursor, endpoints
+on grapheme boundaries — and shape (charwise, linewise, blockwise) belongs
+to the acting mode's projection, never to the type. Emacs, vi visual and
+helix all project onto this one pair.
+_Avoid_: region as a stored range; mark as a separate synchronized position.
+
 **Proposal** _[lesh]_:
 Derived state offered to the user — an autosuggestion, a candidate list. It
 becomes a buffer edit only through an accepting action; it never auto-applies.
