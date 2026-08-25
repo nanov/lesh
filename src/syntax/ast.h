@@ -324,6 +324,15 @@ public:
 
 	uint32_t add_token(const token& t) noexcept { return _tokens.push(t); }
 
+	// Marks an already-recorded word as a reserved word the parser ACCEPTED (#105).
+	//
+	// The only mutation of a token after it is added, and deliberately the narrowest
+	// one: it sets a bit nothing already in the tree reads, so no span, no index and
+	// no node's meaning can move. The parser cannot set it as the token is added,
+	// because at that moment it is only a word - `done` becomes a keyword when the
+	// grammar accepts it there, one production later.
+	void mark_keyword(uint32_t i) noexcept { _tokens[i].flags |= flag_keyword; }
+
 	// Registers text a token may point into that is NOT the input, and returns the
 	// virtual offset of its first byte.
 	//

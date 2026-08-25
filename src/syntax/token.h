@@ -132,6 +132,18 @@ enum token_flags : uint8_t {
 	// A blank separated this token from the previous one. The parser needs this to
 	// distinguish `a b` from `ab` after the lexer has already split them.
 	flag_preceded_by_blank = 1 << 1,
+	// The parser ACCEPTED this word as a reserved word. Set by the parser, never by
+	// the lexer, which cannot know: keyword-ness is positional, so `done` is a
+	// keyword in `for i in 1; do :; done` and an argument in `echo done`, and the
+	// bytes are the same either way (see reserved_of in parser.cpp). It sits here
+	// rather than in token_kind because POSIX is explicit that these are WORDS and
+	// not a token class - a kind would make `echo done` lex differently from
+	// `echo x`, which is exactly the mistake the comment on token_kind warns off.
+	//
+	// A painter's channel for fish's `fish_color_keyword` (#105). Execution must
+	// not read it: the flag says how the word was PARSED, and every consequence of
+	// that is already in the tree's shape.
+	flag_keyword = 1 << 2,
 };
 
 // 16 bytes, trivially copyable, owns nothing. Offsets rather than pointers so a
