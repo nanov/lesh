@@ -37,18 +37,6 @@ bool looks_like_assignment(std::string_view text) noexcept {
 	return false;
 }
 
-// Does `line` equal the here-document delimiter spelled `raw`, once quote removal
-// is applied to `raw`?
-//
-// POSIX applies quote removal to the delimiter word, so `<<\\END`, `<<'END'`,
-// `<<"END"` and `<<E'ND'` all end the body at a line reading `END`. Only the fully
-// quoted forms were handled before, which meant `<<\\END` - the spelling the yash
-// conformance suite uses in every one of its ~1,700 here-documents - never matched
-// its terminator, so the rest of the file silently became the body. Twenty signal
-// files scored zero for that reason alone.
-//
-// This compares rather than unquoting into a buffer, because the parser has no
-// business allocating for a comparison it makes once per line.
 // True when a here-document delimiter carries quoting that suppresses expansion
 // in the body. A line continuation is not quoting, which flag_literal cannot say.
 bool delimiter_is_quoted(std::string_view raw) noexcept {
@@ -64,71 +52,6 @@ bool delimiter_is_quoted(std::string_view raw) noexcept {
 			return true;
 	}
 	return false;
-}
-
-bool delimiter_matches(std::string_view raw, std::string_view line) noexcept {
-	size_t r = 0, l = 0;
-	while (r < raw.size()) {
-		const char c = raw[r];
-		// A line continuation in the delimiter contributes nothing: `<<E\<newline>ND`
-		// is terminated by `END`. Read as an escape it tried to match a newline
-		// inside the line and never matched at all.
-		if (c == '\\' && r + 1 < raw.size() && raw[r + 1] == '\n') {
-			r += 2;
-			continue;
-		}
-		if (c == '\'') {
-			// Single quotes: everything up to the next one is literal, backslash
-			// included. An unterminated quote cannot match anything.
-			++r;
-			while (r < raw.size() && raw[r] != '\'') {
-				if (l >= line.size() || line[l] != raw[r])
-					return false;
-				++r;
-				++l;
-			}
-			if (r >= raw.size())
-				return false;
-			++r;  // closing quote
-			continue;
-		}
-		if (c == '"') {
-			++r;
-			while (r < raw.size() && raw[r] != '"') {
-				// Inside double quotes a backslash escapes only these four bytes;
-				// anywhere else it stands for itself.
-				if (raw[r] == '\\' && r + 1 < raw.size() &&
-				    (raw[r + 1] == '$' || raw[r + 1] == '`' || raw[r + 1] == '"' ||
-				     raw[r + 1] == '\\'))
-					++r;
-				if (l >= line.size() || line[l] != raw[r])
-					return false;
-				++r;
-				++l;
-			}
-			if (r >= raw.size())
-				return false;
-			++r;  // closing quote
-			continue;
-		}
-		if (c == '\\') {
-			// A trailing backslash quotes nothing; treat it as itself rather than
-			// reading past the end of the word.
-			if (r + 1 >= raw.size())
-				return false;
-			++r;
-			if (l >= line.size() || line[l] != raw[r])
-				return false;
-			++r;
-			++l;
-			continue;
-		}
-		if (l >= line.size() || line[l] != c)
-			return false;
-		++r;
-		++l;
-	}
-	return l == line.size();
 }
 
 // Reserved words are recognised by POSITION, not lexically. `if` is a keyword in
@@ -1138,7 +1061,7 @@ private:
 			                     syntax::flag_literal) == 0 &&
 			                    delimiter_is_quoted(text_of_token(pending.delimiter_token));
 			// The delimiter is compared with quote removal applied on the fly - see
-			// delimiter_matches. `raw` is the word exactly as it was typed.
+			// here_doc_delimiter_matches. `raw` is the word exactly as it was typed.
 
 			node& n = const_cast<node&>(_tree[pending.node]);
 			const bool strip = n.error == parse_error::none && _strip_tabs_for.size() > 0
@@ -1160,7 +1083,7 @@ private:
 					while (!compared.empty() && compared.front() == '\t')
 						compared.remove_prefix(1);
 
-				if (delimiter_matches(raw, compared)) {
+				if (here_doc_delimiter_matches(raw, compared)) {
 					terminated = true;
 					at = nl == std::string_view::npos ? static_cast<uint32_t>(src.size())
 					                                  : static_cast<uint32_t>(nl + 1);

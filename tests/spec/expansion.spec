@@ -425,3 +425,67 @@ HOME=//; printf '[%s][%s]\n' ~ ~/foo
 mkdir -p foo/no_search_dir; >foo/no_search_dir/file; chmod a-x foo/no_search_dir
 echo foo/no_search_d*r/file
 chmod a+x foo/no_search_dir
+
+# #68: the scan that finds a command substitution's closing `)` did not
+# understand the shell text it was scanning. Two constructs put an unbalanced `)`
+# into a command list and both were read as the substitution's own: the `)` that
+# ends a case pattern list, and any `)` inside a here-document body. The pattern
+# case was hidden by the optional leading `(` - `(a)` balances - so only a clause
+# written the ordinary way, and every `*)` is one, reached the paren counter.
+#
+# bash gets both of these wrong too, byte for byte on the here-document one; dash,
+# zsh and yash all get them right. dash gets them right by PARSING the
+# substitution where it stands rather than scanning for a paren, which is not the
+# shape here: the lexer owns no memory and cannot build a tree, and the body is
+# parsed later anyway. So the scan learned the two constructs instead, under the
+# same command-position rule the parser uses - `case` and `esac` are reserved
+# words only where a command could begin, which is why `echo case` below still
+# prints a word rather than opening a clause.
+
+--- a case pattern list's paren does not end a command substitution [xfail(legacy): legacy misreads the pattern's paren]
+echo $(case a in a) echo x;; esac)
+echo $(case a in (a) echo x;; *) echo y;; esac)
+echo $(case b in a) echo x;; *) echo y;; esac)
+echo $(case a in a) case b in b) echo nested;; esac;; esac)
+echo $(case a in a|b) echo alt;; esac)
+echo $(case a in a) (echo sub);; esac)
+
+--- case and esac away from command position stay ordinary words [xfail(legacy): legacy misreads the pattern's paren]
+echo $(echo case)
+echo $(echo esac in)
+echo $(case a in a) echo esac;; esac)
+echo $(echo $(echo a) case)
+
+--- a paren in a here-document body does not end a command substitution [xfail(legacy): legacy ends the substitution inside the body]
+echo $(cat <<\END
+foo)
+END
+)
+echo "$(cat <<'END'
+a) b $( ` '
+END
+)"
+echo $(cat <<-END
+	tabbed)
+	END
+)
+echo $(cat <<A <<B
+one)
+A
+two)
+B
+)
+
+--- a here-document inside a substitution leaves the enclosing one alone [xfail(legacy): legacy ends the substitution inside the body]
+cat <<\OUTER; echo "$(cat <<\INNER
+inner)
+INNER
+)"
+outer)
+OUTER
+
+--- arithmetic inside a substitution is not read as a command list [xfail(legacy): legacy misreads the pattern's paren]
+echo $((1<<2))
+echo $(echo $((1<<2)))
+echo $(( (1<<2) + 3 ))
+echo $(case a in a) echo $((1<<3));; esac)

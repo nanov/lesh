@@ -355,6 +355,106 @@ TEST(Lexer, AParenInsideQuotesOrACommentDoesNotCloseASubstitution) {
 	}
 }
 
+// A `)` that ends a case pattern list belongs to the CASE, not to the
+// substitution around it. Counting parens alone ended `$(case a in a) ...)` at
+// the pattern's paren and left the rest of the clause to be read as ordinary
+// words (#68). The optional leading `(` of a pattern list happened to balance,
+// so only a clause written without one - `*)`, which every case has - showed it.
+TEST(Lexer, ACasePatternListsParenDoesNotCloseASubstitution) {
+	for (const std::string src : {
+	         "$(case a in a) echo x;; esac)",
+	         "$(case a in (a) echo x;; *) echo y;; esac)",
+	         "$(\ncase a in\n(a) echo x;;\n *) echo not reached;;\nesac\n)",
+	         "$(case a in a) case b in b) echo x;; esac;; esac)",
+	         "$(case a in a|b) echo x;; esac)",
+	         "$(case a in a) (echo x);; esac)",
+	         "$(case a in a) echo $(echo x);; esac)",
+	     }) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+// The other half of the same claim: `case` and `esac` are reserved only where a
+// command could begin, so a scan that reacted to the BYTES would break input that
+// works today. `$(echo case)` is one word and `$(echo esac)` is another.
+TEST(Lexer, CaseAndEsacAwayFromCommandPositionAreOrdinaryWords) {
+	for (const std::string src : {"$(echo case)", "$(echo esac)", "$(echo in)",
+	                              "$(case)", "$(echo $(echo a) case)",
+	                              "$(case a in a) echo esac;; esac)",
+	                              "$(echo a; echo case in esac)"}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+// A here-document BODY is data, so a `)` in it closes nothing. The scan skipped
+// straight through the body looking for a paren and ended the substitution inside
+// it, which is `cmdsub-p.tst`'s 'here-document in command substitution' (#68).
+TEST(Lexer, AHereDocumentBodyInsideASubstitutionIsNotScannedForAParen) {
+	for (const std::string src : {
+	         "$(cat <<\\END\nfoo)\nEND\n)",
+	         "$(cat <<'END'\nfoo)\nEND\n)",
+	         "$(cat <<\"END\"\nfoo)\nEND\n)",
+	         "$(cat <<END\nfoo)\nEND\n)",
+	         "$(cat <<-END\n\tfoo)\n\tEND\n)",
+	         "$(cat <<END\n$( ` ) '\nEND\n)",
+	         "$(cat <<END\nENDING\nEND\n)",
+	         "$(cat <<A <<B\nx)\nA\ny)\nB\n)",
+	         "$(cat <<A; cat <<B\nx)\nA\ny)\nB\n)",
+	     }) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+// A here-document operator INSIDE a substitution belongs to the substitution's
+// own line, and one outside it belongs to the enclosing script. The scan must not
+// take the outer body for its own: `cat <<OUTER; echo "$(cat <<INNER ...)"` has
+// one body inside the parens and one after them.
+TEST(Lexer, AnOuterHereDocumentSurvivesASubstitutionThatHasOneOfItsOwn) {
+	const std::string src =
+		"cat <<\\OUTER; echoraw \"$(cat <<\\INNER\ninner\nINNER\n)\"\nouter\nOUTER\n";
+	bool found = false;
+	for (const auto& t : lex_all(src))
+		if (t.text.compare(0, 2, "\"$") == 0) {
+			found = true;
+			EXPECT_EQ(t.text, "\"$(cat <<\\INNER\ninner\nINNER\n)\"")
+				<< "the substitution ends at its own paren, not inside INNER's body";
+		}
+	EXPECT_TRUE(found) << "the quoted word carrying the substitution was never lexed";
+}
+
+// Arithmetic is not a command list: `<<` there is a SHIFT and `case` cannot
+// appear at all. Reading `$((1<<2))`'s operator as a here-document would have
+// swallowed the rest of the input looking for a body.
+TEST(Lexer, ArithmeticIsNotScannedAsACommandList) {
+	for (const std::string src : {"$((1<<2))", "$((1+2))", "$((x<<y))",
+	                              "$(( (1<<2) + 3 ))", "$(echo $((1<<2)))"}) {
+		const auto tokens = lex_all(src);
+		ASSERT_EQ(tokens.size(), 1u) << src;
+		EXPECT_EQ(tokens[0].text, src) << src;
+	}
+}
+
+// What the new knowledge must not cost: an unterminated `$(` is still an ERROR
+// and not a word the executor runs (#47). A case clause left open and a
+// here-document left open both run the scan to the end of the input.
+TEST(Lexer, ACaseOrHereDocumentLeftOpenIsStillAnUnterminatedSubstitution) {
+	for (const std::string src : {"echo $(case a in a) echo x",
+	                              "echo $(cat <<END\nfoo",
+	                              "echo $(cat <<END\nfoo)"}) {
+		lexer lx{src};
+		std::ignore = lx.next();
+		const token t = lx.next();
+		EXPECT_EQ(t.error, token_error::unterminated_command_sub) << src;
+		EXPECT_TRUE(lx.incomplete()) << src;
+	}
+}
+
 TEST(Lexer, AnUnterminatedSubstitutionIsStillReportedAsOne) {
 	// The edge the `terminated` flag exists for: the scan's END POSITION cannot say
 	// whether the construct closed, and guessing from it would report an

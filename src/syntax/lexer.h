@@ -131,6 +131,11 @@ private:
 		bool* terminated = nullptr) const noexcept;
 	// True where a word could begin, which is where a `#` opens a comment.
 	[[nodiscard]] bool starts_a_word(uint32_t p, uint32_t begin) const noexcept;
+	// True where a COMMAND could begin, which is where `case` and `esac` are
+	// reserved words rather than ordinary ones. Narrower than starts_a_word: a
+	// BLANK separates two words and does not end a command, so `echo case` is an
+	// argument spelled `case` and not a clause the scan has to follow (#68).
+	[[nodiscard]] bool starts_a_command(uint32_t p, uint32_t begin) const noexcept;
 	// How deep the scan will follow nesting. 256 matches the expander's own
 	// kMaxExpansionDepth, which is the layer that refuses well-formed input nested
 	// deeper than that anyway. PAST it the construct is reported as UNTERMINATED
@@ -144,6 +149,27 @@ private:
 	token lex_word(lex_mode mode) noexcept;
 	token lex_word_segment(lex_mode mode) noexcept;
 };
+
+// Does `line` equal the here-document delimiter spelled `raw`, once quote removal
+// is applied to `raw`?
+//
+// POSIX applies quote removal to the delimiter word, so `<<\END`, `<<'END'`,
+// `<<"END"` and `<<E'ND'` all end the body at a line reading `END`. Only the fully
+// quoted forms were handled before, which meant `<<\END` - the spelling the yash
+// conformance suite uses in every one of its ~1,700 here-documents - never matched
+// its terminator, so the rest of the file silently became the body. Twenty signal
+// files scored zero for that reason alone.
+//
+// This compares rather than unquoting into a buffer, because neither caller has
+// any business allocating for a comparison it makes once per line.
+//
+// It lives HERE, beside the lexer, because TWO layers ask it and a second copy
+// would drift. The parser asks to collect a body it will execute (#21); the
+// SCAN asks to step over one while it looks for a command substitution's closing
+// paren (#68). The two must agree on where a body ends or the parser would be
+// handed text the scan already ruled out.
+[[nodiscard]] bool here_doc_delimiter_matches(std::string_view raw,
+                                              std::string_view line) noexcept;
 
 // True for bytes that end an unquoted word in command position.
 [[nodiscard]] constexpr bool is_word_terminator(char c) noexcept {

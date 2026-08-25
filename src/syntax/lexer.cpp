@@ -66,27 +66,162 @@ bool lexer::starts_a_word(uint32_t p, uint32_t begin) const noexcept {
 	}
 }
 
+// True where a COMMAND could begin at `p`, which is the only place `case` and
+// `esac` are RESERVED rather than ordinary words - `echo case` prints a word.
+// `begin` is where the scanned region started, so its first byte counts.
+//
+// The parser's rule, approximated over bytes because the scan keeps no token
+// history: the previous non-blank ends a command, or the word before it is one
+// that introduces one. Deliberately CONSERVATIVE. A `case` this declines to
+// recognise leaves the scan where #68 found it, while one it recognises WRONGLY
+// would eat a paren that really did close the substitution - so `then case` is
+// worth listing and anything more elaborate is not worth guessing at.
+bool lexer::starts_a_command(uint32_t p, uint32_t begin) const noexcept {
+	uint32_t q = p;
+	while (q > begin && is_blank(_source[q - 1]))
+		--q;
+	if (q <= begin)
+		return true;
+	switch (_source[q - 1]) {
+		case '\n': case ';': case '&': case '|': case '(': case ')':
+			return true;
+		default:
+			break;
+	}
+	uint32_t w = q;
+	while (w > begin && !is_word_terminator(_source[w - 1]))
+		--w;
+	const std::string_view before = _source.substr(w, q - w);
+	return before == "then" || before == "else" || before == "elif" ||
+	       before == "do" || before == "{" || before == "!";
+}
+
+bool here_doc_delimiter_matches(std::string_view raw, std::string_view line) noexcept {
+	size_t r = 0, l = 0;
+	while (r < raw.size()) {
+		const char c = raw[r];
+		// A line continuation in the delimiter contributes nothing: `<<E\<newline>ND`
+		// is terminated by `END`. Read as an escape it tried to match a newline
+		// inside the line and never matched at all.
+		if (c == '\\' && r + 1 < raw.size() && raw[r + 1] == '\n') {
+			r += 2;
+			continue;
+		}
+		if (c == '\'') {
+			// Single quotes: everything up to the next one is literal, backslash
+			// included. An unterminated quote cannot match anything.
+			++r;
+			while (r < raw.size() && raw[r] != '\'') {
+				if (l >= line.size() || line[l] != raw[r])
+					return false;
+				++r;
+				++l;
+			}
+			if (r >= raw.size())
+				return false;
+			++r;  // closing quote
+			continue;
+		}
+		if (c == '"') {
+			++r;
+			while (r < raw.size() && raw[r] != '"') {
+				// Inside double quotes a backslash escapes only these four bytes;
+				// anywhere else it stands for itself.
+				if (raw[r] == '\\' && r + 1 < raw.size() &&
+				    (raw[r + 1] == '$' || raw[r + 1] == '`' || raw[r + 1] == '"' ||
+				     raw[r + 1] == '\\'))
+					++r;
+				if (l >= line.size() || line[l] != raw[r])
+					return false;
+				++r;
+				++l;
+			}
+			if (r >= raw.size())
+				return false;
+			++r;  // closing quote
+			continue;
+		}
+		if (c == '\\') {
+			// A trailing backslash quotes nothing; treat it as itself rather than
+			// reading past the end of the word.
+			if (r + 1 >= raw.size())
+				return false;
+			++r;
+			if (l >= line.size() || line[l] != raw[r])
+				return false;
+			++r;
+			++l;
+			continue;
+		}
+		if (l >= line.size() || line[l] != c)
+			return false;
+		++r;
+		++l;
+	}
+	return l == line.size();
+}
+
 uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
                                          bool* terminated) const noexcept {
-	char expect[kMaxScanNesting];
-	// Whether a single quote is an ordinary byte at each level. `${...}` INHERITS
-	// the context it was opened in, while `$(...)` and a backquote start the shell
-	// language over and so reset it - which is why this travels beside the closer
-	// rather than being read off the bytes.
-	bool ordinary_single[kMaxScanNesting];
+	// What ONE open construct has to remember. A struct rather than the parallel
+	// arrays this began as, because the list grew past a closer: whether a single
+	// quote is a quote there, whether the level is arithmetic rather than a
+	// command list, and how many `case` clauses are open inside it (#68).
+	struct level {
+		char closer;
+		// Whether a single quote is an ordinary byte at this level. `${...}`
+		// INHERITS the context it was opened in, while `$(...)` and a backquote
+		// start the shell language over and so reset it - which is why this travels
+		// beside the closer rather than being read off the bytes.
+		bool ordinary_single;
+		// `$((` rather than `$(`. The two are told apart because a command list and
+		// an arithmetic expression disagree about the very bytes this scan now
+		// reads: `<<` is a here-document operator in one and a SHIFT in the other,
+		// and reading `$((1<<2))`'s shift as an operator sent the scan looking for
+		// a body that does not exist.
+		bool arithmetic;
+		uint8_t awaiting_in;  // `case` seen, its `in` not yet
+		uint8_t open_cases;   // between `in` and `esac`, where `)` ends a pattern list
+	};
+	level stack[kMaxScanNesting];
+	// A here-document operator seen at a `$( )` level, waiting for the newline
+	// whose NEXT line begins its body. POSIX puts the body after the newline and
+	// not after the operator, so `cat <<A <<B` has two of these outstanding at
+	// once and they are consumed in the order the operators were seen.
+	struct pending_here_doc {
+		uint32_t offset;  // the delimiter word, exactly as it was written
+		uint32_t length;
+		int at_depth;     // the depth it belongs to: an inner line is consumed first
+		bool strip_tabs;  // `<<-`
+	};
+	// More outstanding bodies than one line of any real script has. Past the cap
+	// the operator is simply not recorded, which leaves the scan behaving as it
+	// did before #68 rather than mis-attributing a body to the wrong delimiter.
+	static constexpr int kMaxPendingHereDocs = 16;
+	pending_here_doc pending[kMaxPendingHereDocs];
+	int pending_count = 0;
 	int depth = 0;
 	uint32_t p = at;
 
 	bool too_deep = false;
-	auto open = [&](char closer, uint32_t width, bool single_is_ordinary) {
+	auto open = [&](char closer, uint32_t width, bool single_is_ordinary,
+	                bool arithmetic = false) {
 		if (depth < kMaxScanNesting) {
-			expect[depth] = closer;
-			ordinary_single[depth] = single_is_ordinary;
+			stack[depth] = {closer, single_is_ordinary, arithmetic, 0, 0};
 			++depth;
 		} else {
 			too_deep = true;
 		}
 		p += width;
+	};
+	auto close = [&] {
+		--depth;
+		// A here-document operator whose body never arrived dies with its level
+		// rather than attaching itself to the next newline outside it - which is
+		// what `$((1<<2))` produces when the arithmetic guard is not enough.
+		while (pending_count > 0 && pending[pending_count - 1].at_depth > depth)
+			--pending_count;
+		++p;
 	};
 
 	if (terminated != nullptr)
@@ -109,7 +244,7 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 	if (first == '"') {
 		open('"', 1, /*single_is_ordinary=*/true);
 	} else if (first == '`') {
-		open('`', 1, false);
+		open('`', 1, /*single_is_ordinary=*/false);
 	} else if (first == '$') {
 		// The brace or paren may be separated from the `$` by line continuations,
 		// which POSIX removed before tokenising. Missing that returned `at`
@@ -121,7 +256,8 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 			open('}', 1, inside_double_quotes);
 		} else if (char_at(after_dollar) == '(') {
 			p = after_dollar;
-			open(')', 1, false);
+			open(')', 1, /*single_is_ordinary=*/false,
+			     char_at(past_continuations(after_dollar + 1)) == '(');
 		} else {
 			return at;
 		}
@@ -130,6 +266,11 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 	}
 
 	while (depth > 0 && p < _source.size()) {
+		level& cur = stack[depth - 1];
+		// Whether the bytes at this level are a COMMAND LIST. Only there do `case`,
+		// `esac` and `<<` mean what the shell grammar says they mean; inside quotes,
+		// a `${...}` or an arithmetic expression they are ordinary text.
+		const bool command_list = cur.closer == ')' && !cur.arithmetic;
 		const char c = _source[p];
 		// A backslash consumes the next byte for DELIMITING purposes wherever it
 		// appears, which is what makes `\`` not close a backquote and `\"` not close
@@ -138,9 +279,18 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 			p += 2;
 			continue;
 		}
-		if (c == expect[depth - 1]) {
-			--depth;
-			++p;
+		if (c == cur.closer) {
+			// A `)` between a case clause's `in` and its `esac` ends a PATTERN LIST
+			// and is not the substitution's own. Counted as ours, `$(case a in a) echo
+			// x;; esac)` ended at the pattern's paren and the rest of the clause was
+			// read as ordinary words (#68). Only a clause written without the optional
+			// leading `(` shows it - `(a)` balances by accident - which is why the
+			// `*)` every case ends with was the case that failed.
+			if (command_list && cur.open_cases > 0) {
+				++p;
+				continue;
+			}
+			close();
 			continue;
 		}
 		if (c == '\'') {
@@ -148,7 +298,7 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 			// force - the distinction that made `echo "it's"` print `it` when it was
 			// missed (#33), and that keeps `"${x-'}"` from swallowing the rest of the
 			// input.
-			if (ordinary_single[depth - 1]) {
+			if (cur.ordinary_single) {
 				++p;
 				continue;
 			}
@@ -156,23 +306,24 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 			continue;
 		}
 		if (c == '"') {
-			open('"', 1, true);
+			open('"', 1, /*single_is_ordinary=*/true);
 			continue;
 		}
 		if (c == '`') {
-			open('`', 1, false);
+			open('`', 1, /*single_is_ordinary=*/false);
 			continue;
 		}
 		if (c == '$') {
 			const uint32_t after_dollar = past_continuations(p + 1);
 			if (char_at(after_dollar) == '{') {
 				p = after_dollar;
-				open('}', 1, ordinary_single[depth - 1]);
+				open('}', 1, cur.ordinary_single);
 				continue;
 			}
 			if (char_at(after_dollar) == '(') {
 				p = after_dollar;
-				open(')', 1, false);
+				open(')', 1, /*single_is_ordinary=*/false,
+				     char_at(past_continuations(after_dollar + 1)) == '(');
 				continue;
 			}
 			++p;
@@ -182,19 +333,154 @@ uint32_t lexer::skip_quoted_or_expansion(uint32_t at, bool inside_double_quotes,
 		// COMMENT, and everything to the newline - a closing paren included - is
 		// text. `$(\n echo a # ) comment \n)` closed at the paren in the comment and
 		// ran `echo a #` (cmdsub-p.tst's 'comment in command substitution').
-		if (c == '#' && expect[depth - 1] == ')' && starts_a_word(p, at)) {
+		if (c == '#' && cur.closer == ')' && starts_a_word(p, at)) {
 			while (p < _source.size() && _source[p] != '\n')
 				++p;
 			continue;
 		}
-		// A bare paren or brace nests the construct it belongs to, which is how
-		// `$(a $(b) c)` and `${x-${y}}` were counted before there was a stack.
-		if (c == '(' && expect[depth - 1] == ')') {
-			open(')', 1, ordinary_single[depth - 1]);
+		// A here-document BODY is DATA: a `)` in it closes nothing, and neither does
+		// a `$(` or a backquote. `$(cat <<\END<newline>foo)<newline>END<newline>)`
+		// ended at the paren in the body and printed the raw bytes of the rest (#68).
+		// bash gets this one wrong too, byte for byte.
+		//
+		// This is not the lexer reading ahead for a body, which #21 put in the
+		// parser and which stands: nothing is collected and nothing is seeked here.
+		// The scan is DELIMITING a construct it was handed, and it has to walk these
+		// bytes either way to find the paren. Every body it steps over is collected
+		// again, properly, when the parser parses the substitution's text.
+		if (command_list && c == '<' && char_at(p + 1) == '<' && char_at(p + 2) != '<') {
+			uint32_t d = past_continuations(p + 2);
+			bool strip_tabs = false;
+			if (char_at(d) == '-') {
+				strip_tabs = true;
+				d = past_continuations(d + 1);
+			}
+			while (d < _source.size() && is_blank(_source[d]))
+				++d;
+			d = past_continuations(d);
+			const uint32_t word_start = d;
+			// The delimiter word may be quoted - `<<\END`, `<<'END'`, `<<"END"` - and
+			// the quotes are part of the word the body is compared against. Scanned
+			// inline rather than through this function, because a delimiter needs
+			// none of the nesting and a recursive call would carry the whole stack.
+			while (d < _source.size()) {
+				const char w = _source[d];
+				if (w == '\\' && d + 1 < _source.size()) {
+					d += 2;
+					continue;
+				}
+				if (w == '\'') {
+					++d;
+					while (d < _source.size() && _source[d] != '\'')
+						++d;
+					if (d < _source.size())
+						++d;
+					continue;
+				}
+				if (w == '"') {
+					++d;
+					while (d < _source.size() && _source[d] != '"') {
+						if (_source[d] == '\\' && d + 1 < _source.size())
+							++d;
+						++d;
+					}
+					if (d < _source.size())
+						++d;
+					continue;
+				}
+				if (is_word_terminator(w))
+					break;
+				++d;
+			}
+			if (d > word_start && pending_count < kMaxPendingHereDocs)
+				pending[pending_count++] = {word_start, d - word_start, depth, strip_tabs};
+			p = d;
 			continue;
 		}
-		if (c == '{' && expect[depth - 1] == '}') {
-			open('}', 1, ordinary_single[depth - 1]);
+		// The newline the pending bodies were waiting for. Only the ones opened at
+		// THIS level are consumed: an operator from an enclosing level is waiting on
+		// the enclosing line, not on this one, which is what keeps the outer body of
+		// `cat <<OUTER; echo "$(cat <<INNER ...)"` where it belongs.
+		if (c == '\n' && pending_count > 0 && pending[pending_count - 1].at_depth == depth) {
+			int first = pending_count;
+			while (first > 0 && pending[first - 1].at_depth == depth)
+				--first;
+			++p;
+			for (int i = first; i < pending_count; ++i) {
+				const std::string_view raw =
+					_source.substr(pending[i].offset, pending[i].length);
+				while (p < _source.size()) {
+					const size_t nl = _source.find('\n', p);
+					std::string_view line = _source.substr(
+						p, nl == std::string_view::npos ? std::string_view::npos : nl - p);
+					// `<<-` strips leading tabs from the delimiter line as well as from
+					// the body, so the line is compared with them gone.
+					if (pending[i].strip_tabs)
+						while (!line.empty() && line.front() == '\t')
+							line.remove_prefix(1);
+					if (here_doc_delimiter_matches(raw, line)) {
+						p = nl == std::string_view::npos
+							? static_cast<uint32_t>(_source.size())
+							: static_cast<uint32_t>(nl + 1);
+						break;
+					}
+					if (nl == std::string_view::npos) {
+						p = static_cast<uint32_t>(_source.size());
+						break;
+					}
+					p = static_cast<uint32_t>(nl + 1);
+				}
+			}
+			pending_count = first;
+			continue;
+		}
+		// `case` and `esac` are reserved WHERE A COMMAND COULD BEGIN and nowhere
+		// else, so this reads a whole word and asks the position - `$(echo case)` is
+		// one word today and has to stay one. The `in` is required before a `)` is
+		// treated as a pattern's: without it `$(echo $(echo a) case)`, where `case`
+		// is an ARGUMENT that happens to follow a paren, would lose its own closer.
+		if (command_list && (c == 'c' || c == 'i' || c == 'e')) {
+			uint32_t w = p;
+			while (w < _source.size() && !is_word_terminator(_source[w]))
+				++w;
+			const std::string_view word = _source.substr(p, w - p);
+			if (word == "case" && starts_a_command(p, at)) {
+				// Saturating rather than wrapping. A count that wrapped to zero would
+				// hand a pattern's paren back to the substitution and mis-scan; stuck at
+				// the ceiling the construct is reported UNTERMINATED instead, which is
+				// the same answer kMaxScanNesting gives to input this will not follow.
+				if (cur.awaiting_in < 255)
+					++cur.awaiting_in;
+				p = w;
+				continue;
+			}
+			if (word == "in" && cur.awaiting_in > 0) {
+				--cur.awaiting_in;
+				if (cur.open_cases < 255)
+					++cur.open_cases;
+				p = w;
+				continue;
+			}
+			if (word == "esac" && starts_a_command(p, at)) {
+				if (cur.open_cases > 0)
+					--cur.open_cases;
+				else if (cur.awaiting_in > 0)
+					--cur.awaiting_in;
+				p = w;
+				continue;
+			}
+		}
+		// A bare paren or brace nests the construct it belongs to, which is how
+		// `$(a $(b) c)` and `${x-${y}}` were counted before there was a stack.
+		if (c == '(' && cur.closer == ')') {
+			// Arithmetic is INHERITED: the inner parens of `$((1+2))` are the same
+			// expression, while the `(` of `$( (cmd) )` opens a subshell in a command
+			// list. POSIX makes the space the difference and so does this.
+			open(')', 1, cur.ordinary_single, cur.arithmetic);
+			continue;
+		}
+		if (c == '{' && cur.closer == '}') {
+			open('}', 1, cur.ordinary_single);
 			continue;
 		}
 		++p;
