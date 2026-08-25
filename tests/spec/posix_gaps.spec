@@ -1832,3 +1832,124 @@ f
 one
 two
 4
+
+
+# ISSUE #61, decision 1, built on #76's mapper. A runtime diagnostic is
+# `file:line:col: message`, positioned at the INVOCATION SITE, with the alias
+# chain in brackets. Every case below is a divergence, because the format differs
+# from all four reference shells - and every one asserts the text through `2>&1`,
+# since the corpus otherwise compares only whether stderr is empty.
+#
+# The field, measured at b662b5c for a command not found on line 3 of a script:
+#
+#   dash  n.sh: 3: nosuchcmd: not found
+#   zsh   n.sh:3: command not found: nosuchcmd
+#   bash  n.sh: line 3: nosuchcmd: command not found
+#   lesh  lesh: nosuchcmd: No such file or directory     <- own name, no position
+#
+# dash and zsh already agree on the invocation LINE and the EXPANDED name. No
+# shell reports a COLUMN and none names the ALIAS; both are lesh's addition, and
+# it can make them because every node carries a source span (ast.h:23) and #40's
+# regions say which text is an alias body.
+
+--- a command not found from a script names the file, line and column [divergence: dash prints `n.sh: 3: nosuchcmd: not found`, zsh `n.sh:3: command not found: nosuchcmd`, bash `n.sh: line 3: ...`; none reports a column]
+printf 'echo one\necho two\nnosuchcmd\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+n.sh:3:1: nosuchcmd: not found
+
+--- a command not found under -c names $0 [divergence: dash prints `MYNAME: 1: nosuchcmd: not found` and zsh its own name rather than $0; neither reports a column]
+"$TESTEE" -c 'nosuchcmd' MYNAME 2>&1 >/dev/null
+=== expect [status: 127]
+MYNAME:1:1: nosuchcmd: not found
+
+--- a command not found from standard input names $0 [divergence: dash prints `./sh: 2: nosuchcmd: not found`; zsh omits the position entirely when the script arrived on stdin]
+ln -s "$TESTEE" ./sh
+printf 'echo one\nnosuchcmd\n' | ./sh 2>&1 >/dev/null
+=== expect [status: 127]
+./sh:2:1: nosuchcmd: not found
+
+--- the column counts from one along the line [divergence: no shell reports a column at all]
+printf ': ; nosuchcmd\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+n.sh:1:5: nosuchcmd: not found
+
+# COLUMNS COUNT CHARACTERS, NOT BYTES. `é` is two bytes, so on `: é; nosuchcmd`
+# the command word is at BYTE 7 and at CHARACTER 6. Character, because
+# `file:line:col` is a convention with readers - GCC defaults to
+# `-fdiagnostics-column-unit=display`, and every editor's problem matcher places
+# its caret by character - and a byte column lands in the wrong place on any line
+# holding a non-ASCII character. See src/syntax/source_map.h.
+
+--- the column counts characters rather than bytes [divergence: no shell reports a column at all]
+printf ': \303\251; nosuchcmd\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+n.sh:1:6: nosuchcmd: not found
+
+--- a command not found through an alias is reported at the word that was typed [divergence: dash and zsh report the invocation line and the expanded name as lesh does, but neither names the alias; bash does not substitute aliases in a script at all]
+printf 'alias a=nosuchcmd\na\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+n.sh:2:1: nosuchcmd: not found (via alias a)
+
+--- a nested alias reports the whole chain, outermost first [divergence: dash and zsh report `nosuchcmd` at the invocation line and name neither alias; bash reports `a`, because it does not substitute aliases in a script]
+printf 'alias a=b\nalias b=nosuchcmd\na\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+n.sh:3:1: nosuchcmd: not found (via alias a → b)
+
+# THE PREFIX IS NOT THE COMMAND SEARCH'S. #61 asks where the decision lives, and
+# the answer has to be one place: every runtime diagnostic the shell prints goes
+# through runtime/diagnostic.h, so a builtin, a redirection and an expansion are
+# positioned by the same code that positions a command that was not found. dash
+# and zsh position all three too.
+
+--- a builtin's diagnostic is positioned the same way [divergence: dash prints `n.sh: 2: cd: can't cd to /nosuchdir`; the shape is the same and the column is lesh's]
+printf 'echo one\ncd /nosuchdir\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 2]
+n.sh:2:1: cd: /nosuchdir: No such file or directory
+
+--- a redirection failure is positioned at the command that carried it [divergence: dash prints `n.sh: 2: cannot create /nosuch/dir/f: Directory nonexistent`; the column is lesh's, and it names the COMMAND rather than the operator, because that is the word the reader is looking for]
+printf 'echo one\n: >/nosuch/dir/f\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 2]
+n.sh:2:1: /nosuch/dir/f: No such file or directory
+
+--- an expansion error is positioned at the command being expanded [divergence: dash prints `n.sh: 3: NOPE: parameter not set`; the column is lesh's]
+printf 'echo one\nset -u\necho $NOPE\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 2]
+n.sh:3:1: NOPE: parameter not set
+
+# A DOT SCRIPT NAMES ITSELF. `$0` everywhere else, but a dot script's lines are
+# not `$0`'s lines, and naming `$0` beside a line counted in another file is the
+# one way this format can lie. bash and zsh both name the script; dash names $0
+# and then appends the script's path, saying the same thing at greater length.
+
+--- a diagnostic inside a dot script names the dot script [divergence: dash prints `n.sh: 2: /path/dot.sh: nosuchcmd: not found`, naming both; lesh names the file the line belongs to, as bash and zsh do]
+printf 'echo inner\nnosuchcmd\n' >dot.sh
+printf 'echo one\n. ./dot.sh\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 127]
+./dot.sh:2:1: nosuchcmd: not found
+
+# A SYNTAX ERROR POSITIONS ITSELF. It is reported before any node of its command
+# has run, so nothing has told the shell where it is and the origin still holds
+# the PREVIOUS command's line - which is the one line in the file that is fine.
+# The offending token's `error_offset` answers it: the lexer already records where
+# the quote was opened, rather than only which node ended up defective.
+
+--- a syntax error names the line and column of the defect [divergence: dash prints `n.sh: 2: Syntax error: ";;" unexpected`; lesh reports the column, and reports the byte the lexer recorded rather than the token that follows it]
+printf 'echo one\necho ;;\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 2]
+n.sh:2:6: syntax error
+
+--- an unterminated quote is reported where the quote was opened [divergence: dash prints `n.sh: 2: Syntax error: Unterminated quoted string` with no column; lesh points at the opening quote itself]
+printf 'echo one\necho "abc\n' >n.sh
+"$TESTEE" n.sh 2>&1 >/dev/null
+=== expect [status: 2]
+n.sh:2:6: syntax error: unterminated quoted string

@@ -2,6 +2,7 @@
 
 #include "substrate/numeric.h"
 
+#include "runtime/diagnostic.h"
 #include "runtime/builtins.h"
 #include "runtime/pattern.h"
 #include "runtime/signals.h"
@@ -177,7 +178,14 @@ int search_and_exec(char** argv, char** env, std::string_view path_value,
 [[noreturn]] void exec_or_die(char** argv, char** env, std::string_view path_value,
                               std::string_view self_path) {
 	const int failure = search_and_exec(argv, env, path_value, self_path);
-	std::fprintf(stderr, "lesh: %s: %s\n", argv[0], std::strerror(failure));
+	// `not found`, dash's wording, rather than strerror's `No such file or
+	// directory`. The search looked in every directory on $PATH; naming the errno
+	// of the last attempt describes one of them and reads as a complaint about a
+	// file the user never mentioned. Every other failure - a permission, a
+	// directory, an unreadable format - IS about the one file that was found, so
+	// there strerror is exactly right.
+	report("%s: %s", argv[0],
+	       failure == ENOENT ? "not found" : std::strerror(failure));
 	// POSIX: 127 when the command was not found, 126 when it was found but could
 	// not be executed. _exit, not exit: never flush buffers inherited from the
 	// parent.
@@ -248,7 +256,7 @@ bool tree_walking_executor::save_fd(int fd, arena_array<saved_fd>* restore) {
 			restore->push({fd, saved_fd::closed});
 			return true;
 		}
-		std::fprintf(stderr, "lesh: %d: %s\n", fd, std::strerror(errno));
+		report("%d: %s", fd, std::strerror(errno));
 		return false;
 	}
 	restore->push({fd, copy});
@@ -366,11 +374,11 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 			const numeric_result parsed =
 				parse_integer(target, numeric_site::redirection_target_fd);
 			if (parsed.status == numeric_parse::not_a_number) {
-				std::fprintf(stderr, "lesh: %s: bad file descriptor\n", path);
+				report("%s: bad file descriptor", path);
 				return false;
 			}
 			if (parsed.status == numeric_parse::out_of_range) {
-				std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(EBADF));
+				report("%s: %s", path, std::strerror(EBADF));
 				return false;
 			}
 			const int source = static_cast<int>(parsed.value);
@@ -382,20 +390,20 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 			// failure (unreadable file descriptor)'.
 			const int flags = fcntl(source, F_GETFL);
 			if (flags == -1) {
-				std::fprintf(stderr, "lesh: %d: %s\n", source, std::strerror(errno));
+				report("%d: %s", source, std::strerror(errno));
 				return false;
 			}
 			const int access = flags & O_ACCMODE;
 			const bool writable = access == O_WRONLY || access == O_RDWR;
 			const bool readable = access == O_RDONLY || access == O_RDWR;
 			if (op_token.kind == token_kind::great_and ? !writable : !readable) {
-				std::fprintf(stderr, "lesh: %d: %s\n", source,
-				             op_token.kind == token_kind::great_and
-				                 ? "not open for output" : "not open for input");
+				report("%d: %s", source,
+				       op_token.kind == token_kind::great_and
+				           ? "not open for output" : "not open for input");
 				return false;
 			}
 			if (dup2(source, fd) == -1) {
-				std::fprintf(stderr, "lesh: %d: %s\n", source, std::strerror(errno));
+				report("%d: %s", source, std::strerror(errno));
 				return false;
 			}
 			return true;
@@ -405,7 +413,7 @@ bool tree_walking_executor::apply_redirection(const tree& t, node_index n,
 	}
 
 	if (opened == -1) {
-		std::fprintf(stderr, "lesh: %s: %s\n", path, std::strerror(errno));
+		report("%s: %s", path, std::strerror(errno));
 		return false;
 	}
 	if (opened != fd) {
@@ -507,7 +515,7 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 
 	int pipe_fds[2];
 	if (pipe(pipe_fds) == -1) {
-		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		report("pipe: %s", std::strerror(errno));
 		return false;
 	}
 
@@ -527,7 +535,7 @@ bool tree_walking_executor::apply_here_doc(const tree& t, node_index n,
 			// never reached the command is not something to carry on from silently.
 			const ssize_t written = write(pipe_fds[1], text.data(), text.size());
 			if (written != static_cast<ssize_t>(text.size())) {
-				std::fprintf(stderr, "lesh: here-document: %s\n", std::strerror(errno));
+				report("here-document: %s", std::strerror(errno));
 				close(pipe_fds[0]);
 				close(pipe_fds[1]);
 				return false;
@@ -617,7 +625,7 @@ bool tree_walking_executor::has_redirections(const tree& t, node_index command) 
 int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
 	int result_pipe[2];
 	if (pipe(result_pipe) == -1) {
-		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		report("pipe: %s", std::strerror(errno));
 		return kRedirectionError;
 	}
 	// Moved to 10 or above, same as save_fd and for the same reason: pipe(2)
@@ -637,7 +645,7 @@ int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
 	std::fflush(nullptr);
 	const pid_t pid = fork();
 	if (pid == -1) {
-		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		report("fork: %s", std::strerror(errno));
 		close(result_pipe[0]);
 		close(result_pipe[1]);
 		return kRedirectionError;
@@ -692,7 +700,7 @@ int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
 bool tree_walking_executor::drop_unwritable_output(const char* name) {
 	if (std::ferror(stdout) == 0)
 		return false;
-	std::fprintf(stderr, "lesh: %s: I/O error\n", name);
+	report("%s: I/O error", name);
 	std::clearerr(stdout);
 	arena_array<saved_fd> displaced{_pool, 1};
 	if (!save_fd(STDOUT_FILENO, &displaced))
@@ -861,13 +869,34 @@ void tree_walking_executor::echo_if_verbose(std::string_view unit, bool enabled)
 // either test suite compares the text - the yash suite's `-d` only requires
 // stderr to be non-empty, and the differential harness compares stderr for
 // emptiness alone - so the wording is free to be useful.
-static void report_syntax_error(const tree& t) {
+//
+// POSITIONED AT THE DEFECT, which it has to set for itself: a syntax error is
+// reported before any node of this command has RUN, so run_node has not named a
+// place and the origin still holds the previous command's. `echo one` then
+// `echo ;;` reported line 1, which is the one line in the file that is fine.
+//
+// The offending TOKEN's error_offset when there is one - the lexer records where
+// the quote was opened, not merely which node ended up defective - and the node's
+// own start otherwise. Same scan error_detail does, and for the same reason: a
+// redirect's first token is the operator and its unterminated target is the one
+// worth pointing at.
+static void report_syntax_error(shell_state& state, const tree& t) {
 	const syntax::node_index at = t.first_error();
+	if (at != syntax::no_node) {
+		const syntax::node& n = t[at];
+		uint32_t where = t.span_of(n).offset;
+		for (uint32_t i = n.first_token; i <= n.last_token && i < t.token_count(); ++i)
+			if (t.token_at(i).is_error()) {
+				where = t.token_at(i).error_offset;
+				break;
+			}
+		state.set_command_origin(t, where);
+	}
 	const char* detail = at == syntax::no_node ? nullptr : t.error_detail(t[at]);
 	if (detail != nullptr)
-		std::fprintf(stderr, "lesh: syntax error: %s\n", detail);
+		report("syntax error: %s", detail);
 	else
-		std::fprintf(stderr, "lesh: syntax error\n");
+		report("syntax error");
 }
 
 int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
@@ -888,7 +917,7 @@ int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
 	// here even though an interactive reader would answer it with a prompt. See
 	// tree::incomplete() for why the two are separate questions.
 	if (!_state.interactive() && t.has_errors()) {
-		report_syntax_error(t);
+		report_syntax_error(_state, t);
 		_exit_requested = true;
 		return 2;
 	}
@@ -1124,8 +1153,8 @@ int tree_walking_executor::run_node(const tree& t, node_index n) {
 		case node_kind::function_definition: return run_function_definition(t, n);
 		case node_kind::async_list:          return run_async(t, n);
 		case node_kind::error:
-			std::fprintf(stderr, "lesh: syntax error near '%.*s'\n",
-			             static_cast<int>(t.text_of(t[n]).size()), t.text_of(t[n]).data());
+			report("syntax error near '%.*s'",
+			       static_cast<int>(t.text_of(t[n]).size()), t.text_of(t[n]).data());
 			return 2;
 		default:
 			return 0;
@@ -1455,7 +1484,8 @@ int tree_walking_executor::run_case(const tree& t, node_index n) {
 // Parses and runs source in THIS environment. `eval` and `.` both need it, and
 // both must see the shell's own state rather than a copy - which is what makes
 // `. ./config` able to set variables the caller then reads.
-int tree_walking_executor::run_source(std::string_view source, bool echo_as_read) {
+int tree_walking_executor::run_source(std::string_view source, bool echo_as_read,
+                                      std::string_view file) {
 	// A nested pool: the trees live only as long as this call. Functions defined
 	// here would not outlive it, which is the same limitation #25 recorded. A deque
 	// of them rather than one, because POSIX says `eval` and `.` READ their
@@ -1467,6 +1497,11 @@ int tree_walking_executor::run_source(std::string_view source, bool echo_as_read
 	// The trees below die with this call, so where the shell says it is has to go
 	// back to the caller's source before they do. See origin_guard.
 	const origin_guard origin{_state};
+	// A dot script names ITSELF in a diagnostic; an `eval` and a trap body are not
+	// files and keep `$0`. Set after the guard, so that the caller's answer is what
+	// gets put back (#61).
+	if (!file.empty())
+		_state.set_origin_file(file);
 	// ZERO, not `$?`. POSIX gives both `eval` and `.` an exit status of zero when
 	// no command is executed, and starting from the caller's status reported the
 	// status of whatever ran BEFORE instead: `false; eval '' '' ''` reported 1 and
@@ -1572,14 +1607,14 @@ bool tree_walking_executor::run_dot_script(std::string_view operand, int& status
 	if (operand.find('/') != std::string_view::npos) {
 		path.assign(operand);
 	} else if (!search_path_for_dot(operand, path)) {
-		std::fprintf(stderr, "lesh: .: %.*s: not found\n",
-		             static_cast<int>(operand.size()), operand.data());
+		report(".: %.*s: not found",
+		       static_cast<int>(operand.size()), operand.data());
 		status = kDotNotFound;
 		return false;
 	}
 	std::FILE* f = std::fopen(path.c_str(), "rb");
 	if (f == nullptr) {
-		std::fprintf(stderr, "lesh: .: %s: %s\n", path.c_str(), std::strerror(errno));
+		report(".: %s: %s", path.c_str(), std::strerror(errno));
 		status = kDotNotFound;
 		return false;
 	}
@@ -1589,7 +1624,12 @@ bool tree_walking_executor::run_dot_script(std::string_view operand, int& status
 	while ((got = std::fread(buffer, 1, sizeof(buffer), f)) > 0)
 		source.append(buffer, got);
 	std::fclose(f);
-	status = run_source(source, /*echo_as_read=*/true);
+	// A diagnostic inside the script names the SCRIPT, not `$0`, because the line
+	// it carries is counted in the script (#61). bash and zsh both do this; dash
+	// names $0 and then appends the path, which says the same thing at more length.
+	// Handed to run_source rather than set here, so that the guard putting the
+	// caller's position back puts its file back with it - see origin_guard.
+	status = run_source(source, /*echo_as_read=*/true, path);
 	// A dot script is a RETURN BOUNDARY. POSIX XCU `return`: it returns from the
 	// function OR the dot script that invoked it, whichever is innermost - so the
 	// unwind stops at this one call and whatever invoked it carries on. dash and
@@ -1632,7 +1672,7 @@ bool tree_walking_executor::try_run_function(const tree&, arena_array<char*>& ar
 		return false;
 
 	if (_function_depth >= kMaxFunctionDepth) {
-		std::fprintf(stderr, "lesh: %s: recursion too deep\n", argv[0]);
+		report("%s: recursion too deep", argv[0]);
 		status = 1;
 		return true;
 	}
@@ -1688,7 +1728,7 @@ int tree_walking_executor::run_async(const tree& t, node_index n) {
 	std::fflush(nullptr);
 	const pid_t pid = fork();
 	if (pid == -1) {
-		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		report("fork: %s", std::strerror(errno));
 		return 1;
 	}
 	if (pid == 0) {
@@ -1835,7 +1875,7 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 
 	const pid_t pid = fork();
 	if (pid == -1) {
-		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		report("fork: %s", std::strerror(errno));
 		return -1;
 	}
 
@@ -2173,8 +2213,8 @@ int tree_walking_executor::run_exec(const tree& t, node_index n,
 	// message that names the builtin is what makes the failure findable, and
 	// `not found` rather than strerror's `No such file or directory` is what every
 	// other shell prints for a command search that came up empty.
-	std::fprintf(stderr, "lesh: exec: %s: %s\n", argv[0],
-	             failure == ENOENT ? "not found" : std::strerror(failure));
+	report("exec: %s: %s", argv[0],
+	       failure == ENOENT ? "not found" : std::strerror(failure));
 	// POSIX: 127 when the command was not found, 126 when it was found but could
 	// not be executed. Confirmed against dash: `exec ./_no_such_command_` is 127,
 	// `exec ./mode-000-file` and `exec /tmp` are both 126 with `Permission denied`.
@@ -2515,7 +2555,7 @@ bool tree_walking_executor::try_run_executor_builtin(
 	} else if (name == ".") {
 		const size_t operand = first_operand(argv.data());
 		if (argv[operand] == nullptr) {
-			std::fprintf(stderr, "lesh: .: filename argument required\n");
+			report(".: filename argument required");
 			status = kDotNotFound;
 			if (!cmd.present && !_state.interactive())
 				_exit_requested = true;
@@ -2534,7 +2574,7 @@ bool tree_walking_executor::try_run_executor_builtin(
 		// command's own redirections: `command -z cat 2>/dev/null` is silent in dash,
 		// and reporting it before apply_redirections above let the message out.
 		if (cmd.bad_option != '\0') {
-			std::fprintf(stderr, "lesh: command: illegal option -- %c\n", cmd.bad_option);
+			report("command: illegal option -- %c", cmd.bad_option);
 			// 2, as for any other builtin's usage error, and what dash answers.
 			status = 2;
 		} else {
@@ -2860,7 +2900,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 				// than the silent success that made `test 1 = 2` report 0 (#35). The
 				// return value used to be discarded with a `(void)`, which is what let
 				// that through.
-				std::fprintf(stderr, "lesh: %s: not implemented\n", argv[0]);
+				report("%s: not implemented", argv[0]);
 				result.status = 127;
 			}
 		} else if (!ok) {
@@ -3054,7 +3094,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 
 		int pipe_fds[2] = {-1, -1};
 		if (!is_last && pipe(pipe_fds) == -1) {
-			std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+			report("pipe: %s", std::strerror(errno));
 			break;
 		}
 
@@ -3113,7 +3153,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 			_exit(status);
 		}
 		if (pid == -1)
-			std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+			report("fork: %s", std::strerror(errno));
 		if (pid > 0) {
 			setpgid(pid, group == 0 ? pid : group);
 			pids.push(pid);
@@ -3185,20 +3225,24 @@ substitution_result tree_walking_executor::capture(std::string_view code,
 	// more input to continue it with - the same reading run_parsed gives the top
 	// level, and the reason `$(if true` and `$(if true)` answer alike.
 	if (inner.has_errors()) {
-		report_syntax_error(inner);
+		// Guarded, because `inner` is a LOCAL tree and report_syntax_error points the
+		// shell's position at the defect inside it. Left there, the pointer would
+		// outlive the tree by the width of an EXIT trap, which can read `$LINENO`.
+		const origin_guard origin{_state};
+		report_syntax_error(_state, inner);
 		return substitution_result::malformed;
 	}
 
 	int pipe_fds[2];
 	if (pipe(pipe_fds) == -1) {
-		std::fprintf(stderr, "lesh: pipe: %s\n", std::strerror(errno));
+		report("pipe: %s", std::strerror(errno));
 		return substitution_result::unavailable;
 	}
 
 	std::fflush(nullptr);
 	const pid_t pid = fork();
 	if (pid == -1) {
-		std::fprintf(stderr, "lesh: fork: %s\n", std::strerror(errno));
+		report("fork: %s", std::strerror(errno));
 		close(pipe_fds[0]);
 		close(pipe_fds[1]);
 		return substitution_result::unavailable;

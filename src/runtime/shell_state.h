@@ -240,15 +240,34 @@ public:
 	struct command_origin {
 		const syntax::tree* tree = nullptr;
 		uint32_t offset = 0;
+		std::string_view file;
 	};
 	[[nodiscard]] command_origin command_origin_now() const noexcept {
-		return {_origin, _origin_offset};
+		return {_origin, _origin_offset, _origin_file};
 	}
 	void restore_command_origin(const command_origin& saved) noexcept {
 		if (saved.tree != nullptr)
 			set_command_origin(*saved.tree, saved.offset);
 		else
 			_origin = nullptr;
+		_origin_file = saved.file;
+	}
+
+	// WHICH FILE A DIAGNOSTIC NAMES while a DOT SCRIPT is running.
+	//
+	// `$0` everywhere else, per #61 - but a dot script's lines are not `$0`'s
+	// lines, and naming `$0` with a line number counted in another file is the one
+	// way this format can lie. bash and zsh both name the dot script; dash names
+	// `$0` AND appends the script's path, which says the same thing at greater
+	// length.
+	//
+	// A view, not a string: the pathname lives in run_dot_script's own frame, which
+	// outlives the run, and the guard that restores the origin restores this with
+	// it. Empty means `$0`, which is what an `eval` and a trap body want - neither
+	// is a file.
+	void set_origin_file(std::string_view file) noexcept { _origin_file = file; }
+	[[nodiscard]] std::string_view origin_file() const noexcept {
+		return _origin_file.empty() ? std::string_view{_script_name} : _origin_file;
 	}
 
 	// Where the running command sits in the text the user typed, as 1-based line
@@ -451,6 +470,7 @@ private:
 	// Where the running command begins. See set_command_origin.
 	const syntax::tree* _origin = nullptr;
 	uint32_t _origin_offset = 0;
+	std::string_view _origin_file;
 	syntax::source_map _lines{{}};
 	// `$LINENO`'s digits. A member because lookup() hands back a view and has
 	// nowhere else to put them; 12 bytes holds every uint32_t and its NUL. Mutable

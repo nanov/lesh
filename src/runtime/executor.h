@@ -232,7 +232,8 @@ private:
 	// text (per command, as this reads it) while echoing neither an `eval` operand
 	// nor a trap body - both of which it has already echoed once as part of the
 	// line that carried them.
-	int run_source(std::string_view source, bool echo_as_read = false);
+	int run_source(std::string_view source, bool echo_as_read = false,
+	               std::string_view file = {});
 	// `exec`. Returns only when there is no command to become, or the exec failed;
 	// on success this process IS the command. See the definition for why it is not
 	// a builtins.cpp builtin.

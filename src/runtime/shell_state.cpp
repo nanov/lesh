@@ -1,5 +1,6 @@
 #include "runtime/shell_state.h"
 
+#include "runtime/diagnostic.h"
 #include "substrate/numeric.h"
 
 #include <algorithm>
@@ -130,9 +131,12 @@ shell_state::shell_state() {
 	// command, and lineno-p.tst's third assertion says why that write cannot be a
 	// per-line counter: a multi-line expansion has to advance the number by the
 	// lines it spans, which only a lookup from an offset can do (#76).
+
+	// From here on this shell is where a diagnostic reports itself from (#61).
+	bind_diagnostics(this);
 }
 
-shell_state::~shell_state() = default;
+shell_state::~shell_state() { unbind_diagnostics(this); }
 
 void shell_state::set_alias(std::string_view name, std::string_view value) {
 	if (const auto it = _aliases.find(name); it != _aliases.end()) {
@@ -444,13 +448,13 @@ bool shell_state::is_readonly(std::string_view name) const {
 
 void shell_state::report_readonly(std::string_view who, std::string_view name) {
 	if (who.empty()) {
-		std::fprintf(stderr, "lesh: %.*s: is read only\n",
-		             static_cast<int>(name.size()), name.data());
+		report("%.*s: is read only",
+		       static_cast<int>(name.size()), name.data());
 		return;
 	}
-	std::fprintf(stderr, "lesh: %.*s: %.*s: is read only\n",
-	             static_cast<int>(who.size()), who.data(),
-	             static_cast<int>(name.size()), name.data());
+	report("%.*s: %.*s: is read only",
+	       static_cast<int>(who.size()), who.data(),
+	       static_cast<int>(name.size()), name.data());
 }
 
 std::vector<shell_state::variable_row> shell_state::variables() const {

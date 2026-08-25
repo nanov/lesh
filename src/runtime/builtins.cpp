@@ -1,5 +1,6 @@
 #include "runtime/builtins.h"
 
+#include "runtime/diagnostic.h"
 #include "substrate/numeric.h"
 
 #include <cctype>
@@ -132,7 +133,7 @@ builtin_result builtin_pwd(shell_state& state, char** argv) {
 	char unknown = '\0';
 	std::ignore = scan_directory_options(argv, mode, nullptr, unknown);
 	if (unknown != '\0') {
-		std::fprintf(stderr, "lesh: pwd: Illegal option -%c\n", unknown);
+		report("pwd: Illegal option -%c", unknown);
 		return {2};
 	}
 	// Operands are IGNORED rather than diagnosed, which is where `pwd` parts from
@@ -148,7 +149,7 @@ builtin_result builtin_pwd(shell_state& state, char** argv) {
 		// getcwd could not answer: the directory has been removed under the shell.
 		// dash reports and fails here too, and printing nothing at status zero would
 		// be a wrong answer a script would act on.
-		std::fprintf(stderr, "lesh: pwd: %s\n", std::strerror(errno));
+		report("pwd: %s", std::strerror(errno));
 		return {1};
 	}
 	std::printf("%s\n", here.c_str());
@@ -278,7 +279,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	// scan is shared with `pwd`, which has the same pair and the same tie-break.
 	const size_t at = scan_directory_options(argv, mode, &require_pwd, unknown);
 	if (unknown != '\0') {
-		std::fprintf(stderr, "lesh: cd: Illegal option -%c\n", unknown);
+		report("cd: Illegal option -%c", unknown);
 		return {2};
 	}
 
@@ -290,7 +291,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	// POSIX's synopsis takes one operand, bash, ksh, yash and zsh all diagnose a
 	// second, dash is the outlier, and cd-p.tst asserts nothing either way.
 	if (argc_of(argv) - at > 1) {
-		std::fprintf(stderr, "lesh: cd: too many operands\n");
+		report("cd: too many operands");
 		return {2};
 	}
 
@@ -300,7 +301,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	if (argv[at] == nullptr) {
 		std::string_view home;
 		if (!state.lookup("HOME", home) || home.empty()) {
-			std::fprintf(stderr, "lesh: cd: HOME not set\n");
+			report("cd: HOME not set");
 			return {2};
 		}
 		operand.assign(home);
@@ -308,7 +309,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	} else if (std::strcmp(argv[at], "-") == 0) {
 		std::string_view previous;
 		if (!state.lookup("OLDPWD", previous) || previous.empty()) {
-			std::fprintf(stderr, "lesh: cd: OLDPWD not set\n");
+			report("cd: OLDPWD not set");
 			return {2};
 		}
 		operand.assign(previous);
@@ -322,7 +323,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 		// `CDPATH=/x; cd ''` would land in /x. dash succeeds here; cd-p.tst's 'empty
 		// operand' asserts the failure, and #46 records the divergence.
 		if (operand.empty()) {
-			std::fprintf(stderr, "lesh: cd: : %s\n", std::strerror(ENOENT));
+			report("cd: : %s", std::strerror(ENOENT));
 			return {2};
 		}
 		curpath = operand;
@@ -362,7 +363,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 		std::error_code ec;
 		std::filesystem::current_path(curpath, ec);
 		if (ec) {
-			std::fprintf(stderr, "lesh: cd: %s: %s\n", operand.c_str(), ec.message().c_str());
+			report("cd: %s: %s", operand.c_str(), ec.message().c_str());
 			return {2};
 		}
 		next_pwd = shell_state::physical_working_directory();
@@ -376,7 +377,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 	} else {
 		std::string offender;
 		if (!canonicalize_logical(curpath, next_pwd, offender)) {
-			std::fprintf(stderr, "lesh: cd: %s: %s\n", offender.c_str(), std::strerror(errno));
+			report("cd: %s: %s", offender.c_str(), std::strerror(errno));
 			return {2};
 		}
 		// The CANONICAL path is what gets chdir'd, not the operand: under -L the two
@@ -385,7 +386,7 @@ builtin_result builtin_cd(shell_state& state, char** argv) {
 		std::error_code ec;
 		std::filesystem::current_path(next_pwd, ec);
 		if (ec) {
-			std::fprintf(stderr, "lesh: cd: %s: %s\n", operand.c_str(), ec.message().c_str());
+			report("cd: %s: %s", operand.c_str(), ec.message().c_str());
 			return {2};
 		}
 	}
@@ -772,14 +773,14 @@ builtin_result run_test(std::string_view invoked_as, char** args, size_t count) 
 
 	if (fail.message != nullptr) {
 		if (fail.token.empty())
-			std::fprintf(stderr, "lesh: %.*s: %s\n",
-			             static_cast<int>(invoked_as.size()), invoked_as.data(),
-			             fail.message);
+			report("%.*s: %s",
+			       static_cast<int>(invoked_as.size()), invoked_as.data(),
+			       fail.message);
 		else
-			std::fprintf(stderr, "lesh: %.*s: %.*s: %s\n",
-			             static_cast<int>(invoked_as.size()), invoked_as.data(),
-			             static_cast<int>(fail.token.size()), fail.token.data(),
-			             fail.message);
+			report("%.*s: %.*s: %s",
+			       static_cast<int>(invoked_as.size()), invoked_as.data(),
+			       static_cast<int>(fail.token.size()), fail.token.data(),
+			       fail.message);
 		return {2};
 	}
 	return {value ? 0 : 1};
@@ -793,7 +794,7 @@ builtin_result builtin_test(shell_state&, char** argv) {
 	// too, so the check is on the LAST argument rather than a search.
 	if (name == "[") {
 		if (count == 0 || std::string_view{argv[count]} != "]") {
-			std::fprintf(stderr, "lesh: [: missing ]\n");
+			report("[: missing ]");
 			return {2};
 		}
 		--count;
@@ -871,9 +872,9 @@ builtin_result run_declaration(shell_state& state, char** argv, bool make_readon
 			continue;
 		}
 		if (arg.size() >= 2 && arg[0] == '-') {
-			std::fprintf(stderr, "lesh: %.*s: Illegal option %.*s\n",
-			             static_cast<int>(keyword.size()), keyword.data(),
-			             static_cast<int>(arg.size()), arg.data());
+			report("%.*s: Illegal option %.*s",
+			       static_cast<int>(keyword.size()), keyword.data(),
+			       static_cast<int>(arg.size()), arg.data());
 			return {2};
 		}
 		break;
@@ -893,9 +894,9 @@ builtin_result run_declaration(shell_state& state, char** argv, bool make_readon
 		const size_t eq = arg.find('=');
 		const std::string_view name = arg.substr(0, eq);
 		if (!is_name(name)) {
-			std::fprintf(stderr, "lesh: %.*s: %.*s: bad variable name\n",
-			             static_cast<int>(keyword.size()), keyword.data(),
-			             static_cast<int>(name.size()), name.data());
+			report("%.*s: %.*s: bad variable name",
+			       static_cast<int>(keyword.size()), keyword.data(),
+			       static_cast<int>(name.size()), name.data());
 			return {2};
 		}
 		if (eq != std::string_view::npos) {
@@ -944,8 +945,8 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 		if (arg == "-v")
 			continue;
 		if (arg.size() >= 2 && arg[0] == '-') {
-			std::fprintf(stderr, "lesh: unset: Illegal option %.*s\n",
-			             static_cast<int>(arg.size()), arg.data());
+			report("unset: Illegal option %.*s",
+			       static_cast<int>(arg.size()), arg.data());
 			return {2};
 		}
 		break;
@@ -969,7 +970,7 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 		// deliberately NOT validated: `unset -f 1bad` succeeds silently in dash, so
 		// a check on every operand of every form would have been a fix past the bug.
 		if (!is_name(argv[i])) {
-			std::fprintf(stderr, "lesh: unset: %s: bad variable name\n", argv[i]);
+			report("unset: %s: bad variable name", argv[i]);
 			return {2};
 		}
 		// POSIX: unsetting a readonly variable is an error, and `unset` is a special
@@ -1051,14 +1052,14 @@ builtin_result builtin_set(shell_state& state, char** argv) {
 					// succeeded silently - and `set` is a special builtin, so dash both
 					// reports and exits a non-interactive shell. Status 2 and the
 					// wording are dash's.
-					std::fprintf(stderr, "lesh: set: Illegal option %co %s\n",
-					             arg[0], argv[i]);
+					report("set: Illegal option %co %s",
+					       arg[0], argv[i]);
 					return {2};
 				}
 				break;
 			}
 			if (!shell_state::apply_option_letter(state.opts(), c, enable)) {
-				std::fprintf(stderr, "lesh: set: Illegal option %c%c\n", arg[0], c);
+				report("set: Illegal option %c%c", arg[0], c);
 				return {2};
 			}
 		}
@@ -1211,8 +1212,8 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 		// reset ACTION, not an option, and every `trap - SIG` in both test suites
 		// depends on it. Anything after `--` never reaches here at all.
 		if (arg.size() >= 2 && arg[0] == '-') {
-			std::fprintf(stderr, "lesh: trap: Illegal option %.*s\n",
-			             static_cast<int>(arg.size()), arg.data());
+			report("trap: Illegal option %.*s",
+			       static_cast<int>(arg.size()), arg.data());
 			return {2};
 		}
 		break;
@@ -1231,7 +1232,7 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 		for (; argv[i] != nullptr; ++i) {
 			const int signo = signal_state::signal_number(argv[i]);
 			if (signo < 0) {
-				std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[i]);
+				report("trap: %s: bad signal", argv[i]);
 				status = 1;
 				continue;
 			}
@@ -1265,7 +1266,7 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 	for (size_t s = first_signal; argv[s] != nullptr; ++s) {
 		const int signo = signal_state::signal_number(argv[s]);
 		if (signo < 0) {
-			std::fprintf(stderr, "lesh: trap: %s: bad signal\n", argv[s]);
+			report("trap: %s: bad signal", argv[s]);
 			status = 1;
 			continue;
 		}
@@ -1285,8 +1286,8 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 constexpr int kKillUsageError = 2;
 
 builtin_result kill_usage() {
-	std::fprintf(stderr, "lesh: kill: usage: kill -s signal_name pid... | "
-	                     "kill -signal_name pid... | kill -l [exit_status]\n");
+	report("kill: usage: kill -s signal_name pid... | "
+	       "kill -signal_name pid... | kill -l [exit_status]");
 	return {kKillUsageError};
 }
 
@@ -1308,16 +1309,16 @@ builtin_result kill_list_one(const char* operand) {
 	// reach anyway, arrived at without overflowing an int on the way (#63).
 	const numeric_result parsed = parse_integer(operand, numeric_site::kill_list_operand);
 	if (parsed.status != numeric_parse::ok) {
-		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
-		             operand);
+		report("kill: %s: not a signal number or exit status",
+		       operand);
 		return {kKillUsageError};
 	}
 	const int value = static_cast<int>(parsed.value);
 	const int signo = value > 128 ? value - 128 : value;
 	const std::string_view name = signal_state::signal_name(signo);
 	if (signo <= 0 || name.empty()) {
-		std::fprintf(stderr, "lesh: kill: %s: not a signal number or exit status\n",
-		             operand);
+		report("kill: %s: not a signal number or exit status",
+		       operand);
 		return {kKillUsageError};
 	}
 	std::printf("%.*s\n", static_cast<int>(name.size()), name.data());
@@ -1441,7 +1442,7 @@ builtin_result builtin_kill(shell_state&, char** argv) {
 			// Naming the operand matters: the whole of issue #38 presented itself as
 			// this message with nothing in it to say WHICH signal the shell had never
 			// heard of.
-			std::fprintf(stderr, "lesh: kill: %s: bad signal\n", signal_operand);
+			report("kill: %s: bad signal", signal_operand);
 			return {kKillUsageError};
 		}
 	}
@@ -1453,12 +1454,12 @@ builtin_result builtin_kill(shell_state&, char** argv) {
 	for (; argv[i] != nullptr; ++i) {
 		pid_t pid = 0;
 		if (!read_pid_operand(argv[i], pid)) {
-			std::fprintf(stderr, "lesh: kill: %s: not a process id\n", argv[i]);
+			report("kill: %s: not a process id", argv[i]);
 			status = kKillUsageError;
 			continue;
 		}
 		if (::kill(pid, signo) != 0) {
-			std::fprintf(stderr, "lesh: kill: %s: %s\n", argv[i], std::strerror(errno));
+			report("kill: %s: %s", argv[i], std::strerror(errno));
 			// A usage error already reported outranks this one: dash answers 2 for a
 			// line it refused to run and 1 only for one the system refused.
 			if (status == 0)
@@ -1609,7 +1610,7 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 				continue;
 			}
 			if (*opt != 'd') {
-				std::fprintf(stderr, "lesh: read: illegal option -%c\n", *opt);
+				report("read: illegal option -%c", *opt);
 				return {2};
 			}
 			// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`).
@@ -1617,7 +1618,7 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 			++opt;
 			if (*opt == '\0') {
 				if (argv[first + 1] == nullptr) {
-					std::fprintf(stderr, "lesh: read: -d: missing delimiter\n");
+					report("read: -d: missing delimiter");
 					return {2};
 				}
 				++first;
@@ -1678,7 +1679,7 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 		// `printf 'A\nB\n' | { read 1bad; read x; }` leaves x as B, and the earlier
 		// names are assigned before the bad one stops it.
 		if (!is_name(argv[first + v])) {
-			std::fprintf(stderr, "lesh: read: %s: bad variable name\n", argv[first + v]);
+			report("read: %s: bad variable name", argv[first + v]);
 			return {2};
 		}
 		// Fewer fields than variables: the surplus variables are assigned the empty
@@ -1758,13 +1759,13 @@ int getopts_step(shell_state& state, char** argv, bool& refused) {
 	};
 
 	if (argv[1] == nullptr || argv[2] == nullptr) {
-		std::fprintf(stderr, "lesh: getopts: usage: getopts optstring name [arg...]\n");
+		report("getopts: usage: getopts optstring name [arg...]");
 		return 2;
 	}
 	const std::string_view name{argv[2]};
 	if (!is_name(name)) {
-		std::fprintf(stderr, "lesh: getopts: %.*s: bad variable name\n",
-		             static_cast<int>(name.size()), name.data());
+		report("getopts: %.*s: bad variable name",
+		       static_cast<int>(name.size()), name.data());
 		return 2;
 	}
 
@@ -1859,7 +1860,7 @@ int getopts_step(shell_state& state, char** argv, bool& refused) {
 			write("OPTARG", std::string_view{&option, 1});
 		} else {
 			erase("OPTARG");
-			std::fprintf(stderr, "lesh: getopts: illegal option -%c\n", option);
+			report("getopts: illegal option -%c", option);
 		}
 		// Zero, not one: POSIX gives status >0 to the END of the options, and an
 		// unknown option was still an option FOUND. `while getopts ...` has to keep
@@ -1885,8 +1886,8 @@ int getopts_step(shell_state& state, char** argv, bool& refused) {
 			} else {
 				write(name, "?");
 				erase("OPTARG");
-				std::fprintf(stderr, "lesh: getopts: option requires an argument -%c\n",
-				             option);
+				report("getopts: option requires an argument -%c",
+				       option);
 			}
 			return 0;
 		}
@@ -1969,8 +1970,8 @@ builtin_result builtin_alias(shell_state& state, char** argv) {
 		} else if (std::string_view value; state.lookup_alias(arg, value)) {
 			print_alias(arg, value);
 		} else {
-			std::fprintf(stderr, "lesh: alias: %.*s: not found\n",
-			             static_cast<int>(arg.size()), arg.data());
+			report("alias: %.*s: not found",
+			       static_cast<int>(arg.size()), arg.data());
 			status = 1;
 		}
 	}
@@ -1995,7 +1996,7 @@ builtin_result builtin_unalias(shell_state& state, char** argv) {
 		// POSIX: removing an alias that does not exist is an ERROR. Returning 0 made
 		// `unalias true; unalias true` succeed twice.
 		if (!state.unset_alias(argv[i])) {
-			std::fprintf(stderr, "lesh: unalias: %s: not found\n", argv[i]);
+			report("unalias: %s: not found", argv[i]);
 			status = 1;
 		}
 	}
@@ -2026,7 +2027,7 @@ builtin_result builtin_shift(shell_state& state, char** argv) {
 		count = static_cast<size_t>(parsed.value);
 	}
 	if (!state.shift_positional(count)) {
-		std::fprintf(stderr, "lesh: shift: can't shift that many\n");
+		report("shift: can't shift that many");
 		// TWO, the same as the operand that would not parse above it (#73).
 		//
 		// lesh was the only shell of the four surveyed that gave two different
@@ -2082,9 +2083,9 @@ bool read_flow_level(std::string_view name, char* const* argv, int& level) {
 	const int64_t value =
 		parsed.status == numeric_parse::not_a_number ? 0 : parsed.value;
 	if (value == 0) {
-		std::fprintf(stderr, "lesh: %.*s: %.*s: not a positive integer\n",
-		             static_cast<int>(name.size()), name.data(),
-		             static_cast<int>(text.size()), text.data());
+		report("%.*s: %.*s: not a positive integer",
+		       static_cast<int>(name.size()), name.data(),
+		       static_cast<int>(text.size()), text.data());
 		return false;
 	}
 	level = static_cast<int>(value);
@@ -2214,11 +2215,11 @@ int report_bad_number(std::string_view builtin, std::string_view operand,
 	// which prefixes a line number lesh does not track. The two failures are named
 	// apart because they are different mistakes to make: `exit 3x` is a typo in the
 	// operand and `exit 99999999999999999999` is a number the shell cannot hold.
-	std::fprintf(stderr, "lesh: %.*s: %.*s: %s\n",
-	             static_cast<int>(builtin.size()), builtin.data(),
-	             static_cast<int>(operand.size()), operand.data(),
-	             why == numeric_parse::out_of_range ? "number out of range"
-	                                                : "not a number");
+	report("%.*s: %.*s: %s",
+	       static_cast<int>(builtin.size()), builtin.data(),
+	       static_cast<int>(operand.size()), operand.data(),
+	       why == numeric_parse::out_of_range ? "number out of range"
+	                                          : "not a number");
 	return 2;
 }
 

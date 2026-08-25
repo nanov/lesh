@@ -2,6 +2,7 @@
 
 #include "substrate/numeric.h"
 
+#include "runtime/diagnostic.h"
 #include "runtime/arithmetic.h"
 #include "runtime/glob.h"
 #include "runtime/pattern.h"
@@ -518,8 +519,8 @@ bool expander::lookup_parameter(std::string_view name, std::string_view& out) no
 bool expander::report_unset(std::string_view name) noexcept {
 	if (!_unset_is_error)
 		return false;
-	std::fprintf(stderr, "lesh: %.*s: parameter not set\n",
-	             static_cast<int>(name.size()), name.data());
+	report("%.*s: parameter not set",
+	       static_cast<int>(name.size()), name.data());
 	_fatal_error = true;
 	return true;
 }
@@ -530,8 +531,8 @@ bool expander::report_unset(std::string_view name) noexcept {
 // differently depending on which layer noticed.
 void expander::report_malformed(token_error error) noexcept {
 	const char* phrase = syntax::error_phrase(error);
-	std::fprintf(stderr, "lesh: syntax error: %s\n",
-	             phrase != nullptr ? phrase : "malformed expansion");
+	report("syntax error: %s",
+	       phrase != nullptr ? phrase : "malformed expansion");
 	_fatal_error = true;
 }
 
@@ -544,9 +545,9 @@ void expander::report_malformed(token_error error) noexcept {
 // quoted back because the evaluator's `why` alone cannot say which of several
 // `$(( ))` on a line is the one that failed.
 void expander::report_arithmetic(const char* why, std::string_view expression) noexcept {
-	std::fprintf(stderr, "lesh: arithmetic expression: %s: \"%.*s\"\n",
-	             why != nullptr ? why : "invalid expression",
-	             static_cast<int>(expression.size()), expression.data());
+	report("arithmetic expression: %s: \"%.*s\"",
+	       why != nullptr ? why : "invalid expression",
+	       static_cast<int>(expression.size()), expression.data());
 	_fatal_error = true;
 }
 
@@ -569,7 +570,7 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 	// exhausted the stack on the debug build, so refusing malformed input is not
 	// enough on its own - see kMaxExpansionDepth (#48).
 	if (_depth >= kMaxExpansionDepth) {
-		std::fprintf(stderr, "lesh: expansion nested too deeply\n");
+		report("expansion nested too deeply");
 		_fatal_error = true;
 		return expansion_status::malformed_expansion;
 	}
@@ -807,8 +808,8 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							// `set a; echo ${1=x}` substitutes `a` at status zero, and
 							// `${#=y}` substitutes the count, because neither needs to
 							// assign anything.
-							std::fprintf(stderr, "lesh: %.*s: bad variable name\n",
-							             static_cast<int>(p.name.size()), p.name.data());
+							report("%.*s: bad variable name",
+							       static_cast<int>(p.name.size()), p.name.data());
 							// An expansion error, not an unsupported construct. It was the
 							// latter, alongside a genuinely-unbuilt construct and alongside
 							// `$((1/0))`, which is how one value came to mean both "fatal" and
@@ -859,9 +860,9 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							const std::string_view message =
 								p.argument.empty() ? fallback
 								                   : expand_to_value(p.argument, brace_ctx(ctx));
-							std::fprintf(stderr, "lesh: %.*s: %.*s\n",
-							             static_cast<int>(p.name.size()), p.name.data(),
-							             static_cast<int>(message.size()), message.data());
+							report("%.*s: %.*s",
+							       static_cast<int>(p.name.size()), p.name.data(),
+							       static_cast<int>(message.size()), message.data());
 							// Fatal to a non-interactive shell, whatever `set -u` says:
 							// `${x?}` is the caller ASKING for the shell to stop. Until
 							// this was recorded the message was printed and the command

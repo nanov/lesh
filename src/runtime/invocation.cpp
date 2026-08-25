@@ -114,9 +114,12 @@ invocation parse_invocation(int argc, char** argv) {
 	// default in shell_state is how $0 came to be the string "lesh" for every
 	// invocation that named no command_file (issue #43).
 	//
-	// This is $0 and nothing else. lesh's own diagnostics keep their hardcoded
-	// `lesh: ` prefix, because dash prints its own name there too rather than $0 -
-	// `dash: 0: -c requires an argument`, whatever it was invoked as.
+	// This is $0, and #61 has since split what used to be one question about it.
+	// A COMMAND-LINE diagnostic keeps the hardcoded `lesh: ` prefix, because dash
+	// prints its own name there too rather than $0 - `dash: 0: -c requires an
+	// argument`, whatever it was invoked as - and because there is no $0 yet when
+	// the command line is what failed. A RUNTIME diagnostic now uses $0 and a
+	// position, which is what dash and bash both do; see runtime/diagnostic.h.
 	if (inv.command_name == nullptr && argc > 0)
 		inv.command_name = argv[0];
 	inv.first_argument = i;
