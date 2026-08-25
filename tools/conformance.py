@@ -12,6 +12,31 @@ every case here runs in its own process group and is killed by group.
 
 63 of the 122 POSIX files are signal tests that hang against an incomplete
 shell. They are excluded by default rather than left to time out one by one.
+
+THE SWEEP RUNS THE RELEASE BINARY, and that is a measurement decision rather
+than an impatience. Two reasons, both measured on this machine at `79784ed`:
+
+  - ASan makes it FOURTEEN TIMES SLOWER: 1m56s on release against ~28 minutes on
+    debug. The cost is not the suite. yash's macOS workaround (`run-test.sh`)
+    overrides `kill` with three nested subshells each carrying a `sleep 0` EXIT
+    trap, so a self-sent signal lands predictably - roughly six process spawns per
+    `kill`, and the signal files call `kill` hundreds of times. `sighup2-p.tst`
+    measures 30.3s debug against 3.5s release for the same 180/180. A 28-minute
+    scoreboard gets run rarely and quoted from memory, which is how four tickets
+    on this map ended up with stale headline numbers.
+
+  - The debug score is WRONG BY SIX. ASan intercepts SIGBUS, SIGFPE and SIGSEGV,
+    so the shell reports ABRT where the test expects the signal, and
+    `kill2-p.tst` scores 22/28 on debug against 28/28 on release. The sanitizer
+    is measuring itself. Release is the honest number: 5449/5480 rather than
+    5443/5480, and `kill2-p` is the whole difference - verified per file, nothing
+    else moves.
+
+WHAT STAYS SANITIZED IS THE PART THAT NEEDS IT. `ctest --preset debug` runs the
+unit tests and the differential corpus under ASan/UBSan/LSan, and that is where
+the boundary inputs live - #59, #62 and #63 all found real undefined behaviour
+there, from one-line inputs the conformance suite never sends. This file is a
+SCOREBOARD, not a gate; the gate is still sanitized.
 """
 
 import argparse
@@ -127,7 +152,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="third_party/yash-tests",
                     help="directory holding run-test.sh and the .tst files")
-    ap.add_argument("--shell", default="./build/debug/lesh")
+    # Release by default: see the module docstring. Debug is 14x slower AND scores
+    # six lower, because ASan intercepts the signals kill2-p.tst asserts.
+    ap.add_argument("--shell", default="./build/release/lesh")
     ap.add_argument("--frontend", choices=["legacy", "next"], default="next")
     # 10 seconds was the original default, and it was WRONG: a signal file holds 180
     # cases, each spawning several processes, and takes a few seconds on an idle
@@ -146,6 +173,23 @@ def main() -> int:
         print(f"conformance suite not vendored at {suite}", file=sys.stderr)
         print("this is a scoreboard, not a gate: skipping", file=sys.stderr)
         return 0  # absence is not a failure
+
+    # A missing release binary is SAID rather than silently worked around. Falling
+    # back without a word would hand back a score six lower than the real one and
+    # take fourteen times as long to do it, and the reader would have no way to
+    # know which number they were holding - which is exactly how this project
+    # accumulated four tickets quoting stale figures.
+    shell = Path(args.shell)
+    if not shell.exists():
+        print(f"no shell at {shell}", file=sys.stderr)
+        if shell.parts[-2:] == ("release", "lesh"):
+            print("build it with: cmake --preset release && cmake --build --preset release -j8",
+                  file=sys.stderr)
+            print("(the sweep wants the RELEASE binary: ASan makes debug 14x slower and",
+                  file=sys.stderr)
+            print(" scores it six lower - see this file's docstring. Pass --shell to override.)",
+                  file=sys.stderr)
+        return 2
 
     os.environ["LESH_FRONTEND"] = args.frontend
     # Leak detection off: this measures CONFORMANCE, and leaks are a separate
