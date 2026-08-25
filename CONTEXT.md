@@ -380,7 +380,9 @@ _Avoid_: naming the fd; the topic is what the editor sees.
 Parking every worker at a known-idle point, holding no lock, before the
 loop thread forks — the only thing that makes `fork()` safe in a threaded
 shell, since the child inherits every other thread's held locks frozen.
-Like fish's drain before fork. Resumed after the command is reaped.
+Resumed after the command is reaped. Needed because lesh runs shell code in
+forked children (subshells); fish, which only ever execs, does not park and
+relies on the child touching nothing before exec — lesh does both.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,
