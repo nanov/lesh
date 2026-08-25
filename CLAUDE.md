@@ -40,6 +40,13 @@ process group and kills by group, and it clears the stale `.trs` files that woul
 otherwise be counted as this run's. Six times on this map a runner defect has
 masqueraded as a shell bug, and this is the cheapest one to fall into.
 
+**leshper-only changes need no sweep.** The `lesh` binary does not link
+`lesh_leshper`, so a change confined to `src/leshper/` provably cannot move the
+corpus or the conformance score - iterate with
+`./build/debug/lesh_tests --gtest_filter='Leshper*'` (milliseconds), adding
+`:Grapheme*` when positions or width are involved. The full sanitized gate
+still runs once at merge; the exemption is from the sweeps, not the gate.
+
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered
 baseline. Four tickets on this map have opened with a headline number that was
