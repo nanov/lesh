@@ -80,4 +80,6 @@ tmp.h
 
 # Personal, machine-specific Claude Code settings (absolute paths, account identity)
 .claude/settings.local.json
+.envrc
+.direnv/
 .claude/worktrees/
