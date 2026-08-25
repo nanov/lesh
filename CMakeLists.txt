@@ -158,11 +158,15 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # API when #104 landed, and the highlighter reactor is the client that will call
 # it. Nothing here calls it yet.
 add_library(lesh_leshper STATIC
+	src/leshper/blit.cpp
+	src/leshper/blit.h
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
 	src/leshper/event.h
 	src/leshper/state.h
+	src/leshper/surface.cpp
+	src/leshper/surface.h
 	src/leshper/text.h
 	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
