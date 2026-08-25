@@ -135,6 +135,8 @@ add_library(lesh_runtime STATIC
 	src/runtime/expander.cpp
 	src/runtime/glob.cpp
 	src/runtime/glob.h
+	src/runtime/history_store.cpp
+	src/runtime/history_store.h
 	src/runtime/pattern.cpp
 	src/runtime/pattern.h
 	src/runtime/expander.h
@@ -185,6 +187,7 @@ add_executable(lesh_tests
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
+	tests/unit/history_store_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp
