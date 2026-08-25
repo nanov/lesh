@@ -372,6 +372,27 @@ effects step(state& current, const event& incoming) {
 		// #98 settled the behaviour - Ctrl-C while typing runs the rebindable
 		// `cancel-line` action AND fires the INT trap, the zsh way - but a signal
 		// binding is keymap data like any other, and keymaps are #93's.
+	} else if (const auto* pasted = std::get_if<paste_event>(&incoming)) {
+		// F-6, #111's decoder having already established the wholeness: the
+		// payload lands through the one apply_edit as ONE buffer mutation, ONE
+		// undo entry, ONE generation bump, at the cursor, landing (apply_edit's
+		// default) after the inserted text. A pasted newline rides straight into
+		// `with` as a newline, not Enter - this is a mutation, not a key, so
+		// F-35's accept-or-insert decision never runs.
+		//
+		// Coalescing is broken on BOTH sides, not just before: breaking only
+		// before stops a paste from extending a preceding typing run, but
+		// apply_edit's record() would otherwise leave the history "coalescing"
+		// again afterwards (a paste is shaped like a plain insertion), letting
+		// the next typed character fold into it. A paste is its own undo step,
+		// full stop.
+		current.undo.break_coalescing();
+		apply_edit(current, current.cursor, current.cursor, pasted->text);
+		current.undo.break_coalescing();
+		// Mirrors what self_insert emits (perform(), above): a redraw, plus a
+		// worker request tagged with the generation the mutation just produced.
+		out.push_back(render_request{});
+		out.push_back(worker_request{current.gen});
 	}
 
 	// Pending input is drained before the next real event is read, so a lesh
