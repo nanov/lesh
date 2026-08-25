@@ -209,16 +209,22 @@ int run_stream(ZshParserPlus::Parser& parser, std::istream& in) {
 // `echo_when_verbose` is false for `-c`: POSIX makes `set -v` a property of
 // reading INPUT, and dash prints nothing for `dash -v -c 'echo hi'`.
 int run_next_front_end(std::string_view source, lesh::runtime::shell_state& state,
-                       bool echo_when_verbose = true) {
+                       bool echo_when_verbose = true,
+                       lesh::runtime::script_input* input = nullptr) {
 	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
 	lesh::runtime::tree_walking_executor executor{pool, state};
-	return executor.run_input(source, echo_when_verbose);
+	return executor.run_input(source, echo_when_verbose, input);
 }
 
 // Reads a whole stream. The bytes are still slurped up front - stdin is drained
 // so `read` can share the descriptor with the script (#31) - but they are PARSED
 // one command at a time, which is what makes an alias defined on one line take
 // effect on the next.
+//
+// Slurping is no longer visible to anything else on a SEEKABLE input: the read
+// loop hands the descriptor back at each command boundary, so what the shell
+// holds in memory and what the file offset says are two different questions
+// (#67, and see runtime::script_input).
 std::string read_all(std::istream& in) {
 	std::string out;
 	std::string line;
@@ -300,8 +306,12 @@ int main(int argc, char **argv, char **envp) {
 		// Refusing it outright cost 1,800 conformance assertions: ten of the signal
 		// files run the shell under test as `sh -i` with the case piped in.
 		if (!interactive || !isatty(STDIN_FILENO)) {
+			// Bound BEFORE a byte is read: what it records is where the script
+			// begins, and read_all drains the descriptor to EOF on the next line.
+			// A pipe or a terminal leaves it inert and nothing below changes (#67).
+			lesh::runtime::script_input input{STDIN_FILENO};
 			const std::string source = read_all(std::cin);
-			return run_next_front_end(source, next_state);
+			return run_next_front_end(source, next_state, true, &input);
 		}
 		std::fprintf(stderr, "lesh: LESH_FRONTEND=next has no interactive mode yet\n");
 		return 2;

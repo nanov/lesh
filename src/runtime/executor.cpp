@@ -720,7 +720,63 @@ int tree_walking_executor::run(const tree& t) {
 	return status;
 }
 
-int tree_walking_executor::run_input(std::string_view source, bool echo_when_verbose) {
+// A REGULAR file and nothing else. POSIX confines the rule to a seekable input,
+// and a regular file is the only thing lseek can be trusted to put back: a
+// character device may be seekable and un-rewindable at once, and a shell that
+// tried would lose input rather than hand it back.
+script_input::script_input(int fd) noexcept {
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+		return;
+	const off_t here = lseek(fd, 0, SEEK_CUR);
+	if (here < 0)
+		return;
+	_fd = fd;
+	_origin = here;
+	_device = st.st_dev;
+	_inode = st.st_ino;
+}
+
+bool script_input::still_the_script() noexcept {
+	if (_fd < 0)
+		return false;
+	struct stat st;
+	if (fstat(_fd, &st) == 0 && st.st_dev == _device && st.st_ino == _inode)
+		return true;
+	// `exec < other` displaced the script, or the descriptor was closed. Either
+	// way the shell has no input file to hand anything back to, so it reads on
+	// from the bytes it already holds - which is what it did before #67.
+	_fd = -1;
+	return false;
+}
+
+void script_input::hand_back(size_t consumed) noexcept {
+	if (!still_the_script())
+		return;
+	if (lseek(_fd, _origin + static_cast<off_t>(consumed), SEEK_SET) < 0)
+		_fd = -1;
+}
+
+size_t script_input::resume_at(size_t fallback, size_t limit) noexcept {
+	if (!still_the_script())
+		return fallback;
+	const off_t now = lseek(_fd, 0, SEEK_CUR);
+	if (now < 0) {
+		_fd = -1;
+		return fallback;
+	}
+	// Before the origin means the command rewound past where the shell started
+	// reading; the shell can only re-run what it holds, so it starts over. Past
+	// the end means the file grew after it was read: the shell runs the script it
+	// was GIVEN, so that is end of input either way.
+	if (now < _origin)
+		return 0;
+	const size_t moved = static_cast<size_t>(now - _origin);
+	return moved > limit ? limit : moved;
+}
+
+int tree_walking_executor::run_input(std::string_view source, bool echo_when_verbose,
+                                     script_input* input) {
 	int status = _state.last_status();
 	size_t at = 0;
 	while (at < source.size()) {
@@ -731,6 +787,10 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		// with one whole-input parse it held for free.
 		_input_trees.push_back(syntax::parse_next_command(_pool, source, at, &_state));
 		echo_if_verbose(source.substr(from, at - from), echo_when_verbose);
+		// BEFORE the command runs, not after: the whole point is that a command
+		// reading fd 0 finds it positioned at the byte after itself (#67).
+		if (input != nullptr)
+			input->hand_back(at);
 		status = run_parsed(_input_trees.back());
 		// THIS is the prompt an interrupted command returns to (#52). Clearing the
 		// unwind here and not in run_parsed is what makes the interrupt travel out of
@@ -746,6 +806,12 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		// the function or script it was in decides. Only THIS loop reads it.
 		if (_exit_requested || _input_ended)
 			break;
+		// And the command may have read some of what it was handed: `read a` takes
+		// the next line, `cat` takes the rest of the file. Where it left the
+		// descriptor is where the shell reads on from - which is how a pipeline is
+		// fed its own following lines instead of executing them.
+		if (input != nullptr)
+			at = input->resume_at(at, source.size());
 	}
 	int from_trap = 0;
 	if (run_exit_trap(from_trap))

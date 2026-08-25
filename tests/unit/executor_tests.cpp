@@ -16,6 +16,7 @@
 #include <string_view>
 #include <tuple>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace lesh::runtime;
@@ -1371,4 +1372,183 @@ TEST_F(ExecutorTest, ADigitRunTooLargeToBeAFileDescriptorIsAnOrdinaryWord) {
 	// A run that CAN be a descriptor still is one: `9>` opens fd 9 and leaves
 	// stdout alone.
 	EXPECT_EQ(capture("echo three 9>/dev/null"), "three\n");
+}
+
+namespace {
+
+// A script presented the way `sh < script` and the yash harness present one: on
+// FILE DESCRIPTOR ZERO, as a seekable regular file. See issue #67.
+//
+// The descriptor is the whole subject here, so these cannot go through
+// ExecutorTest::run - that parses a string with no input file behind it, and
+// every assertion below is about how much of the file the shell consumed. A pipe
+// would assert the opposite behaviour and is covered separately.
+class ScriptOnFdZeroTest : public ::testing::Test {
+protected:
+	lesh::buffer_pool pool{1024 * 64};
+	shell_state state;
+	lesh::testing::temp_path scratch;
+
+	struct outcome {
+		std::string output;
+		off_t left_at = -1;  // where the shell left fd 0
+		int status = 0;
+	};
+
+	// Runs `text` as the shell's own input, from a regular file on fd 0.
+	//
+	// fd 1 is redirected at the PROCESS level rather than by wrapping the source
+	// in `{ ...; } > file` the way ExecutorTest::capture does: every assertion
+	// here counts bytes of the script, and a wrapper would move all of them.
+	outcome run_script(std::string_view text) {
+		const std::string in_path = scratch.file("script.sh");
+		const std::string out_path = scratch.file("script.out");
+		{
+			std::ofstream f{in_path};
+			f << text;
+		}
+
+		const int saved_in = ::dup(STDIN_FILENO);
+		const int saved_out = ::dup(STDOUT_FILENO);
+		const int in_fd = ::open(in_path.c_str(), O_RDONLY);
+		const int out_fd = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		EXPECT_GE(in_fd, 0);
+		EXPECT_GE(out_fd, 0);
+		::dup2(in_fd, STDIN_FILENO);
+		::dup2(out_fd, STDOUT_FILENO);
+		::close(in_fd);
+		::close(out_fd);
+
+		outcome result;
+		{
+			// Bound before a byte is read, exactly as main() binds it.
+			script_input input{STDIN_FILENO};
+			std::string source;
+			for (;;) {
+				char chunk[512];
+				const ssize_t got = ::read(STDIN_FILENO, chunk, sizeof(chunk));
+				if (got <= 0)
+					break;
+				source.append(chunk, static_cast<size_t>(got));
+			}
+			tree_walking_executor ex{pool, state};
+			result.status = ex.run_input(source, false, &input);
+			result.left_at = ::lseek(STDIN_FILENO, 0, SEEK_CUR);
+		}
+
+		std::fflush(nullptr);
+		::dup2(saved_in, STDIN_FILENO);
+		::dup2(saved_out, STDOUT_FILENO);
+		::close(saved_in);
+		::close(saved_out);
+
+		std::ifstream out{out_path};
+		result.output.assign(std::istreambuf_iterator<char>{out},
+		                     std::istreambuf_iterator<char>{});
+		return result;
+	}
+};
+
+} // namespace
+
+TEST_F(ScriptOnFdZeroTest, ReadTakesTheLineAfterTheCommandThatAskedForIt) {
+	// The shell holds the whole file in memory, but the OFFSET says it has
+	// consumed only `read x` - so `read` gets the line under it, and the shell
+	// resumes after what `read` took rather than running it.
+	const outcome got = run_script("read x\nhello\necho \"[${x-unset}]\"\n");
+	EXPECT_EQ(got.output, "[hello]\n");
+}
+
+TEST_F(ScriptOnFdZeroTest, AnExternalCommandIsFedTheLinesUnderItRatherThanRunningThem) {
+	// pipeline-p.tst's 'stdin for first command & stdout for last are not
+	// modified', reduced: `foo` and `bar` used to be EXECUTED, because the shell
+	// had already swallowed the pipeline's own data.
+	const outcome got = run_script("/bin/cat\nfoo\nbar\n");
+	EXPECT_EQ(got.output, "foo\nbar\n");
+	EXPECT_EQ(got.status, 0);
+}
+
+TEST_F(ScriptOnFdZeroTest, TheDescriptorIsLeftAtTheEndOfTheLastCommandRead) {
+	// `exit` stops the read loop, and what is left on the descriptor is everything
+	// the shell did not read - which is the assertion POSIX 1.4 makes directly.
+	const outcome got = run_script("echo one\nexit\necho three\n");
+	EXPECT_EQ(got.output, "one\n");
+	EXPECT_EQ(got.left_at, static_cast<off_t>(std::string_view{"echo one\nexit\n"}.size()));
+}
+
+TEST_F(ScriptOnFdZeroTest, AHereDocumentBodyBelongsToTheCommandThatOwnsIt) {
+	// THE CONSTRAINT MOST LIKELY TO BREAK (#21). The parser collects a body as a
+	// RANGE of the source, which works only because the whole source is in front of
+	// it; a reader that handed the parser one line at a time would have nothing to
+	// collect. Here the body is consumed by the PARSER and the line after the
+	// terminator by `read`, and the two must not overlap in either direction.
+	const outcome got = run_script("/bin/cat <<EOF\nin the body\nEOF\n"
+	                               "read x\ndata line\necho \"[${x-unset}]\"\n");
+	EXPECT_EQ(got.output, "in the body\n[data line]\n");
+}
+
+TEST_F(ScriptOnFdZeroTest, ACompoundCommandSpanningLinesLeavesTheLineAfterItUnread) {
+	const outcome got = run_script("for i in 1 2\ndo\n\techo \"loop $i\"\ndone\n"
+	                               "read x\ndata line\necho \"[${x-unset}]\"\n");
+	EXPECT_EQ(got.output, "loop 1\nloop 2\n[data line]\n");
+}
+
+TEST_F(ScriptOnFdZeroTest, AnAliasDefinedOnOneLineIsInEffectOnTheNext) {
+	// #40's assertion, re-made through the descriptor: reading a command at a time
+	// is what makes it true, and #67 must not have quietly widened the unit.
+	const outcome got = run_script("alias e='echo aliased'\ne\n");
+	EXPECT_EQ(got.output, "aliased\n");
+}
+
+TEST(ScriptInputTest, ANonSeekableDescriptorLeavesTheShellReadingAhead) {
+	// A pipe cannot be un-read, so POSIX permits the over-read and lesh keeps it.
+	// Asserted rather than assumed: this is the path that must NOT change, and
+	// nothing else in either corpus can tell an inert script_input apart from a
+	// working one that happened to agree.
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(fds), 0);
+	script_input input{fds[0]};
+	input.hand_back(0);
+	EXPECT_EQ(input.resume_at(11, 100), 11u) << "a pipe must fall back to the parsed position";
+	::close(fds[0]);
+	::close(fds[1]);
+}
+
+TEST(ScriptInputTest, ADescriptorThatIsNoLongerTheScriptStopsBeingTracked) {
+	// `exec < other` inside a script displaces fd 0. An offset read back from a
+	// DIFFERENT file and measured against this origin would send the shell to an
+	// arbitrary point in its own source, so the identity is checked rather than
+	// assumed - that failure would look like a parser bug.
+	lesh::testing::temp_path scratch;
+	const std::string first = scratch.file("a.sh");
+	const std::string second = scratch.file("b.sh");
+	{ std::ofstream f{first}; f << "echo a\necho a\n"; }
+	{ std::ofstream f{second}; f << "wholly different content here\n"; }
+
+	const int fd = ::open(first.c_str(), O_RDONLY);
+	ASSERT_GE(fd, 0);
+	script_input input{fd};
+	EXPECT_EQ(input.resume_at(99, 100), 0u) << "an untouched script sits at its origin";
+
+	const int other = ::open(second.c_str(), O_RDONLY);
+	ASSERT_GE(other, 0);
+	::dup2(other, fd);
+	::close(other);
+	EXPECT_EQ(input.resume_at(7, 100), 7u) << "a displaced descriptor falls back";
+	::close(fd);
+}
+
+TEST(ScriptInputTest, AnOffsetPastTheEndOfWhatWasReadIsEndOfInput) {
+	// The file may have grown since the shell read it. The shell runs the script it
+	// was GIVEN, so anything past the end of what it holds is end of input rather
+	// than an index nothing backs.
+	lesh::testing::temp_path scratch;
+	const std::string path = scratch.file("grown.sh");
+	{ std::ofstream f{path}; f << "0123456789"; }
+	const int fd = ::open(path.c_str(), O_RDONLY);
+	ASSERT_GE(fd, 0);
+	script_input input{fd};
+	input.hand_back(10);
+	EXPECT_EQ(input.resume_at(0, 4), 4u);
+	::close(fd);
 }

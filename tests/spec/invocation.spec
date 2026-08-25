@@ -109,3 +109,125 @@ EOF
 d=$(mktemp -d); "$TESTEE" $d/no_such_file 2>/dev/null; echo "status=$?"
 === expect
 status=127
+
+# HOW MUCH INPUT THE SHELL CONSUMES (issue #67).
+#
+# POSIX 1.4, "Input Files": when a shell's input is a SEEKABLE regular file, the
+# shell shall not consume more of it than the command it is about to run needs,
+# so that a command reading fd 0 gets the bytes that follow. Over-reading a PIPE
+# is expressly permitted, because a pipe cannot be un-read.
+#
+# ADR-0001 CANNOT SETTLE THIS ONE. dash over-reads and so does zsh; bash and yash
+# implement the rule. Every case below that dash fails is therefore a divergence
+# carrying its own expectation, argued from POSIX and from bash and yash - not a
+# gap where dash was consulted and agreed.
+#
+# The seekable path is reached by re-invoking `$TESTEE` with its standard input
+# redirected FROM A FILE, which is what the yash harness does and is the whole
+# reason its input-p.tst could see this. A `[stdin]` case here would be a pipe
+# and would assert the opposite.
+
+--- a seekable script is consumed a command at a time, so read takes the line after it [divergence: dash and zsh read ahead and lose the line; bash and yash consume only what the command needs (input-p.tst's 'no input more than needed is read')]
+d=$(mktemp -d); printf 'read x\nhello\necho "[${x-unset}]"\n' > $d/s; "$TESTEE" < $d/s
+=== expect
+[hello]
+
+--- a pipeline reading a seekable script's own following lines gets them as data [divergence: dash and zsh swallow the data and then execute it; bash and yash feed it to the pipeline (pipeline-p.tst's 'stdin for first command & stdout for last are not modified')]
+d=$(mktemp -d); printf 'cat | tail -n 1\nfoo\nbar\n' > $d/s; "$TESTEE" < $d/s
+=== expect
+bar
+
+--- a nested shell reading fd 0 consumes exactly its own line of the outer script [divergence: dash and zsh let the nested shell run past its line; bash and yash stop at it (input-p.tst's 'no input more than needed is read')]
+d=$(mktemp -d)
+cat > $d/s <<'END'
+"$TESTEE" -c 'read -r line && printf "%s\n" "$line"'
+echo - read by the nested shell and printed by printf
+echo - read and executed by the outer shell
+END
+"$TESTEE" < $d/s
+=== expect
+echo - read by the nested shell and printed by printf
+- read and executed by the outer shell
+
+--- a here-document body is collected from the seekable script and the line after it still runs [xfail(legacy): legacy has no here-documents]
+d=$(mktemp -d)
+cat > $d/s <<'END'
+cat <<EOF
+body one
+body two
+EOF
+echo after
+END
+"$TESTEE" < $d/s
+
+--- a command reading fd 0 after a here-document gets the line following the whole construct [divergence: dash and zsh have already read it; bash and yash have not (the here-document body is consumed by the parser, the data line by read)]
+d=$(mktemp -d)
+cat > $d/s <<'END'
+cat <<EOF
+in the body
+EOF
+read x
+data line
+echo "[${x-unset}]"
+END
+"$TESTEE" < $d/s
+=== expect
+in the body
+[data line]
+
+--- a compound command spanning several lines of a seekable script leaves the next line unread [divergence: dash and zsh have already consumed the data line; bash and yash have not]
+d=$(mktemp -d)
+cat > $d/s <<'END'
+for i in 1 2
+do
+	echo "loop $i"
+done
+read x
+data line
+echo "[${x-unset}]"
+END
+"$TESTEE" < $d/s
+=== expect
+loop 1
+loop 2
+[data line]
+
+--- an alias defined on one line of a seekable script is in effect on the next [xfail(legacy): legacy's alias model differs]
+d=$(mktemp -d); printf 'alias f=:\nf\n' > $d/s; "$TESTEE" < $d/s; echo "[$?]"
+
+--- eval re-entering the front end does not disturb the outer script's position [divergence: dash and zsh have already consumed the data line; bash and yash have not]
+d=$(mktemp -d)
+cat > $d/s <<'END'
+eval 'read x
+echo "[${x-unset}]"'
+data line
+echo tail
+END
+"$TESTEE" < $d/s
+=== expect
+[data line]
+tail
+
+--- a dot script re-entering the front end does not disturb the outer script's position [divergence: dash and zsh have already consumed the data line; bash and yash have not]
+d=$(mktemp -d)
+printf 'read y\necho "[${y-unset}]"\n' > $d/lib
+printf '. %s/lib\ndata line\necho tail\n' "$d" > $d/s
+"$TESTEE" < $d/s
+=== expect
+[data line]
+tail
+
+# The other half of the rule, and the half that must NOT change: a PIPE cannot be
+# un-read, so POSIX lets the shell buffer ahead of itself there and dash agrees.
+# These are ordinary differential cases for that reason - if the fix for the
+# seekable path leaked into the non-seekable one, they would start failing.
+
+--- input from a pipe is not seekable, so the shell may read past the command it runs [stdin] [xfail(legacy): legacy never expands a parameter inside double quotes]
+read x
+data line
+echo "[${x-unset}]"
+
+--- a pipeline's following lines on a pipe are not data for it [stdin]
+cat | tail -n 1
+foo
+bar

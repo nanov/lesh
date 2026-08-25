@@ -14,6 +14,71 @@
 
 namespace lesh::runtime {
 
+// How much of its own input the shell is allowed to keep. See issue #67.
+//
+// POSIX 1.4, "Input Files": when a shell's input is a SEEKABLE file, the shell
+// shall not consume more of it than the command it is about to run needs. That
+// is not a quality-of-implementation note - four assertions turn on it. A
+// command reading fd 0 must get the bytes that FOLLOW it, so `read a` takes the
+// next line and `cat | tail -n 1` is fed the lines under it rather than watching
+// the shell swallow them and then try to EXECUTE them.
+//
+// THE SHELL STILL BUFFERS THE WHOLE FILE, and that is deliberate. Spans are
+// offsets into one contiguous source, and #21 has the parser collect a
+// here-document body as a RANGE of that source precisely so the lexer never
+// reads and never seeks; handing the parser a line at a time would break both.
+// What is restored instead is the only thing any other reader of the descriptor
+// can observe - the FILE OFFSET, put back to the end of the command about to run
+// and picked up again afterwards, because the command may have read some itself.
+// Granularity of CONSUMPTION therefore lives in the read loop, and the front end
+// is untouched.
+//
+// A NON-SEEKABLE input - a pipe, a terminal, a socket - leaves this inert, and
+// the shell reads ahead exactly as it did before. That is not a gap: POSIX
+// permits it, for the reason that a pipe cannot be un-read. The path is explicit
+// rather than accidental, so `printf 'read x\ndata\n' | lesh` and
+// `lesh < script` are two documented behaviours rather than one that happens to
+// depend on what fstat said.
+//
+// dash and zsh do not implement any of this; bash and yash do. ADR-0001 makes
+// dash authoritative for the POSIX floor and this is the case it cannot settle,
+// so the argument is POSIX plus the two shells that follow it.
+class script_input {
+public:
+	// Binds to `fd` if the shell may hand input back on it. Must be constructed
+	// BEFORE a byte is read, because the offset it records is where the script
+	// begins - the shell reads to EOF immediately afterwards.
+	explicit script_input(int fd) noexcept;
+
+	// Puts back everything from `consumed` on, so the command about to run reads
+	// the bytes after itself. Nothing is written and nothing is re-read: the
+	// bytes are already in memory and only the offset moves.
+	void hand_back(size_t consumed) noexcept;
+
+	// Where the command that just ran left the descriptor, as an offset into the
+	// source. `fallback` - the position the shell parsed up to - is returned
+	// whenever the descriptor cannot answer, which is what keeps a non-seekable
+	// input on the old path.
+	[[nodiscard]] size_t resume_at(size_t fallback, size_t limit) noexcept;
+
+private:
+	// -1 once the input is known not to be seekable, or once it has stopped being
+	// the file the script came from. One field for both, because the shell's
+	// answer to either is the same: stop tracking and read on from memory.
+	int _fd = -1;
+	off_t _origin = 0;
+	// Which file the script arrived on. A script may run `exec < other`, and an
+	// offset read back from THAT file measured against this origin would send the
+	// shell to an arbitrary point in its own source. Checked rather than assumed:
+	// the failure would be silent and would look like a parser bug.
+	dev_t _device = 0;
+	ino_t _inode = 0;
+
+	// True while fd still refers to the file the script was read from. Latches
+	// the descriptor closed when it does not, so the question is asked once.
+	[[nodiscard]] bool still_the_script() noexcept;
+};
+
 // Runs a parse tree. See issues #12 and #18.
 //
 // AN INTERFACE, so the back end stays a genuine choice. A tree-walking
@@ -47,7 +112,13 @@ public:
 	//
 	// Takes the source rather than a tree, because it does the parsing itself: it
 	// is the read loop, and the trees it produces have to outlive it.
-	[[nodiscard]] int run_input(std::string_view source, bool echo_when_verbose = true);
+	//
+	// `input`, when given, is the descriptor the source was read from, and this
+	// loop is where the shell hands back what it has not run (#67). Null for
+	// `-c`, which has no input file, and for a script named as an operand, whose
+	// descriptor nothing else shares.
+	[[nodiscard]] int run_input(std::string_view source, bool echo_when_verbose = true,
+	                            script_input* input = nullptr);
 
 	// The port the expander takes (#11). The executor supplies it, rather than the
 	// expander depending on the executor - which is what breaks the cycle every
