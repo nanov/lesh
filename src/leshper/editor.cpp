@@ -302,6 +302,13 @@ action binding_for(const key_event& key) noexcept {
 			return action::beginning_of_line;
 		case named_key::end:
 			return action::end_of_line;
+		// The rest of the #97 floor's repertoire, which #111's decoder now
+		// produces and this placeholder table binds to nothing. Deliberately a
+		// default rather than eighteen cases returning action::none: the table is
+		// #93's to replace, and enumerating keys here would be writing the keymap
+		// this file exists to stand in for.
+		default:
+			break;
 		}
 		return action::none;
 	}
