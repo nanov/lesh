@@ -197,6 +197,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/effect.h
 	src/leshper/layout.cpp
 	src/leshper/layout.h
+	src/leshper/tty.cpp
+	src/leshper/tty.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
 	src/leshper/event.h
