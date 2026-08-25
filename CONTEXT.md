@@ -384,15 +384,19 @@ Resumed after the command is reaped. Needed because lesh runs shell code in
 forked children (subshells); fish, which only ever execs, does not park and
 relies on the child touching nothing before exec — lesh does both.
 
-**Definitions version** _[lesh]_:
-The immutable, refcounted snapshot of what a worker may ask the shell —
-`$PATH`, function names, alias names. The loop mutates by copy-on-write and
-swaps the pointer; a request holds the version it was submitted against, so
-holding the pointer is the claim and a later mutation can only make the
-request stale, never unsafe. fish's environment snapshot, applied to all
-three tables.
-_Avoid_: concurrent collections for this — they make one lookup safe, not
-one computation's set of lookups consistent.
+**Shell thread** _[lesh]_:
+The main thread: the one owner of shell state. Executes at accept; while a
+line is edited it serves three latest-wins slots — `execute`, `port_call`,
+`highlight` — one at a time, so a writing action and a reading highlighter
+never overlap. Everything else in the process is stateless or owns only
+editor state.
+_Avoid_: reading shell state from any other thread; a definitions version or
+concurrent collection for it — one owner makes both unnecessary (ADR-0009).
+
+**Loop thread** _[lesh]_:
+leshper's spawned thread: owns editor state and the tty while editing, waits in
+`poll` on its topics, blocks across execution, and drops any shell-thread
+message whose generation is not current.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,
