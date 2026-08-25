@@ -236,6 +236,48 @@ TEST(LeshperHighlight, ExpansionsAndSubstitutionsArePaintedByKind) {
 	EXPECT_TRUE(fixture.has(line, "~", "expansion.tilde"));
 }
 
+TEST(LeshperHighlight, AnAssignmentsValueIsLexedTheWayTheExecutorLexesIt) {
+	// POSIX 2.6.1 confines the after-a-colon tilde to assignments, which is the
+	// whole of what lex_mode::assignment_interior is for. Painted as a plain word
+	// interior, `PATH=~/a:~/b` gets its first tilde and calls the second literal
+	// text - the paint and the execution disagreeing about the same bytes.
+	highlight_fixture fixture;
+	const std::vector<std::pair<std::string, std::string>> want = {
+		{"~", "expansion.tilde"},
+		{"~", "expansion.tilde"},
+	};
+	EXPECT_EQ(fixture.painted("PATH=~/a:~/b"), want);
+	EXPECT_TRUE(fixture.has("x=~/a", "~", "expansion.tilde"));
+
+	// And the name half is a NAME, not a construct, so nothing paints it.
+	for (const auto& [bytes, style] : fixture.painted("PATH=~/a:~/b"))
+		EXPECT_EQ(bytes, "~") << "painted " << style << " over the name";
+}
+
+TEST(LeshperHighlight, TheAfterColonTildeIsAnAssignmentsAloneAndNotAnArguments) {
+	// The mirror of the test above, and the reason the mode has to come from the
+	// tree rather than from the bytes: `x=~/a` and `echo x=~/a` are the same
+	// bytes, and a tilde is eligible in exactly one of them. Only the parser
+	// knows which - #95's probe is the standing reminder of what re-deriving a
+	// role from the bytes costs.
+	highlight_fixture fixture;
+	EXPECT_FALSE(fixture.any_of_style("echo PATH=~/a:~/b", "expansion.tilde"));
+	EXPECT_FALSE(fixture.any_of_style("echo x=~/a", "expansion.tilde"));
+	// A leading tilde in an argument is still a tilde-prefix, which is the case
+	// that would break if this had been done by suppressing tildes in arguments.
+	EXPECT_TRUE(fixture.has("echo ~/a", "~", "expansion.tilde"));
+}
+
+TEST(LeshperHighlight, AnAssignmentsValueStillPaintsItsQuotingAndExpansions) {
+	// The mode change must not have cost the ordinary cases.
+	highlight_fixture fixture;
+	const std::string_view line = "x='a'\"b $y\"$(sh -c ls)";
+	EXPECT_TRUE(fixture.has(line, "'a'", "string.single"));
+	EXPECT_TRUE(fixture.has(line, "\"b $y\"", "string.double"));
+	EXPECT_TRUE(fixture.has(line, "$y", "expansion.parameter"));
+	EXPECT_TRUE(fixture.has(line, "$(sh -c ls)", "expansion.command"));
+}
+
 TEST(LeshperHighlight, ExpansionsInsideDoubleQuotesStillPaint) {
 	// A single quote inside double quotes is an ordinary byte, so the interior
 	// has to be re-lexed in the right mode; lexed as a plain word interior,

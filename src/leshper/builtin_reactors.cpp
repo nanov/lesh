@@ -111,6 +111,32 @@ namespace {
 
 using lesh::leshper::highlighter;
 
+// A run of arena bytes that knows whether it came from the arena's MALLOC
+// FALLBACK and is therefore its own to release - arena_array's rule, one layer
+// up, and the one LeakSanitizer found the hard way when a pool was small enough
+// to overflow. From the arena in the ordinary case, which is what "zero heap on
+// the compute path" means.
+class arena_block {
+public:
+	arena_block(buffer_pool& pool, std::size_t bytes) noexcept {
+		if (bytes != 0)
+			_pooled = pool.allocate(bytes, _data, 1);
+	}
+	~arena_block() noexcept {
+		if (!_pooled && _data != nullptr)
+			std::free(_data);
+	}
+
+	arena_block(const arena_block&) = delete;
+	arena_block& operator=(const arena_block&) = delete;
+
+	[[nodiscard]] char* data() const noexcept { return _data; }
+
+private:
+	char* _data = nullptr;
+	bool _pooled = true;
+};
+
 // --- The one filesystem question F-22 exists to keep off the input path ------
 
 bool is_executable_file(const char* path) noexcept {
@@ -153,10 +179,15 @@ bool is_executable_file(const char* path) noexcept {
 // completion will stand on (#95).
 class painter {
 public:
-	painter(lesh_request* request, const tree& parsed, const highlighter& styles) noexcept
-		: _request(request), _tree(&parsed), _source(parsed.source()), _styles(&styles) {}
+	// `is_assignment` is one byte per token, from the arena, or nullptr when
+	// there are no tokens. See mark_assignments.
+	painter(lesh_request* request, const tree& parsed, const highlighter& styles,
+	        char* is_assignment) noexcept
+		: _request(request), _tree(&parsed), _source(parsed.source()), _styles(&styles),
+		  _is_assignment(is_assignment) {}
 
 	std::int32_t run() noexcept {
+		mark_assignments();
 		std::int32_t status = paint_tokens();
 		if (status != LESH_OK)
 			return status;
@@ -173,6 +204,33 @@ private:
 	const tree* _tree;
 	std::string_view _source;
 	const highlighter* _styles;
+	char* _is_assignment;
+
+	// WHICH WORD TOKENS ARE AN ASSIGNMENT'S, asked of the tree rather than
+	// re-derived from the bytes.
+	//
+	// The segment sweep is over TOKENS, because that is what makes it
+	// outer-before-inner across `$(...)` for free, and a token does not know
+	// where the grammar put it. `x=~/a` and `echo x=~/a` are the same bytes and
+	// the tilde is eligible in exactly one of them - only the parser knows which,
+	// and #95's probe is the standing reminder of what re-deriving a role from
+	// the bytes costs. So the node array is asked once, here, and the answer is
+	// one byte per token in the arena.
+	//
+	// An assignment is exactly ONE word token (parser.cpp's word_node), so this
+	// is a single store per assignment rather than a range.
+	void mark_assignments() const noexcept {
+		if (_is_assignment == nullptr)
+			return;
+		const std::size_t tokens = _tree->token_count();
+		std::memset(_is_assignment, 0, tokens);
+		const std::size_t nodes = _tree->node_count();
+		for (std::uint32_t i = 0; i < nodes; ++i) {
+			const node& n = (*_tree)[i];
+			if (n.kind == node_kind::assignment && n.first_token < tokens)
+				_is_assignment[n.first_token] = 1;
+		}
+	}
 
 	// The cooperative poll (ADR-0008). Not checking would be safe - the loop
 	// drops a stale batch either way - it would just waste the worker on a line
@@ -278,15 +336,29 @@ private:
 			}
 			if (t.kind != token_kind::word)
 				continue;
-			// word_interior for every word, including an assignment's value. The
-			// expander uses assignment_interior there, whose one difference is
-			// that a `~` after an unquoted `:` is a tilde-prefix too - so
-			// `PATH=~/a:~/b` paints its second tilde as literal text. Recorded
-			// rather than fixed: the difference needs the word's NODE, and this
-			// sweep is over tokens because that is what makes it outer-before-
-			// inner across `$(...)` for free.
-			paint_segments(_source.substr(t.offset, t.length), t.offset,
-			               lex_mode::word_interior, 0);
+			const std::string_view text = _source.substr(t.offset, t.length);
+			// AN ASSIGNMENT'S VALUE IS LEXED THE WAY THE EXECUTOR LEXES IT, and
+			// the split is the same one: `text.substr(eq + 1)` through
+			// assignment_interior (executor.cpp's expand_value call, and
+			// value_context::assignment beside it). The one lexical difference
+			// that buys is POSIX 2.6.1's: a `~` after an unquoted `:` is a
+			// tilde-prefix too, so `PATH=~/bin:~/sbin` paints BOTH tildes, which
+			// is what the shell will expand. Lexed as a plain word interior it
+			// painted the first and called the second literal text - the paint
+			// and the execution disagreeing about the same bytes, which is the
+			// C-5 bug class in miniature.
+			//
+			// The name half carries no style: `PATH` is a NAME, not a construct.
+			const std::size_t eq =
+				(_is_assignment != nullptr && _is_assignment[i] != 0)
+					? text.find('=')
+					: std::string_view::npos;
+			if (eq != std::string_view::npos)
+				paint_segments(text.substr(eq + 1),
+				               t.offset + static_cast<std::uint32_t>(eq) + 1,
+				               lex_mode::assignment_interior, 0);
+			else
+				paint_segments(text, t.offset, lex_mode::word_interior, 0);
 		}
 		return superseded() ? LESH_ERR_SUPERSEDED : LESH_OK;
 	}
@@ -450,35 +522,30 @@ std::int32_t highlight(lesh_request* request, void* userdata) {
 	// The snapshot, copied out of the token into the arena. No accessor lends a
 	// pointer - the WASM insurance ADR-0006 bought - so the copy is the contract
 	// and not an inefficiency, and the arena is where it belongs.
-	char* bytes = nullptr;
-	bool pooled = true;
+	//
+	// Declared before the tree so that it OUTLIVES it: the tree's spans and its
+	// source() view point in here.
+	const arena_block snapshot(self->pool, length);
 	if (length != 0) {
-		pooled = self->pool.allocate(length, bytes, 1);
-		if (bytes == nullptr)
+		if (snapshot.data() == nullptr)
 			return LESH_ERR_TOOSMALL;
 		std::size_t written = 0;
-		status = lesh_request_buffer(request, bytes, length, &written);
-		if (status != LESH_OK) {
-			if (!pooled)
-				std::free(bytes);
+		status = lesh_request_buffer(request, snapshot.data(), length, &written);
+		if (status != LESH_OK)
 			return status;
-		}
 		length = written;
 	}
 
-	const std::string_view source{bytes == nullptr ? "" : bytes, length};
-	{
-		// THE HIGHLIGHT PARSE PASSES NO ALIAS TABLE, which is parse()'s default
-		// and #95's whole finding: with a table, `alias e='echo '` puts the
-		// substituted tokens in a text region and the `e` the user typed is
-		// covered by no token at all. The painter paints what was typed.
-		const tree parsed = parse(self->pool, source);
-		painter paint{request, parsed, *self};
-		status = paint.run();
-	}
-	if (!pooled)
-		std::free(bytes);
-	return status;
+	const std::string_view source{snapshot.data() == nullptr ? "" : snapshot.data(),
+	                              length};
+	// THE HIGHLIGHT PARSE PASSES NO ALIAS TABLE, which is parse()'s default and
+	// #95's whole finding: with a table, `alias e='echo '` puts the substituted
+	// tokens in a text region and the `e` the user typed is covered by no token
+	// at all. The painter paints what was typed.
+	const tree parsed = parse(self->pool, source);
+	const arena_block assignments(self->pool, parsed.token_count());
+	painter paint{request, parsed, *self, assignments.data()};
+	return paint.run();
 }
 
 struct style_slot {
