@@ -35,6 +35,26 @@ enum class control_flow {
 	interrupted,
 };
 
+// WHICH INPUT A COMMAND LOOP IS READING (#74).
+//
+// The shell reads commands in exactly two situations - its own input, and a
+// nested source an `eval`, a `.`, a trap body or a command substitution handed
+// it - and the loop is the SAME loop for both. Every guard it applies is shared:
+// the syntax-error exit, `set -n`, pending traps, the interrupt unwind, `set -e`.
+//
+// One rule is not, and this enum exists to carry exactly that one. A `return`,
+// `break` or `continue` that escapes every construct around it ENDS the shell's
+// own input - dash and zsh both stop there - whereas out of an `eval` it must
+// TRAVEL, because `eval return` inside a function returns from the function
+// (return-p.tst's 'returning out of eval'). One flag, named, beats two loops that
+// drift: the copy this replaced went without `run_pending_traps` for its whole
+// life, and the moment #67 routed a command substitution through it that cost
+// fifteen signal files three assertions each.
+enum class source_kind : uint8_t {
+	shell_input, // the shell's own input: an escaping unwind ends it
+	nested,      // an `eval` operand, a dot script, a trap body, a substituted body
+};
+
 // WHICH OF POSIX XCU 2.8.1'S ERROR CLASSES A NON-ZERO STATUS BELONGS TO (#66).
 //
 // That table is what makes a special builtin's failure fatal to a non-interactive

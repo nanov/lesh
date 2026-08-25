@@ -1003,6 +1003,73 @@ TEST_F(ExecutorTest, EvalIsNotAReturnBoundary) {
 	          "after\n");
 }
 
+// --- `eval` and `.` read through the SAME loop the top level does (#74) -------
+//
+// run_source carried a second copy of run_parsed's command loop. A copy drifts:
+// `run_pending_traps` was missing from it for its whole life and cost fifteen
+// signal files three assertions each the moment #67 routed a command
+// substitution through it. These assert the guards that were still missing when
+// the two were merged, one per guard, so a future divergence names itself.
+
+TEST_F(ExecutorTest, ErrexitInsideANestedSourceStopsIt) {
+	// `set -e` is run_parsed's guard and run_source never had it, so a failing
+	// command inside an `eval` ran the rest of the operand AND the rest of the
+	// script. dash and bash both stop at the `false`.
+	EXPECT_EQ(capture("set -e; eval 'false\necho in'; echo after"), "");
+	EXPECT_EQ(run("set -e; eval 'false\necho in'; echo after"), 1);
+	// The same path, entered by `.` rather than by `eval`.
+	const std::string script = scratch.file("errexit_dot.sh");
+	{
+		std::ofstream out{script};
+		out << "false\necho in\n";
+	}
+	EXPECT_EQ(capture("set -e; . " + script + "; echo after"), "");
+	std::remove(script.c_str());
+	// And a command whose failure is EXEMPT stays exempt through the eval, which is
+	// the half a bare `if (status != 0)` would have got wrong.
+	EXPECT_EQ(capture("set -e; eval 'false || true\necho in'; echo after"),
+	          "in\nafter\n");
+}
+
+// `set -n` reads and parses without executing. Set from INSIDE an `eval` it
+// stopped nothing, because the loop that tests it was the other one.
+//
+// One assertion per test, and not for tidiness: `set -n` is shell state, so a
+// second assertion in the same fixture starts with the option already on and
+// passes without ever reaching the code under test.
+//
+// The eval's own operand carries BOTH commands, so what is asserted is
+// run_source's loop rather than the top level's. `capture` wraps its argument in
+// a brace group, whose list has no `-n` test of its own - dash stops there too,
+// which is a third copy of this guard and a defect of its own.
+TEST_F(ExecutorTest, NoexecSetInsideAnEvalStopsTheRestOfThatEval) {
+	EXPECT_EQ(capture("eval 'set -n\necho in'"), "");
+}
+
+TEST_F(ExecutorTest, NoexecStillParses) {
+	// A syntax error under `-n` is still an error, which is what makes `sh -n` a
+	// checker rather than a no-op.
+	EXPECT_EQ(run("eval 'set -n\nif' 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, ASyntaxErrorInANestedSourceStillReportsTwo) {
+	// The status is run_parsed's return value and not `$?`: a syntax error is
+	// diagnosed BEFORE any command in the unit set a status, so re-reading the
+	// state would report whatever ran before the `eval`.
+	EXPECT_EQ(run("true; eval 'if' 2>/dev/null"), 2);
+	EXPECT_EQ(run("(exit 5); eval 'if' 2>/dev/null"), 2);
+}
+
+TEST_F(ExecutorTest, BreakInsideAnEvalBreaksTheLoopAroundIt) {
+	// `break` has to travel out of the nested source the way `return` does - the
+	// loop it belongs to is the caller's. The shared loop consumes it only for the
+	// shell's own input, where there is no loop left to own it.
+	EXPECT_EQ(capture("for i in 1 2 3; do eval break; echo body; done; echo after"),
+	          "after\n");
+	EXPECT_EQ(capture("for i in 1 2; do eval continue; echo body; done; echo after"),
+	          "after\n");
+}
+
 // --- a return outside a function ends the input -------------------------------
 
 TEST_F(ExecutorTest, ReturnOutsideAFunctionEndsTheInput) {

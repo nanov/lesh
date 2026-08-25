@@ -304,6 +304,15 @@ public:
 		return _children[parent.children_start + nth];
 	}
 
+	// True when this unit holds NOTHING TO EXECUTE - blanks, a comment, a bare
+	// newline. Two spellings reach it: no root at all, and a program node with no
+	// children, which is what `# only a comment` parses to. They are one question
+	// and asking only the first one got `eval '' '' ''` wrong, so they are answered
+	// in one place rather than at each caller (#74).
+	[[nodiscard]] bool holds_no_command() const noexcept {
+		return _root == no_node || _nodes[_root].children_count == 0;
+	}
+
 
 	[[nodiscard]] span span_of(const node& n) const noexcept {
 		if (_tokens.empty())

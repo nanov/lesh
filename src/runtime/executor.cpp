@@ -847,7 +847,7 @@ static void report_syntax_error(const tree& t) {
 		std::fprintf(stderr, "lesh: syntax error\n");
 }
 
-int tree_walking_executor::run_parsed(const tree& t) {
+int tree_walking_executor::run_parsed(const tree& t, source_kind kind) {
 	if (t.root() == syntax::no_node)
 		return _state.last_status();
 
@@ -906,6 +906,16 @@ int tree_walking_executor::run_parsed(const tree& t) {
 		// The flow is CLEARED here rather than left for run_input, so a `return` at
 		// the top of a script leaves the EXIT trap free to run its whole body.
 		if (_flow == control_flow::return_from) {
+			// A NESTED source lets it through instead, and that is the whole of what
+			// `kind` decides. `eval return` inside a function returns from the FUNCTION
+			// (return-p.tst's 'returning out of eval'), so the unwind has to survive
+			// this loop and be consumed by whatever invoked the source - try_run_function
+			// for a function, the `.` builtin for a dot script. Consuming it here would
+			// end the eval and carry on with the line after it.
+			if (kind == source_kind::nested) {
+				status = _state.last_status();
+				break;
+			}
 			_flow = control_flow::normal;
 			_input_ended = true;
 			break;
@@ -916,6 +926,12 @@ int tree_walking_executor::run_parsed(const tree& t) {
 		// is in the parent - and then it unwinds out of the subshell, which is what
 		// dash does: `for i in 1; do echo "[$(break; echo insub)]"; done` prints `[]`.
 		if (_flow == control_flow::break_loop || _flow == control_flow::continue_loop) {
+			// Nested, and for the same reason: `for i in 1 2; do eval break; done` has to
+			// break the loop the eval is INSIDE, so the level travels out to run_loop.
+			if (kind == source_kind::nested) {
+				status = _state.last_status();
+				break;
+			}
 			_flow = control_flow::normal;
 			_input_ended = true;
 			break;
@@ -1436,35 +1452,30 @@ int tree_walking_executor::run_source(std::string_view source, bool echo_as_read
 		// about to run - the same order run_input uses.
 		echo_if_verbose(source.substr(from, at - from), echo_as_read);
 		const tree& parsed = trees.back();
-		if (parsed.has_errors() && !_state.interactive()) {
-			// POSIX: a syntax error in `eval` or `.` kills a non-interactive shell,
-			// exactly as one at the top level does. Returning a status and carrying on
-			// let `eval fi; echo not reached` reach the echo.
-			report_syntax_error(parsed);
-			_exit_requested = true;
-			return 2;
-		}
-		if (parsed.root() == syntax::no_node)
+		// An empty unit is SKIPPED rather than handed to run_parsed, which answers
+		// one with `$?` - right for the shell's own input, wrong here. `eval` and `.`
+		// report ZERO when no command is executed, and `$?` is the status of whatever
+		// ran BEFORE: it made `false; eval '' '' ''` report 1 (eval-p.tst's
+		// 'evaluating null operands'). This is the only thing run_source still decides
+		// for itself, and it decides it OUTSIDE the loop rather than inside a copy of
+		// one.
+		//
+		// Errors first, because a unit can be BOTH malformed and empty of commands,
+		// and skipping it would swallow the diagnostic that ends the shell.
+		if (!parsed.has_errors() && parsed.holds_no_command())
 			continue;
-		const node& program = parsed[parsed.root()];
-		for (uint32_t i = 0; i < program.children_count; ++i) {
-			status = run_node(parsed, parsed.child_of(program, i));
-			_state.set_last_status(status);
-			// BETWEEN commands, exactly as at the top level. A signal that arrives
-			// while an `eval` or a dot script is running has a trap action that is due
-			// NOW, not once the script ends: `. lib` where lib traps a signal and then
-			// sends it printed `after` and only then the trap body, where dash and bash
-			// both print the body first. run_parsed has done this since #52 and this
-			// loop never did, which is a difference nobody chose. It stayed invisible
-			// because only `eval` and `.` read through here; the moment a command
-			// substitution's body did too (#67), it cost fifteen signal files three
-			// assertions each.
-			run_pending_traps();
-			// The status is re-read rather than kept, for the reason run_parsed gives:
-			// when a TRAP BODY exited, the status the caller sees is the body's.
-			if (_exit_requested || _flow != control_flow::normal)
-				return _state.last_status();
-		}
+		// And everything else is run_parsed's, which is the point of #74. The
+		// syntax-error exit, `set -n`, pending traps, the interrupt unwind and
+		// `set -e` all live there and are now reached by both readers instead of by
+		// whichever copy last remembered to grow them.
+		status = run_parsed(parsed, source_kind::nested);
+		// `status` and not `_state.last_status()`: run_parsed already re-reads the
+		// state for every unwind it can take - so the two agree wherever the old loop
+		// re-read - and it returns 2 for a syntax error, which is BEFORE any command
+		// set a status. Re-reading here would have made `eval 'if'` exit with the
+		// status of the command before it.
+		if (_exit_requested || _flow != control_flow::normal)
+			return status;
 	}
 	return status;
 }

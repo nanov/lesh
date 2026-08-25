@@ -201,7 +201,13 @@ private:
 	// Runs one already-parsed tree, WITHOUT the EXIT trap: read a command at a
 	// time, the trap belongs at the end of the input rather than at the end of
 	// every command in it.
-	int run_parsed(const syntax::tree& t);
+	//
+	// `kind` is the ONE thing the shell's own input and an `eval` operand disagree
+	// about, and it is a parameter rather than a second loop because a second loop
+	// is what #74 was opened to remove: run_source carried a near-copy of this
+	// function, and a guard added here - `run_pending_traps` - was silently absent
+	// there for as long as the path existed.
+	int run_parsed(const syntax::tree& t, source_kind kind = source_kind::shell_input);
 	void echo_if_verbose(std::string_view unit, bool enabled);
 	int run_node(const syntax::tree& t, syntax::node_index n);
 	int run_simple_command(const syntax::tree& t, syntax::node_index n);

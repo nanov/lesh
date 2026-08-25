@@ -1616,3 +1616,42 @@ readonly r=1; echo before; { r=2 : ; } 2>/dev/null; echo notreached
 
 --- a redirection failure on a special builtin still ends the shell [xfail(legacy): legacy has no redirections]
 echo before; : 2>/dev/null <./_lesh_no_such_file_; echo notreached
+
+# ISSUE #74. `eval` and `.` re-enter the front end through `run_source`, which
+# carried a SECOND COPY of the top-level command loop rather than calling it.
+# Copies drift: `run_pending_traps` was missing from it for as long as the path
+# existed and cost fifteen signal files three assertions each the moment #67
+# routed a command substitution through it. These are the two guards still
+# missing when the two loops were merged into one.
+
+--- errexit inside an eval stops the eval and the shell [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+set -e; eval "false
+echo notreached"; echo alsonotreached
+
+--- errexit inside a dot script stops the script and the shell [stdin] [xfail(legacy): legacy has no dot builtin]
+set -e
+printf 'false\necho notreached\n' >script
+. ./script
+echo alsonotreached
+
+--- noexec set inside an eval stops the rest of that eval [xfail(legacy): legacy has no eval builtin and runs /bin/eval, which does not exist]
+eval "set -n
+echo notreached"; echo alsonotreached
+
+--- noexec set inside a dot script stops the rest of that script [stdin] [xfail(legacy): legacy has no dot builtin]
+printf 'set -n\necho notreached\n' >script
+. ./script
+echo alsonotreached
+
+# The guard the merge must NOT pick up. `return` inside an `eval` returns from
+# the enclosing FUNCTION, so `eval` has to let the unwind through where the top
+# level consumes it and ends its own input. A shared loop has to be told which of
+# the two it is running, or one of these two cases breaks the other.
+
+--- a return inside an eval returns from the enclosing function [xfail(legacy): legacy has no functions]
+f() { eval 'return 7'; echo notreached; }; f; echo "st=$? after=yes"
+
+--- a return inside a dot script ends only that script [stdin] [xfail(legacy): legacy has no dot builtin]
+printf 'return 7\necho notreached\n' >script
+. ./script
+echo "st=$? after=yes"
