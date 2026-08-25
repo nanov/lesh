@@ -170,6 +170,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
+	src/leshper/layout.cpp
+	src/leshper/layout.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
 	src/leshper/event.h
@@ -194,6 +196,7 @@ add_executable(lesh_tests
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_tests.cpp
+	tests/unit/leshper_layout_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
