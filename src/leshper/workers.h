@@ -91,6 +91,24 @@ struct request_snapshot {
 	bool selection_active = false;
 	generation computed_against;
 	std::uint32_t event_kind = 0;
+
+	// What the shell knows (#135), for the reactor that asks - today only the
+	// highlighter, and only for `command_kind`. NOT copied and not owned: a
+	// pointer to the wiring site's adapter over `shell_state`, which outlives
+	// every request.
+	//
+	// ADR-0009 is what makes a bare pointer safe here, and it is worth naming.
+	// The shell is the main thread and owns `shell_state`; a highlight, a port
+	// call that writes it, and an execution are serialized on that thread. So
+	// this points at state that cannot change while the compute it belongs to is
+	// running - which is why #130's copy-on-write definitions version was deleted
+	// rather than kept as insurance.
+	//
+	// Null - the default - is "no shell attached": the tables read empty and
+	// `$PATH` is the process environment's. A submit that leaves it null is
+	// therefore honest rather than broken, and is what every state-free reactor
+	// does.
+	const shell_knowledge* knowledge = nullptr;
 };
 
 // The snapshot of an editor state, as the loop would take it.

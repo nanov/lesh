@@ -206,6 +206,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/tty.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
+	src/leshper/shell_knowledge.h
 	src/leshper/event.h
 	src/leshper/history_search.cpp
 	src/leshper/history_search.h
@@ -245,6 +246,7 @@ add_executable(lesh_tests
 	tests/unit/grapheme_tests.cpp
 	tests/unit/history_store_tests.cpp
 	tests/unit/leshper_history_search_tests.cpp
+	tests/unit/leshper_knowledge_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp

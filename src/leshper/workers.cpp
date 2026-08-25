@@ -479,6 +479,7 @@ void worker_pool::compute(task& job, slot& owner, reactor_batch& into) {
 	token.computed_against = job.snapshot.computed_against;
 	token.event_kind = job.snapshot.event_kind;
 	token.superseded = &owner.superseded;
+	token.knowledge = job.snapshot.knowledge;
 	token.spans = &into.spans;
 	token.texts = &into.texts;
 	token.proposals = &into.proposals;

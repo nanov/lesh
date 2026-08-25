@@ -4,6 +4,10 @@
 #include "substrate/assert.h"
 #include "substrate/grapheme.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstring>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -12,11 +16,24 @@
 
 namespace {
 
+using lesh::leshper::command_kind;
+using lesh::leshper::command_kind_memo;
 using lesh::leshper::decoration_span;
+using lesh::leshper::environment_knowledge;
 using lesh::leshper::loop_outcome;
 using lesh::leshper::position;
 using lesh::leshper::proposal;
+using lesh::leshper::shell_knowledge;
 using lesh::leshper::virtual_text;
+
+// The C numbers and the C++ enumerators are one space, and this is what keeps
+// them one. A reordered enum would otherwise repaint every command name in the
+// wrong colour and compile silently.
+static_assert(static_cast<std::uint32_t>(command_kind::unknown) == LESH_COMMAND_UNKNOWN);
+static_assert(static_cast<std::uint32_t>(command_kind::external) == LESH_COMMAND_EXTERNAL);
+static_assert(static_cast<std::uint32_t>(command_kind::builtin) == LESH_COMMAND_BUILTIN);
+static_assert(static_cast<std::uint32_t>(command_kind::function) == LESH_COMMAND_FUNCTION);
+static_assert(static_cast<std::uint32_t>(command_kind::alias) == LESH_COMMAND_ALIAS);
 
 // A thread's identity as a plain integer, so no header needs <thread> to hold
 // one. Never zero, because zero means "no owner" on a dead handle.
@@ -179,6 +196,122 @@ std::int32_t copy_out(std::string_view source, char* out, std::size_t capacity,
 	for (std::size_t i = 0; i < source.size(); ++i)
 		out[i] = source[i];
 	return LESH_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Classifying a command name (#135; spec §6.7, narrowed by ADR-0009).
+//
+// The tables are the shell's and come through `shell_knowledge`; the $PATH walk
+// is HERE, on leshper's side of the link boundary, because it is the half that
+// touches the filesystem and the half the token memoizes. `lesh_leshper` does
+// not link `lesh_runtime`, so this file cannot look a name up in `shell_state`
+// and does not try to.
+// ---------------------------------------------------------------------------
+
+// Longer than any PATH_MAX this runs on. A candidate that would not fit is
+// DECLINED rather than truncated, because a truncated path names a different
+// file - and answering about a different file is worse than not answering.
+constexpr std::size_t kPathBytes = 4096;
+
+// Moved here verbatim from builtin_reactors.cpp, where it was the highlighter's
+// private getenv-based guess (#124).
+//
+// access(X_OK) alone says yes for a DIRECTORY, so `echo /tmp` would paint as a
+// command. The mode test is what makes the answer mean "this is a thing exec
+// would run".
+bool is_executable_file(const char* path) noexcept {
+	struct stat info;
+	if (::stat(path, &info) != 0)
+		return false;
+	if (!S_ISREG(info.st_mode))
+		return false;
+	return ::access(path, X_OK) == 0;
+}
+
+// One stat per directory in `path`, in order, first hit wins - the search the
+// shell itself would do (POSIX 2.9.1.1).
+bool resolves_on_path(std::string_view path, std::string_view name) noexcept {
+	char candidate[kPathBytes];
+	std::string_view rest = path;
+	for (;;) {
+		const std::size_t colon = rest.find(':');
+		std::string_view dir = colon == std::string_view::npos ? rest : rest.substr(0, colon);
+		// POSIX: an empty PATH element means the current directory.
+		if (dir.empty())
+			dir = std::string_view{"."};
+		if (dir.size() + name.size() + 2 <= sizeof(candidate)) {
+			std::memcpy(candidate, dir.data(), dir.size());
+			candidate[dir.size()] = '/';
+			std::memcpy(candidate + dir.size() + 1, name.data(), name.size());
+			candidate[dir.size() + 1 + name.size()] = '\0';
+			if (is_executable_file(candidate))
+				return true;
+		}
+		if (colon == std::string_view::npos)
+			break;
+		rest.remove_prefix(colon + 1);
+	}
+	return false;
+}
+
+// A name with a slash is a PATHNAME, not a lookup: POSIX 2.9.1.1 sends it
+// straight to the filesystem, past every table. `./configure` is not shadowed by
+// an alias called `./configure`, and could not be - no table can hold that name.
+bool names_a_pathname(std::string_view name) noexcept {
+	return name.find('/') != std::string_view::npos;
+}
+
+bool resolves_as_pathname(std::string_view name) noexcept {
+	char candidate[kPathBytes];
+	if (name.size() >= sizeof(candidate))
+		return false;
+	std::memcpy(candidate, name.data(), name.size());
+	candidate[name.size()] = '\0';
+	return is_executable_file(candidate);
+}
+
+// The whole resolution, tables then filesystem. No memo, no validity - the ABI
+// entry point owns both.
+command_kind classify_command_name(const shell_knowledge& shell,
+                                   std::string_view name) noexcept {
+	if (!names_a_pathname(name)) {
+		const command_kind known = shell.classify(name);
+		if (known != command_kind::unknown)
+			return known;
+	} else {
+		return resolves_as_pathname(name) ? command_kind::external : command_kind::unknown;
+	}
+	std::string_view path;
+	if (!shell.path(path))
+		return command_kind::unknown;
+	return resolves_on_path(path, name) ? command_kind::external : command_kind::unknown;
+}
+
+// The memo. Linear, because `capacity` is small and the thing it is racing is a
+// sweep of the filesystem.
+bool memo_find(const command_kind_memo& memo, std::string_view name,
+               std::uint32_t& out) noexcept {
+	if (name.size() > command_kind_memo::name_capacity)
+		return false;
+	for (std::uint32_t i = 0; i < memo.used; ++i) {
+		const command_kind_memo::entry& one = memo.entries[i];
+		if (one.length == name.size() && std::memcmp(one.name, name.data(), name.size()) == 0) {
+			out = one.kind;
+			return true;
+		}
+	}
+	return false;
+}
+
+void memo_store(command_kind_memo& memo, std::string_view name, std::uint32_t kind) noexcept {
+	if (name.size() > command_kind_memo::name_capacity || memo.used >= command_kind_memo::capacity)
+		return;
+	command_kind_memo::entry& one = memo.entries[memo.used];
+	one.kind = kind;
+	one.length = static_cast<std::uint16_t>(name.size());
+	if (!name.empty())
+		std::memcpy(one.name, name.data(), name.size());
+	++memo.used;
 }
 
 } // namespace
@@ -664,6 +797,38 @@ int32_t lesh_request_superseded(const lesh_request* request, int32_t* out) {
 	return LESH_OK;
 }
 
+int32_t lesh_request_command_kind(const lesh_request* request, const char* name,
+                                  size_t length, uint32_t* out) {
+	LESH_REQUEST_HANDLE(request);
+	if (out == nullptr || (name == nullptr && length != 0))
+		return LESH_ERR_INVAL;
+	*out = LESH_COMMAND_UNKNOWN;
+	if (length == 0)
+		return LESH_OK;
+
+	const std::string_view given{name, length};
+	// A NUL inside the name would truncate the candidate handed to stat(2), and
+	// a truncated name is a different name. The buffer is bytes and may contain
+	// one, so this is a real input and not a theoretical one.
+	if (given.find('\0') != std::string_view::npos)
+		return LESH_OK;
+
+	if (memo_find(request->command_kinds, given, *out))
+		return LESH_OK;
+
+	// The documented fallback when no shell is attached: empty tables, and the
+	// process environment's PATH. A file-scope instance rather than one per
+	// call, because it holds nothing and constructing a vtable pointer per
+	// command name is work for no answer.
+	static const environment_knowledge kEnvironment;
+	const shell_knowledge& shell =
+		request->knowledge != nullptr ? *request->knowledge : kEnvironment;
+
+	*out = static_cast<std::uint32_t>(classify_command_name(shell, given));
+	memo_store(request->command_kinds, given, *out);
+	return LESH_OK;
+}
+
 int32_t lesh_emit_span(lesh_request* request, size_t start, size_t end, uint32_t style_id) {
 	LESH_REQUEST_HANDLE(request);
 	if (request->spans == nullptr)
@@ -896,6 +1061,7 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		token.computed_against = target.gen;
 		token.event_kind = kinds;
 		token.superseded = &_superseded;
+		token.knowledge = _knowledge;
 		token.spans = &batch.spans;
 		token.texts = &batch.texts;
 		token.proposals = &batch.proposals;

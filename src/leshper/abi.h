@@ -341,6 +341,44 @@ int32_t lesh_request_event_kind(const lesh_request* request, uint32_t* out);
  * it just wastes the worker. */
 int32_t lesh_request_superseded(const lesh_request* request, int32_t* out);
 
+/* --- What the shell knows (#130, #135) ------------------------------------ */
+
+/* What a command name is. Additive, like every other enumerated space here: a
+ * new kind is a new number, and a consumer that does not know it reads it as
+ * something it cannot classify rather than as a wrong class. LESH_COMMAND_
+ * UNKNOWN is zero so an ignored failure reads as the harmless answer. */
+#define LESH_COMMAND_UNKNOWN 0u
+#define LESH_COMMAND_EXTERNAL 1u
+#define LESH_COMMAND_BUILTIN 2u
+#define LESH_COMMAND_FUNCTION 3u
+#define LESH_COMMAND_ALIAS 4u
+
+/* Classifies a command name against the shell's own tables and $PATH.
+ *
+ * `name` is BYTES, `length` bytes of them, as they appear in the buffer - no
+ * NUL, no quote removal, no expansion. The caller decides whether the bytes name
+ * a command at all; the highlighter asks only for words the lexer marked
+ * literal, because `$cmd` names a command only after expansion.
+ *
+ * Resolution is the shell's: alias, then function, then builtin, then a $PATH
+ * walk with a stat per directory, then LESH_COMMAND_UNKNOWN. A name containing a
+ * slash is a pathname and is not looked up in any table (POSIX 2.9.1.1). An
+ * alias is resolved ONE level - the answer is `alias` and the body is neither
+ * re-resolved nor expanded (#95: spans stay on the typed bytes).
+ *
+ * THE FILESYSTEM IS WHY THIS IS ON THE TOKEN and not on the editor handle. The
+ * walk is the one cost F-22 moved off the keystroke path, so it belongs where a
+ * cooperative poll can abandon it: a caller polls lesh_request_superseded before
+ * each call, and a stat storm then delays the next highlight rather than a
+ * keypress. The answers are memoized for the life of the request, so a name
+ * repeated on one line is walked once.
+ *
+ * With no shell attached to the token the tables are empty and $PATH is the
+ * process environment's - what a leshper embedded in something that is not this
+ * shell sees. */
+int32_t lesh_request_command_kind(const lesh_request* request,
+                                  const char* name, size_t length, uint32_t* out);
+
 /* --- Emission: only here, and only outward ------------------------------- */
 
 /* A highlight span over [start, end) carrying an interned semantic style id
