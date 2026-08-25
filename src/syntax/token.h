@@ -16,6 +16,12 @@ enum class token_kind : uint16_t {
 	newline,      // significant in the shell grammar, unlike other blanks
 	word,         // anything that is not an operator
 	io_number,    // a digit run immediately before < or >
+	// A comment, from `#` to the end of the line. EMITTED, not skipped (#103):
+	// a painter needs the span and a token is the lexer's only channel. The
+	// parser records comments on the tree's side list and keeps them out of the
+	// token array, so the grammar never sees one and no node's span moves.
+	// Before the operators so is_operator() stays a range test.
+	comment,
 	// control operators
 	pipe,         // |
 	and_if,       // &&

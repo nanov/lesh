@@ -1295,7 +1295,13 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	const syntax::word_role role = n.kind == syntax::node_kind::word
 		? static_cast<syntax::word_role>(n.aux)
 		: syntax::word_role::ordinary;
-	const bool one_value = role != syntax::word_role::ordinary;
+	// ENUMERATED, not "anything unusual": command_name expands exactly as an
+	// ordinary word - field splitting applies, `$cmd` carrying arguments works -
+	// so a role test that lumped every non-ordinary role into one-value would
+	// silently stop splitting command names the day the role was recorded (#103).
+	const bool one_value = role == syntax::word_role::pattern ||
+	                       role == syntax::word_role::case_subject ||
+	                       role == syntax::word_role::redirect_target;
 	const expand_context ctx = one_value
 		? expand_context{.split = false, .fields = false,
 		                 .pattern = role == syntax::word_role::pattern}

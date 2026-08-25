@@ -25,7 +25,7 @@ constexpr bool needs_expansion(char c) noexcept {
 
 } // namespace
 
-bool lexer::skip_blanks_and_comments() noexcept {
+bool lexer::skip_blanks() noexcept {
 	const uint32_t start = _position;
 	for (;;) {
 		while (!at_end() && is_blank(peek()))
@@ -37,14 +37,6 @@ bool lexer::skip_blanks_and_comments() noexcept {
 		if (const uint32_t after = past_continuations(_position); after != _position) {
 			_position = after;
 			continue;
-		}
-		// POSIX: '#' opens a comment only where a word could begin. Inside a word
-		// it is an ordinary character, which is why this runs before lex_word and
-		// never inside it.
-		if (!at_end() && peek() == '#') {
-			while (!at_end() && peek() != '\n')
-				++_position;
-			continue;  // a comment may be followed by more blanks
 		}
 		break;
 	}
@@ -1243,12 +1235,29 @@ token lexer::next(lex_mode mode) noexcept {
 		return lex_word_segment(mode);
 	}
 
-	const bool skipped = skip_blanks_and_comments();
+	const bool skipped = skip_blanks();
 
 	if (at_end()) {
 		token t;
 		t.kind = token_kind::end;
 		t.offset = _position;
+		return t;
+	}
+
+	// POSIX: '#' opens a comment only where a word could begin - which is where
+	// next() stands once the blanks are skipped: a token boundary. Inside a word
+	// `#` is an ordinary character and lex_word consumes it, so this test never
+	// fires there. Emitted rather than swallowed (#103); the newline that ends
+	// the comment is NOT part of it and comes out as its own token.
+	if (peek() == '#') {
+		token t;
+		t.kind = token_kind::comment;
+		t.offset = _position;
+		while (!at_end() && peek() != '\n')
+			++_position;
+		t.length = _position - t.offset;
+		if (skipped)
+			t.flags |= flag_preceded_by_blank;
 		return t;
 	}
 

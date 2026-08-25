@@ -153,8 +153,11 @@ TEST(Lexer, BackslashEscapesTheNextByte) {
 }
 
 TEST(Lexer, CommentRunsToEndOfLine) {
+	// The comment is a TOKEN now (#103) - the painter needs its span - and the
+	// newline that ends it is still its own token, not part of the comment.
 	EXPECT_EQ(kinds_of("echo # not a word\nnext"),
-	          (std::vector{token_kind::word, token_kind::newline, token_kind::word}));
+	          (std::vector{token_kind::word, token_kind::comment, token_kind::newline,
+	                       token_kind::word}));
 }
 
 TEST(Lexer, HashInsideAWordIsLiteral) {

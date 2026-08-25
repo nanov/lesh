@@ -769,6 +769,9 @@ private:
 				probe_frame& from = depth == 0 ? input : bodies[depth - 1];
 				lexer probe{from.text, from.at};
 				out[i] = probe.next(lex_mode::command);
+				// The probe wants the next GRAMMAR token; trivia is not one (#103).
+				while (out[i].kind == token_kind::comment)
+					out[i] = probe.next(lex_mode::command);
 				if (out[i].kind == token_kind::end && depth != 0) {
 					eligible = eligible || from.trailing_blank;
 					--depth;
@@ -910,6 +913,12 @@ private:
 		bool eligible = false;
 		while (!_alias_stack.empty()) {
 			token t = _alias_stack.back().lex.next(lex_mode::command);
+			// Trivia from an alias body: recorded at its virtual offset - the same
+			// shift every real token from this frame gets - and drawn past (#103).
+			if (t.kind == token_kind::comment) {
+				_tree.add_comment({t.offset + _alias_stack.back().base, t.length});
+				continue;
+			}
 			if (t.kind != token_kind::end) {
 				// The lexer reports offsets within the body it was handed; the tree
 				// addresses that body above the input. Without the shift a token from an
@@ -941,7 +950,16 @@ private:
 		// one command at a time resumes here, so the lookahead token this fill is
 		// about to produce is read again rather than lost.
 		_input_cursor = _lexer.position();
-		_index = _tree.add_token(_lexer.next(lex_mode::command));
+		token drawn = _lexer.next(lex_mode::command);
+		// A comment is trivia: recorded for the painter, excluded from the token
+		// array so no node's span moves (#103). The cursor advances past it, so a
+		// caller reading one command at a time does not record it twice.
+		while (drawn.kind == token_kind::comment) {
+			_tree.add_comment({drawn.offset, drawn.length});
+			_input_cursor = _lexer.position();
+			drawn = _lexer.next(lex_mode::command);
+		}
+		_index = _tree.add_token(drawn);
 		if (_lexer.incomplete())
 			_tree.set_incomplete(true);
 
@@ -1085,11 +1103,17 @@ private:
 				}
 				const uint32_t at = advance();
 				node_kind kind = node_kind::word;
+				word_role role = word_role::ordinary;
 				if (!seen_command_name && looks_like_assignment(text_of_token(at)))
 					kind = node_kind::assignment;
-				else
+				else if (!seen_command_name) {
 					seen_command_name = true;
-				_scratch.push(word_node(at, kind));
+					// The flip IS the classification: this word names the command
+					// (#103). The expander treats it exactly as ordinary; the role is
+					// for the readers that resolve it - highlighter, completer.
+					role = word_role::command_name;
+				}
+				_scratch.push(word_node(at, kind, role));
 				continue;
 			}
 
@@ -1388,6 +1412,13 @@ private:
 		}
 
 		const uint32_t target = advance();
+		// The target becomes a WORD NODE like every other word, so it has a span
+		// for a painter and a place for completion to stand (#103). The executor
+		// still reads the token at last_token and expands its text - the child is
+		// additive, and its role records what POSIX 2.7 makes the target:
+		// expanded, never field-split.
+		const uint32_t children = mark_scratch();
+		_scratch.push(word_node(target, node_kind::word, word_role::redirect_target));
 		node n;
 		n.kind = node_kind::redirect;
 		n.first_token = first;
@@ -1398,6 +1429,7 @@ private:
 		if (_tree.token_at(target).is_error())
 			n.error = parse_error::unterminated_word;
 		n.aux = fd;
+		commit_children(n, children);
 		return _tree.add_node(n);
 	}
 

@@ -161,7 +161,9 @@ private:
 	// status 2 is the answer this project gives to input it will not follow.
 	static constexpr int kMaxScanNesting = 256;
 
-	bool skip_blanks_and_comments() noexcept;  // returns whether anything was skipped
+	// Blanks and line continuations only. Comments are TOKENS now (#103), so
+	// they are lexed, not skipped.
+	bool skip_blanks() noexcept;  // returns whether anything was skipped
 	token lex_operator() noexcept;
 	token lex_word(lex_mode mode) noexcept;
 	token lex_word_segment(lex_mode mode) noexcept;

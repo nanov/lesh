@@ -307,11 +307,15 @@ TEST_F(ParserTest, ACaseClauseGivesItsWordsTheirRoles) {
 	for (uint32_t i = 0; i < item.aux; ++i)
 		EXPECT_EQ(static_cast<word_role>(t[t.child_of(item, i)].aux), word_role::pattern);
 
-	// The body's words are ordinary too, or `echo *` inside a case would stop
-	// globbing.
+	// The body's command name carries its role (#103); the arguments stay
+	// ordinary, and `echo *` inside a case still globs because the expander
+	// treats command_name exactly as ordinary - the guarantee moved from "every
+	// body word is ordinary" to the expander's enumerated one-value test.
 	const node& body = t[t.child_of(item, item.aux)];
 	const node& command = t[t.child_of(body, 0)];
-	for (uint32_t i = 0; i < command.children_count; ++i) {
+	EXPECT_EQ(static_cast<word_role>(t[t.child_of(command, 0)].aux),
+	          word_role::command_name);
+	for (uint32_t i = 1; i < command.children_count; ++i) {
 		const node& w = t[t.child_of(command, i)];
 		if (w.kind == node_kind::word)
 			EXPECT_EQ(static_cast<word_role>(w.aux), word_role::ordinary);
@@ -1087,4 +1091,86 @@ TEST_F(ParserTest, AnOffsetInTheInputPassesThroughUnchanged) {
 	const invocation_site site = t.invocation_of(5);
 	EXPECT_EQ(site.offset, 5u);
 	EXPECT_EQ(site.depth, 0u);
+}
+
+
+// --- #103: what the highlighter reads ----------------------------------------
+
+TEST_F(ParserTest, TheCommandNameCarriesItsRole) {
+	const tree t = parse_it("x=1 echo a b");
+	const node_index cmd = t.child_of(t[t.root()], 0);
+	ASSERT_EQ(t[cmd].kind, node_kind::simple_command);
+	ASSERT_EQ(t[cmd].children_count, 4u);
+	EXPECT_EQ(t[t.child_of(t[cmd], 0)].kind, node_kind::assignment);
+	const node& name = t[t.child_of(t[cmd], 1)];
+	EXPECT_EQ(name.kind, node_kind::word);
+	EXPECT_EQ(static_cast<word_role>(name.aux), word_role::command_name);
+	EXPECT_EQ(t.text_of(name), "echo");
+	// The arguments stay ordinary - the role marks exactly one word.
+	EXPECT_EQ(static_cast<word_role>(t[t.child_of(t[cmd], 2)].aux), word_role::ordinary);
+	EXPECT_EQ(static_cast<word_role>(t[t.child_of(t[cmd], 3)].aux), word_role::ordinary);
+}
+
+TEST_F(ParserTest, ARedirectTargetIsAWordNodeWithItsOwnRole) {
+	const tree t = parse_it("echo x > out");
+	const node_index cmd = t.child_of(t[t.root()], 0);
+	ASSERT_EQ(t[cmd].children_count, 3u);
+	const node& redirect = t[t.child_of(t[cmd], 2)];
+	ASSERT_EQ(redirect.kind, node_kind::redirect);
+	ASSERT_EQ(redirect.children_count, 1u) << "the target is a child word now";
+	const node& target = t[t.child_of(redirect, 0)];
+	EXPECT_EQ(target.kind, node_kind::word);
+	EXPECT_EQ(static_cast<word_role>(target.aux), word_role::redirect_target);
+	EXPECT_EQ(t.text_of(target), "out");
+}
+
+TEST_F(ParserTest, ACommentIsRecordedBesideTheTreeAndNotAsAToken) {
+	const tree t = parse_it("echo hi # note");
+	ASSERT_EQ(t.comment_count(), 1u);
+	const span c = t.comment_at(0);
+	EXPECT_EQ(t.source().substr(c.offset, c.length), "# note");
+	for (uint32_t i = 0; i < t.token_count(); ++i)
+		EXPECT_NE(t.token_at(i).kind, token_kind::comment)
+			<< "trivia must stay out of the token array";
+	// The command's own span is untouched by the trivia after it.
+	const node_index cmd = t.child_of(t[t.root()], 0);
+	EXPECT_EQ(t.text_of(t[cmd]), "echo hi");
+	EXPECT_FALSE(t.has_errors());
+}
+
+TEST_F(ParserTest, ACommentAloneIsAnEmptyProgramWithOneRecordedSpan) {
+	const tree t = parse_it("# only a comment");
+	EXPECT_EQ(t[t.root()].children_count, 0u);
+	ASSERT_EQ(t.comment_count(), 1u);
+	EXPECT_FALSE(t.has_errors());
+}
+
+TEST_F(ParserTest, ReadingOneCommandAtATimeRecordsACommentExactlyOnce) {
+	const std::string_view src = "echo a # c\necho b";
+	size_t position = 0;
+	size_t comments = 0;
+	size_t commands = 0;
+	while (position < src.size()) {
+		const tree t = parse_next_command(pool, src, position);
+		comments += t.comment_count();
+		for (uint32_t i = 0; i < t[t.root()].children_count; ++i)
+			commands += t[t.child_of(t[t.root()], i)].kind != node_kind::error;
+	}
+	EXPECT_EQ(commands, 2u);
+	EXPECT_EQ(comments, 1u) << "the resume cursor must sit past the comment";
+}
+
+TEST_F(ParserTest, TheLexerEmitsACommentTokenWhereAWordCouldBegin) {
+	lexer lx("echo # tail");
+	EXPECT_EQ(lx.next().kind, token_kind::word);
+	const token c = lx.next();
+	EXPECT_EQ(c.kind, token_kind::comment);
+	EXPECT_EQ(c.offset, 5u);
+	EXPECT_EQ(c.length, 6u);
+	EXPECT_EQ(lx.next().kind, token_kind::end);
+	// Inside a word, `#` stays an ordinary byte.
+	lexer inside("foo#bar");
+	const token w = inside.next();
+	EXPECT_EQ(w.kind, token_kind::word);
+	EXPECT_EQ(w.length, 7u);
 }

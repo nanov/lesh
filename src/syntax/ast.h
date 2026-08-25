@@ -105,6 +105,18 @@ enum class word_role : uint32_t {
 	// nowhere for a second field to go. `IFS=:; case a:b in 'a:b')` matched
 	// nothing, having compared the pattern against `a` alone.
 	case_subject = 2,
+	// The word that NAMES the command. Expanded exactly as an ordinary word -
+	// field splitting applies, so `$cmd` carrying arguments still works - which
+	// is why the expander must never branch on it. Recorded because the
+	// highlighter and the completer both need to know which word resolves
+	// against $PATH, and #95's probe showed a client re-deriving "first
+	// ordinary word" gets the alias case wrong.
+	command_name = 3,
+	// A redirection's target. POSIX 2.7 expands it but never field-splits it.
+	// The executor does not read this node - it expands the token's text through
+	// value_context::redirection_operand as before - the node exists so the
+	// target has a span for a painter and a place for completion to stand (#95).
+	redirect_target = 4,
 };
 
 enum class parse_error : uint16_t {
@@ -253,7 +265,7 @@ class tree {
 public:
 	tree(buffer_pool& pool, std::string_view source) noexcept
 		: _source(source), _nodes(pool, 32), _children(pool, 64), _tokens(pool, 32),
-		  _here_docs(pool, 4), _regions(pool, 4),
+		  _here_docs(pool, 4), _comments(pool, 4), _regions(pool, 4),
 		  _region_end(static_cast<uint32_t>(source.size())) {}
 
 	// --- construction ---------------------------------------------------------
@@ -297,6 +309,15 @@ public:
 	// Here-doc bodies are stored separately and referenced by index from a
 	// here_doc node's `aux`, because a body is a source range rather than tokens.
 	uint32_t add_here_doc(const here_doc_body& b) noexcept { return _here_docs.push(b); }
+
+	// Comments are TRIVIA, held beside the tree the way here-doc bodies are: the
+	// lexer emits them (#103), the parser records them here and excludes them
+	// from the token array, so token indices and every node's span are unchanged
+	// by a comment anywhere. A painter greys them from this list; the grammar
+	// never sees them.
+	uint32_t add_comment(const span& s) noexcept { return _comments.push(s); }
+	[[nodiscard]] size_t comment_count() const noexcept { return _comments.size(); }
+	[[nodiscard]] const span& comment_at(uint32_t i) const noexcept { return _comments[i]; }
 	[[nodiscard]] const here_doc_body& here_doc_at(uint32_t i) const noexcept {
 		return _here_docs[i];
 	}
@@ -554,6 +575,7 @@ private:
 	arena_array<uint32_t> _children;
 	arena_array<token> _tokens;
 	arena_array<here_doc_body> _here_docs;
+	arena_array<span> _comments;
 	arena_array<text_region> _regions;
 	uint32_t _region_end = 0;
 	node_index _root = no_node;
