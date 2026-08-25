@@ -134,6 +134,104 @@ TEST_F(BuiltinRegistryTest, SpecialBuiltinsAreExactlyThePosixList) {
 	EXPECT_EQ(classify_builtin(""), builtin_kind::none);
 }
 
+// --- which of a special builtin's failures is fatal (issue #66) ---------------
+//
+// POSIX XCU 2.8.1's table lists the error classes that end a non-interactive
+// shell when they happen in a SPECIAL builtin, and the list is closed: a shell
+// language syntax error, an expansion error, a redirection error, a variable
+// assignment error, and a UTILITY SYNTAX ERROR - which that row itself
+// parenthesises as "option or operand error", meaning the command line was not
+// the shape the utility accepts. A command line that WAS the right shape, and
+// whose operation then failed, appears on none of those rows: it reports a status
+// and the shell carries on.
+//
+// try_run_builtin had the two collapsed - every non-zero status from a special
+// builtin became an exit - so `trap "" "" || echo reached` killed a script at a
+// line whose author had written down that the failure was expected. dash, bash,
+// zsh and yash all keep the shell alive there, and it was trap-p.tst's last
+// failure at 41/42.
+//
+// The cases below come in pairs deliberately. Narrowing a rule that #34 built,
+// and that holds error-p.tst at 220/220, is only safe if the rows it must NOT
+// touch are asserted beside the row it must.
+
+TEST_F(BuiltinRegistryTest, AnInvalidSignalNameIsReportedRatherThanFatal) {
+	// WHICH SIGNAL NAMES EXIST IS A PROPERTY OF THE PLATFORM - SIGURG, SIGINFO and
+	// SIGPWR are not all present everywhere - so a shell that made an unknown one
+	// fatal would have made 2.8.1's fatality rule itself platform-dependent, and a
+	// script would die on a host that merely lacks a signal.
+	EXPECT_EQ(capture("trap '' '' 2>/dev/null; echo reached"), "reached\n");
+	EXPECT_EQ(capture("trap '' NOSUCHSIG 2>/dev/null; echo reached"), "reached\n");
+	EXPECT_EQ(capture("trap - NOSUCHSIG 2>/dev/null; echo reached"), "reached\n");
+	EXPECT_EQ(capture("trap 'echo x' NOSUCHSIG 2>/dev/null; echo reached"),
+	          "reached\n");
+	// A NUMBER outside the range is the same error and takes the same answer: the
+	// operand is a well-formed condition that this platform does not have.
+	EXPECT_EQ(capture("trap '' 9999 2>/dev/null; echo reached"), "reached\n");
+	EXPECT_EQ(capture("trap - 99999999999999999999 2>/dev/null; echo reached"),
+	          "reached\n");
+	// The listing form reaches the same lookup and must answer the same way, or the
+	// distinction would depend on which spelling of `trap` asked.
+	EXPECT_EQ(capture("trap -p NOSUCHSIG 2>/dev/null; echo reached"), "reached\n");
+	// 1, which is what all four reference shells report - not 2. This is not a
+	// usage error being reported quietly; it is not a usage error.
+	EXPECT_EQ(run("trap '' NOSUCHSIG 2>/dev/null"), 1);
+}
+
+TEST_F(BuiltinRegistryTest, ABadConditionDoesNotStopTrapReadingTheRest) {
+	// The loop reports and continues, so a condition after the bad one is still
+	// set. SIGURG because its default action is to discard, which keeps a case that
+	// reaches the old path from killing this binary instead of failing.
+	EXPECT_EQ(capture("trap 'echo hit' NOSUCHSIG URG 2>/dev/null; kill -s URG $$"),
+	          "hit\n");
+}
+
+TEST_F(BuiltinRegistryTest, CommandDemotesTheFatalityAsWellAsTheAssignment) {
+	// POSIX XCU `command`: when the name is a special builtin, "the special
+	// properties in XCU 2.14 shall not occur" - and 2.14 names exactly two, the
+	// abort and the persisting assignment. lesh demoted the assignment and the
+	// REDIRECTION failure and left the status half special, so `command set -Z`
+	// still ended the shell where dash and bash both report and carry on.
+	EXPECT_EQ(capture("command trap '' NOSUCHSIG 2>/dev/null; echo reached"),
+	          "reached\n");
+	EXPECT_EQ(capture("command set -Z 2>/dev/null; echo reached"), "reached\n");
+	EXPECT_EQ(capture("command shift abc 2>/dev/null; echo reached"), "reached\n");
+	// A fresh NAME per line: the fixture's shell_state outlives a single capture(),
+	// so reusing one would make the SECOND line's `readonly ro=1` the failure being
+	// observed rather than the line under test.
+	EXPECT_EQ(capture("readonly ro=1; command readonly ro=2 2>/dev/null; echo reached"),
+	          "reached\n");
+	EXPECT_EQ(capture("readonly ru=1; command unset ru 2>/dev/null; echo reached"),
+	          "reached\n");
+}
+
+TEST_F(BuiltinRegistryTest, TheErrorClassesPosixMakesFatalStillAre) {
+	// One row of 2.8.1's table per line, each reached through a different special
+	// builtin. Every one of these agreed with dash before #66 and has to still.
+	EXPECT_EQ(capture("set -Z 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("shift abc 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("shift 5 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("export 1bad=x 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("readonly 1bad=x 2>/dev/null; echo notreached"), "");
+	// A fresh NAME on each of these two: the fixture's shell_state outlives a single
+	// capture(), so a reused one would make the second line's `readonly` the
+	// failure being observed rather than the `export` or `unset` under test.
+	EXPECT_EQ(capture("readonly re=1; export re=2 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("readonly rv=1; unset rv 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture("eval 'if' 2>/dev/null; echo notreached"), "");
+	EXPECT_EQ(capture(". ./_lesh_no_such_file_ 2>/dev/null; echo notreached"), "");
+	// The redirection row, on the very builtin this ticket softened elsewhere. The
+	// `2>/dev/null` comes FIRST because redirections are applied left to right and
+	// the failing one would otherwise never let it take effect.
+	EXPECT_EQ(capture("trap '' INT 2>/dev/null <./_lesh_no_such_file_; echo notreached"),
+	          "");
+	EXPECT_EQ(capture(": 2>/dev/null <./_lesh_no_such_file_; echo notreached"), "");
+	// And a REGULAR builtin's failure is still not fatal in any of those rows.
+	EXPECT_EQ(capture("kill -l 2>/dev/null <./_lesh_no_such_file_; echo reached"),
+	          "reached\n");
+	EXPECT_EQ(capture("kill -s NOSUCH $$ 2>/dev/null; echo reached"), "reached\n");
+}
+
 TEST_F(BuiltinRegistryTest, ExecutorBuiltinsWorkInsideAPipelineStage) {
 	// A pipeline stage builds its own argv and called try_run_builtin directly,
 	// which has no entry for the executor's four - and the false return was

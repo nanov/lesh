@@ -1478,15 +1478,19 @@ test 99999999999999999999 -eq 1 2>/dev/null; echo "c=$?"
 
 # A SIGNAL NUMBER has a bounded valid set, so there is nothing above the ceiling
 # for a large one to become - a saturated signal number would name a real signal
-# the script never asked for. Run in a subshell because a special builtin's error
-# ends a non-interactive lesh where it does not end dash, which is a separate
-# difference and not this one.
+# the script never asked for.
+#
+# THE SUBSHELLS THAT USED TO WRAP THESE FOUR LINES ARE GONE. #62 needed them
+# because a special builtin's error ended a non-interactive lesh where it does not
+# end dash, so the four refusals could not be read back in one shell; #66 was that
+# difference, and with it fixed the workaround was a lie in the corpus - a reader
+# would have taken the parentheses for something this case was asserting.
 
---- a signal number too large to be one is refused rather than overflowed [xfail(legacy): legacy has no subshells and no trap builtin, so it runs `trap` as a command name]
-( trap - 99999999999999999999 ) 2>/dev/null; echo "a=$?"
-( trap : 99999999999999999999 ) 2>/dev/null; echo "b=$?"
-( trap - 99 ) 2>/dev/null; echo "c=$?"
-( trap : 2 ) 2>/dev/null; echo "d=$?"
+--- a signal number too large to be one is refused rather than overflowed [xfail(legacy): legacy has no trap builtin, so it runs `trap` as a command name]
+trap - 99999999999999999999 2>/dev/null; echo "a=$?"
+trap : 99999999999999999999 2>/dev/null; echo "b=$?"
+trap - 99 2>/dev/null; echo "c=$?"
+trap : 2 2>/dev/null; echo "d=$?"
 
 --- kill refuses a signal number too large to be one [xfail(legacy): legacy has no command lists, and its kill is the external one]
 kill -s 99999999999999999999 $$ 2>/dev/null; echo "a=$?"
@@ -1534,3 +1538,59 @@ shift -- && echo "[$#][$1]"
 === expect
 [3][c]
 [2][d]
+
+# WHICH SPECIAL BUILTINS KEEP THEIR FATALITY (#66). The narrowing that made an
+# invalid signal name soft was made once, in the single place the rule is applied,
+# so every OTHER special builtin was in its blast radius. These cases are the
+# fence: each is one of POSIX XCU 2.8.1's rows reached through a different
+# builtin, each already agreed with dash before #66, and each has to still agree
+# after it. They were surveyed against dash, bash, zsh and yash first - dash is
+# the strictest of the four and lesh follows dash, per ADR-0001.
+#
+# `echo before` on every case so an assertion of "nothing after this line ran"
+# cannot be satisfied by a shell that died BEFORE the line, which an empty stdout
+# would otherwise allow.
+
+--- a utility syntax error in `set` still ends the shell [xfail(legacy): legacy has no set builtin]
+echo before; set -Z 2>/dev/null; echo notreached
+
+--- an operand that is not a number still ends the shell in `shift` [xfail(legacy): legacy has no shift builtin]
+echo before; shift abc 2>/dev/null; echo notreached
+
+# A shift count PAST THE END is fatal here too - POSIX 2.14 lets a shell treat it
+# as a syntax error and dash does - but it is deliberately not a case here,
+# because lesh reports 1 for it where dash reports 2 and a case would be asserting
+# that unrelated difference. `shift abc` above covers the same row of 2.8.1.
+
+--- an operand that is not a NAME still ends the shell in `export` [xfail(legacy): legacy has no export builtin]
+echo before; export 1bad=x 2>/dev/null; echo notreached
+
+--- and in `readonly` [xfail(legacy): legacy has no readonly builtin]
+echo before; readonly 1bad=x 2>/dev/null; echo notreached
+
+--- a variable assignment error through `export` still ends the shell [xfail(legacy): legacy has no export builtin]
+readonly r=1; echo before; export r=2 2>/dev/null; echo notreached
+
+--- and through `readonly` [xfail(legacy): legacy has no readonly builtin]
+readonly r=1; echo before; readonly r=2 2>/dev/null; echo notreached
+
+--- unsetting a readonly variable still ends the shell [xfail(legacy): legacy has no unset builtin]
+readonly r=1; echo before; unset r 2>/dev/null; echo notreached
+
+--- a shell language syntax error inside `eval` still ends the shell [xfail(legacy): legacy has no eval builtin]
+echo before; eval 'if' 2>/dev/null; echo notreached
+
+--- a dot script that cannot be found still ends the shell [xfail(legacy): legacy has no dot builtin]
+echo before; . ./_lesh_no_such_file_ 2>/dev/null; echo notreached
+
+# The `2>/dev/null` is on the GROUP rather than on `:` itself, and that is not
+# incidental: dash reports a refused assignment prefix through the command's own
+# redirections and lesh reports it before them, so with `r=2 : 2>/dev/null` the two
+# shells agree about the shell's fate and differ about where the diagnostic went.
+# That is a separate defect and this case is not the place to assert it.
+
+--- an assignment prefix refused before a special builtin still ends the shell [xfail(legacy): legacy has no assignment prefixes]
+readonly r=1; echo before; { r=2 : ; } 2>/dev/null; echo notreached
+
+--- a redirection failure on a special builtin still ends the shell [xfail(legacy): legacy has no redirections]
+echo before; : 2>/dev/null <./_lesh_no_such_file_; echo notreached

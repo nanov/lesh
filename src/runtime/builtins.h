@@ -35,10 +35,38 @@ enum class control_flow {
 	interrupted,
 };
 
+// WHICH OF POSIX XCU 2.8.1'S ERROR CLASSES A NON-ZERO STATUS BELONGS TO (#66).
+//
+// That table is what makes a special builtin's failure fatal to a non-interactive
+// shell, and the rows it lists are closed: a shell language syntax error, an
+// expansion error, a redirection error, a variable assignment error, and a
+// UTILITY SYNTAX ERROR - which the table itself parenthesises as "option or
+// operand error", meaning the command line was not the shape the utility accepts.
+// A command line that WAS the right shape, whose operation then failed, is on none
+// of those rows.
+//
+// The distinction had no representation here, so try_run_builtin applied the rule
+// to any non-zero status at all and `trap "" "" || echo reached` killed the script
+// at a line whose author had written down that the failure was expected. dash,
+// bash, zsh and yash all draw the line; lesh collapsed it.
+//
+// `usage` IS THE DEFAULT, and deliberately so. Nearly every failure a special
+// builtin can report is a malformed command line, that is the answer #34 built
+// error-p.tst's 220 assertions on, and a new builtin that says nothing therefore
+// keeps the answer this shell already gives. The exceptions name themselves, which
+// is the direction that fails safe: forgetting the marker leaves a shell that
+// exits too eagerly, where the inverted default would leave one that runs on past
+// an error POSIX requires it to die on.
+enum class failure_kind {
+	usage,        // the command line was wrong: fatal in a special builtin
+	operational,  // the command line was right and the operation failed: never fatal
+};
+
 struct builtin_result {
 	int status = 0;
 	control_flow flow = control_flow::normal;
 	int level = 1;  // for break/continue N
+	failure_kind failure = failure_kind::usage;
 };
 
 // Where a builtin's implementation lives.
@@ -185,7 +213,17 @@ constexpr std::array<builtin_descriptor, 29> kBuiltinRegistry = {{
 // executor owns it. Either way the caller must not treat the call as having run:
 // the false return was discarded with a `(void)`, and that is why an
 // unimplemented `test` reported success (#35).
-[[nodiscard]] bool try_run_builtin(shell_state& state, char** argv, builtin_result& out);
+//
+// `demoted` is the caller's `command` prefix. POSIX XCU `command` says that when
+// the name is a special builtin "the special properties in XCU 2.14 shall not
+// occur", and 2.14 names exactly two - the abort and the persisting assignment.
+// The executor demoted the assignment and the redirection failure and could not
+// demote the status, because this function was handed nothing but shell state and
+// argv, so `command set -Z` still ended the shell where dash and bash report and
+// carry on. Not defaulted: the two call sites both have a `command` prefix to
+// hand, and a default would let a third forget to pass it (#66).
+[[nodiscard]] bool try_run_builtin(shell_state& state, char** argv, builtin_result& out,
+                                   bool demoted);
 
 // Whether the handler table has an entry for this name, WITHOUT running it.
 //

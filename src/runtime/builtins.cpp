@@ -1135,6 +1135,31 @@ bool is_unsigned_integer(std::string_view text) {
 	return true;
 }
 
+// EVERY non-zero status `trap` reports comes from one place: a condition operand
+// that names no signal on this platform. ISSUE #66 is that the shell then treated
+// it as a reason to exit.
+//
+// POSIX XCU 2.8.1 makes a special builtin's failure fatal to a non-interactive
+// shell for a UTILITY SYNTAX ERROR, which that table spells out as "option or
+// operand error" - a command line that is not the shape the utility accepts. This
+// is not one. `INT`, `URG` and `9` are all well-formed conditions; whether this
+// platform HAS them is a runtime lookup, the same class of question as `cd` on a
+// directory that is not there, and `trap` reports it the way any utility reports
+// an operation it could not perform.
+//
+// The platform is the argument that settles it. SIGURG, SIGINFO and SIGPWR are not
+// present everywhere, so a shell that made an unknown name fatal would have made
+// 2.8.1's own rule depend on which kernel the script was running under - and it
+// ended `trap "" "" || echo reached` at a line whose author had written down that
+// the failure was expected. dash, bash, zsh and yash all report and carry on.
+//
+// Returned on the success path too, where the field is not read: the alternative
+// is for each `return` to decide, and the point of putting the answer in one
+// function is that `trap` has only one answer to give.
+[[nodiscard]] constexpr builtin_result trap_condition_status(int status) noexcept {
+	return {status, control_flow::normal, 1, failure_kind::operational};
+}
+
 builtin_result builtin_trap(shell_state& state, char** argv) {
 	signal_state& sigs = state.signals();
 
@@ -1162,7 +1187,7 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 		if (argv[i] == nullptr) {
 			for (int signo = 0; signo < kMaxSignal; ++signo)
 				print_trap(sigs, signo, include_default);
-			return {0};
+			return trap_condition_status(0);
 		}
 		int status = 0;
 		for (; argv[i] != nullptr; ++i) {
@@ -1174,7 +1199,10 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 			}
 			print_trap(sigs, signo, include_default);
 		}
-		return {status};
+		// The listing form reaches the same lookup as the setting form below and takes
+		// the same answer for the same reason; a condition that named no signal must
+		// not depend on which spelling of `trap` asked about it.
+		return trap_condition_status(status);
 	}
 
 	// `trap - SIG...` resets; `trap '' SIG...` ignores; `trap 'cmd' SIG...` sets.
@@ -1210,7 +1238,7 @@ builtin_result builtin_trap(shell_state& state, char** argv) {
 		else
 			sigs.set_trap(signo, std::string(action));
 	}
-	return {status};
+	return trap_condition_status(status);
 }
 
 // 2, as for any other builtin's usage error, and what dash answers for every
@@ -2171,7 +2199,8 @@ bool unset_selects_functions(char** argv) noexcept {
 	return false;
 }
 
-bool try_run_builtin(shell_state& state, char** argv, builtin_result& out) {
+bool try_run_builtin(shell_state& state, char** argv, builtin_result& out,
+                     bool demoted) {
 	if (argv == nullptr || argv[0] == nullptr)
 		return false;
 	const std::string_view name{argv[0]};
@@ -2181,10 +2210,19 @@ bool try_run_builtin(shell_state& state, char** argv, builtin_result& out) {
 			continue;
 		out = b.fn(state, argv);
 
-		// POSIX: a failing SPECIAL builtin exits a non-interactive shell. The same
-		// failure in a regular builtin does not. This is the one place that
+		// POSIX 2.8.1: a failing SPECIAL builtin exits a non-interactive shell. The
+		// same failure in a regular builtin does not. This is the one place that
 		// distinction is applied, so it cannot be forgotten per-builtin.
-		if (out.flow == control_flow::normal && out.status != 0 &&
+		//
+		// THREE CONDITIONS, NOT ONE, and the two that were missing are #66. The rule
+		// asks which builtin (special), who is asking (`command` demotes it, as it
+		// already demoted the assignment and the redirection failure) and WHICH ERROR
+		// (2.8.1 lists the classes, and an operation that simply failed is on none of
+		// them - see failure_kind). Reading only the status made every one of a
+		// special builtin's failures a syntax error, which is how an unknown signal
+		// name came to end a script at a line that had handled it.
+		if (out.flow == control_flow::normal && out.status != 0 && !demoted &&
+		    out.failure == failure_kind::usage &&
 		    classify_builtin(name) == builtin_kind::special && !state.interactive())
 			out.flow = control_flow::exit_shell;
 		return true;

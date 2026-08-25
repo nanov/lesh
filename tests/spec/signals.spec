@@ -344,3 +344,59 @@ kill -s 0 $$; echo "s=$?"; kill -0 $$; echo "n=$?"; kill -s URG $$; echo "u=$?"
 
 --- EXIT is a trap condition and not a signal kill can send [xfail(legacy): legacy has no kill builtin, so `kill` runs /bin/kill]
 kill -s EXIT $$; echo "st=$?"
+
+# ISSUE #66. AN INVALID SIGNAL NAME IS A RUNTIME OPERAND ERROR, NOT A SYNTAX ONE.
+#
+# POSIX XCU 2.8.1's table names the error classes that end a non-interactive shell
+# when they occur in a SPECIAL builtin, and the list is closed: a shell language
+# syntax error, an expansion error, a redirection error, a variable assignment
+# error, and a UTILITY SYNTAX ERROR - which the same paragraph parenthesises as
+# "option or operand error", meaning the command line was not the shape the
+# utility accepts. A utility whose command line WAS that shape and which then
+# could not do the job is on none of those rows; it reports a status, and the
+# shell carries on. lesh had the two collapsed: any non-zero status from a
+# special builtin became an exit.
+#
+# `trap`'s condition operand is where the two are easiest to confuse and where the
+# cost is highest. WHICH NAMES EXIST IS A PROPERTY OF THE PLATFORM - SIGURG,
+# SIGINFO and SIGPWR are not all present everywhere - so a shell that made an
+# unknown name fatal would have made the fatality rule itself platform-dependent,
+# and a script would die on a host that merely lacks a signal. dash, bash, zsh and
+# yash all draw the line the same way and all four print `reached`.
+#
+# The reported shape is the argument: `trap "" "" || echo reached` is a line whose
+# author WROTE DOWN that the failure was expected, and lesh killed the script
+# there. trap-p.tst's last failure, 41/42.
+#
+# `2>/dev/null` throughout: dash writes `bad trap` where lesh writes `bad signal`,
+# which is a diagnostic wording these cases are not about.
+
+--- an invalid signal name is reported without ending the shell [xfail(legacy): legacy has no trap builtin and runs /bin/trap, which does not exist]
+trap '' '' 2>/dev/null; echo "st=$?"; echo reached
+
+--- and neither does a name that is merely unknown [xfail(legacy): legacy has no trap builtin]
+trap '' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
+
+--- a signal NUMBER outside the range is the same kind of error [xfail(legacy): legacy has no trap builtin]
+trap '' 9999 2>/dev/null; echo "st=$?"; echo reached
+
+--- the reset form answers the same way as the ignore form [xfail(legacy): legacy has no trap builtin]
+trap - NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
+
+--- and so does the set form, whose action is a real command [xfail(legacy): legacy has no trap builtin]
+trap 'echo x' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
+
+--- a `command` prefix reaches the same answer, having only demotion to offer [xfail(legacy): legacy has no command builtin]
+command trap '' NOSUCHSIG 2>/dev/null; echo "st=$?"; echo reached
+
+# THE OTHER HALF, which is what a narrowing has to prove it did not take with it:
+# a REDIRECTION failure on the same builtin is one of 2.8.1's rows and stays
+# fatal. `echo before` so the case asserts the shell reached the line at all,
+# rather than passing on an empty stdout it would also produce if it had died
+# earlier.
+
+--- a redirection failure on trap still ends the shell [xfail(legacy): legacy has no trap builtin]
+echo before; trap '' INT 2>/dev/null <./_lesh_no_such_file_; echo notreached
+
+--- and a redirection failure on a REGULAR builtin still does not [xfail(legacy): legacy has no redirections]
+echo before; kill -l 2>/dev/null <./_lesh_no_such_file_; echo "st=$?"; echo reached

@@ -2700,7 +2700,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			if (std::string_view{argv[0]} == "unset" &&
 			    unset_selects_functions(argv.data())) {
 				result = run_unset_functions(argv.data());
-			} else if (!try_run_builtin(_state, argv.data(), result)) {
+			} else if (!try_run_builtin(_state, argv.data(), result, cmd.present)) {
 				// A CLASSIFIED name with no implementation. The registry guard in
 				// builtins.cpp makes this a compile error, and this branch is what
 				// happens if the guard is ever removed: 127 and a diagnostic rather
@@ -2867,7 +2867,10 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 			// made the registry static_assert both ways, so a classified name always
 			// has a handler. Discarding this same return where that did NOT hold is
 			// what made `test 1 = 2` return 0.
-			const bool handled = try_run_builtin(_state, argv.data(), r);
+			// `cmd.present` for the same reason the branch above passes it, though this
+			// stage discards `r.flow` either way: a stage is its own process and has no
+			// shell left to end. Passing it keeps the two sites saying the same thing.
+			const bool handled = try_run_builtin(_state, argv.data(), r, cmd.present);
 			LESH_ASSERT(handled);
 			(void)handled;
 			status = r.status;
