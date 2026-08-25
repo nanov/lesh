@@ -1,10 +1,15 @@
 #include "leshper/editor.h"
 
+#include "leshper/keymap.h"
+#include "leshper/registry.h"
 #include "leshper/text.h"
 #include "leshper/undo.h"
 #include "substrate/assert.h"
 #include "substrate/log.h"
 
+#include <chrono>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -88,33 +93,6 @@ void log_event(const event& incoming) {
 	entry.commit();
 }
 
-constexpr char32_t control_w = 0x17;  // Ctrl-W
-constexpr char32_t control_a = 0x01;  // Ctrl-A
-constexpr char32_t control_e = 0x05;  // Ctrl-E
-constexpr char32_t control_b = 0x02;  // Ctrl-B
-constexpr char32_t control_f = 0x06;  // Ctrl-F
-constexpr char32_t control_h = 0x08;  // Ctrl-H, backspace on terminals that send it
-constexpr char32_t control_underscore = 0x1F; // Ctrl-_, emacs undo
-constexpr char32_t delete_character = 0x7F;   // DEL, what most terminals send for backspace
-
-void encode_utf8(char32_t codepoint, std::string& out) {
-	if (codepoint < 0x80) {
-		out.push_back(static_cast<char>(codepoint));
-	} else if (codepoint < 0x800) {
-		out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
-		out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-	} else if (codepoint < 0x10000) {
-		out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
-		out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
-		out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-	} else {
-		out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
-		out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
-		out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
-		out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
-	}
-}
-
 // Reads one scalar value out of UTF-8 text, answering how many bytes it took.
 //
 // Used only to drain injected input (F-7) - real keys arrive decoded. A
@@ -149,164 +127,78 @@ decoded decode_utf8(std::string_view text) {
 	return {lead, 1};
 }
 
-constexpr bool is_blank(char byte) noexcept {
-	return byte == ' ' || byte == '\t' || byte == '\n';
-}
-
-// The start of the line the position is on (F-2: the buffer is a 2D text object,
-// so `beginning-of-line` means this line rather than the whole buffer).
-position line_start(const text_buffer& buffer, position at) {
-	const std::string_view text = buffer.text();
-	size_t offset = at.byte_offset();
-	while (offset > 0 && text[offset - 1] != '\n')
-		--offset;
-	return position::from_byte_offset(offset);
-}
-
-position line_end(const text_buffer& buffer, position at) {
-	const std::string_view text = buffer.text();
-	size_t offset = at.byte_offset();
-	while (offset < text.size() && text[offset] != '\n')
-		++offset;
-	return position::from_byte_offset(offset);
-}
-
-// Where a backward word deletion stops.
+// Dispatch: one key event, through the keymap stack and into the action
+// registry (#117, #118, spec §6.4).
 //
-// Blank-separated, and that is a placeholder too: C-6 makes the lexer
-// independently callable precisely so word-wise movement can use TOKEN
-// boundaries, which is what makes `rm foo/bar` and `rm 'foo bar'` behave the way
-// a shell user expects rather than the way a text editor does. Wiring that is
-// work for the ticket that gives leshper its first look at the syntax layer;
-// until then, skip trailing blanks, then take the run of non-blanks.
-position backward_word_start(const text_buffer& buffer, position from) {
-	const std::string_view text = buffer.text();
-	size_t offset = from.byte_offset();
-	while (offset > 0 && is_blank(text[offset - 1]))
-		--offset;
-	while (offset > 0 && !is_blank(text[offset - 1]))
-		--offset;
-	return position::from_byte_offset(offset);
-}
-
-// True when the action can change the buffer. Non-mutating actions must not
-// touch the generation: a cursor move that bumped it would make every reactor
-// recompute for nothing, which is the cost A-10's separation exists to avoid.
-constexpr bool may_mutate(action a) noexcept {
-	switch (a) {
-	case action::self_insert:
-	case action::delete_backward_char:
-	case action::delete_backward_word:
-	case action::undo:
-	case action::redo:
-		return true;
-	default:
-		return false;
-	}
-}
-
-void perform(state& current, action chosen, const key_event& key, effects& out) {
-	if (chosen == action::none)
-		return; // bound to nothing: no state change, and nothing to redraw
-
-	const generation before = current.gen;
-	const position cursor_before = current.cursor;
-
-	// Any action that is not plain typing ends the coalescing run (F-4): typing
-	// `ab`, moving the cursor, then typing `cd` is two undo steps, because the
-	// user watched the cursor move in between.
-	if (chosen != action::self_insert)
-		current.undo.break_coalescing();
-
-	switch (chosen) {
-	case action::none:
-		return;
-
-	case action::self_insert: {
-		std::string text;
-		encode_utf8(key.codepoint, text);
-		apply_edit(current, current.cursor, current.cursor, text);
-		break;
-	}
-
-	case action::delete_backward_char: {
-		if (current.cursor == current.buffer.begin_position())
-			return;
-		const position from = current.buffer.previous_position(current.cursor);
-		apply_edit(current, from, current.cursor, {});
-		break;
-	}
-
-	case action::delete_backward_word: {
-		const position from = backward_word_start(current.buffer, current.cursor);
-		if (from == current.cursor)
-			return;
-		apply_edit(current, from, current.cursor, {});
-		break;
-	}
-
-	case action::backward_char:
-		current.cursor = current.buffer.previous_position(current.cursor);
-		break;
-
-	case action::forward_char:
-		current.cursor = current.buffer.next_position(current.cursor);
-		break;
-
-	case action::beginning_of_line:
-		current.cursor = line_start(current.buffer, current.cursor);
-		break;
-
-	case action::end_of_line:
-		current.cursor = line_end(current.buffer, current.cursor);
-		break;
-
-	case action::undo:
-		if (!current.undo_one())
-			return;
-		current.gen.bump();
-		break;
-
-	case action::redo:
-		if (!current.redo_one())
-			return;
-		current.gen.bump();
-		break;
-	}
-
-	// The half of A-10 a test cannot see: a non-mutating action must leave the
-	// generation alone. Asserted rather than commented, because the failure is
-	// silent - every reactor recomputing on a cursor move costs exactly what the
-	// action/reactor split exists to save.
-	LESH_ASSERT(may_mutate(chosen) || current.gen == before);
-
-	// An action that changed nothing asks for nothing. `backward-char` at the
-	// start of the line is the ordinary case, and a redraw per held-down arrow
-	// key against a cursor that cannot move is a cost worth not paying.
-	if (current.gen == before && current.cursor == cursor_before)
-		return;
-
-	// The A-10 loop, in three lines: an action edited the buffer, the generation
-	// bumped, and the reactors are asked to recompute against the new one. The
-	// answer comes back as a worker_result event carrying this same generation,
-	// and is dropped if the buffer has moved on by then.
-	out.push_back(render_request{});
-	if (may_mutate(chosen) && current.gen != before)
-		out.push_back(worker_request{current.gen});
-}
-
-void handle_key(state& current, const key_event& key, effects& out) {
-	perform(current, binding_for(key), key, out);
-}
-
-// Drains what lesh code injected (F-7), through the same dispatch a typed key
-// takes.
+// WHAT USED TO BE HERE was `perform`, a switch over an `action` enum, and it was
+// a SECOND implementation of the nine built-ins - builtin_actions.cpp being the
+// first, written against the ABI. `LeshperAbiEquivalence` existed to catch the
+// two drifting apart. There is one implementation now: this resolves a NAME and
+// `loop_harness::invoke` runs whatever is registered under it, so a user's
+// rebinding of `backward_char` and the built-in are reached by the identical
+// path, which is the whole of what F-13 asks for.
 //
-// Through the keymap, not around it: `zle -U` pushes characters onto the input
-// stack and they are read back as though typed, so injecting a control
-// character invokes its binding. Splicing the text into the buffer instead
-// would be quicker and would break A-12 - leshper would be editing the line by
-// a route the user's own bindings never see.
+// One consequence worth naming, because a test used to pin the opposite: motion
+// is grapheme-cluster-wise everywhere now. The enum path stepped scalar values
+// through `text_buffer::next_position`; the ABI asks the editor, which asks
+// #108's segmenter. `LeshperAbiBuiltins.MotionIsGraphemeWiseWhereTheEnumPathIs
+// StillScalarWise` pinned that disagreement and is retired with this ticket -
+// the disagreement is gone because one of the two paths is.
+void invoke_action(state& current, std::string_view name, std::string_view keys,
+                   effects& out) {
+	editing_context& context = context_of(current);
+	invocation how;
+	// The bytes the sequence would have typed, which is what `self_insert`
+	// inserts and what the ABI documents `keys` to be. A named key contributes
+	// nothing: `<Up>` is not text.
+	encoded_keys_as_text(keys, how.keys);
+
+	action_result ran = context.loop().invoke(current, name, how);
+	// A miss is a miss and not a crash (ADR-0008): a keymap naming an action
+	// nobody registered leaves the state alone, exactly as an unbound key does.
+	if (ran.status == LESH_ERR_NOTFOUND) {
+		LESH_LOG(log::level::debug, log::category::dispatch,
+		         "no action registered for a bound name");
+		return;
+	}
+	// Taken rather than copied, and the empty case is taken WHOLE. One key
+	// producing effects into an empty list is the overwhelmingly common turn, and
+	// appending would buy a second allocation on the keystroke path for nothing.
+	if (out.empty()) {
+		out = std::move(ran.produced);
+		return;
+	}
+	out.insert(out.end(), std::make_move_iterator(ran.produced.begin()),
+	           std::make_move_iterator(ran.produced.end()));
+}
+
+void handle_key(state& current, const key_event& key,
+                std::optional<std::chrono::steady_clock::time_point> now, effects& out) {
+	editing_context& context = context_of(current);
+
+	// The candidate is what is held plus what was just pressed. Short by
+	// construction - six bytes a key - so the copy stays inside the string's
+	// small-buffer and the keystroke path allocates nothing for it.
+	std::string candidate = current.keymaps.pending;
+	encode_key(key, candidate);
+
+	const resolution what = resolve_keys(context.keymaps(), current.keymaps, candidate,
+	                                     is_self_inserting(key));
+	if (what.what == resolution::kind::hold) {
+		current.keymaps.pending = std::move(candidate);
+		// The deadline is the LOOP's instant plus the configured timeout, never a
+		// clock read here (F-5). A caller with no instant to give leaves the hold
+		// unarmed, and the next key resolves it.
+		current.keymaps.hold_deadline =
+			now.has_value() ? std::optional{*now + context.key_timeout} : std::nullopt;
+		return;
+	}
+
+	current.keymaps.clear_hold();
+	if (what.what == resolution::kind::dispatch)
+		invoke_action(current, what.action, candidate, out);
+}
+
 void drain_pending(state& current, effects& out) {
 	while (!current.pending.empty()) {
 		std::string text;
@@ -315,7 +207,10 @@ void drain_pending(state& current, effects& out) {
 		while (!rest.empty()) {
 			const decoded next = decode_utf8(rest);
 			rest.remove_prefix(next.length);
-			handle_key(current, key_event::of(next.codepoint), out);
+			// No instant: injected text is not something a terminal sent, so
+			// there is no arrival time to anchor a hold to. A prefix begun by
+			// injected input waits for the next real key rather than for a clock.
+			handle_key(current, key_event::of(next.codepoint), std::nullopt, out);
 		}
 	}
 }
@@ -401,91 +296,46 @@ void apply_edit(state& current, position from, position to, std::string_view wit
 	current.gen.bump();
 }
 
-const char* name_of(action a) noexcept {
-	switch (a) {
-	case action::none:
-		return "none";
-	case action::self_insert:
-		return "self-insert";
-	case action::delete_backward_char:
-		return "delete-backward-char";
-	case action::delete_backward_word:
-		return "delete-backward-word";
-	case action::backward_char:
-		return "backward-char";
-	case action::forward_char:
-		return "forward-char";
-	case action::beginning_of_line:
-		return "beginning-of-line";
-	case action::end_of_line:
-		return "end-of-line";
-	case action::undo:
-		return "undo";
-	case action::redo:
-		return "redo";
-	}
-	return "none";
+// F-5's hold, and the loop's two calls around it. See editor.h.
+std::optional<std::chrono::steady_clock::time_point>
+keymap_deadline(const state& current) noexcept {
+	return current.keymaps.holding() ? current.keymaps.hold_deadline : std::nullopt;
 }
 
-action binding_for(const key_event& key) noexcept {
-	if (key.named) {
-		switch (key.key) {
-		case named_key::backspace:
-			return action::delete_backward_char;
-		case named_key::left:
-			return action::backward_char;
-		case named_key::right:
-			return action::forward_char;
-		case named_key::home:
-			return action::beginning_of_line;
-		case named_key::end:
-			return action::end_of_line;
-		// The rest of the #97 floor's repertoire, which #111's decoder now
-		// produces and this placeholder table binds to nothing. Deliberately a
-		// default rather than eighteen cases returning action::none: the table is
-		// #93's to replace, and enumerating keys here would be writing the keymap
-		// this file exists to stand in for.
-		default:
-			break;
-		}
-		return action::none;
-	}
+effects keymap_expire(state& current, std::chrono::steady_clock::time_point now) {
+	effects out;
+	if (!current.keymaps.holding())
+		return out;
+	// An early wake - poll(2) returning on a signal, a replay stepping time
+	// coarsely - must not resolve a sequence that was still in flight.
+	if (current.keymaps.hold_deadline.has_value() && now < *current.keymaps.hold_deadline)
+		return out;
 
-	switch (key.codepoint) {
-	case delete_character:
-	case control_h:
-		return action::delete_backward_char;
-	case control_w:
-		return action::delete_backward_word;
-	case control_a:
-		return action::beginning_of_line;
-	case control_e:
-		return action::end_of_line;
-	case control_b:
-		return action::backward_char;
-	case control_f:
-		return action::forward_char;
-	case control_underscore:
-		return action::undo;
-	default:
-		break;
-	}
+	editing_context& context = context_of(current);
+	std::string held;
+	held.swap(current.keymaps.pending);
+	current.keymaps.hold_deadline.reset();
 
-	// Everything printable types itself. The newline is deliberately absent:
-	// F-35 makes Enter a decision the parser takes part in (complete → accept,
-	// incomplete → insert a newline and keep editing), and binding it to
-	// self-insert here would answer that question wrongly and quietly.
-	if (key.codepoint >= 0x20 && key.codepoint != delete_character)
-		return action::self_insert;
-	return action::none;
+	// The longest exact match is the held sequence's own, if it has one: nothing
+	// longer can arrive now. A lone printable that was held only because
+	// something longer was bound falls to the floor and types itself, which is
+	// what makes `bind gg ...` survivable for anyone who wanted a single `g`.
+	// Anything else is a prefix the user abandoned, and it is DROPPED rather than
+	// replayed - typing the `x` out of an unfinished `<C-x>x` is the wrong
+	// recovery from a mistake.
+	const resolution what = resolve_expired_keys(context.keymaps(), current.keymaps, held);
+	if (what.what == resolution::kind::dispatch)
+		invoke_action(current, what.action, held, out);
+	return out;
 }
 
-effects step(state& current, const event& incoming) {
+effects step(state& current, const event& incoming,
+             std::optional<std::chrono::steady_clock::time_point> now) {
 	log_event(incoming);   // #109's `event` category, and N-3's replay file
 	effects out;
 
 	if (const auto* key = std::get_if<key_event>(&incoming)) {
-		handle_key(current, *key, out);
+		handle_key(current, *key, now, out);
 	} else if (const auto* resize = std::get_if<resize_event>(&incoming)) {
 		current.columns = resize->columns;
 		current.rows = resize->rows;
@@ -528,8 +378,9 @@ effects step(state& current, const event& incoming) {
 		current.undo.break_coalescing();
 		apply_edit(current, current.cursor, current.cursor, pasted->text);
 		current.undo.break_coalescing();
-		// Mirrors what self_insert emits (perform(), above): a redraw, plus a
-		// worker request tagged with the generation the mutation just produced.
+		// Mirrors what a mutating action's commit emits (loop_harness::invoke):
+		// a redraw, plus a worker request tagged with the generation the mutation
+		// just produced.
 		out.push_back(render_request{});
 		out.push_back(worker_request{current.gen});
 	}

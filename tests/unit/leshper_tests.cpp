@@ -4,6 +4,7 @@
 #include "leshper/editor.h"
 #include "leshper/effect.h"
 #include "leshper/event.h"
+#include "leshper/keymap.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
 #include "leshper/surface.h"
@@ -205,12 +206,26 @@ TEST(LeshperEditor, DeleteBackwardWordEatsTrailingBlanksAndOneWord) {
 }
 
 TEST(LeshperEditor, EveryBuiltInActionHasAName) {
-	// F-13: nothing unnamed, nothing unrebindable. The name is what #93's
-	// registry will key on.
-	EXPECT_STREQ(name_of(action::self_insert), "self-insert");
-	EXPECT_STREQ(name_of(action::delete_backward_word), "delete-backward-word");
-	EXPECT_STREQ(name_of(binding_for(key_event::of(named_key::left))), "backward-char");
-	EXPECT_STREQ(name_of(binding_for(key_event::of(U'x'))), "self-insert");
+	// F-13: nothing unnamed, nothing unrebindable. The name is what #110's
+	// registry keys on and what #118's keymaps hold - there is no enum between
+	// them any more, so the name a key resolves to IS the registered name.
+	state s;
+	editing_context& context = context_of(s);
+	const keymap* emacs = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(emacs, nullptr);
+
+	const std::string* left = emacs->action_for(encode_key(key_event::of(named_key::left)));
+	ASSERT_NE(left, nullptr);
+	EXPECT_EQ(*left, "backward_char");
+
+	int32_t exists = 0;
+	EXPECT_EQ(lesh_action_exists(&context.actions(), left->c_str(), &exists), LESH_OK);
+	EXPECT_EQ(exists, 1);
+
+	// A printable is bound by nothing and typed by the floor, which is the one
+	// binding that is a rule rather than a row.
+	EXPECT_EQ(emacs->action_for(encode_key(key_event::of(U'x'))), nullptr);
+	EXPECT_TRUE(is_self_inserting(key_event::of(U'x')));
 }
 
 TEST(LeshperEditor, AnUnboundKeyChangesNothingAndEmitsNothing) {
@@ -1869,11 +1884,13 @@ TEST(LeshperAbiBuiltins, EveryEnumBehaviourHasAnAbiRegistration) {
 }
 
 TEST(LeshperAbiEquivalence, TheAbiPathAndTheKeymapPathAgreeOnEveryBuiltIn) {
-	// Two implementations of these behaviours exist right now: editor.cpp's
-	// switch over the enum, and builtin_actions.cpp over the ABI. The keymap
-	// stack that deletes the first is the rest of #93's work. Until then this is
-	// what keeps them from drifting, and it asserts on the whole state rather
-	// than on the fields somebody remembered to check.
+	// It used to be two implementations - editor.cpp's switch over an `action`
+	// enum and builtin_actions.cpp over the ABI - and this test existed to catch
+	// them drifting. #118 deleted the switch, so what it asserts now is the
+	// stronger statement: a key pressed through the keymap stack reaches the same
+	// registered action a binding would invoke by name, over a whole session and
+	// over the whole state rather than the fields somebody remembered to check.
+	// It is no longer a drift alarm; it is the equivalence itself.
 	struct move {
 		const char* abi_name;
 		const char* keys;   // the bytes self_insert inserts; null for the rest
@@ -1932,39 +1949,22 @@ TEST(LeshperAbiEquivalence, TheAbiPathAndTheKeymapPathAgreeOnEveryBuiltIn) {
 	EXPECT_FALSE(through_abi == through_keymap);
 }
 
-TEST(LeshperAbiBuiltins, MotionIsGraphemeWiseWhereTheEnumPathIsStillScalarWise) {
-	// F-3 through #108, and the one place the two paths deliberately DISAGREE.
-	// "e" plus a combining acute is one cluster of three bytes; the enum path's
-	// text_buffer still steps scalar values and stops between them, which #107
-	// wrote down as a placeholder. The ABI asks the editor, and the editor asks
-	// the segmenter.
-	abi_fixture fixture;
-	state s;
-	fixture.type_all(s, "x");
-	fixture.type_one(s, "e");
-	fixture.type_one(s, "\xCC\x81");   // U+0301 COMBINING ACUTE ACCENT
-	ASSERT_EQ(std::string(s.buffer.text()), "xe\xCC\x81");
-	ASSERT_EQ(s.cursor.byte_offset(), 4u);
-
-	fixture.run(s, "backward_char");
-	EXPECT_EQ(s.cursor.byte_offset(), 1u);   // over the whole cluster, not into it
-
-	fixture.run(s, "forward_char");
-	EXPECT_EQ(s.cursor.byte_offset(), 4u);
-
-	// The enum path, for contrast, stops between the "e" and its accent.
-	state scalar_wise;
-	type(scalar_wise, "x");
-	step(scalar_wise, key_event::of(U'e'));
-	step(scalar_wise, key_event::of(static_cast<char32_t>(0x0301)));
-	ASSERT_EQ(std::string(scalar_wise.buffer.text()), "xe\xCC\x81");
-	press(scalar_wise, named_key::left);
-	EXPECT_EQ(scalar_wise.cursor.byte_offset(), 2u);
-
-	// And through the ABI one backspace takes the whole cluster.
-	fixture.run(s, "delete_backward_char");
-	EXPECT_EQ(std::string(s.buffer.text()), "x");
-}
+// RETIRED with #118: `MotionIsGraphemeWiseWhereTheEnumPathIsStillScalarWise`.
+//
+// It pinned a deliberate disagreement - the ABI moved by grapheme cluster
+// through #108's segmenter while editor.cpp's enum switch stepped scalar values
+// through `text_buffer::next_position` - and its whole value was that neither
+// side could change without somebody noticing. #118 deleted the enum switch:
+// dispatch resolves a name and invokes the registered action, so the ABI path
+// IS the keymap path and there is no second answer left to disagree with. Motion
+// is grapheme-cluster-wise everywhere, which is what F-3 asked for.
+//
+// What replaced it is `LeshperKeymapDispatch.MotionOverACombiningMarkMovesByThe
+// WholeCluster` in leshper_keymap_tests.cpp: the same combining-acute input,
+// asserted through `step` rather than through the fixture, because `step` is now
+// the path that used to be wrong. `text_buffer`'s own scalar stepping is still
+// tested where it belongs, in `LeshperBuffer`, and is no longer what a cursor
+// key runs.
 
 // ---------------------------------------------------------------------------
 // Staging and the atomic commit.

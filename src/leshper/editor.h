@@ -4,46 +4,39 @@
 #include "leshper/event.h"
 #include "leshper/state.h"
 
+#include <chrono>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace lesh::leshper {
 
-// The built-in actions of the first editing slice (F-1 subset).
+// The keymap path's two entry points beside `step`, both the loop's.
 //
-// Named, because F-13 says every built-in behaviour is a named action and
-// nothing is unnamed or unrebindable. An enum is NOT the action registry #93
-// will build - that one is language-neutral (NG-4), holds native and lesh-script
-// actions side by side, and is looked up by name at runtime. This enum is the
-// placeholder standing in its doorway, and it is deliberately small: the whole
-// slice is insert, delete, move, undo.
-enum class action : uint8_t {
-	none, // the key is bound to nothing
-	self_insert,
-	delete_backward_char,
-	delete_backward_word,
-	backward_char,
-	forward_char,
-	beginning_of_line,
-	end_of_line,
-	undo,
-	redo,
-};
+// #118 deleted what used to stand here: an `action` enum, a `name_of` for it and
+// a `binding_for` that was a hardcoded switch over key events. All three were
+// placeholders for the keymap stack, and the stack has landed - dispatch resolves
+// an action NAME through the keymap registry and invokes it through #110's action
+// registry, which makes builtin_actions.cpp the one implementation of the nine
+// built-ins rather than the second one.
 
-// The name of an action (F-13). The string is what #93's registry will key on,
-// so it is written the way a user will type it into a binding.
-[[nodiscard]] const char* name_of(action a) noexcept;
-
-// The default keymap, as a function rather than as data (A-8, F-8).
+// F-5's prefix-hold, resolved by TIME rather than by the next key.
 //
-// PLACEHOLDER, and the largest one in this module. Keymaps are first-class
-// mutable data in the design - created, copied, pushed and popped at runtime,
-// with modal input being a stack of them and never a second dispatch system -
-// and that machinery is #93's, downstream of the action ABI. A hardcoded
-// key-to-action table is what stands here until then. It is exposed so tests can
-// assert the binding separately from the behaviour, which is the seam #93 will
-// cut along.
-[[nodiscard]] action binding_for(const key_event& key) noexcept;
+// leshper owns no clock (the rule decode.h states and this obeys): the loop, which
+// read the bytes and therefore knows when they arrived, passes `now` into `step`
+// and gets a deadline back from `keymap_deadline`. When that deadline passes with
+// nothing more typed, this is where the held sequence resolves - to its own exact
+// match if it has one, and to nothing if it does not.
+//
+// Takes `now` and checks it rather than trusting the caller, for the reason
+// input_decoder::expire gives: an early wake must not resolve a hold that was
+// still legitimately in flight.
+effects keymap_expire(state& current, std::chrono::steady_clock::time_point now);
+
+// When keymap_expire must be called if nothing more is typed; nullopt when
+// nothing is being held.
+[[nodiscard]] std::optional<std::chrono::steady_clock::time_point>
+keymap_deadline(const state& current) noexcept;
 
 // The one buffer mutation (F-1, F-4, A-10).
 //
@@ -77,6 +70,15 @@ void apply_edit(state& current, position from, position to, std::string_view wit
 // as `(state, event) -> (state, effects)`, and the state is a struct with a
 // buffer in it. Copying one per keystroke to honour the notation literally would
 // buy nothing that matters and cost N-1's millisecond.
-effects step(state& current, const event& incoming);
+// `now` is when this event arrived, and leshper uses it for exactly one thing:
+// anchoring the deadline of a prefix-hold that this key begins (F-5). Never a
+// clock call - the same discipline decode.h is written to, and for the same
+// reason, which is that a state machine reading a clock cannot be replayed.
+//
+// Defaulted to nullopt so that a test and the N-3 replay harness, neither of
+// which has a clock, still drive the editor: a hold begun with no instant simply
+// never expires on time, and is resolved by the next key instead.
+effects step(state& current, const event& incoming,
+             std::optional<std::chrono::steady_clock::time_point> now = std::nullopt);
 
 } // namespace lesh::leshper
