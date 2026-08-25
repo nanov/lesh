@@ -1182,6 +1182,28 @@ printf 'echo sourced\n(exit 3)\n' >script; . -- ./script; echo "st=$?"
 (exit 41); exit --
 === expect [status: 41]
 
+# `alias` is the same shape one builtin further out: POSIX gives it OPTIONS "None."
+# and the operands `alias-name[=string]`, so the rule above applies unchanged. It is
+# what makes the LISTING re-inputtable, which is the property alias-p.tst:93 asserts
+# by writing every alias to a file, clearing the table and feeding the file back
+# through `eval alias -- $(cat ...)`. Without the separator a name beginning with `-`
+# could not survive that round trip. dash and bash both report `--` as an alias that
+# is not found; zsh and yash discard it.
+
+--- the separator precedes the operands of alias [stdin] [divergence: dash and bash report `alias: -- not found` and fail alias-p.tst's 'printing all aliases'; POSIX XCU 1.4 discards a leading -- for a utility with no options]
+alias -- e='echo hi'
+alias e
+e
+=== expect
+e='echo hi'
+hi
+
+--- a separator with no operands after it still lists every alias [divergence: dash and bash look for an alias named `--`; POSIX XCU 1.4 discards it and `alias --` is then `alias`]
+alias b=b a='echo hi'; alias --
+=== expect
+a='echo hi'
+b='b'
+
 # Control flow unwinds PAST the operator that follows it. `break`, `continue` and
 # a bare `return` all report 0, and 0 is what `&&` continues on, so an and-or list
 # that read only the left operand's status ran the right-hand side of every one of

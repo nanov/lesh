@@ -1897,21 +1897,35 @@ builtin_result builtin_times(shell_state&, char**) {
 // to define the same alias the listing would.
 
 builtin_result builtin_alias(shell_state& state, char** argv) {
+	// `--` as the FIRST argument is discarded. POSIX XCU 1.4 requires it of a utility
+	// with no options that takes operands - "Standard utilities that do not accept
+	// options, but that do accept operands, shall recognize '--' as a first argument
+	// to be discarded" - and `alias` is exactly that shape: OPTIONS is "None." and
+	// the operands are `alias-name[=string]`.
+	//
+	// dash and bash both report `--` as an alias that is not found, so this is a
+	// DELIBERATE DIVERGENCE from the reference shell rather than a match for it; zsh
+	// and yash conform. It is what `alias >f; unalias -a; eval alias -- $(cat f)`
+	// needs, which is how alias-p.tst:93 asserts the listing is re-inputtable - a
+	// name beginning with `-` would otherwise be read as an option by a shell that
+	// has one.
+	const size_t first = first_operand(argv);
+
 	// No operands: every alias, sorted. It printed NOTHING before - a listing that
 	// produces no output fails every case that inspects one, and it made `unalias -a`
 	// look correct while doing nothing (#40).
-	if (argv[1] == nullptr) {
+	if (argv[first] == nullptr) {
 		for (const auto& row : state.aliases())
 			print_alias(row.name, row.value);
 		return {0};
 	}
 	int status = 0;
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
+	for (size_t i = first; argv[i] != nullptr; ++i) {
 		const std::string_view arg{argv[i]};
 		// The `=` is searched from the SECOND byte, so `=foo` is a lookup of an alias
 		// named `=foo` rather than an assignment to the empty name. dash does the
-		// same, and POSIX gives `alias` no options at all - which is why `-p` and
-		// `--` are operands here and not flags, and are reported as not found.
+		// same, and POSIX gives `alias` no options at all - which is why `-p` is an
+		// operand here and not a flag, and is reported as not found.
 		if (const size_t eq = arg.find('=', 1); eq != std::string_view::npos) {
 			state.set_alias(arg.substr(0, eq), arg.substr(eq + 1));
 		} else if (std::string_view value; state.lookup_alias(arg, value)) {
