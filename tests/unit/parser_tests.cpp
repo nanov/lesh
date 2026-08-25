@@ -502,6 +502,79 @@ TEST_F(ParserTest, AMissingOperandNamesTheConstructItBelongsTo) {
 	}
 }
 
+// --- a word-list item spelled `do` or `in` (#65) -----------------------------
+//
+// The word list of a `for` is a list of WORDS, and `do`/`in` are reserved words
+// only by POSITION - #19's rule, the same one that makes `echo done` print
+// `done`. The word-list position is not a reserved-word position at all: only
+// the token that follows a SEPARATOR after the list is, because that is where
+// the grammar's `do_group` actually begins.
+
+TEST_F(ParserTest, AWordListItemSpelledLikeAReservedWordIsAnOrdinaryWord) {
+	// Every one of these is a word list holding a word that also spells a
+	// reserved word elsewhere. dash, bash, zsh and yash all run every one of
+	// them; lesh refused the first two before this fix - for-p.tst:35, :44 and
+	// :117.
+	const struct { std::string_view src; std::vector<std::string_view> words; } cases[] = {
+		{"for i in in; do echo $i; done",            {"in"}},
+		{"for i in done esac fi; do echo $i; done",  {"done", "esac", "fi"}},
+		// `do` right after `in`, separated from the REAL `do` by a `;` rather
+		// than a newline.
+		{"for i in do; do echo $i; done",            {"do"}},
+		// The same, separated by a newline instead - for-p.tst:35's shape.
+		{"for i in do\ndo\necho $i\ndone",           {"do"}},
+		// Two reserved spellings back to back - for-p.tst:44's shape.
+		{"for word in do done\ndo\necho $word\ndone", {"do", "done"}},
+	};
+	for (const auto& c : cases) {
+		const tree t = parse_it(c.src);
+		EXPECT_FALSE(t.has_errors()) << "dash runs this: " << c.src;
+		const node_index loop = t.child_of(t[t.root()], 0);
+		ASSERT_EQ(t[loop].kind, node_kind::for_loop) << c.src;
+		ASSERT_EQ(t[loop].children_count, c.words.size() + 1)
+			<< "the word list plus the body: " << c.src;
+		for (size_t i = 0; i < c.words.size(); ++i) {
+			const node& w = t[t.child_of(t[loop], i)];
+			EXPECT_EQ(w.kind, node_kind::word) << c.src;
+			EXPECT_EQ(t.text_of(w), c.words[i]) << c.src;
+		}
+	}
+}
+
+TEST_F(ParserTest, AForLoopWithoutASeparatorBeforeDoIsStillASyntaxError) {
+	// POSIX requires a `sequential_sep` (`;` or a newline) between the word list
+	// and `do`, so an unseparated `do` is swallowed as one more WORD rather than
+	// closing the list - and nothing then terminates the list, so dash, bash, zsh
+	// and yash all refuse it. Verified against dash directly rather than guessed:
+	// `for i in a b do echo $i; done` is `rc=2` there, with no output.
+	for (const std::string_view src : {
+	         "for i in a b do echo $i; done",
+	         "for i in a b do; echo hi; done",
+	     }) {
+		const tree t = parse_it(src);
+		EXPECT_TRUE(t.has_errors()) << "dash refuses this: " << src;
+	}
+}
+
+TEST_F(ParserTest, TheOverEagerFixWouldHaveBrokenTheseAndMustNot) {
+	// The boundary in the other direction: an ordinary word list, no `in` at
+	// all, and a newline standing in for the `;` must all keep working exactly
+	// as before.
+	const std::string_view cases[] = {
+		"for i in a b; do echo $i; done",   // still an ordinary word list
+		"for i; do echo $i; done",          // no `in` - iterates $@
+		"for i in a b\ndo echo $i; done",   // newline where `;` could stand
+		"for i in a b; done",               // still missing `do` (#58)
+	};
+	for (const std::string_view src : cases) {
+		const tree t = parse_it(src);
+		if (src == "for i in a b; done")
+			EXPECT_TRUE(t.has_errors()) << "#58's fix must hold: " << src;
+		else
+			EXPECT_FALSE(t.has_errors()) << "dash runs this: " << src;
+	}
+}
+
 TEST_F(ParserTest, RunningOutOfInputBeforeAnOperandIsStillIncomplete) {
 	// The third combination, and the one an interactive reader depends on: the
 	// operand is empty AND the input ended, so more of it would help. A missing

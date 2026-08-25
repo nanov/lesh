@@ -300,6 +300,44 @@ echo done
 for i in; do echo x; done
 echo done
 
+# The word list of a `for` is a list of WORDS (#65). `do` and `in` are reserved
+# words only by POSITION - #19's rule, the same one that makes `echo done` print
+# `done` - and the word-list position is not a reserved-word position at all.
+# `for in in a b; do` already worked (#58): the variable NAME `in` was handled.
+# What was missing is the word-list ITEMS, where the parser re-triggered on a
+# reserved spelling and either refused the construct (`in`) or misread where the
+# body began (`do`).
+#
+# `do` right after the list is genuinely ambiguous without a look at what comes
+# next: POSIX requires a `sequential_sep` (`;` or a newline) between the word
+# list and the `do_group`, so an unseparated `do` is swallowed as one more WORD
+# and nothing then closes the list - dash refuses it, and the case at the end of
+# this block checks lesh matches rather than assuming so.
+
+--- a for loop word list item spelled `in` still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in in; do echo $i; done
+
+--- a for loop word list item spelled `do`, separated from the real `do` by a semicolon, still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in do; do echo $i; done
+
+--- a for loop word list item spelled `do`, separated from the real `do` by a newline, still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in do
+do
+echo $i
+done
+
+--- a for loop word list holding `do` and `done` back to back still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for word in do done
+do
+echo $word
+done
+
+--- a for loop word list holding `done`, `esac` and `fi` still runs [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in done esac fi; do echo $i; done
+
+--- a for loop with no separator before `do` is a syntax error [xfail(legacy): legacy has no for loop, so it runs `for` as a command name]
+for i in a b do echo $i; done
+
 --- a trailing backslash is incomplete without being an error
 echo one\
 

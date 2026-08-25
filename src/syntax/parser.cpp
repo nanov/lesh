@@ -610,7 +610,17 @@ private:
 		bool has_in = false;
 		if (accept(reserved::kw_in)) {
 			has_in = true;
-			while (peek().kind == token_kind::word && peek_reserved() == reserved::none)
+			// The word list is a list of WORDS (#65) - `do` and `in` are reserved
+			// only by POSITION (#19), and this is not a reserved-word position at
+			// all: `for i in in; do` names the word `in`, and `for i in do\ndo`
+			// names the word `do` before the do_group's OWN `do` starts on the next
+			// line. peek_reserved() must not be consulted here, unlike
+			// at_list_terminator() a compound_list checks - the only thing that
+			// closes a for loop's word list is running out of WORD tokens; the
+			// keyword that follows is read by require(kw_do) below, after the
+			// separator loop, exactly as the grammar's `sequential_sep do_group`
+			// spells it.
+			while (peek().kind == token_kind::word)
 				_scratch.push(word_node(advance(), node_kind::word));
 		}
 		while (is_separator(peek().kind))
