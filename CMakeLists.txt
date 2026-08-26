@@ -117,6 +117,8 @@ enable_testing()
 # be the gate `configure` armed. Everything else here is still header-only.
 add_library(lesh_substrate STATIC
 	src/substrate/arena.h
+	src/substrate/args.cpp
+	src/substrate/args.h
 	src/substrate/assert.h
 	src/substrate/char_utils.h
 	src/substrate/fork_guard.h
