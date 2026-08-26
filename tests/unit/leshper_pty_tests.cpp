@@ -203,6 +203,13 @@ private:
 	return (modes.c_lflag & ICANON) != 0 && (modes.c_lflag & ECHO) != 0;
 }
 
+// The driver's extended input processing (#140 decision 1). While the editor
+// holds the terminal this is OFF, so VDSUSP, VDISCARD, VLNEXT, VWERASE and
+// VREPRINT are inert and their keys reach the decoder as bytes.
+[[nodiscard]] bool extended_input(const struct termios& modes) noexcept {
+	return (modes.c_lflag & IEXTEN) != 0;
+}
+
 // Every test starts the same way, and the rc file proves #101's ordering as a
 // side effect: the prompt only says `lesh-test>` because `~/.leshrc` ran before
 // the first read.
@@ -515,4 +522,71 @@ TEST(LeshperPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
 
 	EXPECT_TRUE(shell.wait_for("42", 2)) << "the accept never reached the buffer; saw: "
 	                                     << shell.seen();
+}
+
+TEST(LeshperPty, RawModeClearsIEXTENAndTheExitPutsItBack) {
+	// #140 decision 1, and #98's raw mode made complete. On macOS and the BSDs
+	// IEXTEN is what makes the driver's extended `c_cc` entries live: Ctrl-Y is
+	// VDSUSP, Ctrl-O is VDISCARD, Ctrl-V is VLNEXT, Ctrl-W is VWERASE and Ctrl-R
+	// is VREPRINT, and every one of those bytes is eaten before the decoder sees
+	// it. fish and zle both clear the bit; so does `enter_raw` now, and which
+	// keys a user can bind stops being a fact about the platform.
+	//
+	// IT RIDES THE ORDINARY RESTORE. There is no second save and no second
+	// restore path: `_original` is the whole termios from before the first
+	// `enter_raw`, and `leave_raw` and the armed exit restore write it back
+	// wholesale - which is why the "after" half of this test is an assertion
+	// about a bit nobody wrote code for.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+
+	struct termios before{};
+	ASSERT_TRUE(shell.modes(before));
+	ASSERT_TRUE(extended_input(before)) << "the pty did not start with IEXTEN on";
+
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+	struct termios editing{};
+	ASSERT_TRUE(shell.modes(editing));
+	EXPECT_FALSE(extended_input(editing)) << "the editor left IEXTEN on";
+	// And nothing else moved: ISIG is still the driver's job (tty.h's first rule).
+	EXPECT_NE(editing.c_lflag & ISIG, 0u);
+
+	shell.type("\x04");
+	ASSERT_TRUE(shell.reap().has_value()) << "Ctrl-D did not end the session";
+
+	struct termios after{};
+	ASSERT_TRUE(shell.modes(after));
+	EXPECT_TRUE(extended_input(after)) << "the exit path did not restore IEXTEN";
+	EXPECT_TRUE(is_cooked(after));
+}
+
+TEST(LeshperPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
+	// The bit above, spent. `<C-v>` is VLNEXT on this platform, so before #147
+	// the driver swallowed the 0x16 and quoted the byte after it - and the `\r`
+	// that follows here would have been inserted as a literal carriage return,
+	// sending `echo $((6*` to the continuation prompt instead of running
+	// anything. Ctrl-V is the sharpest of the five to test with because its
+	// failure mode is not "nothing happened" but "the next key was stolen too".
+	//
+	// THE ARITHMETIC IS THE ASSERTION, the same way #144's is: `42` is nowhere in
+	// what is typed and nowhere in what is painted, so a second `42` on the wire
+	// can only be a second RUN of the remembered line - which means the byte
+	// reached the keymap, dispatched the action the rc bound, and the action read
+	// the proposal back.
+	const scratch_home home{"PS1='lesh-test>'\nbind '<C-v>' accept_autosuggestion\n"};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("echo $((6*7))\r");
+	ASSERT_TRUE(shell.wait_for("42")) << "saw: " << shell.seen();
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
+
+	shell.type("echo $((6*");
+	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	shell.type("\x16\r");
+
+	EXPECT_TRUE(shell.wait_for("42", 2))
+		<< "the Ctrl-V byte never reached the shell; saw: " << shell.seen();
 }

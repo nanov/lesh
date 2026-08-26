@@ -29,7 +29,12 @@
 //   into the next child - and only then forces `~ICANON ~ECHO` for the shell
 //   itself. `enter_raw` does the same. ISIG stays ON: Ctrl-C must reach the
 //   process as SIGINT so that #98's rebindable `cancel-line` runs off a signal
-//   event rather than off a byte the driver would have eaten anyway.
+//   event rather than off a byte the driver would have eaten anyway. IEXTEN
+//   goes OFF with ICANON and ECHO (#140 decision 1): the BSD driver's extended
+//   `c_cc` entries - VDSUSP, VDISCARD, VLNEXT, VWERASE, VREPRINT - would
+//   otherwise swallow Ctrl-Y, Ctrl-O, Ctrl-V, Ctrl-W and Ctrl-R before the
+//   decoder saw them, so which keys are bindable would be a fact about the
+//   platform rather than about the keymap. It rides the ordinary restore.
 //
 //   NEVER RE-ENABLE ECHO AROUND AN ACTION'S SHELL CODE (fish #7770). There is
 //   no "donate" call in this header at all, which is the enforcement: an
@@ -203,13 +208,13 @@ public:
 	// no `if (is_tty)` of its own.
 	[[nodiscard]] bool is_terminal() const noexcept;
 
-	// Saves the modes as they are and installs the shell's: `~ICANON ~ECHO`,
-	// VMIN 1, VTIME 0, ISIG kept.
+	// Saves the modes as they are and installs the shell's: `~ICANON ~ECHO
+	// ~IEXTEN`, VMIN 1, VTIME 0, ISIG kept.
 	//
 	// THE MODES A CHILD LEFT ARE KEPT (fish's `term_copy_modes`). What is read
 	// here is whatever the last foreground command left behind, so a `stty -a`
 	// change a user made in one command is still there for the next one; only
-	// the four bits the editor needs are forced. The very first call also
+	// the bits the editor needs are forced. The very first call also
 	// records the ORIGINAL modes, which are what `leave_raw` and the exit path
 	// put back, so a session's worth of children cannot ratchet the terminal
 	// somewhere the shell never restores from.
