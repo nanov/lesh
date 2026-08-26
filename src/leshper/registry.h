@@ -53,6 +53,14 @@ namespace lesh::leshper {
 // One reactor's whole answer, carrying both halves; defined below.
 struct reactor_batch;
 
+// The prompt engine (#157, spec §6.10). Declared, not included: this header
+// hands a pointer through and never touches one, so `prompt.h` - which brings
+// `<span>`, the combinator templates and a screenful of static_asserts with it -
+// stays out of every translation unit that only wanted an action registry.
+namespace prompt {
+class engine;
+}
+
 // The memo behind lesh_request_command_kind (#135), one per request.
 //
 // A $PATH walk is a stat per directory, and a line repeats command names -
@@ -161,6 +169,19 @@ struct lesh_registry {
 	// Whoever set it owns it and must outlive the registry (ADR-0007: the owner
 	// takes the view away as it takes the object).
 	const lesh::leshper::completer* completion = nullptr;
+
+	// The prompt engine the `lesh_prompt_*` verbs configure (#157, §6.10).
+	//
+	// A BORROWED POINTER ON THE REGISTRY, for `completion`'s reason exactly: the
+	// ABI's only long-lived handle is the registry, so a registry of a second
+	// kind has to hang off it. Null is "no prompt engine wired up" - a
+	// non-interactive shell - and every prompt verb reports it as
+	// LESH_ERR_NOTFOUND rather than pretending the configuration landed
+	// somewhere.
+	//
+	// NOT const, unlike `completion`: configuring is the point of the door.
+	// Whoever set it owns it and must outlive the registry.
+	lesh::leshper::prompt::engine* prompt_engine = nullptr;
 };
 
 // The editor, for the duration of one action call.
