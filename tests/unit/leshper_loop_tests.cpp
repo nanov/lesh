@@ -10,8 +10,10 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -409,26 +411,221 @@ TEST(LeshperLoopSignals, InstallPutsBackExactlyWhatItReplaced) {
 	EXPECT_EQ(after.sa_handler, SIG_DFL) << "uninstall restores what install saved";
 }
 
-TEST(LeshperLoopSignals, SighupIsNotInstalledOverAnInheritedIgnore) {
-	// `nohup` sets SIGHUP to SIG_IGN before exec, and a shell that installed a
-	// handler over that would undo what the user asked for.
-	lesh::testing::saved_disposition hangup{SIGHUP};
-	lesh::testing::saved_disposition interrupt{SIGINT};
-	lesh::testing::saved_disposition quit{SIGQUIT};
-	lesh::testing::saved_disposition child{SIGCHLD};
-	lesh::testing::saved_disposition winch{SIGWINCH};
-	lesh::testing::saved_disposition pipe{SIGPIPE};
-	lesh::testing::saved_disposition tstp{SIGTSTP};
-	lesh::testing::saved_disposition ttou{SIGTTOU};
-	lesh::testing::saved_disposition ttin{SIGTTIN};
-	hangup.ignore();
+// ---------------------------------------------------------------------------
+// Ownership: what the hub takes, and what it does not (#142)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Every disposition an installed hub can touch, restored on the way out. One
+// guard per signal was not enough in the shell's own signal tests (#52) and it
+// is not enough here either: a hub takes eight signals at once, and a test that
+// guarded three would leave the other five as this hub left them for the whole
+// rest of the binary.
+class every_hub_disposition {
+public:
+	[[nodiscard]] const lesh::testing::saved_disposition& hangup() const { return _guards[0]; }
+	[[nodiscard]] const lesh::testing::saved_disposition& child() const { return _guards[3]; }
+	[[nodiscard]] const lesh::testing::saved_disposition& stop() const { return _guards[6]; }
+
+private:
+	std::array<lesh::testing::saved_disposition, 9> _guards{
+		lesh::testing::saved_disposition{SIGHUP},   lesh::testing::saved_disposition{SIGINT},
+		lesh::testing::saved_disposition{SIGQUIT},  lesh::testing::saved_disposition{SIGCHLD},
+		lesh::testing::saved_disposition{SIGWINCH}, lesh::testing::saved_disposition{SIGPIPE},
+		lesh::testing::saved_disposition{SIGTSTP},  lesh::testing::saved_disposition{SIGTTOU},
+		lesh::testing::saved_disposition{SIGTTIN}};
+};
+
+// What a `trap` installs, as far as the hub can tell: a real function that is
+// not ours. `runtime/signals.cpp`'s `record_signal` is the only one that ever
+// appears in a real lesh process, and it is this shape.
+volatile sig_atomic_t g_trap_handler_ran = 0;
+
+void trap_style_handler(int) { g_trap_handler_ran = 1; }
+
+void install_handler(int signo, void (*fn)(int)) {
+	struct sigaction sa{};
+	sa.sa_handler = fn;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	ASSERT_EQ(::sigaction(signo, &sa, nullptr), 0);
+}
+
+[[nodiscard]] struct sigaction disposition_of(int signo) {
+	struct sigaction current{};
+	sigaction(signo, nullptr, &current);
+	return current;
+}
+
+} // namespace
+
+TEST(LeshperLoopSignals, ReassertOverAForeignHandlerRetargetsTheChain) {
+	// Rule 4a, and the defect it fixes. `trap 'cmd' CHLD` installs
+	// `record_signal`; the old save-once hub stomped it and went on chaining to
+	// what was there BEFORE the trap existed, so `g_pending[CHLD]` was never set
+	// and the trap body never ran - not while editing, not during a command.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	signal_hub hub;
+	ASSERT_TRUE(hub.install());
+
+	// The trap, typed after the hub took the disposition.
+	install_handler(SIGCHLD, trap_style_handler);
+	EXPECT_TRUE(hub.reassert());
+
+	// Taken back - the wakeup is genuinely ours, because a job notice has to
+	// reach a loop blocked in `poll`.
+	EXPECT_NE(disposition_of(SIGCHLD).sa_handler, trap_style_handler)
+		<< "reassert left SIGCHLD with the trap's handler and lost the wakeup";
+
+	g_trap_handler_ran = 0;
+	hub.deliver(SIGCHLD);
+	EXPECT_EQ(g_trap_handler_ran, 1) << "the chain still points at the pre-trap disposition";
+
+	hub.uninstall();
+}
+
+TEST(LeshperLoopSignals, ReassertOverAForeignWinchHandlerRetargetsTheChainToo) {
+	// The same rule on the other caught signal that a `trap` can reach, because
+	// "INT works" was how the CHLD defect stayed invisible: INT escaped only by
+	// the accident that the interactive default had installed `record_signal`
+	// before the hub's first take.
+	const every_hub_disposition guards;
+
+	signal_hub hub;
+	ASSERT_TRUE(hub.install());
+	install_handler(SIGWINCH, trap_style_handler);
+	EXPECT_TRUE(hub.reassert());
+
+	g_trap_handler_ran = 0;
+	hub.deliver(SIGWINCH);
+	EXPECT_EQ(g_trap_handler_ran, 1);
+	// And the hub's own work happened first: the counter, never a queue.
+	EXPECT_EQ(hub.resize_count(), 1u);
+
+	hub.uninstall();
+}
+
+TEST(LeshperLoopSignals, ReassertLeavesAnIgnoreStanding) {
+	// Rule 3. The newest ignore stands, whoever set it - `nohup`'s before exec
+	// or `trap '' CHLD` a moment ago. This is what used to be a SIGHUP-shaped
+	// special case, generalized into the rule that governs every signal.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	signal_hub hub;
+	ASSERT_TRUE(hub.install());
+	ASSERT_NE(disposition_of(SIGCHLD).sa_handler, SIG_IGN) << "the hub never took SIGCHLD";
+
+	guards.child().ignore();
+	EXPECT_TRUE(hub.reassert());
+	EXPECT_EQ(disposition_of(SIGCHLD).sa_handler, SIG_IGN)
+		<< "reassert stomped an ignore the user asked for";
+
+	hub.uninstall();
+}
+
+TEST(LeshperLoopSignals, ReassertLeavesAForeignHandlerOnTheIgnoredSetStanding) {
+	// Rule 4b, and the second defect. The hub never CONSUMED SIGTSTP - its
+	// SIG_IGN was only "better than the default action" - so a user's
+	// `trap 'cmd' TSTP` outranks it. The old hub re-ignored unconditionally and
+	// the trap was not one level removed but erased.
+	const every_hub_disposition guards;
+	guards.stop().default_action();
+
+	signal_hub hub;
+	ASSERT_TRUE(hub.install());
+	ASSERT_EQ(disposition_of(SIGTSTP).sa_handler, SIG_IGN);
+
+	install_handler(SIGTSTP, trap_style_handler);
+	EXPECT_TRUE(hub.reassert());
+	EXPECT_EQ(disposition_of(SIGTSTP).sa_handler, trap_style_handler)
+		<< "reassert erased a TSTP trap";
+
+	hub.uninstall();
+}
+
+TEST(LeshperLoopSignals, UninstallRestoresTheEntryDispositionAndNotTheNewest) {
+	// The reason `_saved` and `_chain` are two slots. `_chain` follows the newest
+	// handler so the trap fires; `_saved` must not, or leaving the editor would
+	// hand the process back a disposition it never started with.
+	const every_hub_disposition guards;
+	guards.child().default_action();
 
 	{
 		signal_hub hub;
 		ASSERT_TRUE(hub.install());
-		struct sigaction current{};
-		ASSERT_EQ(::sigaction(SIGHUP, nullptr, &current), 0);
-		EXPECT_EQ(current.sa_handler, SIG_IGN) << "nohup is respected, not overridden";
+		install_handler(SIGCHLD, trap_style_handler);
+		EXPECT_TRUE(hub.reassert());
+		hub.uninstall();
+	}
+
+	EXPECT_EQ(disposition_of(SIGCHLD).sa_handler, SIG_DFL)
+		<< "uninstall put back the trap's handler rather than the entry disposition";
+}
+
+TEST(LeshperLoopSignals, TheLoopNeverWritesADisposition) {
+	// #142's second amendment, as an assertion rather than a convention. Taking
+	// the dispositions back used to happen on the LOOP thread, in `enter_read`
+	// and on the unpark - two threads writing one piece of process-wide state,
+	// the other being the shell thread's `trap` builtin. The re-assert moved to
+	// the shell side of the wiring site (`read.cpp`), and what is left here must
+	// call no `sigaction` at all: a foreign handler installed after `install()`
+	// survives a read entry and a turn untouched.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	// THE HUB IS DECLARED BEFORE THE LOOP, for the reason `session` states about
+	// its actor: `~event_loop` calls `request_stop`, which pokes the attached
+	// hub's pipe. A hub declared after the loop dies first and that poke is a use
+	// after scope - ASan says so immediately, which is how this line got written.
+	signal_hub hub;
+	event_loop loop{tty.fds(), pipe_options()};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+
+	install_handler(SIGCHLD, trap_style_handler);
+	loop.enter_read();
+	tty.type("x");
+	EXPECT_EQ(loop.turn(50).events, 1u);
+	loop.leave_read();
+
+	EXPECT_EQ(disposition_of(SIGCHLD).sa_handler, trap_style_handler)
+		<< "the loop thread wrote a disposition";
+
+	hub.uninstall();
+}
+
+TEST(LeshperLoopSignals, SighupIsNeverTakenAtAll) {
+	// #142 removed SIGHUP from the hub entirely, and this test is the guard on
+	// that decision rather than on the old `nohup` conditional. The editor's
+	// hangup is the tty's POLLHUP, which `drain_tty` synthesizes; a real SIGHUP
+	// is the shell's own business, so `trap - HUP` is fatal as POSIX says and
+	// `nohup`'s ignore is respected by construction. BOTH entry states are
+	// checked, because the old conditional got the ignore right and the default
+	// wrong - and the default is the one that swallowed a `kill -HUP`.
+	{
+		const every_hub_disposition guards;
+		guards.hangup().ignore();
+		signal_hub hub;
+		ASSERT_TRUE(hub.install());
+		EXPECT_EQ(disposition_of(SIGHUP).sa_handler, SIG_IGN) << "nohup is respected";
+		EXPECT_TRUE(hub.reassert());
+		EXPECT_EQ(disposition_of(SIGHUP).sa_handler, SIG_IGN);
+		hub.uninstall();
+	}
+	{
+		const every_hub_disposition guards;
+		guards.hangup().default_action();
+		signal_hub hub;
+		ASSERT_TRUE(hub.install());
+		EXPECT_EQ(disposition_of(SIGHUP).sa_handler, SIG_DFL)
+			<< "the hub caught a default-fatal SIGHUP and swallowed it";
+		EXPECT_TRUE(hub.reassert());
+		EXPECT_EQ(disposition_of(SIGHUP).sa_handler, SIG_DFL);
 		hub.uninstall();
 	}
 }

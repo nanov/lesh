@@ -300,6 +300,102 @@ TEST(LeshperPty, TheIntTrapFiresAtThePromptTheZshWay) {
 	EXPECT_TRUE(shell.wait_for("caught-int")) << "saw: " << shell.seen();
 }
 
+TEST(LeshperPty, AnIgnoredIntLeavesTheLineAloneAtThePrompt) {
+	// #142 rule 3, end to end: the newest ignore stands. `trap '' INT` means in
+	// lesh what it means in bash - Ctrl-C inert at the prompt - because the hub's
+	// reassert now asks the kernel first and declines to take a SIG_IGN back.
+	// Before this, reassert stomped the ignore and the line was cancelled anyway.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("trap '' INT\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	shell.type("echo survives");
+	ASSERT_TRUE(shell.wait_for("survives"));
+	shell.type("\x03");
+
+	// Nothing to wait FOR when the assertion is that nothing happens, so the
+	// proof is positive: the line is still there and still runs. Enter after the
+	// Ctrl-C echoes the command and its output, which a cancelled line could not
+	// produce.
+	shell.type("\r");
+	EXPECT_TRUE(shell.wait_for("survives", 2)) << "the ignored SIGINT cancelled the line anyway";
+	EXPECT_EQ(shell.count_of("^C"), 0u) << "an ignored SIGINT still printed a cancel indicator";
+}
+
+TEST(LeshperPty, ADefaultHangupKillsTheShell) {
+	// #142 rule 5 - SIGHUP left the hub entirely. The hub used to CATCH a
+	// SIG_DFL SIGHUP, and the editor's signal entrance is deliberately unbound,
+	// so `kill -HUP $$` on a shell with no HUP trap was simply eaten. `trap - HUP`
+	// is written out explicitly rather than relied upon, because the point is the
+	// disposition the shell itself asks for being the one that runs.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("trap - HUP\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	ASSERT_EQ(::kill(shell.child(), SIGHUP), 0);
+	const std::optional<int> status = shell.reap();
+	ASSERT_TRUE(status.has_value()) << "the shell swallowed a default-fatal SIGHUP; saw: "
+	                                << shell.seen();
+	EXPECT_TRUE(WIFSIGNALED(*status) && WTERMSIG(*status) == SIGHUP)
+		<< "SIGHUP did not kill the shell the way its own disposition says it should";
+}
+
+TEST(LeshperPty, AChildTrapFiresAfterACommand) {
+	// #142 rule 4a, end to end, and the defect that motivated the whole ticket.
+	// `trap 'cmd' CHLD` installs `record_signal`; the old save-once hub stomped
+	// it at the next reassert and went on chaining to the disposition from before
+	// the trap existed, so `g_pending[CHLD]` was never set and the body never ran.
+	// `/bin/echo` and not the builtin, because a builtin forks no child and there
+	// would be no SIGCHLD to catch.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("trap 'echo caught-chld' CHLD\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	shell.type("/bin/echo ran\r");
+	EXPECT_TRUE(shell.wait_for("caught-chld")) << "the CHLD trap never fired; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlCDuringAForegroundCommandStillYields130AndFiresTheTrap) {
+	// #142's second amendment: delivery is pinned to the shell thread now - the
+	// loop thread and every helper block the caught set at spawn - so a Ctrl-C
+	// during EXECUTION reaches the one thread that owns `g_pending` every time
+	// rather than whichever thread the kernel happened to pick. The behaviour
+	// asserted is #134's and unchanged; what is new is that it is deterministic.
+	//
+	// It is also where the accepted consequence shows: SIGINT carries no
+	// SA_RESTART, so it now reliably interrupts the shell thread's syscalls
+	// mid-command. Anything that surfaces here is a real latent bug on the
+	// executor's EINTR path rather than a flake.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("trap 'echo caught-int' INT\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	shell.type("sleep 5\r");
+	// Long enough that the command is certainly running and the editor parked.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x03");
+
+	EXPECT_TRUE(shell.wait_for("caught-int")) << "the INT trap did not fire; saw: " << shell.seen();
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
+}
+
 TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};

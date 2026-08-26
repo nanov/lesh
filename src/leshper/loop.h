@@ -101,6 +101,29 @@ namespace lesh::leshper {
 // carries the same rule for the same reason).
 inline constexpr int kMaxTrackedSignal = 32;
 
+// Blocks the hub's caught set - SIGINT, SIGCHLD, SIGWINCH - on the CALLING
+// thread, and answers false if `pthread_sigmask` refused.
+//
+// DELIVERY IS PINNED TO THE SHELL THREAD, and this is the whole mechanism (#142).
+// A process-directed signal is delivered to any one thread that does not block
+// it, so before this existed a Ctrl-C could land on the loop thread, on a helper,
+// or on main, chosen by the kernel afresh each time. Every thread leshper spawns
+// calls this first thing in its body; main does not, so main is the one thread
+// left unblocked and the handler runs there - which is where it ran before
+// leshper existed at all.
+//
+// THE INVARIANT, and it is the reason the block goes on the spawned threads
+// rather than on main: A SIGNAL MASK SURVIVES `execve`. A thread that forks and
+// execs must therefore stay unmasked, or every child inherits a shell's mask and
+// a `kill -INT` on a pipeline does nothing. Main is the only thread that forks
+// (ADR-0009), so the invariant holds by construction - but a future thread that
+// spawns children must not call this.
+//
+// The loop thread loses nothing by being deaf: its knowledge of a signal is
+// exactly the self-pipe byte the `signal` topic drains, which is an event like
+// any other. It never needed the EINTR.
+bool block_caught_signals_on_this_thread() noexcept;
+
 // The self-pipe, the pending set, and the resize counter.
 //
 // INSTANTIABLE, and only `install()` is process-global. A signal handler cannot
@@ -145,10 +168,25 @@ public:
 	//   SIGCHLD  caught, WITH SA_RESTART - "we want SIGCHLD to not interrupt
 	//            restartable syscalls" (fish `signal.cpp`).
 	//   SIGWINCH caught, with SA_RESTART; the counter is the payload.
-	//   SIGHUP   caught ONLY IF currently SIG_DFL, which is how `nohup` is
-	//            respected rather than overridden.
 	//   SIGPIPE, SIGQUIT, SIGTSTP, SIGTTOU, SIGTTIN ignored. fish's words on the
 	//            last three: "We are a shell, we know what is best for the user."
+	//
+	// EACH ONE ONLY WHERE THE KERNEL SAYS IT IS OURS TO TAKE - see `reassert`,
+	// whose rules `install` is the first application of, not a special case.
+	//
+	// SIGHUP IS NOT IN THAT LIST AND THAT IS THE DECISION (#142). The editor's
+	// hangup is the TTY's, not the signal's: `drain_tty` turns a POLLHUP on the
+	// input fd into `signal_event{SIGHUP}` plus `_exiting`, which is the path
+	// that actually fires when a terminal goes away. A real SIGHUP is left to
+	// the shell's own disposition, so `trap 'cmd' HUP` fires at the next command
+	// boundary exactly as it always did, `trap - HUP` kills the shell as POSIX
+	// says, and `nohup`'s SIG_IGN is respected by construction rather than by a
+	// conditional. THE RESIDUAL, written down rather than discovered later:
+	// death by a SIG_DFL SIGHUP skips the termios restore, because nothing of
+	// ours runs on that path. On a real hangup the terminal is already gone and
+	// restoring it means nothing; if it is ever wanted for a synthetic
+	// `kill -HUP`, `install_fatal_restore_handlers` (tty.h) is where it goes,
+	// alongside the other default-fatal signals it already covers.
 	//
 	// Answers false if any `sigaction` failed. `uninstall()` puts back exactly
 	// what was saved, which is what lets a test install and restore without
@@ -158,7 +196,7 @@ public:
 	void uninstall() noexcept;
 	[[nodiscard]] bool installed() const noexcept { return _installed; }
 
-	// Takes the dispositions again, keeping what was saved the FIRST time.
+	// Takes the dispositions again - ASKING THE KERNEL, per signal, first.
 	//
 	// #134's resolution of the ownership question #129 returned. The shell's own
 	// `trap` machinery (`runtime/signals.cpp`) installs a handler of its own the
@@ -168,10 +206,55 @@ public:
 	// every read entry and after every command, which is where a `trap` can have
 	// run.
 	//
-	// The SAVE IS ONCE PER SIGNAL, deliberately: what we chain to has to be the
-	// handler that was there before leshper existed, and re-saving would either
-	// record our own handler (an infinite chain) or record whatever the shell
-	// installed a moment ago and lose the original for `uninstall` to put back.
+	// TWO SAVED SLOTS PER SIGNAL, and separating them is what #142 fixed. The
+	// old single save served two purposes at once - the thing `uninstall` puts
+	// back AND the thing `deliver` chains to - and one slot cannot be both: a
+	// save that is once-per-signal keeps `uninstall` honest but leaves the chain
+	// pointing at a disposition from before the user's `trap` existed, and a save
+	// that re-runs keeps the chain fresh but loses the entry-time original (or
+	// records our own handler, an infinite chain). So:
+	//
+	//   `_saved`  written AT MOST ONCE per signal, read only by `uninstall`.
+	//   `_chain`  retargeted at every take, read only by `deliver`.
+	//
+	// THE RULES, applied per signal at `install()` and at every `reassert()`
+	// alike, from the kernel's own answer to `sigaction(signo, nullptr, &now)`:
+	//
+	//   1. It is already our handler -> held. Nothing to do, and self-chaining
+	//      is excluded here rather than guarded against downstream.
+	//   2. SIG_DFL -> take it (catch or ignore per the table above), with no
+	//      chain: there was no handler, so there is nothing to call.
+	//   3. SIG_IGN -> LEAVE IT. The newest ignore stands, whoever set it -
+	//      `nohup`'s before exec, or `trap '' SIG` a moment ago. This is what
+	//      used to be a SIGHUP-shaped special case, generalized into the rule.
+	//      It makes `trap '' INT` mean what it means in bash: Ctrl-C inert at
+	//      the prompt. That is intended.
+	//   4. Any other real handler - in a lesh process that is only ever
+	//      `runtime/signals.cpp`'s `record_signal`, installed by a `trap`:
+	//        - caught set (INT, CHLD, WINCH): TAKE IT AND RETARGET `_chain` to
+	//          it. The wakeup is genuinely ours - a job notice has to reach a
+	//          loop blocked in `poll` - and the user's trap still runs because
+	//          `deliver` calls through afterwards. Without the retarget the
+	//          chain points at whatever was there before the trap and
+	//          `g_pending` is never set, which is exactly how `trap 'cmd' CHLD`
+	//          was silently dead.
+	//        - ignored set (PIPE, QUIT, TSTP, TTOU, TTIN): LEAVE IT. The hub
+	//          never consumed these; its SIG_IGN was only "better than the
+	//          default", and a user's trap outranks "we are a shell, we know
+	//          what is best".
+	//
+	// THE SHELL THREAD IS THE ONLY WRITER, and this call belongs to it (#142's
+	// second amendment). `install`, `reassert` and `uninstall` all `sigaction`,
+	// which is process-wide state; the trap builtin writes the same state from
+	// the same thread; and `block_caught_signals_on_this_thread` leaves the shell
+	// thread as the only one a signal is delivered to. So the writer, the other
+	// writer, and the handler are one thread, and the loop thread only ever READS
+	// the hub - `drain`, `resize_count`, and the byte in the pipe.
+	//
+	// The chain slots are atomic anyway (see `_chain`): a `sigprocmask` fence
+	// would have been no fence at all, because it masks the calling thread and
+	// says nothing about delivery elsewhere, and one lock-free pointer store
+	// costs nothing and stays correct if a thread is ever left unmasked.
 	bool reassert() noexcept;
 
 	// THE HANDLER'S WHOLE BODY, async-signal-safe, exposed so a test can deliver
@@ -182,12 +265,21 @@ public:
 	//
 	// AND THEN IT CHAINS (#134). After the self-pipe work - and only after, so a
 	// previous handler that never returns cannot cost us the wakeup - the
-	// handler saved for this signal is called, when one was saved and it is a
-	// real function rather than SIG_DFL or SIG_IGN. That is what keeps the
-	// shell's `g_pending` being set while the editor owns the dispositions, so a
-	// user's `trap INT` still fires (#98 decision 3, the zsh way) - during
-	// editing AND during a command, when the shell thread is running the command
-	// and draining no slots at all.
+	// handler in `_chain[signo]` is called, when one is there and it is a real
+	// function rather than SIG_DFL or SIG_IGN. That is what keeps the shell's
+	// `g_pending` being set while the editor owns the dispositions, so a user's
+	// `trap INT` still fires (#98 decision 3, the zsh way) - during editing AND
+	// during a command, when the shell thread is running the command and
+	// draining no slots at all.
+	//
+	// `_chain`, NOT `_saved` (#142). The chain target is whatever the kernel had
+	// at the LAST take, so a `trap` typed five commands into the session is the
+	// thing called; `_saved` is the entry-time disposition and belongs to
+	// `uninstall` alone. See `reassert` for why one slot could not be both.
+	//
+	// THIS RUNS ON THE SHELL THREAD in a real session, not on the loop's - the
+	// spawned threads block the caught set, so main is the only thread a
+	// process-directed signal reaches. The loop hears about it as a byte.
 	//
 	// A previous handler installed with SA_SIGINFO is NOT chained: this entry
 	// point has only a signal number, and inventing a `siginfo_t` to pass it
@@ -208,7 +300,8 @@ public:
 	std::size_t drain(std::vector<int>& out) noexcept;
 
 private:
-	// The body `install` and `reassert` share: catch, ignore, and save-once.
+	// The body `install` and `reassert` share: ask the kernel, then catch,
+	// ignore or stand aside per the rules on `reassert`.
 	bool take_dispositions() noexcept;
 
 	int _read_fd = -1;
@@ -221,9 +314,28 @@ private:
 	volatile sig_atomic_t _pending[kMaxTrackedSignal]{};
 	volatile sig_atomic_t _resizes = 0;
 
-	// What was installed before us, put back by `uninstall`.
+	// What was installed before us the FIRST time we took this signal, put back
+	// by `uninstall` and read by nothing else.
 	struct sigaction _saved[kMaxTrackedSignal]{};
 	bool _saved_valid[kMaxTrackedSignal]{};
+
+	// What `deliver` chains to: the handler the kernel had at the LAST take, or
+	// null for "nothing to call".
+	//
+	// A LOCK-FREE ATOMIC POINTER, and nothing bigger. `take_dispositions` writes
+	// these and the handler reads them, so the store must be un-tearable - and it
+	// cannot be fenced with `sigprocmask`, which masks the CALLING THREAD only
+	// and says nothing about delivery to another. One pointer-sized relaxed store
+	// against one relaxed load is the whole synchronisation: the race is benign
+	// (an in-flight signal chains to the old target or the new one, both of which
+	// are real handlers) and the value is never half-written.
+	//
+	// A `struct sigaction` will not do here for that reason; the flags it carried
+	// are consumed at the STORE instead - an SA_SIGINFO handler is stored as null,
+	// because this entry point has only a signal number to give it.
+	std::atomic<void (*)(int)> _chain[kMaxTrackedSignal]{};
+	static_assert(std::atomic<void (*)(int)>::is_always_lock_free,
+	              "the chain slot is read from a signal handler and must never lock");
 };
 
 // ---------------------------------------------------------------------------
