@@ -2049,15 +2049,19 @@ public:
 	void clear(surface_id which);
 	void use_default(surface_id which);
 
-	// ONE PLACEMENT VERB, which is what the model change bought the ABI. What was
-	// `add_module`, `add_literal` and `add_style` - three verbs that between them
-	// could say things the template language cannot, and could not say things it
-	// can - is one call that places exactly what `{name:style:type:prefix:postfix}`
+	// ONE PLACEMENT, the internal primitive `add_module` and `add_literal` place
+	// through: one call that places exactly what `{name:style:type:prefix:postfix}`
 	// spells, and nothing else.
 	//
 	// An empty `name` places a LITERAL: a placement with no module, its bytes in
 	// the affixes, its pen painting them. That is the same record and not a
 	// special case.
+	//
+	// NOT THE ABI'S OWN DOOR. `lesh_prompt_set_placements` resolves `module`
+	// itself (including the "literal" keyword and its two refusals) against
+	// `builder` directly, rather than through this method - see
+	// `engine::build_placements` in prompt.cpp for why: the ABI walks a tree, not
+	// a flat verb stream, and needs the group hooks `place` has no way to reach.
 	//
 	// The bytes of every argument are COPIED into the surface's arena (the ABI's
 	// copy-in convention, and the only convention that survives a binding whose
@@ -2083,6 +2087,20 @@ public:
 
 	// False when none is open.
 	bool close_group(surface_id which);
+
+	// THE C ABI's WHOLE-SURFACE VERB (#157, owner's ruling): a `lesh_prompt_placement`
+	// tree, validated recursively and swapped atomically, exactly the promise
+	// `set_template` below makes for a string. Returns the ABI's own status:
+	// LESH_OK, LESH_ERR_INVAL (a structural error in the tree), LESH_ERR_NOTFOUND
+	// (the first unresolved module) or 1 (the first style/type/literal refusal) -
+	// see abi.h for the rule each answers.
+	//
+	// ONE BUILDER, TWO FRONT DOORS: this walks the tree calling the identical
+	// `builder` `set_template` drives from scanned bytes, so a tree that says what
+	// a template says builds the identical program. `count == 0` clears the
+	// surface, `items` unread.
+	std::int32_t set_placements(surface_id which, const lesh_prompt_placement* items,
+	                            std::size_t count);
 
 	// The template language, parsed ONCE and swapped ATOMICALLY.
 	//
@@ -2204,6 +2222,19 @@ private:
 	// application to undo because nothing was applied.
 	struct builder;
 
+	// The four-way answer `set_placements` collapses the template parser's finer
+	// refusals into (#157): the array verb has one status for a style refusal, a
+	// type refusal and `literal`'s two refusals, because it has no message
+	// channel to tell them apart with.
+	enum class placements_error : std::uint8_t { none, invalid, unknown_module, refused };
+
+	// `set_placements`'s recursive walk over one `lesh_prompt_placement` array,
+	// calling `builder`'s four hooks exactly as `scan_template` does from scanned
+	// bytes - "one builder, two front doors". A `struct builder` member is what
+	// lets this reach the private type; defined in prompt.cpp beside `builder`.
+	static placements_error build_placements(builder& build, const lesh_prompt_placement* items,
+	                                         std::size_t count);
+
 	// The C function, its optional validator and its registration context, for a
 	// module that came in across the ABI. A `module` like any other - it parses
 	// its type slot through the validator and renders through the trampoline - so
@@ -2259,6 +2290,26 @@ private:
 	// render, not a user asking for it.
 	bool _configured = false;
 };
+
+// ---------------------------------------------------------------------------
+// C++ sugar over `lesh_prompt_set_placements` - NOT part of the ABI (#157)
+// ---------------------------------------------------------------------------
+
+// Deduces the count a C caller has to pass by hand, so an in-tree caller writes
+//
+//   set_placements(registry, LESH_PROMPT_LEFT, {
+//       { "path", { .style = "cyan", .type = "s" } },
+//       { "literal", { .prefix = "> " } },
+//   });
+//
+// This is exactly `lesh_prompt_set_placements(registry, surface, items, N)` -
+// abi.h stays purely C11, where the same call is a compound literal plus its
+// own count, and that form is what this forwards to.
+template <std::size_t N>
+inline std::int32_t set_placements(lesh_registry* registry, std::uint32_t surface,
+                                   const lesh_prompt_placement (&items)[N]) {
+	return lesh_prompt_set_placements(registry, surface, items, N);
+}
 
 // ---------------------------------------------------------------------------
 // The tick timer's interval

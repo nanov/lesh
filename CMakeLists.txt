@@ -44,6 +44,12 @@ target_compile_options(lesh_options INTERFACE
 	# the character lookup tables. We are clang-only by policy, so this is a
 	# choice rather than an accident.
 	-Wno-c99-designator
+	# Partial designated initializers are the whole point of the ABI's OPTIONS
+	# STRUCT convention (#157: required arguments positional, optionals in a
+	# by-value struct - `{ .style = "magenta", .prefix = "on " }` leaves every
+	# unnamed field at its zero default). Naming every field defeats it, so this
+	# warning is off by policy rather than by omission.
+	-Wno-missing-designated-field-initializers
 	# Release treats warnings as errors. The hygiene categories below are
 	# demoted to plain warnings for now: they are noisy in code that ADR-0002
 	# and the module-layout ticket are about to delete or move wholesale. They
