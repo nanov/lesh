@@ -136,6 +136,17 @@ int32_t end_of_line(lesh_editor* editor, const lesh_invocation*, void*) {
 	return cursor_to(editor, LESH_MOTION_LINE_END);
 }
 
+// emacs's `forward-word`, and LESH_MOTION_NEXT_WORD is the motion that means it:
+// blank-separated, landing PAST the end of the word rather than on its last
+// byte, which is the difference abi.h names between the two word families.
+//
+// Registered but bound to nothing until #140's table below reaches it through
+// `accept_suggestion_or_forward_word` - `<A-f>` had no binding before, and the
+// wrapper needs a name to delegate to rather than a motion of its own.
+int32_t forward_word(lesh_editor* editor, const lesh_invocation*, void*) {
+	return cursor_to(editor, LESH_MOTION_NEXT_WORD);
+}
+
 // --- Accepting an autosuggestion (#133, F-25) -------------------------------
 //
 // A proposal becomes buffer text HERE and nowhere else. The reactor that found
@@ -231,12 +242,106 @@ int32_t accept_autosuggestion_word(lesh_editor* editor, const lesh_invocation*, 
 	return lesh_cursor_set(editor, boundary);
 }
 
+// DELIBERATELY BOUND TO NO KEY, in any keymap, and it is a decision rather than
+// an omission (#140 decision 4, fish's answer). A suggestion changes as you
+// type, so it dismisses itself; Ctrl-C clears the whole line when it does not.
+// A default key here would be a key spent on the case the user can already
+// reach - and it is one `bind '<C-g>' dismiss_autosuggestion` away for anyone
+// who wants it, which is what registering a name with no key is FOR.
 int32_t dismiss_autosuggestion(lesh_editor* editor, const lesh_invocation*, void*) {
 	// Requested, never performed: the loop drops the batch once this action's
 	// writes have been committed. Answers LESH_OK with nothing showing, because
 	// dismissing nothing is not an error either.
 	return lesh_proposal_dismiss(editor, LESH_PROPOSAL_AUTOSUGGESTION);
 }
+
+// --- Accepting by FALLTHROUGH (#140 decision 2, #147) -----------------------
+//
+// THE ACCEPTING ACTION IS THE BOUND ACTION AND THE MOTIONS STAY PURE. The
+// alternative fish takes - teaching `forward_char` to accept when it is at the
+// end of the buffer - was rejected on one argument: vi operators drive motions,
+// so `d$` and `dw` with a suggestion showing would accept while deleting. Here
+// the `w` in `dw` dispatches inside the opaque operator-pending keymap, which
+// binds the pure motion table (#119), and safety is a fact about the tables
+// rather than about a condition somebody has to remember to check.
+//
+// ONE IMPLEMENTATION, five registrations. What differs between `<Right>` and
+// `e` is two action NAMES, and a name is data - so it rides in as registration
+// userdata (the ABI's third argument, the same door the vi repertoire's context
+// comes through) and the wrapper is a lookup and a delegation.
+//
+// COMPOSED, NEVER REIMPLEMENTED. Both halves go through `lesh_action_invoke`
+// (#110), which shares the caller's staging area and undo group - so accepting
+// through `<Right>` is the one undo entry accepting through
+// `accept_autosuggestion` is, and the fallthrough is the same single motion the
+// key meant before. The PLAIN names and not `.name`: a user who replaces
+// `forward_char` or `accept_autosuggestion` has replaced what these keys do,
+// which is the whole point of a name being rebindable.
+
+struct fallthrough {
+	const char* accept;   // what the key means with a suggestion showing
+	const char* motion;   // what it means otherwise - and what it always meant
+};
+
+// True when the accept half should run.
+//
+// THREE QUESTIONS, and each is load-bearing. Something is proposed; the cursor
+// is at the END of the buffer, because that is where a suggestion is a
+// continuation of what you typed and anywhere else `<Right>` means what
+// `<Right>` means; and the proposal is LONGER than the buffer, so a key never
+// disappears into an accept that had nothing left to accept.
+bool suggestion_is_acceptable(lesh_editor* editor) {
+	// A LENGTH-ONLY ASK: capacity zero, so a non-empty proposal answers
+	// LESH_ERR_TOOSMALL having filled the length in. LESH_ERR_NOTFOUND is the
+	// one answer that means nothing is showing, and it is not an error - see
+	// `read_suggestion` above. Nothing is copied, which is what keeps a key
+	// that only moved the cursor from touching 4 KiB of stack.
+	size_t suggested = 0;
+	const int32_t showing =
+		lesh_proposal_read(editor, LESH_PROPOSAL_AUTOSUGGESTION, 0, nullptr, 0, &suggested);
+	if (showing != LESH_OK && showing != LESH_ERR_TOOSMALL)
+		return false;
+
+	size_t typed = 0;
+	if (lesh_buffer_length(editor, &typed) != LESH_OK)
+		return false;
+	if (suggested <= typed)
+		return false;
+
+	size_t cursor = 0;
+	if (lesh_cursor_get(editor, &cursor) != LESH_OK)
+		return false;
+	return cursor == typed;
+}
+
+int32_t accept_suggestion_or(lesh_editor* editor, const lesh_invocation* invocation,
+                             void* userdata) {
+	const fallthrough* which = static_cast<const fallthrough*>(userdata);
+	if (which == nullptr)
+		return LESH_ERR_INVAL;
+	// The invocation travels UNCHANGED, so a count typed before the key reaches
+	// `vi_word_next` the way it would have without the wrapper. A null one - an
+	// action invoked from somewhere that was not a key - becomes an empty
+	// invocation rather than LESH_ERR_INVAL, on the stack, because a keystroke
+	// path takes nothing from the heap.
+	lesh_invocation none{};
+	const lesh_invocation* how = invocation != nullptr ? invocation : &none;
+	return lesh_action_invoke(
+		editor, suggestion_is_acceptable(editor) ? which->accept : which->motion, how);
+}
+
+// The five rows of #140's table, as registration userdata. File scope and
+// non-const because the ABI's context argument is a `void*`; constant-
+// initialized and never written, so nothing here is a mutable global in any
+// sense that matters.
+fallthrough to_forward_char{"accept_autosuggestion", "forward_char"};
+fallthrough to_end_of_line{"accept_autosuggestion", "end_of_line"};
+fallthrough to_forward_word{"accept_autosuggestion_word", "forward_word"};
+// vi command mode gets the WORD accepts only, and falls through to its own
+// class-aware motions. `b` is not here: a suggestion exists only forward of the
+// cursor, so backward has nothing to accept.
+fallthrough to_vi_word_next{"accept_autosuggestion_word", "vi_word_next"};
+fallthrough to_vi_word_end{"accept_autosuggestion_word", "vi_word_end"};
 
 // --- Completion (#139, F-28/F-30, spec 6.9) ---------------------------------
 //
@@ -353,6 +458,9 @@ int32_t redo_action(lesh_editor* editor, const lesh_invocation*, void*) {
 struct builtin {
 	const char* name;
 	lesh_action_fn fn;
+	// The registration-time context. Null for all but the fallthrough wrappers,
+	// which are one function registered five times and told apart by it.
+	void* userdata = nullptr;
 };
 
 // snake_case, per #93. The names are what a user types into a binding, what an
@@ -365,15 +473,26 @@ constexpr builtin builtins[] = {
 	{"forward_char", forward_char},
 	{"beginning_of_line", beginning_of_line},
 	{"end_of_line", end_of_line},
+	{"forward_word", forward_word},
 	{"undo", undo_action},
 	{"redo", redo_action},
-	// F-25's three. NOT BOUND TO ANYTHING YET, and deliberately: the default
-	// keymap is #118's, and a name registered with no key is exactly what an rc
-	// file binds. Fish's defaults are Right/Ctrl-F for the whole, Alt-Right/
-	// Alt-F for the word, and Escape or Ctrl-C for the dismissal.
+	// F-25's three. THE ACCEPTS ARE STILL BOUND TO NO KEY THEMSELVES, and that
+	// is unchanged by #140: what the default table binds is the five wrappers
+	// below, which compose these. A user who wants a key that accepts and does
+	// nothing else binds one of these two names, and a user who wants no
+	// dismissal key gets that for free - see the note above the action.
 	{"accept_autosuggestion", accept_autosuggestion},
 	{"accept_autosuggestion_word", accept_autosuggestion_word},
 	{"dismiss_autosuggestion", dismiss_autosuggestion},
+	// #140's table, five thin names over one implementation. Which accept each
+	// composes is in the userdata beside it, not in the name - the fallback is
+	// what tells them apart to a reader, and `bind -m emacs` shows the name a
+	// key really runs, which was the argument for wrappers over overloading.
+	{"accept_suggestion_or_forward_char", accept_suggestion_or, &to_forward_char},
+	{"accept_suggestion_or_end_of_line", accept_suggestion_or, &to_end_of_line},
+	{"accept_suggestion_or_forward_word", accept_suggestion_or, &to_forward_word},
+	{"accept_suggestion_or_word_start_next", accept_suggestion_or, &to_vi_word_next},
+	{"accept_suggestion_or_word_end_next", accept_suggestion_or, &to_vi_word_end},
 	// #139's. Bound to Tab at the wiring site (read.cpp) rather than in
 	// keymap.cpp's default tables, because it is only in a session that a
 	// completer exists to complete WITH - the same reason `accept_line` is bound
@@ -391,7 +510,7 @@ namespace lesh::leshper {
 std::size_t register_builtin_actions(lesh_registry& reg) {
 	std::size_t registered = 0;
 	for (const builtin& one : builtins) {
-		if (lesh_action_register(&reg, one.name, one.fn, nullptr) == LESH_OK)
+		if (lesh_action_register(&reg, one.name, one.fn, one.userdata) == LESH_OK)
 			++registered;
 	}
 	return registered;
