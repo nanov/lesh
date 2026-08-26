@@ -238,6 +238,110 @@ int32_t dismiss_autosuggestion(lesh_editor* editor, const lesh_invocation*, void
 	return lesh_proposal_dismiss(editor, LESH_PROPOSAL_AUTOSUGGESTION);
 }
 
+// --- Completion (#139, F-28/F-30, spec 6.9) ---------------------------------
+//
+// THE WHOLE TAB BEHAVIOUR, in one action and through the ABI like everything
+// else in this file. What is NOT here is any knowledge of what a completion IS:
+// where the token starts, which of the trio it belongs to, how a name is quoted
+// and whether it is a directory are the `Completer` provider's (#94's override
+// point), reached through `lesh_complete`. What is also not here is F-30 - the
+// choice between inserting and listing belongs to `lesh_pager_commit`, so that
+// this action, the history search and a plugin cannot disagree about it.
+//
+// So the action is three moves: ask, feed, commit. That it stages no write of
+// its own is the point - the pager's insertion is the staged write, and A-12
+// holds for a completion exactly as it holds for an accepted suggestion.
+
+// Feeds one completion into the pager and commits it. `*outcome` is what commit
+// decided; `*inserted_length` is how many bytes the span grew by, which is how
+// the caller below learns whether a directory was just entered.
+int32_t offer_completion(lesh_editor* editor, uint32_t* outcome) {
+	size_t count = 0;
+	int32_t status = lesh_complete(editor, &count);
+	// No completer wired up. Not an error to report: Tab in a leshper with no
+	// completer is the same ordinary nothing that Tab on an unmatched prefix is.
+	if (status == LESH_ERR_NOTFOUND)
+		return LESH_OK;
+	if (status != LESH_OK)
+		return status;
+
+	size_t from = 0;
+	size_t to = 0;
+	status = lesh_completion_range(editor, &from, &to);
+	if (status != LESH_OK)
+		return status;
+	status = lesh_pager_open(editor, from, to);
+	if (status != LESH_OK)
+		return status;
+
+	char text[kCandidateBytes];
+	for (size_t index = 0; index < count; ++index) {
+		size_t length = 0;
+		uint32_t kind = LESH_PAGER_WORD;
+		// A candidate too long for the scratch is SKIPPED and not truncated: a
+		// truncated candidate would insert bytes that name a different file, which
+		// is the one failure worse than not offering it. Nothing anyone completes
+		// is 4 KiB long; a paste is, and a paste is not a candidate.
+		if (lesh_completion_candidate(editor, index, text, sizeof(text), &length, &kind)
+		    != LESH_OK)
+			continue;
+		if (length > sizeof(text))
+			continue;
+		(void)lesh_pager_add(editor, text, length, kind);
+	}
+	// COMMIT EVEN WITH NOTHING ADDED. An empty commit closes whatever the pager
+	// held and answers NOTHING, which is what Tab on an unmatched prefix should
+	// do - and leaving a stale list open instead would be a pager showing
+	// candidates for a line that has moved on.
+	return lesh_pager_commit(editor, outcome);
+}
+
+// True when the byte just before the cursor is a `/`.
+//
+// How "directories stay open" is detected, and it is deliberately a question
+// about the BUFFER rather than about what was inserted: the `/` is appended by
+// the pager from the candidate's kind (pager.h: "this is the byte that makes
+// re-running find a directory rather than a prefix"), so reading it back is
+// reading the pager's own answer rather than guessing at it.
+int32_t just_entered_a_directory(lesh_editor* editor, int32_t* answer) {
+	*answer = 0;
+	size_t cursor = 0;
+	const int32_t status = lesh_cursor_get(editor, &cursor);
+	if (status != LESH_OK || cursor == 0)
+		return status;
+	char last = 0;
+	size_t length = 0;
+	if (lesh_buffer_read(editor, cursor - 1, cursor, &last, 1, &length) != LESH_OK)
+		return LESH_OK;
+	*answer = length == 1 && last == '/' ? 1 : 0;
+	return LESH_OK;
+}
+
+int32_t complete_word(lesh_editor* editor, const lesh_invocation*, void*) {
+	uint32_t outcome = LESH_PAGER_NOTHING;
+	int32_t status = offer_completion(editor, &outcome);
+	if (status != LESH_OK)
+		return status;
+
+	// SPEC 6.9: "directories complete with `/` and stay open". Staying open is
+	// the completer's half - the pager appended the `/` and closed - so the
+	// completion runs once more, and what it finds this time is the directory's
+	// contents rather than a prefix.
+	//
+	// ONCE, NOT A LOOP. A second pass that also entered a directory would descend
+	// again, and a chain of single-entry directories would walk the tree on one
+	// keypress. One re-run is what makes `cd sr<Tab>` show what is in `src/`;
+	// going further is the user pressing Tab again, which is a decision they get
+	// to take.
+	if (outcome != LESH_PAGER_INSERTED)
+		return LESH_OK;
+	int32_t entered = 0;
+	status = just_entered_a_directory(editor, &entered);
+	if (status != LESH_OK || entered == 0)
+		return status;
+	return offer_completion(editor, &outcome);
+}
+
 int32_t undo_action(lesh_editor* editor, const lesh_invocation*, void*) {
 	return lesh_undo(editor);
 }
@@ -270,6 +374,12 @@ constexpr builtin builtins[] = {
 	{"accept_autosuggestion", accept_autosuggestion},
 	{"accept_autosuggestion_word", accept_autosuggestion_word},
 	{"dismiss_autosuggestion", dismiss_autosuggestion},
+	// #139's. Bound to Tab at the wiring site (read.cpp) rather than in
+	// keymap.cpp's default tables, because it is only in a session that a
+	// completer exists to complete WITH - the same reason `accept_line` is bound
+	// there. zsh calls it `expand-or-complete`, readline `complete`, fish
+	// `complete`; `complete_word` says which of the two things Tab could mean.
+	{"complete_word", complete_word},
 };
 
 } // namespace

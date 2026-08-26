@@ -27,8 +27,9 @@
 // the second comment on #134 describes - which is where the literal call-shaped
 // `read` arrives, because a nested read genuinely does return to its caller.
 //
-// NOT IN v1, and each is somebody else's ticket: completion and the pager, `$PS1`
-// EXPANSION (see `shell_prompt_source`), job-control UI, `vared` (#102), and the
+// NOT IN v1, and each is somebody else's ticket: the completion PAGER (#138 -
+// the completer itself landed with #139 and is wired below), `$PS1` EXPANSION
+// (see `shell_prompt_source`), job-control UI, `vared` (#102), and the
 // autosuggestion accept keys (#140, undecided - so nothing is bound to them).
 
 #include "leshper/history_search.h"
@@ -147,10 +148,12 @@ private:
 	std::string _continuation;
 };
 
-// The `Completer` override point (#94). DECLARED AND NOT DEFINED: completion and
-// its pager are not this ticket's, and a bundle field that is always null is an
-// honest statement of that, where an empty implementation would be a claim that
-// the seam works.
+// The `Completer` override point (#94), DEFINED IN `complete.h` since #139.
+//
+// Forward-declared here rather than included, because this header hands a
+// pointer through and never touches one - the same arrangement `history_source`
+// has. The bundle field below keeps its meaning and gains a default: null now
+// means "the session builds its own trio" rather than "there is no completer".
 class completer;
 
 // #113's store, adapted onto #125's shape.
@@ -182,7 +185,10 @@ struct provider_bundle {
 	const syntax_layer* syntax = nullptr;
 	const history_source* history = nullptr;
 	const prompt_source* prompt = nullptr;
-	// Null in v1, and see `completer` above.
+	// Null means the session builds the default `shell_completer` (#139): the
+	// three sources of spec 6.9 over the shell's own tables. A caller that
+	// supplies one replaces the whole trio, which is #94's override point, at one
+	// indirect call per Tab.
 	const completer* completion = nullptr;
 
 	// The OTHER half of #94's `HistoryStore`, and the only non-const member here.

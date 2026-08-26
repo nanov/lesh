@@ -28,6 +28,7 @@
 // under them: staging, commit, generation binding, the drop rule.
 
 #include "leshper/abi.h"
+#include "leshper/complete.h"
 #include "leshper/effect.h"
 #include "leshper/shell_knowledge.h"
 #include "leshper/state.h"
@@ -147,6 +148,18 @@ struct lesh_registry {
 
 	// Bumped per action call so a stashed handle can be told from a live one.
 	std::uint64_t calls = 0;
+
+	// #94's `Completer` override point, reachable from `lesh_complete` (#139).
+	//
+	// A BORROWED POINTER ON THE REGISTRY and not a fifth field on a bundle,
+	// because the ABI's only handles are the registry and the editor, and a
+	// provider a binding can pull has to hang off one of them. Null is "no
+	// completer wired up", which `lesh_complete` reports as LESH_ERR_NOTFOUND -
+	// the same answer a leshper embedded with no completer should give.
+	//
+	// Whoever set it owns it and must outlive the registry (ADR-0007: the owner
+	// takes the view away as it takes the object).
+	const lesh::leshper::completer* completion = nullptr;
 };
 
 // The editor, for the duration of one action call.
@@ -194,6 +207,20 @@ struct lesh_editor {
 	// loop outcomes have, for the same reason: the action goes on running.
 	std::uint32_t dismissed_kind = 0;
 	bool dismiss_requested = false;
+
+	// What `lesh_complete` found, this call (#139).
+	//
+	// A MEMBER AND NOT A RETURN VALUE, because three ABI calls read it - the
+	// count, the span, and the candidates one at a time - and because the handle
+	// is reused across dispatches, so the vectors keep their capacity between
+	// Tabs.
+	//
+	// It does NOT become a proposal and the loop never takes it: the candidates'
+	// destination is the pager (#138), which the action fills through
+	// `lesh_pager_add` before it returns, and a second copy of the list living on
+	// past the call would be a second answer to "what is showing".
+	lesh::leshper::completion_result completion;
+	bool completion_ran = false;
 
 	std::uint8_t outcome = 0;  // lesh::leshper::loop_outcome
 	std::int32_t exit_status = 0;
@@ -415,6 +442,8 @@ public:
 	void set_shell_knowledge(const shell_knowledge* knowledge) noexcept {
 		_knowledge = knowledge;
 	}
+
+
 
 private:
 	registry* _registry;

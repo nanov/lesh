@@ -38,6 +38,10 @@ static_assert(static_cast<std::uint32_t>(command_kind::builtin) == LESH_COMMAND_
 static_assert(static_cast<std::uint32_t>(command_kind::function) == LESH_COMMAND_FUNCTION);
 static_assert(static_cast<std::uint32_t>(command_kind::alias) == LESH_COMMAND_ALIAS);
 
+// The completer speaks the pager's kinds and nothing of its own (#139), so the
+// only agreement left to keep is #138's - already asserted beside the pager
+// doors below.
+
 // A thread's identity as a plain integer, so no header needs <thread> to hold
 // one. Never zero, because zero means "no owner" on a dead handle.
 std::uint64_t current_thread_key() noexcept {
@@ -1401,6 +1405,59 @@ int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index, cha
 	return LESH_ERR_NOTFOUND;
 }
 
+// --- Completion, from the action side (#139, F-28/F-30) --------------------
+
+int32_t lesh_complete(lesh_editor* editor, size_t* count_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (count_out == nullptr)
+		return LESH_ERR_INVAL;
+	*count_out = 0;
+	editor->completion.clear();
+	editor->completion_ran = false;
+	if (editor->registry == nullptr || editor->registry->completion == nullptr)
+		return LESH_ERR_NOTFOUND;
+
+	// THE STAGED BUFFER, not the target's. An action may have edited before it
+	// asked - a `complete_word` bound after an `end_of_line`, or a vi operator
+	// that pushed a key - and completing text the user can no longer see would be
+	// the class of bug staging exists to prevent. The staging area is what
+	// `lesh_position_move` reads too, for exactly this reason (#133).
+	lesh::leshper::completion_query query;
+	query.buffer = editor->staged;
+	query.cursor = editor->staged_cursor;
+	editor->registry->completion->complete(query, editor->completion);
+	editor->completion_ran = true;
+	*count_out = editor->completion.candidates.size();
+	return LESH_OK;
+}
+
+int32_t lesh_completion_range(lesh_editor* editor, size_t* from_out, size_t* to_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (!editor->completion_ran)
+		return LESH_ERR_NOTFOUND;
+	if (from_out != nullptr)
+		*from_out = editor->completion.replace_from;
+	if (to_out != nullptr)
+		*to_out = editor->completion.replace_to;
+	return LESH_OK;
+}
+
+int32_t lesh_completion_candidate(lesh_editor* editor, size_t index, char* out,
+                                  size_t capacity, size_t* length_out, uint32_t* kind_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (length_out == nullptr)
+		return LESH_ERR_INVAL;
+	*length_out = 0;
+	if (!editor->completion_ran || index >= editor->completion.candidates.size())
+		return LESH_ERR_NOTFOUND;
+	const lesh::leshper::candidate& one = editor->completion.candidates[index];
+	// The KIND FIRST, so a caller that got LESH_ERR_TOOSMALL still knows what it
+	// was about to add and can ask again with a bigger buffer.
+	if (kind_out != nullptr)
+		*kind_out = static_cast<std::uint32_t>(one.kind);
+	return copy_out(one.text, out, capacity, length_out);
+}
+
 int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind) {
 	LESH_EDITOR_HANDLE(editor);
 	// Requested, never performed - see the header. The loop reads this once the
@@ -1676,6 +1733,12 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.applied = &_applied;
 	_handle.dismissed_kind = 0;
 	_handle.dismiss_requested = false;
+	// Cleared per call and not per Tab: an action that did not ask for a
+	// completion must not read the last one's candidates back (#139). `clear`
+	// keeps the vectors' capacity, which is the point of the handle being a
+	// member at all.
+	_handle.completion.clear();
+	_handle.completion_ran = false;
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
 	_handle.depth = 0;
@@ -1773,6 +1836,10 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	result.cursor_moved = target.cursor != cursor_before;
 	_handle.target = nullptr;
 	_handle.applied = nullptr;
+	// The handle is dead, and so is what it was pointing an ABI reader at. The
+	// candidates went to the pager while the action was running; what is cleared
+	// here is the flag that would let a stashed handle read them back.
+	_handle.completion_ran = false;
 
 	// The same rule the enum path follows: an action that changed nothing asks
 	// for nothing, a mutation asks the reactors to recompute, and a bare cursor
