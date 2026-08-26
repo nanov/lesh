@@ -158,11 +158,41 @@ public:
 	void uninstall() noexcept;
 	[[nodiscard]] bool installed() const noexcept { return _installed; }
 
+	// Takes the dispositions again, keeping what was saved the FIRST time.
+	//
+	// #134's resolution of the ownership question #129 returned. The shell's own
+	// `trap` machinery (`runtime/signals.cpp`) installs a handler of its own the
+	// moment a user types `trap ... INT` at the prompt, and that `sigaction`
+	// silently replaces ours - after which Ctrl-C sets `g_pending` and rings no
+	// pipe, so the editor never hears it. The wiring site therefore re-asserts at
+	// every read entry and after every command, which is where a `trap` can have
+	// run.
+	//
+	// The SAVE IS ONCE PER SIGNAL, deliberately: what we chain to has to be the
+	// handler that was there before leshper existed, and re-saving would either
+	// record our own handler (an infinite chain) or record whatever the shell
+	// installed a moment ago and lose the original for `uninstall` to put back.
+	bool reassert() noexcept;
+
 	// THE HANDLER'S WHOLE BODY, async-signal-safe, exposed so a test can deliver
 	// a signal to this hub without one being raised at the process.
 	//
 	// Public because a free-function handler must reach it, and named for what
 	// it is: a signal has been delivered to this hub.
+	//
+	// AND THEN IT CHAINS (#134). After the self-pipe work - and only after, so a
+	// previous handler that never returns cannot cost us the wakeup - the
+	// handler saved for this signal is called, when one was saved and it is a
+	// real function rather than SIG_DFL or SIG_IGN. That is what keeps the
+	// shell's `g_pending` being set while the editor owns the dispositions, so a
+	// user's `trap INT` still fires (#98 decision 3, the zsh way) - during
+	// editing AND during a command, when the shell thread is running the command
+	// and draining no slots at all.
+	//
+	// A previous handler installed with SA_SIGINFO is NOT chained: this entry
+	// point has only a signal number, and inventing a `siginfo_t` to pass it
+	// would be worse than saying so. Nothing lesh installs uses SA_SIGINFO, and
+	// the sanitizers' handlers are for signals this hub never takes.
 	void deliver(int signo) noexcept;
 
 	// One byte, no signal. What `event_loop::stop()` rings to wake a loop that
@@ -178,6 +208,9 @@ public:
 	std::size_t drain(std::vector<int>& out) noexcept;
 
 private:
+	// The body `install` and `reassert` share: catch, ignore, and save-once.
+	bool take_dispositions() noexcept;
+
 	int _read_fd = -1;
 	int _write_fd = -1;
 	bool _installed = false;
@@ -234,6 +267,14 @@ struct loop_options {
 	// is fixed and adding a bit to it for one built-in would be the side door
 	// the whole registry design exists to prevent.
 	std::string shell_thread_reactor = "highlighter";
+
+	// What a SIGINT at the prompt runs (#98 decision 2). A name, so Ctrl-C is
+	// rebindable exactly as a key is (F-13), and dispatched by the loop rather
+	// than by the keymap because Ctrl-C never arrives as a byte: ISIG stays on,
+	// so the driver turns it into a signal before any decoder could see it.
+	// Empty means the loop does nothing with SIGINT but note it, which is what
+	// the editor-only tests want.
+	std::string interrupt_action = "cancel_line";
 
 	// Whether the loop owns the terminal's modes and foreground group. False in
 	// the tests that drive it over a plain pipe, where there is nothing to own.
@@ -295,6 +336,17 @@ public:
 	void attach_shell(shell_actor& shell) noexcept;
 	void attach_signals(signal_hub& hub) noexcept;
 
+	// What the shell knows (#135), put on the snapshot of every reactor that
+	// runs ON THE SHELL THREAD and on no other.
+	//
+	// THE RESTRICTION IS THE POINT. `shell_knowledge` is a window into
+	// `shell_state`, whose one owner is the shell thread (ADR-0009); a helper
+	// reading through it would be reading tables another thread may be writing.
+	// The shell-thread reactor is the only one for which the pointer is safe, so
+	// it is the only one that gets it, and a state-free reactor keeps the null
+	// that means "no shell attached". Never owned; must outlive this loop.
+	void attach_shell_knowledge(const shell_knowledge* knowledge) noexcept;
+
 	// --- The read entry (#98, fish #9181) -----------------------------------
 
 	// Everything that must happen every time the editor starts reading:
@@ -331,6 +383,11 @@ public:
 	// thread: it sets a flag and rings the signal topic's pipe, which is the one
 	// wakeup that always exists.
 	void stop();
+	// The same ask WITHOUT the join, for the one caller that must not join: the
+	// shell thread, inside `execute`, having just run an `exit`. The loop is
+	// blocked waiting for that execution's reply, so joining it from there would
+	// be waiting for a thread that is waiting for us.
+	void request_stop() noexcept;
 	[[nodiscard]] bool running() const noexcept;
 
 	// --- Quiesce (#91, #128, ADR-0009) --------------------------------------
@@ -362,6 +419,12 @@ public:
 	// attached - in which case the line is still finished and cleared, which is
 	// what the editor-only tests exercise.
 	std::optional<std::int32_t> accept_current_line();
+
+	// The other half of `cancel_line`: the shell sets `$?` = 130 and runs the
+	// user's INT trap (#98 decision 3). Posted through the `execute` slot as an
+	// empty line, on the same park-restore-post path an accepted line takes,
+	// because a trap body may fork. A no-op with no shell attached.
+	void finish_cancelled_line();
 
 	// #92's port, from the loop's side: fill the `port_call` slot and block on
 	// the `shell` and `signal` topics until it answers. The action sees a
@@ -431,6 +494,7 @@ private:
 	registry* _registry = nullptr;
 	shell_actor* _shell = nullptr;
 	signal_hub* _signals = nullptr;
+	const shell_knowledge* _knowledge = nullptr;
 	// Minted when a registry is attached: the loop's own dispatch of an action
 	// by name, which is what a timer expiry needs.
 	std::optional<loop_harness> _dispatch;

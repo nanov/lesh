@@ -1,5 +1,6 @@
 #include "leshper/loop.h"
 
+#include "leshper/keymap.h"
 #include "substrate/assert.h"
 #include "substrate/fork_guard.h"
 #include "substrate/log.h"
@@ -124,6 +125,21 @@ void signal_hub::deliver(int signo) noexcept {
 		_pending[signo] = 1;
 	}
 	poke();
+
+	// THE CHAIN, and it is last on purpose (#134). Our own work is done and the
+	// wakeup is already in the pipe, so whatever the shell installed before us -
+	// `runtime/signals.cpp`'s `record_signal`, which is the only thing that ever
+	// sets `g_pending` - runs with nothing of ours left to lose. Calling a
+	// function pointer is async-signal-safe; the function on the other end is the
+	// shell's business and is written to the same rule.
+	if (signo <= 0 || signo >= kMaxTrackedSignal || !_saved_valid[signo])
+		return;
+	const struct sigaction& previous = _saved[signo];
+	if ((previous.sa_flags & SA_SIGINFO) != 0)
+		return;  // no siginfo_t to give it; see the header
+	if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN)
+		return;  // a disposition, not a handler: there is nothing to call
+	previous.sa_handler(signo);
 }
 
 void signal_hub::poke() noexcept {
@@ -166,10 +182,26 @@ bool signal_hub::install() noexcept {
 	if (_installed)
 		return true;
 	LESH_ASSERT(g_installed_hub == nullptr);
+	g_installed_hub = this;
+	_installed = true;
+	return take_dispositions();
+}
 
+bool signal_hub::reassert() noexcept {
+	// Nothing was ever taken, so there is nothing to take back - and a hub a test
+	// only ever `deliver`s to must not start writing the binary's dispositions.
+	if (!_installed)
+		return false;
+	return take_dispositions();
+}
+
+bool signal_hub::take_dispositions() noexcept {
 	bool complete = true;
+	// ONCE PER SIGNAL. See `reassert` in the header: the chain target must stay
+	// the handler that was there before us, and re-saving would capture either
+	// our own handler or the shell's newest one.
 	const auto save = [this](int signo) {
-		if (signo <= 0 || signo >= kMaxTrackedSignal)
+		if (signo <= 0 || signo >= kMaxTrackedSignal || _saved_valid[signo])
 			return;
 		_saved_valid[signo] = ::sigaction(signo, nullptr, &_saved[signo]) == 0;
 	};
@@ -191,8 +223,6 @@ bool signal_hub::install() noexcept {
 			complete = false;
 	};
 
-	g_installed_hub = this;
-
 	// SIGINT WITHOUT SA_RESTART. The whole point: a `poll` blocked in the middle
 	// of a turn must be interrupted so Ctrl-C becomes an event now rather than
 	// whenever the next key happens to arrive.
@@ -207,7 +237,8 @@ bool signal_hub::install() noexcept {
 	// exec, and a shell that installed a handler over that would be undoing what
 	// the user asked for.
 	struct sigaction hup_now{};
-	if (::sigaction(SIGHUP, nullptr, &hup_now) == 0 && hup_now.sa_handler == SIG_DFL)
+	if (::sigaction(SIGHUP, nullptr, &hup_now) == 0
+	    && (hup_now.sa_handler == SIG_DFL || hup_now.sa_handler == &fish_style_handler))
 		catch_it(SIGHUP, SA_RESTART);
 
 	// "We are a shell, we know what is best for the user" (fish). SIGTTOU and
@@ -220,7 +251,6 @@ bool signal_hub::install() noexcept {
 	ignore_it(SIGTTOU);
 	ignore_it(SIGTTIN);
 
-	_installed = true;
 	return complete;
 }
 
@@ -287,6 +317,10 @@ void event_loop::attach_registry(registry& reg) noexcept {
 
 void event_loop::attach_shell(shell_actor& shell) noexcept { _shell = &shell; }
 
+void event_loop::attach_shell_knowledge(const shell_knowledge* knowledge) noexcept {
+	_knowledge = knowledge;
+}
+
 void event_loop::attach_signals(signal_hub& hub) noexcept {
 	_signals = &hub;
 	_resizes_seen = hub.resize_count();
@@ -325,8 +359,15 @@ void event_loop::enter_read() {
 	// #98 decision 6: the winsize is re-queried at EVERY read start, which is
 	// what makes a resize missed during a command impossible rather than
 	// handled. The SIGWINCH counter is realigned here for the same reason.
-	if (_signals != nullptr)
+	if (_signals != nullptr) {
 		_resizes_seen = _signals->resize_count();
+		// TAKEN AGAIN, because the shell may have given them away (#134). A
+		// `trap ... INT` run at the prompt installs the shell's own handler over
+		// ours, after which Ctrl-C sets `g_pending` and rings no pipe. Re-asserting
+		// is nine `sigaction` calls once per read entry, and `reassert` keeps what
+		// it saved the first time so the chain still reaches the shell's handler.
+		_signals->reassert();
+	}
 	refresh_size_from_terminal();
 	_needs_render = true;
 }
@@ -701,6 +742,23 @@ void event_loop::handle(const event& incoming, turn_result& result) {
 	const position before_anchor = _state.selection_anchor();
 	const bool before_active = _state.selection_active();
 
+	// KEYBOARD INTERRUPT, BEFORE THE EDITOR SEES IT (#98 decision 2). Ctrl-C in
+	// raw mode never arrives as a byte - ISIG stays on precisely so the kernel
+	// turns it into SIGINT - so it can never reach a keymap, and `step` says as
+	// much: the entrance for a signal exists and the binding does not. The
+	// binding is HERE, by action name, so it is still the rebindable
+	// `cancel_line` of F-13 and not a hardcoded behaviour.
+	if (const auto* signal = std::get_if<signal_event>(&incoming);
+	    signal != nullptr && signal->signal_number == SIGINT && !_options.interrupt_action.empty()) {
+		editing_context& context = context_of(_state);
+		const action_result what = context.loop().invoke(_state, _options.interrupt_action,
+		                                                 invocation{});
+		if (what.status == LESH_ERR_NOTFOUND)
+			LESH_LOG(log::level::warn, log::category::dispatch,
+			         "no action registered for the interrupt: %s",
+			         _options.interrupt_action.c_str());
+	}
+
 	// `step` logs the event itself, at #109's `event` category and into the
 	// replay file - the one event serialization, and the reason this loop does
 	// not write a second one for the events that reach the editor.
@@ -719,6 +777,20 @@ void event_loop::handle(const event& incoming, turn_result& result) {
 		notify_reactors(kinds);
 
 	carry_out(produced, result);
+
+	// THE OUTCOME AN ACTION ASKED FOR, taken here (#134). Dispatch on the
+	// keystroke path happens inside `step`, which is a pure function over state
+	// and events and has nowhere to put a request to accept, cancel or exit - so
+	// the harness latches it and the loop, which is the only thing that can carry
+	// one out, takes it the moment the event is done. The timer path reads its
+	// outcome off `invoke`'s return value and never reaches this.
+	const loop_harness::requested_outcome asked = context_of(_state).loop().take_outcome();
+	if (asked.what != loop_outcome::none) {
+		action_result carried;
+		carried.outcome = asked.what;
+		carried.exit_status = asked.exit_status;
+		apply_outcome(carried, result);
+	}
 }
 
 void event_loop::carry_out(const effects& produced, turn_result& result) {
@@ -753,7 +825,14 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 		// owner. Everything else is state-free - history search, the
 		// autosuggester, path checks - and stays on the stateless helper pool.
 		if (_shell != nullptr && name == _options.shell_thread_reactor) {
-			_shell->post_highlight(name, entry.fn, entry.userdata, snapshot_of(_state, served));
+			request_snapshot asking = snapshot_of(_state, served);
+			// #135's door, opened here and nowhere else. Forgetting it does not
+			// break the highlighter - it degrades to `environment_knowledge`,
+			// which is the `getenv` behaviour #124 recorded as wrong about a
+			// `PATH=` the user has just typed - so the assignment is silent and
+			// its absence would be too. See `attach_shell_knowledge`.
+			asking.knowledge = _knowledge;
+			_shell->post_highlight(name, entry.fn, entry.userdata, std::move(asking));
 			continue;
 		}
 		if (_helpers != nullptr)
@@ -770,14 +849,16 @@ void event_loop::apply_outcome(const action_result& what, turn_result& result) {
 			break;
 		case loop_outcome::cancel_line:
 			// #98 decision 2: discard the buffer, paint the indicator, fresh
-			// prompt. `$?` = 130 and the user's INT trap are the SHELL's, at the
-			// wiring site - the loop does not own exit statuses.
+			// prompt. `$?` = 130 and the user's INT trap are the SHELL's, and
+			// `finish_cancelled_line` is how they are asked for - the loop still
+			// does not own exit statuses, it owns the handoff.
 			if (_options.manage_terminal || _fds.output >= 0)
 				write_all(_fds.output, "^C\r\n");
 			apply_edit(_state, position{}, _state.buffer.end_position(), "");
 			_state.undo.break_coalescing();
 			_have_previous = false;
 			_needs_render = true;
+			finish_cancelled_line();
 			break;
 		case loop_outcome::exit:
 			_exiting = true;
@@ -860,8 +941,11 @@ void event_loop::resume_after_execution() {
 		_terminal.enter_raw();
 	}
 	if (_park_depth == 0) {
-		if (_signals != nullptr)
+		if (_signals != nullptr) {
 			_resizes_seen = _signals->resize_count();
+			// The command that just ran may have been a `trap`; see enter_read.
+			_signals->reassert();
+		}
 		refresh_size_from_terminal();
 		// The screen is whatever the command left behind, so there is nothing to
 		// diff against: the next render is a full repaint.
@@ -919,6 +1003,25 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	_needs_render = true;
 	render();
 	return status;
+}
+
+void event_loop::finish_cancelled_line() {
+	// #98 decision 3, the zsh way: Ctrl-C at the prompt cancels the line AND
+	// fires the user's INT trap, with `$?` = 130. Both are the shell's, and the
+	// only door to the shell thread is the `execute` slot - so a cancel is posted
+	// as an EMPTY line, which is exactly what it is: nothing to run, at a command
+	// boundary, which is where #33 says a trap body belongs.
+	//
+	// THE QUIESCE IS NOT CEREMONY. A trap body is arbitrary shell code and may
+	// fork, so the helpers have to be parked and the terminal handed back before
+	// the shell thread touches it, on the identical path an accepted line takes.
+	if (_shell == nullptr)
+		return;
+	quiesce();
+	assert_quiesced();
+	_shell->post_execute(std::string_view{}, _state.gen);
+	wait_on_shell(shell_message::kind::execute_done, 0);
+	resume_after_execution();
 }
 
 port_result event_loop::call_port(std::string_view code) {
@@ -1016,6 +1119,12 @@ std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
 
 void event_loop::run() {
 	enter_read();
+	// THE PROMPT IS PAINTED BEFORE THE FIRST POLL. `enter_read` asks for a
+	// render, but a turn clears that flag before it polls and the first poll
+	// blocks until a key arrives - so without this the prompt would appear only
+	// once the user had typed something, which is the one moment they no longer
+	// need it.
+	render();
 	while (!_exiting && !_stopping.load(std::memory_order_relaxed))
 		turn();
 	leave_read();
@@ -1024,15 +1133,29 @@ void event_loop::run() {
 void event_loop::start() {
 	LESH_ASSERT(!_thread.joinable());
 	_stopping.store(false, std::memory_order_relaxed);
-	_thread = std::thread([this] { run(); });
+	_thread = std::thread([this] {
+		run();
+		// THE LOOP THREAD RELEASES THE SHELL THREAD, and nothing else can
+		// (ADR-0009, #134). The shell is the main thread and is parked in
+		// `shell_actor::run` on a condition variable with no descriptor to
+		// watch; when the editor is finished - Ctrl-D, an `exit` action, a
+		// hangup - the only side that knows is this one. `stop()` is documented
+		// as the loop thread's call, and this is the loop thread making it.
+		if (_shell != nullptr)
+			_shell->stop();
+	});
 }
 
-void event_loop::stop() {
+void event_loop::request_stop() noexcept {
 	_stopping.store(true, std::memory_order_relaxed);
 	// The one wakeup that always exists: ring the signal topic's own pipe. No
 	// signal is raised, so nothing else in the process notices.
 	if (_signals != nullptr)
 		_signals->poke();
+}
+
+void event_loop::stop() {
+	request_stop();
 	if (_thread.joinable())
 		_thread.join();
 }
