@@ -185,6 +185,11 @@ private:
 		int input_fd = 0;
 		int output_fd = 1;
 		pid_t group = 0;  // 0 means "this child becomes the group leader"
+		// Whether this child is the FOREGROUND job, and so takes the terminal on
+		// its way to exec (#158 decision 1). Default false, because the default
+		// must be the one that cannot steal the tty from the editor: a background
+		// job, a command substitution and a helper child all leave it alone.
+		bool foreground = false;
 	};
 
 	// A variable's value before an assignment prefix overwrote it, so the command
@@ -465,6 +470,90 @@ private:
 	                          const syntax::tree* t = nullptr,
 	                          syntax::node_index command = 0,
 	                          bool standard_path = false);
+
+	// THE CHILD'S OWN HANDOFF, and the one place in the runtime that is allowed to
+	// touch the terminal from a process that is not the shell (#158 decisions 1
+	// and 4, #159). Runs IN THE CHILD, after its `setpgid` and before its exec.
+	//
+	// CHILD-SIDE, not loop-side, and that is fish's pattern and zsh's: the child
+	// races nothing, because it touches the tty only after owning it. `Src/exec.c`
+	// (`entersubsh`) says why the shell cannot do it any earlier - *"This only
+	// works if we are still ignoring SIGTTOU at this point; in this case ignoring
+	// the signal has the special effect that the operation is allowed to work"*.
+	//
+	// SO THE ORDER IS THE WHOLE CONTRACT. `tcsetpgrp` from a background process
+	// group is legal only while the SIGTTOU-ignore inherited from
+	// `ignore_background_write_signals` still stands; reset the signals first and
+	// the child stops itself trying to take the terminal it was given. Handoff,
+	// then reset.
+	//
+	// THE RESET IS UNCONDITIONAL AND IS NOT `drop_interactive_defaults`. That
+	// function's #37 rule - an inherited SIG_IGN stands - is exactly wrong for
+	// these three: SIGTTOU, SIGTTIN and SIGTSTP are ignored because THIS shell's
+	// loop ignored them for its own editing, not because the invoker handed them
+	// over, and SIG_IGN is the one disposition that survives execve. Left alone,
+	// every command lesh runs is a command that cannot be suspended and whose
+	// background tty access silently succeeds - which is the #158 defect: nvim's
+	// background `tcsetattr` worked, its read returned EIO instead of stopping,
+	// and the terminal's unread query replies came back as a command line.
+	//
+	// `tty_fd < 0` DOES BOTH NOTHINGS. No terminal to hand over means no
+	// self-inflicted ignores to undo either - a non-interactive shell's
+	// dispositions are its invoker's, and #37 says they stand.
+	//
+	// Static because it runs after a fork and must reach nothing but its argument:
+	// only `tcsetpgrp`, `getpgrp` and `sigaction`, all async-signal-safe. #160
+	// calls it from the foreground pipeline and subshell forks unchanged.
+	static void take_terminal_in_child(int tty_fd) noexcept;
+
+	// The other half, on the shell thread: takes the terminal back the instant a
+	// foreground job's wait returns (#158 decision 2).
+	//
+	// PER JOB, not per line, and that is the point. The loop reclaims in
+	// `resume_after_execution` when the whole line is done, which is the backstop;
+	// without this one `nvim .; read x` breaks, because between nvim exiting and
+	// the end of the line the shell is not the foreground group and the `read`
+	// builtin's stdin read gets EIO rather than the user's typing.
+	//
+	// Unconditional when there is a terminal, fish #9181's reasoning: a command
+	// may have taken the tty whether or not we gave it, so do not ask.
+	void reclaim_terminal() noexcept;
+
+	// The third thing a foreground wait owes, and it exists only because of the
+	// first two: the SIGINT the shell was excluded from by its own handoff.
+	//
+	// WHY THERE IS ANYTHING TO DO. Before the handoff the shell WAS the terminal's
+	// foreground group, so a keyboard interrupt was delivered to it as well and
+	// the ordinary handler-plus-`run_pending_traps` path did whatever the
+	// disposition said. Handing the terminal to the child excludes the shell from
+	// that group, so the signal now reaches the child alone - #98 decision 2's
+	// *"the shell never sees it"* arriving literally - and BOTH of that path's
+	// answers silently stop happening.
+	//
+	// BOTH, and the second one is the one that is easy to miss. A user's INT trap
+	// stops firing: dash fires it, zsh fires it, bash does not, and ADR-0001 plus
+	// #98 decision 3 - the owner's override adopting zsh's INT-trap visibility and
+	// declining bash's silence by name - compose to "fires". And with NO trap set,
+	// the rest of the line stops being abandoned: `sleep 5; echo after` prints
+	// `after`, which dash, zsh AND bash all refuse to do, and which lesh itself
+	// refused to do before the handoff existed. Unanimous, including bash this
+	// time, and matching lesh's own prior behaviour - so a synthesis that covered
+	// only the trap was under-correcting rather than being careful.
+	//
+	// SO IT DECIDES NOTHING. It records a pending SIGINT and lets the
+	// between-commands machinery answer exactly as it answers a real arrival: the
+	// trap body, or #52's `interrupts_command` unwind. That is #33's discipline,
+	// and a second route would be a second timing to get wrong.
+	//
+	// GATED ON THE HANDOFF HAVING HAPPENED - the same `tty_fd` test
+	// reclaim_terminal makes, at the same point, and that gate is load bearing
+	// rather than tidy. Where the terminal never moved the kernel still delivers
+	// to the shell and the normal machinery already answered, so synthesizing
+	// there would double-fire interactively and fire at all non-interactively,
+	// where dash does not (`trap 'echo x' INT; sh -c 'kill -INT $$'` prints
+	// nothing and reports 130 - lesh matches it byte for byte). That is the whole
+	// reason the conformance corpus cannot see any of this.
+	void note_interrupt_after_handoff(int wait_status);
 
 	// Applies a command's redirections and its assignment prefix and BECOMES it.
 	//

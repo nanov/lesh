@@ -26,6 +26,7 @@ x .d88"               z`    ^%    .uef^"
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -176,8 +177,35 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	} else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
 		rc = std::string{home} + "/.leshrc";
 	}
+	// THE SAVED TTY (#158 decision 6, #159). One dup of the terminal, taken here
+	// because here is where the shell becomes the kind that manages one, and lent
+	// to the state so the runtime can hand the terminal to a foreground child and
+	// take it back after the wait. The runtime cannot use fd 0 for that: by the
+	// time a child does the handoff its stdin may be a pipe, and `tcsetpgrp` on a
+	// pipe is ENOTTY.
+	//
+	// `F_DUPFD_CLOEXEC` from 10, and both halves are deliberate. CLOEXEC, because
+	// the fd is wanted only BETWEEN fork and exec - the command that replaces the
+	// child has no business holding a spare descriptor onto its own terminal, and
+	// #98's rule is about who may touch the tty. From 10, because `exec 3>file`
+	// names small descriptors and the shell's own must be out of their way; it is
+	// the fd floor bash keeps its internals above for the same reason.
+	//
+	// A failure costs the handoff and nothing else: -1 is the state's own default
+	// and reads back as "this shell manages no terminal", so the session runs
+	// exactly as it did before #159 rather than refusing to start.
+	const int tty_fd = ::fcntl(STDIN_FILENO, F_DUPFD_CLOEXEC, 10);
+	if (tty_fd != -1)
+		state.set_tty_fd(tty_fd);
+
 	const int status = lesh::leshper::run_interactive_shell(state, pool, providers,
 	                                                        STDIN_FILENO, STDOUT_FILENO, rc);
+	// The state outlives this function (main built it), so the borrowed fd is
+	// taken back before it is closed - ADR-0007's ownership, and it also means a
+	// late `tcsetpgrp` cannot reach a descriptor that has been reused.
+	state.set_tty_fd(-1);
+	if (tty_fd != -1)
+		::close(tty_fd);
 	// ADR-0007: the logger owns two descriptors, and this is where they go back.
 	lesh::log::shutdown();
 	return status;

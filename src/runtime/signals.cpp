@@ -499,6 +499,11 @@ bool signal_state::any_pending() const {
 	return false;
 }
 
+void signal_state::note_pending(int signo) {
+	if (signo > 0 && signo < kMaxSignal)
+		g_pending[signo] = 1;
+}
+
 bool signal_state::take_pending(int& signo) {
 	for (int i = 1; i < kMaxSignal; ++i) {
 		if (g_pending[i] != 0) {
