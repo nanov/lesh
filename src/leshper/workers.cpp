@@ -1,6 +1,12 @@
 #include "leshper/workers.h"
 
+// FOR THE SIGNAL MASK ONLY (#142). `block_caught_signals_on_this_thread` is
+// declared with the hub whose caught set it names, and a helper thread has to
+// call it before it does anything else. `loop.h` includes this header and not
+// the other way round, so there is no cycle.
+#include "leshper/loop.h"
 #include "substrate/assert.h"
+#include "substrate/log.h"
 
 #include <cerrno>
 #include <fcntl.h>
@@ -407,6 +413,22 @@ std::size_t worker_pool::dropped() const noexcept {
 }
 
 void worker_pool::run(worker& me) {
+	// FIRST THING IN THE BODY (#142), before the arena and before the mutex. A
+	// process-directed signal lands on any one thread that does not block it, and
+	// a helper is the worst possible choice: it would run the shell's handler
+	// while parked in a highlight, on a thread that owns no shell state at all.
+	// Blocked here and on the loop thread, delivery is pinned to main - which is
+	// the shell thread, the one that writes the dispositions and the one that
+	// must stay unmasked because a mask survives `execve` and main is the only
+	// thread that forks (ADR-0009). A helper that ever gains children must lose
+	// this line.
+	//
+	// A failure is logged and not fatal: the worst case is the nondeterministic
+	// delivery this whole session used to have.
+	if (!block_caught_signals_on_this_thread())
+		LESH_LOG(log::level::warn, log::category::loop,
+		         "a helper thread could not block the caught signals");
+
 	t_worker_arena = &me.arena;
 
 	std::unique_lock lock(_mutex);

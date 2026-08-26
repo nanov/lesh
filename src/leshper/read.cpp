@@ -404,6 +404,16 @@ std::int32_t session::execute(std::string_view line) {
 		_loop.request_stop();
 
 	refresh_prompt();
+	// THE DISPOSITIONS, RE-ASSERTED HERE AND NOT ON THE LOOP THREAD (#142). The
+	// line that just ran may have been a `trap`, which `sigaction`s from THIS
+	// thread; the hub takes them back from this thread too. The loop used to do
+	// it in `enter_read` and on the unpark, which made two threads writers of one
+	// piece of process-wide state; now the loop only reads the hub.
+	//
+	// BEFORE THE REPLY IS POSTED, which is what "before the loop resumes" means:
+	// this function's return value IS the reply, so everything above it is
+	// ordered ahead of the loop waking up.
+	_signals.reassert();
 	return _state.last_status();
 }
 
@@ -420,6 +430,9 @@ std::int32_t session::port_call(std::string_view code) {
 	LESH_LOG(log::level::debug, log::category::exec, "port: %zu bytes", code.size());
 	(void)_executor.run_input(code);
 	refresh_prompt();
+	// The other door onto `run_input` from this thread, so the other place a
+	// `trap` can have run; see `execute`.
+	_signals.reassert();
 	return _state.last_status();
 }
 
@@ -516,6 +529,12 @@ int session::run(std::string_view rc_path) {
 	// anything that needs a live read answers "the editor is not reading" (F-18).
 	source_rc(rc_path);
 
+	// AFTER THE RC AND BEFORE THE LOOP, and both halves matter (#142). `install`
+	// IS the first take - the same disposition rules `reassert` applies, applied
+	// once - so running it after the rc is what lets an rc's `trap 'cmd' CHLD`
+	// be seen by the hub and chained to, rather than stomped by a hub that had
+	// already decided. Before `_loop.start()`, because from there on this thread
+	// is the only writer of dispositions and the loop must find them settled.
 	if (!_signals.install())
 		LESH_LOG(log::level::warn, log::category::loop,
 		         "some signal dispositions could not be installed");
