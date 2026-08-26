@@ -40,6 +40,10 @@ enum class builtin_kind {
 // the command search never reached PATH and `test 1 = 2` silently succeeded (#35).
 [[nodiscard]] builtin_kind classify_builtin(std::string_view name) noexcept;
 
+// Declared in runtime/builtins.h; only POINTED AT here, so shell_state can hold
+// the `bind` seam (#134) without this header depending on the builtin table.
+class binding_console;
+
 class shell_state final : public parameter_source,
                           public arithmetic_variables,
                           public parameter_assigner,
@@ -491,6 +495,20 @@ public:
 		_signals.set_interactive(v);
 	}
 
+	// The keymap registry `bind` reaches, or null when there is no line editor
+	// (#118, #134). NON-OWNING and per-shell: the interactive wiring site owns
+	// the editing context and lends this view of it for the life of the session,
+	// so ADR-0007's "everything has an owner that frees it" is answered on the
+	// other side of the boundary. It lived at file scope in builtins.cpp until
+	// the loop was wired up, which is what the note there said would happen.
+	//
+	// `binding_console` is declared in runtime/builtins.h and only pointed at
+	// here, so this header stays free of it.
+	void set_binding_console(binding_console* console) noexcept {
+		_binding_console = console;
+	}
+	[[nodiscard]] binding_console* console() const noexcept { return _binding_console; }
+
 private:
 	struct variable {
 		std::string value;
@@ -542,6 +560,9 @@ private:
 	size_t _getopts_offset = 0;
 	options _options;
 	bool _interactive = false;
+	// Non-owning; see set_binding_console. Null in every non-interactive shell,
+	// which is what makes `bind` say "no line editor" rather than pretend.
+	binding_console* _binding_console = nullptr;
 	// Backing store for option_flags(). Rebuilt on demand and mutable because
 	// parameter_source::option_flags() is const, for the same reason
 	// environment_block() owns its strings: the returned view must outlive the call.

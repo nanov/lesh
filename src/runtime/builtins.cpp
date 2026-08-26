@@ -2047,8 +2047,8 @@ int report_bind_outcome(binding_console::outcome what, std::string_view subject)
 	return 1;
 }
 
-builtin_result builtin_bind(shell_state&, char** argv) {
-	binding_console* console = installed_binding_console();
+builtin_result builtin_bind(shell_state& state, char** argv) {
+	binding_console* console = state.console();
 
 	// Options first, POSIX-style, and `--` ends them. Read before the console is
 	// consulted so that a malformed command line is a malformed command line in
@@ -2384,19 +2384,13 @@ static_assert(registry_agrees_with_handlers(),
 
 // The one seam between the shell's `bind` and leshper's keymap registry.
 //
-// A file-scope pointer, and it is deliberately NOT an owner: the loop owns the
+// The POINTER lives on `shell_state` since #134 (see set_binding_console there);
+// what is left here is the out-of-line destructor every polymorphic base needs a
+// home for. It is deliberately NOT an owner: the interactive wiring site owns the
 // editing context and lends this view of it, so ADR-0007's "everything has an
 // owner that frees it" is answered on the other side of the boundary. The
 // registry itself is reached from `state` and is owned there (spec §6.4).
-binding_console* g_binding_console = nullptr;
-
 binding_console::~binding_console() = default;
-
-void install_binding_console(binding_console* console) noexcept {
-	g_binding_console = console;
-}
-
-binding_console* installed_binding_console() noexcept { return g_binding_console; }
 
 int report_bad_number(std::string_view builtin, std::string_view operand,
                       numeric_parse why) {
