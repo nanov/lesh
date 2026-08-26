@@ -745,10 +745,35 @@ int tree_walking_executor::run(const tree& t) {
 	// The EXIT trap runs on the way out, whether that is the end of input or an
 	// explicit `exit` - which is why it cannot live at the `exit` builtin. An
 	// `exit` INSIDE the body replaces the status the shell was leaving with.
+	//
+	// An interactive session defers it: for that caller "the way out" is the end
+	// of the SESSION and not the end of this line (#134, see defer_exit_trap).
+	if (_defer_exit_trap)
+		return status;
 	int from_trap = 0;
 	if (run_exit_trap(from_trap))
 		status = from_trap;
 	return status;
+}
+
+int tree_walking_executor::finish(int status) {
+	_defer_exit_trap = false;
+	int from_trap = 0;
+	if (run_exit_trap(from_trap))
+		return from_trap;
+	return status;
+}
+
+void tree_walking_executor::interrupt_at_prompt() {
+	// BEFORE the traps, so a trap body reads the 130 the cancel produced - and
+	// after them too, because `run_pending_traps` restores `$?` around a body it
+	// ran and the interactive default sets 130 only where no trap exists. Both
+	// paths land on the same number, which is what #98 decision 3 asks for.
+	_state.set_last_status(128 + SIGINT);
+	run_pending_traps();
+	if (_flow == control_flow::interrupted)
+		_flow = control_flow::normal;
+	_state.set_last_status(128 + SIGINT);
 }
 
 // A REGULAR file and nothing else. POSIX confines the rule to a seekable input,
@@ -847,6 +872,8 @@ int tree_walking_executor::run_input(std::string_view source, bool echo_when_ver
 		if (input != nullptr)
 			at = input->resume_at(at, source.size());
 	}
+	if (_defer_exit_trap)
+		return status;
 	int from_trap = 0;
 	if (run_exit_trap(from_trap))
 		status = from_trap;
