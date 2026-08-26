@@ -2122,40 +2122,41 @@ int report_bind_outcome(binding_console::outcome what, std::string_view subject)
 	return 1;
 }
 
+// `bind`'s table. It is leshper's builtin rather than POSIX's, and the third
+// consumer the substrate placement of lesh::args was argued from (#148).
+struct bind_opts {
+	bool list_keymaps = false;   // -l
+	std::string_view keymap{};   // -m KEYMAP
+	std::string_view create{};   // -N NAME
+};
+
+constexpr auto kBind = args::spec<bind_opts>(
+	args::option{'l', args::field<&bind_opts::list_keymaps>}
+		.help("write the keymap names"),
+	args::option{'m', args::field<&bind_opts::keymap>, args::value("KEYMAP")}
+		.help("act on KEYMAP rather than the current one"),
+	args::option{'N', args::field<&bind_opts::create>, args::value("NAME")}
+		.help("create keymap NAME, optionally copying an existing one"));
+
 builtin_result builtin_bind(shell_state& state, char** argv) {
 	binding_console* console = state.console();
 
 	// Options first, POSIX-style, and `--` ends them. Read before the console is
 	// consulted so that a malformed command line is a malformed command line in
 	// every shell, interactive or not.
-	std::string_view keymap;
-	bool list_keymaps = false;
-	std::string_view create;
-	size_t at = 1;
-	for (; argv[at] != nullptr; ++at) {
-		const std::string_view arg{argv[at]};
-		if (arg == "--") {
-			++at;
-			break;
-		}
-		if (arg.size() < 2 || arg[0] != '-')
-			break;
-		if (arg == "-l") {
-			list_keymaps = true;
-			continue;
-		}
-		if (arg == "-m" || arg == "-N") {
-			if (argv[at + 1] == nullptr) {
-				report("bind: %.*s: option requires an argument",
-				       static_cast<int>(arg.size()), arg.data());
-				return {2};
-			}
-			(arg == "-m" ? keymap : create) = argv[++at];
-			continue;
-		}
-		report("bind: %.*s: unknown option", static_cast<int>(arg.size()), arg.data());
-		return {2};
-	}
+	//
+	// `bind -memacs` NOW WORKS, and did not before: the loop this replaces compared
+	// whole words, so `-m` took the next word and the attached spelling every other
+	// option-taking utility in the tree accepts was an unknown option. XBD 12.2
+	// Guideline 7 gives a row no say in which spelling it takes, which is half of
+	// what the thirteen loops disagreed about.
+	const auto parsed = args::parse(kBind, argv);
+	if (parsed.err)
+		return {report_option_error("bind", parsed.err)};
+	const std::string_view keymap = parsed.opts.keymap;
+	const bool list_keymaps = parsed.opts.list_keymaps;
+	const std::string_view create = parsed.opts.create;
+	size_t at = static_cast<size_t>(parsed.rest - argv);
 
 	if (list_keymaps && (!create.empty() || argv[at] != nullptr)) {
 		report("bind: -l takes no operands");
@@ -2226,21 +2227,47 @@ builtin_result builtin_bind(shell_state& state, char** argv) {
 	return {report_bind_outcome(what, keys)};
 }
 
+// `unalias -a`, and the one letter POSIX gives it.
+//
+// `unalias -Z` USED TO BE AN OPERAND - an alias named `-Z`, reported as not found
+// at status 1 - because the loop only ever compared argv[1] with `-a`. POSIX gives
+// `unalias` an OPTIONS section, so a word in option position that names no option
+// is a usage error, and dash, bash and zsh all say so. Measured at 634e4c8:
+//
+//     lesh   unalias -Z   unalias: -Z: not found         status 1
+//     dash   unalias -Z   unalias: Illegal option -Z     status 2
+//     bash   unalias -Z   unalias: -Z: invalid option    status 2
+//     zsh    unalias -Z   unalias: bad option: -Z        status 1
+//
+// `alias` is the opposite case and keeps its operand reading: POSIX gives it no
+// options at all ("OPTIONS: None."), so `alias -Z` is a lookup of an alias named
+// `-Z` - which is dash's answer too, and what alias-p.tst:93's re-input round trip
+// needs.
+struct unalias_opts {
+	bool all = false;  // -a
+};
+
+constexpr auto kUnalias = args::spec<unalias_opts>(
+	args::option{'a', args::field<&unalias_opts::all>}.help("remove every alias"));
+
 builtin_result builtin_unalias(shell_state& state, char** argv) {
 	// `-a` removes every alias. It used to be looked up as the NAME `-a`, which
 	// removed nothing and reported nothing - and the case that asserts it passed
 	// anyway, because `alias` printed nothing to compare against. Two silent
 	// failures cancelling out is exactly what #38 found in sigurg5-p.tst.
-	if (argv[1] != nullptr && std::string_view{argv[1]} == "-a") {
+	//
+	// POSIX puts the options first and `--` after them, so `unalias -a` is an
+	// option and `unalias -- -a` removes an alias whose name is `-a`. The table
+	// orders the two without a fast path in front of it.
+	const auto parsed = args::parse(kUnalias, argv);
+	if (parsed.err)
+		return {report_option_error("unalias", parsed.err)};
+	if (parsed.opts.all) {
 		state.clear_aliases();
 		return {0};
 	}
 	int status = 0;
-	// AFTER the `-a` check above and not before it: POSIX puts the options first
-	// and `--` after them, so `unalias -a` is an option and `unalias -- -a` removes
-	// an alias whose name is `-a`. dash, bash, zsh and ksh all discard the
-	// separator here and lesh looked for an alias literally called `--` (#63).
-	for (size_t i = first_operand(argv); argv[i] != nullptr; ++i) {
+	for (size_t i = static_cast<size_t>(parsed.rest - argv); argv[i] != nullptr; ++i) {
 		// POSIX: removing an alias that does not exist is an ERROR. Returning 0 made
 		// `unalias true; unalias true` succeed twice.
 		if (!state.unset_alias(argv[i])) {
