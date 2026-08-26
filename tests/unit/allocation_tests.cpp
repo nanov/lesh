@@ -1,6 +1,7 @@
 #include "leshper/editor.h"
 #include "leshper/loop.h"
 #include "leshper/event.h"
+#include "leshper/prompt.h"
 #include "leshper/state.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
@@ -454,5 +455,83 @@ TEST_F(AllocationTest, PaintingDecorationsAddsNothingToWhatALayoutAlreadyCosts) 
 
 	EXPECT_GT(bare, 0u) << "a zero here would mean the hook, not the layout, is broken";
 	EXPECT_EQ(painted, bare) << "painting the decorations reached the heap";
+}
+
+// §6.10's steady-state cost for the prompt composer (#157), as the number it is
+// stated in: a WARM render allocates nothing at all.
+//
+// WHY THIS IS A NUMBER AND NOT A COMMENT. The prompt is drawn once per command
+// and, with a clock or a spinner on it, up to a hundred times a second while the
+// user is doing nothing; an allocation on that path is a page fault and a lock in
+// the middle of a keystroke's latency budget. The old engine hung a `sink` off
+// every heap node and looked its memo up by `std::string` comparison, so this was
+// a claim about code nobody could check. The placement model makes it checkable:
+// the program is a flat vector, the scratch is one entry per step found by index,
+// and the memo compares a pointer and a byte range - nothing on the path
+// constructs a string.
+//
+// EVERY ALLOCATION HAPPENS AT CONFIGURATION TIME, which is where it belongs:
+// `set_template` parses, sizes the scratch and the slots, and hands the surface
+// two containers. The warm renders below are what the shell actually does.
+TEST_F(AllocationTest, AWarmPromptRenderNeverReachesTheHeap) {
+	namespace prompt = leshper::prompt;
+
+	prompt::engine which;
+	std::string error;
+	// The owner's own example: a short cyan path, a magenta branch in a group that
+	// vanishes with it, red brackets round `$?` that vanish with the number, and
+	// an unconditional arrow.
+	ASSERT_TRUE(which.set_template(prompt::surface_id::left,
+	                               "{path:cyan:s}( on {git:magenta}){status:red::[:]}> ", error))
+		<< error;
+	ASSERT_TRUE(which.set_template(prompt::surface_id::continuation, "> ", error)) << error;
+
+	prompt::state facts;
+	facts.pwd = "/home/u/src";
+	facts.home = "/home/u";
+	facts.status = 2;
+	facts.tick = 0;
+	// NO FILESYSTEM, and that is what is being measured rather than dodged: this
+	// test is about the composer's own cost, and `git`'s budgeted probe has its
+	// own cases. `fs_allowed` false is the same guard the compiled default renders
+	// under.
+	facts.fs_allowed = false;
+
+	// WARM IT. The first render is where the slots take their strings, the memo
+	// takes its entries and the sinks take their capacity - all of it kept, none
+	// of it given back.
+	for (int i = 0; i < 4; ++i)
+		which.render_full(facts);
+
+	const size_t full = mallocs_during([&] { which.render_full(facts); });
+	const size_t tick = mallocs_during([&] { (void)which.render_tick(facts); });
+	EXPECT_EQ(full, 0u) << "a new prompt reached the heap";
+	EXPECT_EQ(tick, 0u) << "a tick reached the heap";
+	EXPECT_EQ(which.output(prompt::surface_id::left), "\x1b[36msrc\x1b[0m\x1b[31m[2]\x1b[0m> ");
+
+	// AND A TICK THAT ACTUALLY RECOMPUTES SOMETHING, because the tick above had
+	// nothing due and a loop that does nothing is a poor witness. A clock arms a
+	// deadline, the tick re-invokes it, the slot is rewritten and the surface is
+	// rebuilt - the whole path, still off the heap.
+	prompt::engine ticking;
+	ASSERT_TRUE(ticking.set_template(prompt::surface_id::left, "{time::24hs} {path}> ", error))
+		<< error;
+	ASSERT_TRUE(ticking.set_template(prompt::surface_id::continuation, "> ", error)) << error;
+
+	facts.hours = 9;
+	facts.minutes = 5;
+	for (int i = 0; i < 4; ++i) {
+		facts.tick += 100;
+		facts.seconds = static_cast<uint8_t>((facts.seconds + 1) % 60);
+		ticking.render_full(facts);
+		(void)ticking.render_tick(facts);
+	}
+
+	facts.tick += 100;
+	facts.seconds = static_cast<uint8_t>((facts.seconds + 1) % 60);
+	bool moved = false;
+	const size_t animated = mallocs_during([&] { moved = ticking.render_tick(facts); });
+	EXPECT_TRUE(moved) << "the clock did not advance, so this measured nothing";
+	EXPECT_EQ(animated, 0u) << "animating the prompt reached the heap";
 }
 #endif
