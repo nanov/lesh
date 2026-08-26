@@ -956,21 +956,53 @@ typedef struct lesh_prompt_context lesh_prompt_context;
  * answers a LESH_PROMPT_* status.
  *
  * `userdata` is the registration-time context, exactly as an action's is. The
- * PLACEMENT's argument is not a parameter - `lesh_prompt_arg` reads it - because
+ * PLACEMENT's type slot is not a parameter - `lesh_prompt_arg` reads it - because
  * a module is a singleton with free placement (6.10) and the argument belongs to
  * the placement rather than to the registration. */
 typedef int32_t (*lesh_prompt_module_fn)(lesh_prompt_context* context, void* userdata);
+
+/* A module's TYPE-SLOT GRAMMAR, checked once at set time (6.10).
+ *
+ * Every built-in owns one - `path` knows its five variants, `env` knows that a
+ * variable name is required - and this is the same door for a module that came
+ * from a binding. Zero accepts. A POSITIVE value refuses, and `error_out` may
+ * carry one short human phrase saying why; `*length_out` is its length whether or
+ * not it fit, `lesh_buffer_get`'s convention as everywhere else here.
+ *
+ * WHY IT IS WORTH A VERB. Without one, a mistyped type slot is not an error at
+ * all: the module gets bytes it does not understand at RENDER time, once a
+ * prompt, with nowhere to report them - so the user sees a segment silently doing
+ * the wrong thing rather than a message naming the byte they got wrong. A
+ * validator moves that discovery to the moment the template was written. */
+typedef int32_t (*lesh_prompt_validate_fn)(const char* type, size_t length, void* userdata,
+                                           char* error_out, size_t capacity, size_t* length_out);
 
 /* Registers a module under `name`, replacing any existing registration - #101's
  * rule again, so re-sourcing an rc file is idempotent. Names are snake_case;
  * anything else, or a null function, is LESH_ERR_INVAL.
  *
- * Registering does not place anything. `lesh_prompt_add_module` does that, and
- * may do it more than once. */
+ * A module registered this way ACCEPTS ANY TYPE SLOT: it has no grammar this side
+ * can check, so nothing is refused at set time and the bytes arrive at
+ * `lesh_prompt_arg` as written. Use the checked form below to own a grammar.
+ *
+ * Registering does not place anything. `lesh_prompt_place` does that, and may do
+ * it more than once. */
 int32_t lesh_prompt_module_register(lesh_registry* registry,
                                     const char* name,
                                     lesh_prompt_module_fn fn,
                                     void* userdata);
+
+/* The same registration, with a type-slot validator. ADDITIVE: the verb above is
+ * unchanged and still means "accepts any type", so nothing written against it has
+ * to move.
+ *
+ * `validate` may be NULL, which makes this exactly the unchecked form. Both
+ * functions receive the same `userdata`. */
+int32_t lesh_prompt_module_register_checked(lesh_registry* registry,
+                                            const char* name,
+                                            lesh_prompt_module_fn fn,
+                                            lesh_prompt_validate_fn validate,
+                                            void* userdata);
 
 /* True (1) when a module of that name is registered, built-in ones included. */
 int32_t lesh_prompt_module_exists(lesh_registry* registry, const char* name, int32_t* out);
@@ -1020,34 +1052,40 @@ int32_t lesh_prompt_clear(lesh_registry* registry, uint32_t surface);
 /* Puts a surface back on the built-in default table. */
 int32_t lesh_prompt_use_default(lesh_registry* registry, uint32_t surface);
 
-/* Appends a module placement, with `arg` as its argument (NULL for none).
- * LESH_ERR_NOTFOUND when no module of that name is registered.
+/* Appends ONE PLACEMENT - the template's five parts, as five arguments. Every
+ * argument is a NUL-terminated string and NULL means empty.
+ *
+ * ONE VERB, BECAUSE THERE IS ONE ELEMENT (6.10). This replaces the three that
+ * were here - a module verb, a literal verb and a style verb - and the reason is
+ * not tidiness: three verbs let a caller say things the template language cannot
+ * (a style with no span to close it) while not letting it say things the language
+ * can (a module with a prefix that vanishes with it). One `place` call is exactly
+ * `{name:style:type:prefix:postfix}` and exactly nothing else, so the ABI and the
+ * string are the same configuration language with two spellings.
+ *
+ *   `name`    the module. NULL or "" places a LITERAL: no module, the affix bytes
+ *             painted unconditionally, taking no part in a group's vote.
+ *   `style`   the string grammar - `"cyan.bold"`, `"#89dceb"`, `"red+#222"`.
+ *   `type`    the module's own slot, handed to it as written and parsed by IT.
+ *   `prefix`  bytes before the module's, painted only if it said something.
+ *   `postfix` bytes after, on the same condition.
  *
  * The placement lands INSIDE the open group when there is one, and at top level
- * otherwise. The bytes of `arg` are copied. */
-int32_t lesh_prompt_add_module(lesh_registry* registry, uint32_t surface,
-                               const char* name, const char* arg);
-
-/* Appends a literal. Bytes, copied; NULL with length zero is a literal that says
- * nothing, which is pointless but not wrong.
+ * otherwise. Every byte is copied.
  *
- * A TOP-LEVEL LITERAL IS UNCONDITIONAL and a literal inside a group vanishes
- * with the group. That is the whole of the binding rule: explicit grouping,
- * never inferred from adjacency (6.10). */
-int32_t lesh_prompt_add_literal(lesh_registry* registry, uint32_t surface,
-                                const char* bytes, size_t length);
-
-/* Appends a style decoration, spelled in the string grammar - `"cyan.bold"`,
- * `"#89dceb"`, `"red+#222"`. Bytes, copied; an empty spec is the pen's default.
- *
- * A style inside a group is what makes the group put the pen back at its end; a
- * style at top level paints from there on.
- *
- * A SPEC THAT WILL NOT PARSE ANSWERS 1, a positive domain status, and places
- * nothing. It is not LESH_ERR_INVAL: the arguments were well formed and the
- * CONTENT was wrong, which is the caller's own text. */
-int32_t lesh_prompt_add_style(lesh_registry* registry, uint32_t surface,
-                              const char* spec, size_t length);
+ * FOUR ANSWERS:
+ *   LESH_OK            - placed.
+ *   LESH_ERR_NOTFOUND  - no module of that name (and no engine on the registry).
+ *   1                  - the STYLE spec would not parse.
+ *   2                  - the module REFUSED the type slot.
+ * The two positive ones are domain statuses, not LESH_ERR_INVAL: the arguments
+ * were well formed and their CONTENT was wrong, which is the caller's own text.
+ * There is no message channel here because there is nothing to say that the
+ * caller, holding the string, could not say better; `lesh_prompt_set`, whose text
+ * a human typed, has one. */
+int32_t lesh_prompt_place(lesh_registry* registry, uint32_t surface,
+                          const char* name, const char* style,
+                          const char* type, const char* prefix, const char* postfix);
 
 /* Sets a surface from a TEMPLATE - `{module:style:type:prefix:postfix}`, `(…)`
  * groups, `\:`-family escapes - replacing everything on it.
@@ -1079,14 +1117,15 @@ int32_t lesh_prompt_set(lesh_registry* registry, uint32_t surface,
  * spelling.
  *
  * A surface on the shipped default answers the default's own template; one built
- * out of `lesh_prompt_add_module` and friends answers zero bytes, because a
- * prompt assembled element by element has no template string and inventing one
- * would put the element vocabulary on the caller's side of this boundary. */
+ * out of `lesh_prompt_place` calls answers zero bytes, because a prompt assembled
+ * placement by placement has no template string and inventing one would put the
+ * element vocabulary on the caller's side of this boundary. */
 int32_t lesh_prompt_text(lesh_registry* registry, uint32_t surface,
                          char* out, size_t capacity, size_t* length_out);
 
-/* Opens a group: everything added until the matching close is its child, and the
- * group is shown only when a module inside it is ready.
+/* Opens a group - the ONLY combinator (6.10). Everything placed until the
+ * matching close is its child, and the group is shown only when a child inside it
+ * is ready; a literal child never votes.
  *
  * LESH_ERR_REFUSED when one is already open. Groups do not nest across THIS
  * surface, and refusing is the honest answer - a caller that lost track of its

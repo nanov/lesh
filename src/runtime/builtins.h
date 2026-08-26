@@ -393,9 +393,12 @@ public:
 	// put the element vocabulary on this side of the boundary, where every new
 	// module kind becomes a new enumerator in a runtime header. Remembering the
 	// bytes that were handed in costs one `std::string` per surface and keeps the
-	// vocabulary where it belongs. Empty for a surface never set from a template
-	// (the shipped default is a table, not a string), which prints as an empty
-	// line rather than as an error.
+	// vocabulary where it belongs. The shipped default answers its own canonical
+	// template text - `{path}> ` - because that string is what the default IS
+	// (#157: it is compiled from that spelling), so bare `prompt` on a fresh shell
+	// prints the prompt on screen rather than an empty line. Empty is reserved for
+	// a surface assembled placement by placement, which has no template string at
+	// all; that prints as an empty line rather than as an error.
 	virtual void text(surface which, std::string& out) const = 0;
 
 protected:

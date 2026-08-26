@@ -38,18 +38,32 @@ using lesh::leshper::prompt::engine;
 using lesh::leshper::prompt::surface_id;
 namespace prompt = lesh::leshper::prompt;
 
-// One element, run on its own. What the module tests want and nothing more.
+// One module, run on its own - through its OWN type-slot grammar, because that
+// is now half of what a module is. `parse` then `render`, which is exactly the
+// pair a placement makes at set time and at render time.
 struct rendered {
 	std::string bytes;
 	element_status status = element_status::omitted;
 	std::uint64_t wake = 0;
 };
 
-rendered run_element(prompt::element_fn fn, const prompt::state& facts,
-                     const void* data = nullptr) {
+rendered run_module(const prompt::module& which, std::string_view type,
+                    const prompt::state& facts) {
+	prompt::params_blob params;
+	prompt::parse_error why;
+	EXPECT_TRUE(which.parse(type, params, why)) << which.name() << " refused '" << type << "'";
+
 	prompt::sink out;
-	const element_status answered = prompt::status_of(fn(facts, out, data));
+	const element_status answered = prompt::status_of(which.render(facts, params, out));
 	return rendered{std::string{out.bytes()}, answered, out.wake()};
+}
+
+// Whether a module refuses a type slot. The WORDING is asserted through
+// `set_template`, where a user would actually see it.
+bool refuses_type(const prompt::module& which, std::string_view type) {
+	prompt::params_blob params;
+	prompt::parse_error why;
+	return !which.parse(type, params, why);
 }
 
 // A session in `~/src`, no repo, last command succeeded.
@@ -78,25 +92,62 @@ bool fake_getvar(const void*, std::string_view name, std::string_view& out) {
 	return false;
 }
 
-// A module that counts its invocations and says so, so that "was this
-// re-invoked" is answerable from the bytes as well as from the counter.
-struct counter {
-	int calls = 0;
-	std::string label;
-	std::uint64_t wake = 0;
-	bool constant = false;   // when set, the bytes do not change between calls
+// A module written the way a module is now written: a `typed_module` over a
+// STRUCT of params, with its own type-slot grammar.
+//
+// IT COUNTS BOTH VERBS SEPARATELY, and that is the point of it. `parses` says
+// how many times the type slot was interpreted and `calls` how many times bytes
+// were produced - so "parsed once at set time, rendered once per prompt" is a
+// pair of numbers rather than a claim. The old test double was a bare function
+// pointer plus a `void*`, which could not have been asked either question.
+struct probe_params {
+	prompt::fixed_text<32> tag{};
 };
 
-int counting_module(const prompt::state&, prompt::sink& out, const void* data) {
-	auto* which = static_cast<counter*>(prompt::userdata_of(data));
-	++which->calls;
-	out.append(which->label);
-	if (!which->constant)
-		out.append(std::to_string(which->calls));
-	if (which->wake != 0)
-		out.wake_in(which->wake);
-	return prompt::code(element_status::ready);
-}
+class test_module final : public prompt::typed_module<probe_params> {
+public:
+	test_module(std::string named, std::string label)
+		: _named(std::move(named)), _label(std::move(label)) {}
+
+	mutable int parses = 0;
+	mutable int calls = 0;
+
+	std::uint64_t wake = 0;
+	bool constant = false;   // when set, the bytes do not change between calls
+	bool silent = false;     // when set, it omits - a module with nothing to say
+
+	[[nodiscard]] std::string_view name() const noexcept override { return _named; }
+
+protected:
+	// A GRAMMAR OF ITS OWN: anything up to 32 bytes is a tag, longer is refused.
+	// Enough to be a real one, small enough to say so in a sentence.
+	bool parse(std::string_view type, probe_params& out, prompt::parse_error& err) const override {
+		++parses;
+		if (!out.tag.assign(type)) {
+			err.what = ": tag is too long";
+			return false;
+		}
+		return true;
+	}
+
+	int render(const prompt::state&, const probe_params& params,
+	           prompt::sink& out) const override {
+		++calls;
+		if (wake != 0)
+			out.wake_in(wake);
+		if (silent)
+			return prompt::code(element_status::omitted);
+		out.append(_label);
+		out.append(params.tag.view());
+		if (!constant)
+			out.append(std::to_string(calls));
+		return prompt::code(element_status::ready);
+	}
+
+private:
+	std::string _named;
+	std::string _label;
+};
 
 // What a module registered across the C ABI saw, and what it did with the four
 // verbs it has.
@@ -138,135 +189,237 @@ std::int32_t abi_module(lesh_prompt_context* context, void* userdata) {
 // ---------------------------------------------------------------------------
 
 TEST(LeshperPromptModules, PathContractsHomeByComponent) {
-	EXPECT_EQ(run_element(&prompt::module_path, quiet()).bytes, "~/src");
+	EXPECT_EQ(run_module(prompt::kModulePath, "", quiet()).bytes, "~/src");
 
 	prompt::state facts = quiet();
 	facts.pwd = "/home/u";
-	EXPECT_EQ(run_element(&prompt::module_path, facts).bytes, "~");
+	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).bytes, "~");
 
 	// A sibling whose name merely starts with the home directory's is not under
 	// it. The cheap prefix test would have rendered `~name/x`.
 	facts.pwd = "/home/username/x";
-	EXPECT_EQ(run_element(&prompt::module_path, facts).bytes, "/home/username/x");
+	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).bytes, "/home/username/x");
 
 	facts.home = std::string_view{};
 	facts.pwd = "/home/u/src";
-	EXPECT_EQ(run_element(&prompt::module_path, facts).bytes, "/home/u/src");
+	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).bytes, "/home/u/src");
 }
 
 TEST(LeshperPromptModules, PathOmitsWithoutAPwd) {
 	prompt::state facts;
-	EXPECT_EQ(run_element(&prompt::module_path, facts).status, element_status::omitted);
-	EXPECT_TRUE(run_element(&prompt::module_path, facts).bytes.empty());
+	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).status, element_status::omitted);
+	EXPECT_TRUE(run_module(prompt::kModulePath, "", facts).bytes.empty());
+}
+
+// THE FIVE VARIANTS `path` NOW OWNS (#157's ruling, prmt's spellings). The
+// compile-time selftests render each against one set of facts; what is here is
+// the two questions a constant expression cannot ask - what a variant does to a
+// path with no home in it, and what the module says to a spelling it does not
+// know.
+TEST(LeshperPromptModules, PathHasFiveVariantsAndRefusesAnySixth) {
+	prompt::state facts = quiet();
+	facts.pwd = "/home/u/private/github/lesh";
+
+	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).bytes, "~/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "relative", facts).bytes, "~/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "r", facts).bytes, "~/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "absolute", facts).bytes,
+	          "/home/u/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "a", facts).bytes, "/home/u/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "f", facts).bytes, "/home/u/private/github/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "short", facts).bytes, "lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "s", facts).bytes, "lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "initials", facts).bytes, "~/p/g/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "i", facts).bytes, "~/p/g/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "unvowel", facts).bytes, "~/prvt/gthb/lesh");
+	EXPECT_EQ(run_module(prompt::kModulePath, "u", facts).bytes, "~/prvt/gthb/lesh");
+
+	// OUTSIDE HOME THERE IS NO `~` TO KEEP, and the reduction starts at the root:
+	// the leading `/` is a separator, not a component, so nothing eats it.
+	facts.pwd = "/usr/local/share/doc";
+	facts.home = "/home/u";
+	EXPECT_EQ(run_module(prompt::kModulePath, "i", facts).bytes, "/u/l/s/doc");
+	EXPECT_EQ(run_module(prompt::kModulePath, "u", facts).bytes, "/sr/lcl/shr/doc");
+	EXPECT_EQ(run_module(prompt::kModulePath, "s", facts).bytes, "doc");
+
+	// A COMPONENT THAT WOULD VANISH KEEPS ITS FIRST BYTE. `~//x` would read as a
+	// mistake; one letter is the smallest honest answer.
+	facts.pwd = "/home/u/aeiou/x";
+	EXPECT_EQ(run_module(prompt::kModulePath, "u", facts).bytes, "~/a/x");
+
+	// AT HOME THE SHORT FORM IS `~`, not the name of the directory home happens
+	// to live in - which falls out of contracting first and shortening after.
+	facts.pwd = "/home/u";
+	EXPECT_EQ(run_module(prompt::kModulePath, "s", facts).bytes, "~");
+
+	// And a spelling nobody defined is refused, at set time, by `path`.
+	EXPECT_TRUE(refuses_type(prompt::kModulePath, "medum"));
+	EXPECT_TRUE(refuses_type(prompt::kModulePath, "SHORT"));
 }
 
 TEST(LeshperPromptModules, StatusOmitsOnSuccess) {
-	EXPECT_EQ(run_element(&prompt::module_status, quiet()).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
 	facts.status = 127;
-	const rendered got = run_element(&prompt::module_status, facts);
+	const rendered got = run_module(prompt::kModuleStatus, "", facts);
 	EXPECT_EQ(got.status, element_status::ready);
 	EXPECT_EQ(got.bytes, "127");
 
 	facts.status = -6;
-	EXPECT_EQ(run_element(&prompt::module_status, facts).bytes, "-6");
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "", facts).bytes, "-6");
+
+	// `code` is the default spelled out, and the one word that is not a symbol.
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "code", facts).bytes, "-6");
+}
+
+// THE SYMBOL FORM: the type slot IS the mark, so there is no vocabulary for a
+// typo to fall outside of - only a ceiling on how long a mark may be.
+TEST(LeshperPromptModules, StatusShowsASymbolInsteadOfANumber) {
+	prompt::state facts = quiet();
+	facts.status = 1;
+
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "✗", facts).bytes, "✗");
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "FAIL", facts).bytes, "FAIL");
+
+	// And it still omits on success, which is the whole reason it is one module
+	// with two forms rather than two modules.
+	facts.status = 0;
+	EXPECT_EQ(run_module(prompt::kModuleStatus, "✗", facts).status, element_status::omitted);
+
+	EXPECT_TRUE(refuses_type(prompt::kModuleStatus, std::string(17, 'x')));
+	EXPECT_FALSE(refuses_type(prompt::kModuleStatus, std::string(16, 'x')));
 }
 
 TEST(LeshperPromptModules, JobsOmitsWhenThereAreNone) {
-	EXPECT_EQ(run_element(&prompt::module_jobs, quiet()).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleJobs, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
 	facts.jobs = 12;
-	EXPECT_EQ(run_element(&prompt::module_jobs, facts).bytes, "12");
+	EXPECT_EQ(run_module(prompt::kModuleJobs, "", facts).bytes, "12");
 }
 
 TEST(LeshperPromptModules, ModeIsWhateverTheKeymapDeclared) {
-	EXPECT_EQ(run_element(&prompt::module_mode, quiet()).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleMode, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
 	facts.mode = "NORMAL";
-	EXPECT_EQ(run_element(&prompt::module_mode, facts).bytes, "NORMAL");
+	EXPECT_EQ(run_module(prompt::kModuleMode, "", facts).bytes, "NORMAL");
 }
 
-TEST(LeshperPromptModules, TimeIsPaddedAndAsksForTheNextSecond) {
+// THE PARAMETERLESS MODULES REFUSE A TYPE SLOT, all four with one wording,
+// because a `{git::x}` that was quietly ignored is a user who believes they
+// asked for something.
+TEST(LeshperPromptModules, TheParameterlessModulesTakeNoType) {
+	const prompt::module* const parameterless[] = {
+		&prompt::kModuleGit,
+		&prompt::kModuleJobs,
+		&prompt::kModuleMode,
+		&prompt::kModuleDuration,
+	};
+	for (const prompt::module* which : parameterless) {
+		EXPECT_FALSE(refuses_type(*which, "")) << which->name();
+		EXPECT_TRUE(refuses_type(*which, "x")) << which->name();
+	}
+}
+
+TEST(LeshperPromptModules, TimeHasFourFormsAndACadenceForEach) {
 	prompt::state facts = quiet();
 	facts.hours = 9;
 	facts.minutes = 5;
 	facts.seconds = 3;
 	facts.tick = 37;
 
-	const rendered got = run_element(&prompt::module_time, facts);
-	EXPECT_EQ(got.status, element_status::ready);
-	EXPECT_EQ(got.bytes, "09:05:03");
+	// THE DEFAULT IS HH:MM (prmt's `24h`, owner's ruling on #157), and the form
+	// that shows seconds asks for them by name.
+	const rendered minutes = run_module(prompt::kModuleTime, "", facts);
+	EXPECT_EQ(minutes.status, element_status::ready);
+	EXPECT_EQ(minutes.bytes, "09:05");
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24h", facts).bytes, "09:05");
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24hs", facts).bytes, "09:05:03");
 
-	// The next second on the 10 ms grid, DERIVED from the tick and stored
+	// Twelve-hour, with no am/pm suffix: midnight is 12, noon is 12, 13 is 1.
+	facts.hours = 0;
+	EXPECT_EQ(run_module(prompt::kModuleTime, "12h", facts).bytes, "12:05");
+	facts.hours = 12;
+	EXPECT_EQ(run_module(prompt::kModuleTime, "12hs", facts).bytes, "12:05:03");
+	facts.hours = 13;
+	EXPECT_EQ(run_module(prompt::kModuleTime, "12h", facts).bytes, "01:05");
+
+	// THE CADENCE FOLLOWS THE FORM, and both are DERIVED from the tick and stored
 	// nowhere - which is what makes a parked clock re-arm from the fire rather
-	// than catch up.
-	EXPECT_EQ(got.wake, 63u);
+	// than catch up. The next second on the 10 ms grid is `100 - tick % 100`; the
+	// next minute is that plus the whole seconds left in this one.
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24hs", facts).wake, 63u);
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24h", facts).wake, 56u * 100 + 63);
 
 	facts.tick = 100;
-	EXPECT_EQ(run_element(&prompt::module_time, facts).wake, 100u);
-
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24hs", facts).wake, 100u);
 	facts.tick = 199;
-	EXPECT_EQ(run_element(&prompt::module_time, facts).wake, 1u);
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24hs", facts).wake, 1u);
+
+	// The last second of a minute wants the next second, which IS the next minute.
+	facts.seconds = 59;
+	facts.tick = 100;
+	EXPECT_EQ(run_module(prompt::kModuleTime, "24h", facts).wake, 100u);
+
+	EXPECT_TRUE(refuses_type(prompt::kModuleTime, "13h"));
 }
 
 TEST(LeshperPromptModules, DurationHasAFloorAndThreeFormats) {
 	prompt::state facts = quiet();
 
 	facts.duration_ms = 1999;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).status, element_status::omitted);
 
 	facts.duration_ms = 2000;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).bytes, "2s");
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "2s");
 
 	facts.duration_ms = 59'999;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).bytes, "59s");
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "59s");
 
 	facts.duration_ms = 90'000;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).bytes, "1m30s");
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "1m30s");
 
 	facts.duration_ms = 3'600'000;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).bytes, "1h0m0s");
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "1h0m0s");
 
 	facts.duration_ms = 7'384'000;
-	EXPECT_EQ(run_element(&prompt::module_duration, facts).bytes, "2h3m4s");
+	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "2h3m4s");
 }
 
-TEST(LeshperPromptModules, EnvReadsItsBoundArgument) {
+TEST(LeshperPromptModules, EnvReadsTheVariableItsTypeSlotNames) {
 	prompt::state facts = quiet();
 	facts.getvar = &fake_getvar;
 
-	prompt::binding user{std::string_view{"USER"}, nullptr};
-	EXPECT_EQ(run_element(&prompt::module_env, facts, &user).bytes, "dana");
+	EXPECT_EQ(run_module(prompt::kModuleEnv, "USER", facts).bytes, "dana");
 
-	// Set but empty omits: `{env:HOST}@` should vanish rather than render a bare
+	// Set but empty omits: `{env::HOST}@` should vanish rather than render a bare
 	// `@`.
-	prompt::binding empty{std::string_view{"EMPTY"}, nullptr};
-	EXPECT_EQ(run_element(&prompt::module_env, facts, &empty).status, element_status::omitted);
-
-	prompt::binding missing{std::string_view{"NOPE"}, nullptr};
-	EXPECT_EQ(run_element(&prompt::module_env, facts, &missing).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleEnv, "EMPTY", facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleEnv, "NOPE", facts).status, element_status::omitted);
 
 	// No lookup wired up is an omission, not an error.
 	facts.getvar = nullptr;
-	EXPECT_EQ(run_element(&prompt::module_env, facts, &user).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleEnv, "USER", facts).status, element_status::omitted);
 
-	// An unargued placement has no variable to read.
-	facts.getvar = &fake_getvar;
-	EXPECT_EQ(run_element(&prompt::module_env, facts, nullptr).status, element_status::omitted);
+	// AND A NAMELESS `env` NEVER GETS AS FAR AS A RENDER. There is no default
+	// variable to mean, so the placement is refused where it was written - which
+	// is the difference between a typo and a segment that silently disappeared.
+	EXPECT_TRUE(refuses_type(prompt::kModuleEnv, ""));
+	EXPECT_FALSE(refuses_type(prompt::kModuleEnv, std::string(64, 'V')));
+	EXPECT_TRUE(refuses_type(prompt::kModuleEnv, std::string(65, 'V')));
 }
 
 TEST(LeshperPromptModules, GitOmitsBeforeTouchingTheFilesystem) {
 	prompt::state facts = quiet();
 	EXPECT_FALSE(facts.fs_allowed);
-	EXPECT_EQ(run_element(&prompt::module_git, facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleGit, "", facts).status, element_status::omitted);
 
 	// Allowed, but with nowhere to look.
 	facts.fs_allowed = true;
 	facts.pwd = std::string_view{};
-	EXPECT_EQ(run_element(&prompt::module_git, facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(prompt::kModuleGit, "", facts).status, element_status::omitted);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,18 +441,18 @@ TEST(LeshperPromptEngine, RegistersTheBuiltInsAndListsThemSorted) {
 
 TEST(LeshperPromptEngine, RegistrationReplacesAndValidatesTheName) {
 	engine which;
-	counter first;
-	counter second;
-	first.label = "first";
-	second.label = "second";
+	test_module first{"probe", "first"};
+	test_module second{"probe", "second"};
+	first.constant = true;
+	second.constant = true;
 
-	EXPECT_EQ(which.register_module("probe", &counting_module, &first), LESH_OK);
-	EXPECT_EQ(which.register_module("probe", &counting_module, &second), LESH_OK);
+	EXPECT_EQ(which.register_module("probe", &first), LESH_OK);
+	EXPECT_EQ(which.register_module("probe", &second), LESH_OK);
 
-	EXPECT_EQ(which.register_module("Probe", &counting_module, &first), LESH_ERR_INVAL);
-	EXPECT_EQ(which.register_module("two-words", &counting_module, &first), LESH_ERR_INVAL);
-	EXPECT_EQ(which.register_module("", &counting_module, &first), LESH_ERR_INVAL);
-	EXPECT_EQ(which.register_module("probe", nullptr, &first), LESH_ERR_INVAL);
+	EXPECT_EQ(which.register_module("Probe", &first), LESH_ERR_INVAL);
+	EXPECT_EQ(which.register_module("two-words", &first), LESH_ERR_INVAL);
+	EXPECT_EQ(which.register_module("", &first), LESH_ERR_INVAL);
+	EXPECT_EQ(which.register_module("probe", nullptr), LESH_ERR_INVAL);
 
 	which.clear(surface_id::left);
 	which.add_module(surface_id::left, "probe", "");
@@ -309,6 +462,39 @@ TEST(LeshperPromptEngine, RegistrationReplacesAndValidatesTheName) {
 	// idempotent (#101), not cumulative.
 	EXPECT_EQ(first.calls, 0);
 	EXPECT_EQ(second.calls, 1);
+}
+
+// PARSED ONCE AT SET TIME, RENDERED ONCE PER PROMPT, and the two counters say so
+// separately. This is the property the typed-module split exists for: the type
+// slot is interpreted where a user can be told about it, and the render path
+// never looks at a string again.
+TEST(LeshperPromptEngine, AModulesTypeSlotIsParsedOnceAndNotPerRender) {
+	engine which;
+	test_module probe{"probe", "p"};
+	probe.constant = true;
+	ASSERT_EQ(which.register_module("probe", &probe), LESH_OK);
+
+	which.clear(surface_id::left);
+	which.clear(surface_id::continuation);
+	ASSERT_TRUE(which.add_module(surface_id::left, "probe", "tag"));
+
+	EXPECT_EQ(probe.parses, 1);
+	EXPECT_EQ(probe.calls, 0);
+
+	which.render_full(quiet());
+	which.render_full(quiet());
+	which.render_full(quiet());
+
+	// Three prompts, three renders - and still ONE parse.
+	EXPECT_EQ(probe.parses, 1);
+	EXPECT_EQ(probe.calls, 3);
+	EXPECT_EQ(which.output(surface_id::left), "ptag");
+
+	// A REFUSED TYPE SLOT PLACES NOTHING, which is `place`'s half of the same
+	// atomicity `set_template` promises: the surface is what it was.
+	EXPECT_FALSE(which.add_module(surface_id::left, "probe", std::string(33, 'x')));
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "ptag");
 }
 
 TEST(LeshperPromptEngine, DefaultAndClearRoundTrip) {
@@ -366,13 +552,12 @@ TEST(LeshperPromptEngine, GroupsDoNotNestAndCloseNeedsAnOpen) {
 // The memo
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerArgument) {
-	counter probe;
-	probe.label = "x";
+TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerParams) {
+	engine which;
+	test_module probe{"probe", "x"};
 	probe.constant = true;
 
-	engine which;
-	which.register_module("probe", &counting_module, &probe);
+	which.register_module("probe", &probe);
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
 	which.add_module(surface_id::left, "probe", "same");
@@ -381,12 +566,14 @@ TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerArgument) {
 
 	which.render_full(quiet());
 
-	// Two placements, one computation - §6.10's per-prompt `(module, arg)` memo,
-	// which is what makes free placement free.
+	// Two placements, one computation - §6.10's per-prompt (module, params) memo,
+	// which is what makes free placement free. THE KEY IS THE PARAMS BYTES, not a
+	// string compare: two placements that parsed to the same value are the same
+	// question however they were spelled.
 	EXPECT_EQ(probe.calls, 1);
-	EXPECT_EQ(which.output(surface_id::left), "x/x");
+	EXPECT_EQ(which.output(surface_id::left), "xsame/xsame");
 
-	// A different argument is a different question and is asked.
+	// Different params are a different question and are asked.
 	probe.calls = 0;
 	which.add_module(surface_id::left, "probe", "other");
 	which.render_full(quiet());
@@ -398,25 +585,51 @@ TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerArgument) {
 	EXPECT_EQ(probe.calls, 2);
 }
 
+// THE MEMO'S KEY IS (MODULE, PARAMS) AND BOTH HALVES MATTER. Two modules that
+// parsed identical params are still two questions, because the module pointer
+// differs; one module with two different params is two questions, because the
+// bytes differ. Neither half alone would be enough, and a memo that got this
+// wrong would show one segment's bytes under another segment's name.
+TEST(LeshperPromptEngine, TheMemoKeysOnTheModuleAndItsParamsTogether) {
+	engine which;
+	test_module first{"one", "A"};
+	test_module second{"two", "B"};
+	first.constant = true;
+	second.constant = true;
+
+	ASSERT_EQ(which.register_module("one", &first), LESH_OK);
+	ASSERT_EQ(which.register_module("two", &second), LESH_OK);
+
+	which.clear(surface_id::left);
+	which.clear(surface_id::continuation);
+	// The same params bytes, twice each, over two different modules.
+	ASSERT_TRUE(which.add_module(surface_id::left, "one", "t"));
+	ASSERT_TRUE(which.add_module(surface_id::left, "two", "t"));
+	ASSERT_TRUE(which.add_module(surface_id::left, "one", "t"));
+	ASSERT_TRUE(which.add_module(surface_id::left, "two", "t"));
+
+	which.render_full(quiet());
+	EXPECT_EQ(first.calls, 1);
+	EXPECT_EQ(second.calls, 1);
+	EXPECT_EQ(which.output(surface_id::left), "AtBtAtBt");
+}
+
 // ---------------------------------------------------------------------------
 // The tick wheel - recalculation by cause
 // ---------------------------------------------------------------------------
 
 TEST(LeshperPromptEngine, ATickReInvokesOnlyWhatIsDue) {
-	counter early;
-	counter late;
-	counter still;
-	early.label = "a";
+	test_module early{"early", "a"};
+	test_module late{"late", "b"};
+	test_module still{"still", "c"};
 	early.wake = 2;
-	late.label = "b";
 	late.wake = 5;
-	still.label = "c";
 	still.constant = true;   // no wake at all
 
 	engine which;
-	which.register_module("early", &counting_module, &early);
-	which.register_module("late", &counting_module, &late);
-	which.register_module("still", &counting_module, &still);
+	which.register_module("early", &early);
+	which.register_module("late", &late);
+	which.register_module("still", &still);
 
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
@@ -467,13 +680,12 @@ TEST(LeshperPromptEngine, ATickReInvokesOnlyWhatIsDue) {
 }
 
 TEST(LeshperPromptEngine, ATickThatChangesNothingOwesNoWrite) {
-	counter steady;
-	steady.label = "tick";
+	test_module steady{"steady", "tick"};
 	steady.constant = true;
 	steady.wake = 3;
 
 	engine which;
-	which.register_module("steady", &counting_module, &steady);
+	which.register_module("steady", &steady);
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
 	which.add_module(surface_id::left, "steady", "");
@@ -514,7 +726,11 @@ TEST(LeshperPromptEngine, TheTimeModuleDrivesTheWheel) {
 	engine which;
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
-	which.add_module(surface_id::left, "time", "");
+	// THE SECONDS FORM, ASKED FOR BY NAME. The default shows HH:MM and therefore
+	// wakes once a minute (owner's ruling on #157, prmt's `24h`); the wheel is
+	// easier to watch a second at a time, and the minute cadence is asserted
+	// below on the same engine.
+	which.add_module(surface_id::left, "time", "24hs");
 
 	prompt::state facts = quiet();
 	facts.tick = 37;
@@ -530,6 +746,18 @@ TEST(LeshperPromptEngine, TheTimeModuleDrivesTheWheel) {
 	EXPECT_TRUE(which.render_tick(facts));
 	EXPECT_EQ(which.output(surface_id::left), "01:02:04");
 	EXPECT_EQ(which.next_wake(), 200u);
+
+	// AND THE DEFAULT FORM COSTS SIXTY TIMES FEWER WAKEUPS. A prompt showing
+	// HH:MM has no business being woken to redraw bytes that did not move -
+	// §6.10's "unchanged output produces no write" would have caught the write,
+	// but not the wakeup, and the wakeup is what costs a laptop its battery.
+	which.clear(surface_id::left);
+	which.add_module(surface_id::left, "time", "");
+	which.render_full(facts);
+	EXPECT_EQ(which.output(surface_id::left), "01:02");
+	// Absolute, like every other deadline: the tick it was computed at, plus the
+	// rest of this second, plus the whole seconds left in the minute.
+	EXPECT_EQ(which.next_wake(), facts.tick + 100u + (59u - facts.seconds) * 100u);
 }
 
 // ---------------------------------------------------------------------------
@@ -545,9 +773,11 @@ TEST(LeshperPromptAbi, EveryVerbNeedsAnEngineOnTheRegistry) {
 	EXPECT_EQ(lesh_prompt_module_exists(&bare, "x", &exists), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_clear(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_use_default(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_add_module(&bare, LESH_PROMPT_LEFT, "path", nullptr),
+	EXPECT_EQ(lesh_prompt_place(&bare, LESH_PROMPT_LEFT, "path", nullptr, nullptr, nullptr,
+	                            nullptr),
 	          LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_add_literal(&bare, LESH_PROMPT_LEFT, "$", 1), LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_module_register_checked(&bare, "x", &abi_module, nullptr, nullptr),
+	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_group_open(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_group_close(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
 
@@ -561,15 +791,82 @@ TEST(LeshperPromptAbi, RejectsBadSurfacesAndBadNames) {
 	registry.prompt_engine = &which;
 
 	EXPECT_EQ(lesh_prompt_clear(&registry, 7u), LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, nullptr, 3), LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, nullptr, nullptr),
+	EXPECT_EQ(lesh_prompt_place(&registry, 7u, "path", nullptr, nullptr, nullptr, nullptr),
 	          LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "weather", nullptr),
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "weather", nullptr, nullptr, nullptr,
+	                            nullptr),
 	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_module_register(&registry, "Bad-Name", &abi_module, nullptr),
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_module_register(&registry, "ok_name", nullptr, nullptr),
 	          LESH_ERR_INVAL);
+
+	// A NULL NAME IS A LITERAL, not a malformed call: the one verb says both
+	// things, and "no module" is a legitimate placement rather than an omission.
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "x",
+	                            nullptr),
+	          LESH_OK);
+}
+
+// THE ONE PLACEMENT VERB, ROUND TRIP. Five arguments in, the same five parts a
+// template spells, and the same bytes out - which is what makes the ABI and the
+// string one configuration language rather than two.
+TEST(LeshperPromptAbi, PlaceSpellsExactlyWhatATemplateDoes) {
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
+
+	// `{path:cyan:s}` then `{status:red::[:]}` then a literal `> `.
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "cyan", "s", nullptr,
+	                            nullptr),
+	          LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "status", "red", nullptr, "[", "]"),
+	          LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "> ",
+	                            nullptr),
+	          LESH_OK);
+
+	prompt::state failed = quiet();
+	failed.status = 2;
+	which.render_full(failed);
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m\x1b[31m[2]\x1b[0m> ");
+
+	// The affixes vanish with the module; the free literal does not.
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m> ");
+
+	// AND THE SAME CONFIGURATION AS A STRING RENDERS THE SAME BYTES. Two
+	// spellings, one language - asserted rather than asserted-by-comment.
+	engine spelled;
+	std::string error;
+	ASSERT_TRUE(spelled.set_template(surface_id::left, "{path:cyan:s}{status:red::[:]}> ", error))
+		<< error;
+	for (const prompt::state& against : {failed, quiet()}) {
+		spelled.render_full(against);
+		which.render_full(against);
+		EXPECT_EQ(spelled.output(surface_id::left), which.output(surface_id::left))
+			<< "the verb stream and the template disagree";
+	}
+
+	// THE TWO DOMAIN REFUSALS, told apart. A style that will not parse and a type
+	// the module will not take are different mistakes and answer differently -
+	// and both place nothing.
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "blod", nullptr, nullptr,
+	                            nullptr),
+	          1);
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", nullptr, "medum", nullptr,
+	                            nullptr),
+	          2);
+	// A literal has no type slot either, the same refusal `{literal::x}` gets.
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, "x", "hi",
+	                            nullptr),
+	          2);
+
+	which.render_full(failed);
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m\x1b[31m[2]\x1b[0m> ");
 }
 
 TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
@@ -589,7 +886,7 @@ TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
 
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "probe", "hello"), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "probe", nullptr, "hello", nullptr, nullptr), LESH_OK);
 
 	prompt::state facts = quiet();
 	facts.tick = 42;
@@ -623,7 +920,7 @@ TEST(LeshperPromptAbi, ARegisteredModuleIsReplacedNotStacked) {
 
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "probe", "x"), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "probe", nullptr, "x", nullptr, nullptr), LESH_OK);
 	which.render_full(quiet());
 
 	EXPECT_EQ(first.calls, 0);
@@ -642,13 +939,13 @@ TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
 	// A second open while one is open is refused rather than nested: groups do
 	// not nest in v1 across this surface.
 	EXPECT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_ERR_REFUSED);
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, " [", 2), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "status", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, "]", 1), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, " [", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "status", nullptr, nullptr, nullptr, nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "]", nullptr), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	EXPECT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_ERR_REFUSED);
 
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, "$ ", 2), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "$ ", nullptr), LESH_OK);
 
 	// The module omitted, so the brackets went with it - and the top-level
 	// literal did not, because binding is explicit grouping.
@@ -662,8 +959,7 @@ TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
 }
 
 TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
-	counter inner;
-	inner.label = "!";
+	test_module inner{"shout", "!"};
 
 	engine which;
 	lesh_registry registry;
@@ -673,8 +969,8 @@ TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, "on ", 3), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "git", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "on ", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "git", nullptr, nullptr, nullptr, nullptr), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
 
 	which.render_full(quiet());
@@ -682,11 +978,11 @@ TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 
 	// The same shape with a module that DOES say something: the literal runs
 	// now, and in declared order before the module's bytes.
-	ASSERT_EQ(which.register_module("shout", &counting_module, &inner), LESH_OK);
+	ASSERT_EQ(which.register_module("shout", &inner), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, "on ", 3), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "shout", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "on ", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "shout", nullptr, nullptr, nullptr, nullptr), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
 
 	which.render_full(quiet());
@@ -735,7 +1031,7 @@ TEST(LeshperPromptAbi, ArgFollowsTheCopyOutConvention) {
 	          LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "measure", "abcdef"), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "measure", nullptr, "abcdef", nullptr, nullptr), LESH_OK);
 
 	which.render_full(quiet());
 	EXPECT_EQ(probe.calls, 1);
@@ -760,8 +1056,8 @@ TEST(LeshperPromptAbi, ANegativeStatusReadsAsOmitted) {
 	          LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "broken", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_literal(&registry, LESH_PROMPT_LEFT, "$ ", 2), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "broken", nullptr, nullptr, nullptr, nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "$ ", nullptr), LESH_OK);
 
 	which.render_full(quiet());
 
@@ -1344,12 +1640,11 @@ TEST_F(LeshperPromptGit, ATickSplicesGitsSlotAndOnlyANewPromptRereadsIt) {
 	write_text(repo + "/.git/refs/heads/one", sha40('e') + "\n");
 	write_text(repo + "/.git/refs/heads/two", sha40('f') + "\n");
 
-	counter spinner;
-	spinner.label = "|";
+	test_module spinner{"spinner", "|"};
 	spinner.wake = 3;
 
 	engine which;
-	which.register_module("spinner", &counting_module, &spinner);
+	which.register_module("spinner", &spinner);
 	which.clear(surface_id::left);
 	which.add_module(surface_id::left, "git", "");
 	which.add_literal(surface_id::left, " ");
@@ -1731,10 +2026,31 @@ TEST(LeshperPromptTemplate, EveryRefusalIsOneSentenceWithTheByteItPointsAt) {
 	refuses("{path:blod}", "bad style 'blod' at byte 6");
 	refuses("{path:cyan.blod}", "bad style 'blod' at byte 11");
 	refuses("{a:b:c:d:e:f}", "too many fields at byte 10");
-	refuses("{env}", "env needs a variable name at byte 1");
-	refuses("{path::short}", "path takes no argument at byte 7");
 	refuses("{}", "a placement needs a module name at byte 1");
 	refuses("a\\qb", "unknown escape '\\q' at byte 1");
+
+	// THE TYPE SLOT'S REFUSALS ARE THE MODULES' OWN, assembled from the module's
+	// name and the module's own words. There is no table of message shapes here
+	// and there could not be one: a module a binding registered would not be in
+	// it, and it gets the same sentence.
+	//
+	// An empty slot has no byte of its own to point at, so the NAME is what a user
+	// has to look at; a slot with bytes in it is pointed at directly and quoted
+	// back.
+	refuses("{env}", "env needs a variable name at byte 1");
+	refuses("{path}{env:cyan}", "env needs a variable name at byte 7");
+	refuses("{git::x}", "git takes no argument at byte 6");
+	refuses("{path::medum}", "path: unknown variant 'medum' at byte 7");
+	refuses("{path:cyan:medum}", "path: unknown variant 'medum' at byte 11");
+	refuses("{time::13h}", "time: unknown variant '13h' at byte 7");
+	refuses("{status::" + std::string(17, 'x') + "}", "status: symbol is too long at byte 9");
+
+	// AND WHAT IS NO LONGER A REFUSAL, which is the model change seen from the
+	// outside: `path` had no type slot at all and now owns five variants, so the
+	// spelling that used to be `path takes no argument` is a prompt.
+	std::string ok;
+	EXPECT_TRUE(which.set_template(surface_id::left, "{path::short}", ok)) << ok;
+	EXPECT_TRUE(which.set_template(surface_id::left, "{path:cyan:s}", ok)) << ok;
 }
 
 TEST(LeshperPromptTemplate, ARefusedTemplateLeavesEverythingExactlyAsItWas) {
@@ -1838,16 +2154,19 @@ TEST(LeshperPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
 	EXPECT_EQ(set_and_render(which, "{probe::whatever}", quiet()), "<whatever>");
 	EXPECT_EQ(probe.arg, "whatever");
 
-	// A REPLACED BUILT-IN IS THE SAME CASE. `path` takes no argument only while
-	// `path` is the built-in; a user who registered their own owns its grammar,
-	// which is why the rule is keyed on what the name resolves to.
-	counter mine;
-	mine.label = "p";
+	// A REPLACED BUILT-IN IS THE SAME CASE, and it is the case that says WHOSE a
+	// type slot's grammar is. `medum` is not one of `path`'s five variants only
+	// while `path` IS the built-in; a user who registered their own owns its
+	// grammar as surely as they own its bytes, so the template that was a refusal
+	// a moment ago is legal now. Nothing in the engine decides this - the module
+	// the name resolves to does.
+	test_module mine{"path", "p"};
 	mine.constant = true;
 	std::string error;
-	EXPECT_FALSE(which.set_template(surface_id::left, "{path::short}", error));
-	ASSERT_EQ(which.register_module("path", &counting_module, &mine), LESH_OK);
-	EXPECT_TRUE(which.set_template(surface_id::left, "{path::short}", error)) << error;
+	EXPECT_FALSE(which.set_template(surface_id::left, "{path::medum}", error));
+	EXPECT_EQ(error, "path: unknown variant 'medum' at byte 7");
+	ASSERT_EQ(which.register_module("path", &mine), LESH_OK);
+	EXPECT_TRUE(which.set_template(surface_id::left, "{path::medum}", error)) << error;
 
 	// And before any registration at all the same template is a refusal.
 	engine fresh;
@@ -1855,34 +2174,40 @@ TEST(LeshperPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
 	EXPECT_EQ(error, "unknown module 'probe' at byte 1");
 }
 
-TEST(LeshperPromptEngine, AddStyleReachesTheGroupsResetFlag) {
+// A STYLE IS A FIELD OF A PLACEMENT, NOT A THING PLACED BESIDE ONE, and this is
+// what that bought. The verb that used to exist - `add_style`, a decoration in
+// the stream that painted from there on and left an enclosing group owing a reset
+// at its end - is gone, and with it the whole question of who owes the reset: the
+// placement that opened a pen closes it, always, so the `$` after this group
+// cannot be red no matter what is around it.
+//
+// The bytes are the ones the old spelling produced, unchanged.
+TEST(LeshperPromptEngine, APlacementsPenIsScopedToThatPlacement) {
 	engine which;
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
 
 	ASSERT_TRUE(which.open_group(surface_id::left));
-	EXPECT_TRUE(which.add_style(surface_id::left, "red.bold"));
-	which.add_literal(surface_id::left, "[");
-	ASSERT_TRUE(which.add_module(surface_id::left, "status", ""));
-	which.add_literal(surface_id::left, "]");
+	ASSERT_EQ(which.place(surface_id::left, "status", "red.bold", "", "[", "]"),
+	          prompt::place_result::ok);
 	ASSERT_TRUE(which.close_group(surface_id::left));
 	which.add_literal(surface_id::left, "$");
 
-	// THE FLAG THIS VERB FINALLY SETS: the group ends with a reset, so the `$`
-	// after it is not red.
 	prompt::state failed = quiet();
 	failed.status = 7;
 	which.render_full(failed);
 	EXPECT_EQ(which.output(surface_id::left), "\x1b[1;31m[7]\x1b[0m$");
 
-	// And the style vanishes with the module, like any other decoration.
+	// And the pen vanishes with the module, exactly as the brackets do - because
+	// it is the same record and answers with them.
 	which.render_full(quiet());
 	EXPECT_EQ(which.output(surface_id::left), "$");
 
-	// A spec that will not parse places nothing.
-	EXPECT_FALSE(which.add_style(surface_id::left, "blod"));
-	which.render_full(quiet());
-	EXPECT_EQ(which.output(surface_id::left), "$");
+	// A spec that will not parse places nothing at all.
+	EXPECT_EQ(which.place(surface_id::left, "status", "blod", "", "", ""),
+	          prompt::place_result::bad_style);
+	which.render_full(failed);
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[1;31m[7]\x1b[0m$");
 }
 
 TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConvention) {
@@ -1929,13 +2254,17 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_OK);
 	EXPECT_EQ(std::string(buffer, out_length), kTemplate);
 
-	// The style verb, and its own domain status for a spec that will not parse.
+	// A styled placement inside a group, over the verbs, and the domain status for
+	// a spec that will not parse.
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, "cyan", 4), LESH_OK);
-	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "path", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "cyan", nullptr, nullptr,
+	                            nullptr),
+	          LESH_OK);
 	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	EXPECT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, "blod", 4), 1);
+	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "blod", nullptr, nullptr,
+	                            nullptr),
+	          1);
 	which.render_full(quiet());
 	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m");
 
@@ -1952,7 +2281,8 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_text(&bare, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
 	          LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_add_style(&bare, LESH_PROMPT_LEFT, "cyan", 4), LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_place(&bare, LESH_PROMPT_LEFT, "path", "cyan", nullptr, nullptr, nullptr),
+	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_set(nullptr, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, &needed),
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_set(&registry, 7u, "x", 1, nullptr, 0, &needed), LESH_ERR_INVAL);
@@ -1960,8 +2290,11 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, nullptr),
 	          LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_add_style(&registry, 7u, "cyan", 4), LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, nullptr, 4), LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_place(&registry, 7u, "path", "cyan", nullptr, nullptr, nullptr),
+	          LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_place(nullptr, LESH_PROMPT_LEFT, "path", nullptr, nullptr, nullptr,
+	                            nullptr),
+	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_text(&registry, 7u, buffer, sizeof buffer, &out_length), LESH_ERR_INVAL);
 }
 
@@ -2010,22 +2343,35 @@ TEST_F(LeshperPromptGit, GroupsNestAndTheInnerOneRendersOnlyIfTheOuterSurvived) 
 	facts.status = 3;
 
 	// NESTING IS THE TEMPLATE LANGUAGE'S - the ABI's verb stream still refuses it,
-	// having no way to say which group a close belongs to - and the vote is
-	// unchanged by it: only DIRECT module children vote, exactly as a `seg` nested
-	// in a `seg` does not vote at compile time. So this outer group lives or dies
-	// on `git`, and the inner one runs only if it lived.
+	// having no way to say which group a close belongs to - and THE VOTE RECURSES
+	// THROUGH IT. A child reports `ready` or `omitted`, and a nested group reports
+	// exactly what a placement does; there is no third answer, because there is no
+	// third kind of thing. So the outer group here shows when `git` speaks or when
+	// the inner group does.
 	EXPECT_EQ(set_and_render(which, "( on {git} ([{status}]))", facts), " on deep [3]");
 
-	// Outside a repository the whole thing goes, inner group included.
+	// Outside a repository `git` says nothing, and the inner group carries the
+	// outer one on `$?` alone - the literal " on " and the space with it, because
+	// they are decorations of a group that IS being shown.
 	prompt::state elsewhere = facts;
 	elsewhere.pwd = bare;
 	which.render_full(elsewhere);
-	EXPECT_EQ(which.output(surface_id::left), "");
+	EXPECT_EQ(which.output(surface_id::left), " on  [3]");
 
-	// The inner module alone cannot save the outer group, which is the other half
-	// of the same rule and the half that would surprise someone: a group is not a
-	// module and does not vote for its parent.
-	EXPECT_EQ(set_and_render(which, "( on ({status}))", elsewhere), "");
+	// THE RULE THE MODEL CHANGE CORRECTED, and it is worth being explicit about
+	// because the old engine answered the other way. A group used to be stamped
+	// with a kind and only DIRECT module children were counted, so a nested group
+	// could never vote - which made `(({git}))` a prompt that rendered nothing for
+	// ever, whatever the repository, with nothing in the spelling to say so. Now
+	// wrapping a placement in redundant parentheses changes nothing at all, which
+	// is the only answer a reader can predict.
+	EXPECT_EQ(set_and_render(which, "( on ({status}))", elsewhere), " on 3");
+	EXPECT_EQ(set_and_render(which, "(({git}))", facts), "deep");
+	EXPECT_EQ(set_and_render(which, "(({git}))", elsewhere), "");
+
+	// And with nothing inside that can speak, the whole nest still vanishes: the
+	// recursion carries an omission up as faithfully as it carries a readiness.
+	EXPECT_EQ(set_and_render(which, "( on ({git} ({git})))", elsewhere), "");
 }
 
 TEST_F(LeshperPromptGit, PuttingAColourOnAPlacementDoesNotChangeHowItVotes) {

@@ -1,50 +1,65 @@
 #pragma once
 
-// The prompt engine (#157, architecture spec §6.10): one element kind, two-phase
-// groups, a tick wheel, and a `constexpr` default table.
+// The prompt engine (#157, architecture spec §6.10): the element is the
+// PLACEMENT, `(…)` is the only combinator, and a module is a typed singleton
+// object that owns its own parameter grammar.
 //
-// ONE ELEMENT KIND, AND THAT IS THE WHOLE DESIGN. A module, a literal, a style
-// and a group are all `int f(const state&, sink&, const void* data)` - a
-// function of the facts into a byte sink, answering with a status. Nothing here
-// is a class hierarchy and nothing here is virtual: a prompt render is a loop
-// over a handful of function pointers, which is what makes §6.10's "well under
-// 100 µs" a property of the shape rather than of an optimizer's mood.
+// THE ELEMENT IS THE PLACEMENT, AND THAT IS THE WHOLE DESIGN. The template's
+// five parts - module, style, type, prefix, postfix - are ONE record here, not a
+// module element with decorations arranged around it. Rendering one is a single
+// two-phase span: ask the module, and if it said something, paint the pen, the
+// prefix, its bytes, the postfix and the reset. A placement's decorations are
+// FIELDS of the placement, so there is nothing about a styled placement that a
+// composer could mistake for something else.
 //
-// WHY THE AUTHORING SIDE IS TYPES AND THE STORED SIDE IS POINTERS. `{fn, data,
-// kind}` is the record the ABI, a Lua binding and a config string all produce,
-// and a function POINTER carries no traits - `seg` cannot ask a pointer whether
-// it is a module. So a compile-time element is a small TYPE with a
-// `static constexpr element_kind k` and a `static constexpr int call(...)`, and
-// `make<E>()` adapts it to a record through a thunk. The combinators then read
-// `k` with `if constexpr`, the two-phase vote happens at compile time, and the
-// default prompt is a `constexpr std::array` with no initializer running at
-// startup. A runtime element is the same record with the traits it needs
-// carried as data instead.
+// WHAT THAT MAKES IMPOSSIBLE. The first cut of this engine desugared
+// `{git:magenta}` into a GROUP over `[style, module, affixes]` and then had to
+// stamp that group with a module kind so it would still vote in its parent -
+// because `( on {git})` worked and `( on {git:magenta})` rendered nothing, for
+// ever, and nothing about the spelling said so. That whole class of bug is gone
+// by construction: a placement is one record with one status, and putting a
+// colour on it sets a `style` field. There is no node to mis-stamp, because the
+// decoration is not a node. `PuttingAColourOnAPlacementDoesNotChangeHowItVotes`
+// is still in the suite, and it is now a statement about a struct rather than
+// about a rule somebody has to remember.
 //
-// WHAT MAKES A CONSTEXPR DEFAULT TABLE LEGAL. `state::fs_allowed`. The memory-
-// only modules are pure functions of the struct; `git` is the one that touches
-// the filesystem, and it answers `omitted` on a false `fs_allowed` BEFORE
-// reaching `read_git_head`. C++23 lets a `constexpr` function contain a call it
-// never evaluates, so the same `module_git` serves the compile-time table and
-// the running shell, and the static_asserts at the bottom of this file render
-// the real default prompt rather than a paper copy of it.
+// MODULES ARE TYPED SINGLETON OBJECTS. `module` is an interface with two verbs:
+// `parse`, which turns the template's type slot into a `params_blob` ONCE at set
+// time, and `render`, which is a function of the facts and those params. A
+// module author writes `typed_module<my_params>` and never sees the blob; the
+// blob exists so that the (module, params) pair is a memcmp - which is what the
+// per-render memo keys on - and so that a compiled template is a trivially
+// copyable value with no pointers into itself.
 //
-// STYLES AUTHORED IN C++ ARE VALUES. `style_of<kCyan>` takes a `leshper::style`
-// as a non-type template argument, and `emit_sgr` below is the exact inverse of
-// `sgr.h`'s reader, asserted as such. §6.10's string grammar has since arrived
-// with its first string source - `style_grammar.h`, called from the template
-// parser's style slot and from `add_style` - so the two authoring sides now
-// differ only in WHEN the style is a value: at compile time for the table, at
-// set time for a template.
+// SET-TIME REFUSAL IS THE MODULE'S OWN. `{path:cyan:medum}` is refused when it
+// is written, by `path`, with the byte to look at - not silently rendered as the
+// default and not discovered three weeks later. The engine has no table of which
+// module takes what; the module has the grammar, because the module is the only
+// thing that can have it once a binding may register one.
 //
-// THE TEMPLATE LANGUAGE IS A THIRD AUTHORING SIDE AND NOT A THIRD COMPOSER. The
-// parser below (`scan_template`) builds the same `{fn, data, kind}` nodes the
-// ABI verbs build, through the same paths, so `{path:cyan}` and an
-// `add_style`/`add_module` pair are one configuration spelled twice. One grammar
-// serves two evaluation times: `validate_template` walks it at compile time
-// against the built-in module names, and the engine's builder walks it at set
-// time against the live registry - the same walk with a different policy, which
-// is #156's rule that a second walk is a second grammar.
+// ONE AUTHORING SURFACE, TWO EVALUATION TIMES. `compile<"{path}> ">()` runs the
+// SAME scanner and the SAME `parse` methods a `prompt` builtin runs, at compile
+// time, into a `constexpr` value - so the shipped default is not a hand-built
+// table that has to be kept in step with its own spelling, it IS that spelling
+// compiled. `kDefaultLeft = compile<"{path}> ">()`; the equivalence with
+// `set_template("{path}> ")` is asserted rather than claimed.
+//
+// WHAT MAKES A CONSTEXPR DEFAULT LEGAL. Two things. `state::fs_allowed` - the
+// memory-only modules are pure functions of the struct, and `git` answers
+// `omitted` on a false `fs_allowed` BEFORE reaching `read_git_head`, and C++23
+// lets a `constexpr` function contain a call it never evaluates. And C++20's
+// constexpr virtual functions (P1064): the built-in modules are literal types
+// with `constexpr` bodies and `inline constexpr` instances, so a virtual call
+// through a pointer whose target the compiler can see is a constant expression.
+// The static_asserts at the bottom render the REAL default through the REAL
+// module objects rather than a paper copy of either.
+//
+// AFFIX BYTES ARE OFFSETS, NOT POINTERS. A placement's prefix and postfix are
+// `{at, length}` into an arena the program carries beside its steps. That is
+// what lets one representation serve both worlds: the compile-time program is a
+// self-contained value with nothing pointing into itself (so it can be returned
+// out of a `consteval` function), and the runtime one is a `std::vector<step>`
+// beside a `std::string` that may grow without dangling a single view.
 //
 // WHAT THIS FILE DOES NOT DO. It does not know about the loop, the layout, the
 // blitter or `shell_state`. `state` is a plain struct of facts somebody else
@@ -57,6 +72,7 @@
 #include "leshper/surface.h"
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -70,17 +86,20 @@
 namespace lesh::leshper::prompt {
 
 // ---------------------------------------------------------------------------
-// Status and kind
+// Status
 // ---------------------------------------------------------------------------
 
-// What an element answered (§6.10). Modules return the first three; literals
-// and styles return `neutral`, which is what "decorations do not vote" means
-// spelled as a value rather than as a rule the group has to remember.
+// What a placement answered (§6.10). A module returns the first three; a
+// placement with no module at all - a literal - returns `neutral`, which is what
+// "decorations do not vote" means spelled as a value rather than as a rule the
+// group has to remember.
 //
 // `pending` is in the enum and unused by v1's modules: the async half - a
 // killable `git status` child, the spinner it would drive - is #156's, and a
 // status the composer can already carry is cheaper than a status added later to
-// a surface a binding has started writing against.
+// a surface a binding has started writing against. It is NOT-READY in v1: it
+// emits nothing and it does not win a group's vote, because there is no
+// completion path to resolve it.
 enum class element_status : std::uint8_t {
 	omitted = 0,
 	ready = 1,
@@ -88,19 +107,11 @@ enum class element_status : std::uint8_t {
 	neutral = 3,
 };
 
-// What an element IS, for the group vote. The three roles §6.10 names: a module
-// reads a shell fact, a decoration is grammar, a group composes.
-enum class element_kind : std::uint8_t {
-	module,
-	decoration,
-	group,
-};
-
 [[nodiscard]] constexpr int code(element_status status) noexcept {
 	return static_cast<int>(status);
 }
 
-// An element's `int` answer, read as a status. Anything outside the four is
+// A module's `int` answer, read as a status. Anything outside the four is
 // `omitted` - which is the whole of the ABI's error handling on this path: a C
 // module that returned LESH_ERR_INVAL contributes nothing and the prompt still
 // draws (N-4: malformed degrades, it does not abort).
@@ -123,7 +134,7 @@ enum class element_kind : std::uint8_t {
 // A PLAIN STRUCT, NOT AN INTERFACE, and that is load bearing twice over. It
 // makes a render a pure function of a value, so a test writes the facts down
 // instead of building a shell; and it makes the value a literal type, so the
-// default table renders inside a `static_assert`. The wiring site fills it from
+// default prompt renders inside a `static_assert`. The wiring site fills it from
 // `shell_knowledge` on the shell thread (§6.10: never by reaching across the
 // link boundary), and this file has never heard of that.
 //
@@ -148,7 +159,7 @@ struct state {
 	std::uint8_t seconds = 0;
 
 	// Whether a module may touch the filesystem at all. False is what the
-	// compile-time table renders under, and it is not only a constexpr trick: a
+	// compile-time default renders under, and it is not only a constexpr trick: a
 	// caller that knows the prompt is being drawn somewhere a syscall must not
 	// happen sets it false and gets the same answer.
 	bool fs_allowed = false;
@@ -202,7 +213,7 @@ struct decimal {
 //
 // EVERY MAPPING IS `blit.cpp`'s `set_pen`, restated rather than shared, and the
 // restatement is deliberate: `set_pen` resolves against terminal capabilities
-// and against the pen already in force, and a prompt element has neither. The
+// and against the pen already in force, and a placement has neither. The
 // prompt's `style` is an ABSOLUTE statement - the pen the prompt starts in is
 // the layout's business (#123, and `sgr.h`'s note about `prompt_pen`) - so the
 // emission starts from reset semantics and says everything it means:
@@ -287,24 +298,27 @@ constexpr void emit_sgr(const style& pen, std::string& out) {
 // The sink
 // ---------------------------------------------------------------------------
 
-// Where an element writes, and how it asks to be woken.
+// Where a module writes, and how it asks to be woken.
 //
 // ONE CONCRETE CLASS, NO VIRTUALS, and it is `constexpr`-capable end to end.
 // The obvious alternative - an abstract sink so a test could capture bytes -
 // would have cost an indirect call per append on the one path §6.10 promises a
-// number for, and would have made the compile-time table impossible: a virtual
-// call is not a constant expression. `std::string` IS usable inside constant
-// evaluation, and at runtime the buffer keeps its capacity across renders, so
-// the warm path allocates nothing.
+// number for, and would have made the compile-time default impossible: a virtual
+// call through a pointer nobody can see the target of is not a constant
+// expression. `std::string` IS usable inside constant evaluation, and at runtime
+// the buffer keeps its capacity across renders, so the warm path allocates
+// nothing.
 //
-// THE WAKE IS THE SMALLEST ONE ASKED FOR. Several elements may ask on the same
+// THE WAKE IS THE SMALLEST ONE ASKED FOR. Several placements may ask on the same
 // render, and the composer arms one timer for the earliest (§6.10: one deadline
-// list, one prompt timer, an empty list is no timer at all). `wake_in(0)`
-// clamps to 1 rather than meaning "never": an element that asked for a wake
-// meant to be woken, and a zero would arm a timer that fires in the past.
+// list, one prompt timer, an empty list is no timer at all). `wake_in(0)` clamps
+// to 1 rather than meaning "never": a module that asked for a wake meant to be
+// woken, and a zero would arm a timer that fires in the past.
 class sink {
 public:
 	constexpr void append(std::string_view text) { _bytes.append(text); }
+
+	constexpr void append_byte(char one) { _bytes.push_back(one); }
 
 	constexpr void write_style(const style& pen) { emit_sgr(pen, _bytes); }
 
@@ -314,8 +328,8 @@ public:
 			_wake = want;
 	}
 
-	// Another sink's whole contribution - its bytes and its request. What a
-	// group does in phase two, and what the composer does with a slot.
+	// Another sink's whole contribution - its bytes and its request. What a group
+	// does in phase two, and what the composer does with a slot.
 	constexpr void splice(const sink& other) {
 		_bytes.append(other._bytes);
 		if (other._wake != 0)
@@ -331,256 +345,22 @@ public:
 		_wake = 0;
 	}
 
+	// Room for a render's worth of bytes, asked for once when a surface is
+	// configured. What keeps the warm render path off malloc entirely: a `sink`
+	// that never grows past its reservation never calls the allocator again.
+	void reserve(std::size_t bytes) { _bytes.reserve(bytes); }
+
 private:
 	std::string _bytes;
 	std::uint64_t _wake = 0;
 };
 
 // ---------------------------------------------------------------------------
-// The stored element
+// A module's parameters
 // ---------------------------------------------------------------------------
 
-using element_fn = int (*)(const state&, sink&, const void* data);
-
-// `{fn, data, kind}` - §6.10's record, and the only shape the composer walks.
-//
-// `data` is null for everything authored in C++: the argument is baked into the
-// instantiation by the NTTP, so `env<"USER">` is a pure function pointer with
-// nothing to carry. It is non-null only for a RUNTIME element - an ABI
-// placement, later a Lua one or a config string - where it points at the
-// `binding` the engine owns beside the placement.
-struct element {
-	element_fn fn = nullptr;
-	const void* data = nullptr;
-	element_kind kind = element_kind::module;
-};
-
-// What a runtime placement hands its function.
-//
-// Two fields and not one: the ARGUMENT belongs to the placement (`{env:USER}`
-// and `{env:HOST}` are two placements of one module), and the USERDATA belongs
-// to the registration (§6.10: modules are singletons in the registry with free
-// placement). Both have to reach the function, and the ABI's module signature
-// takes the second separately, so the pair travels as one pointer.
-struct binding {
-	std::string_view arg;
-	void* userdata = nullptr;
-};
-
-[[nodiscard]] constexpr std::string_view arg_of(const void* data) noexcept {
-	return data == nullptr ? std::string_view{} : static_cast<const binding*>(data)->arg;
-}
-
-[[nodiscard]] constexpr void* userdata_of(const void* data) noexcept {
-	return data == nullptr ? nullptr : static_cast<const binding*>(data)->userdata;
-}
-
-// ---------------------------------------------------------------------------
-// The built-in modules: the memory-only set, plus the budgeted `git`
-//
-// Every one is a pure function of `state` and, where it has one, of its bound
-// argument. `constexpr` throughout - `git` included, see its comment - so the
-// default table renders at compile time and the running shell calls exactly the
-// same code.
-//
-// THE OMISSION RULE IS EACH MODULE'S OWN, and it is checked BEFORE any bytes
-// are written. `status` omits on zero, `jobs` omits on none, `duration` omits
-// under its floor. That is what makes `seg` able to vanish a literal: the
-// module said nothing at all, so there is nothing to unsay.
-// ---------------------------------------------------------------------------
-
-// `$PWD`, with the home directory contracted to `~`.
-//
-// A PREFIX MATCH THAT RESPECTS COMPONENTS: `/home/user` contracts under
-// `/home/user`, and so does `/home/user/src`, but `/home/username` does not.
-// The cheap `starts_with` would have turned the third into `~name`, which is a
-// path that does not exist.
-constexpr int module_path(const state& facts, sink& out, const void*) {
-	if (facts.pwd.empty())
-		return code(element_status::omitted);
-
-	std::string_view rest = facts.pwd;
-	if (!facts.home.empty() && rest.size() >= facts.home.size()
-	    && rest.substr(0, facts.home.size()) == facts.home
-	    && (rest.size() == facts.home.size() || rest[facts.home.size()] == '/')) {
-		out.append("~");
-		rest.remove_prefix(facts.home.size());
-	}
-	out.append(rest);
-	return code(element_status::ready);
-}
-
-// `$?`, and nothing at all when the last command succeeded - which is the
-// module that makes the whole design worth having, because the brackets around
-// it are a literal that has to vanish with it.
-constexpr int module_status(const state& facts, sink& out, const void*) {
-	if (facts.status == 0)
-		return code(element_status::omitted);
-
-	// A negative status is not a shell exit status, but a `state` filled from
-	// somewhere unusual can hold one, and printing `18446744073709551615` for it
-	// would be a worse answer than a minus sign.
-	std::uint64_t magnitude = 0;
-	if (facts.status < 0) {
-		out.append("-");
-		magnitude = static_cast<std::uint64_t>(-static_cast<std::int64_t>(facts.status));
-	} else {
-		magnitude = static_cast<std::uint64_t>(facts.status);
-	}
-	out.append(decimal{magnitude}.view());
-	return code(element_status::ready);
-}
-
-constexpr int module_jobs(const state& facts, sink& out, const void*) {
-	if (facts.jobs == 0)
-		return code(element_status::omitted);
-	out.append(decimal{static_cast<std::uint64_t>(facts.jobs)}.view());
-	return code(element_status::ready);
-}
-
-// The vi-mode indicator (F-40). The TEXT arrives on the facts rather than being
-// chosen here: #117 says the indicator is whatever the topmost keymap declares,
-// so a module that mapped modes to strings would be a second, disagreeing
-// answer to that question.
-constexpr int module_mode(const state& facts, sink& out, const void*) {
-	if (facts.mode.empty())
-		return code(element_status::omitted);
-	out.append(facts.mode);
-	return code(element_status::ready);
-}
-
-constexpr void append_two_digits(sink& out, unsigned value) {
-	const char pair[2] = {
-		static_cast<char>('0' + (value / 10u) % 10u),
-		static_cast<char>('0' + value % 10u),
-	};
-	out.append(std::string_view{pair, 2});
-}
-
-// `HH:MM:SS`, and the one v1 element that asks to be woken.
-//
-// THE REQUEST IS DERIVED FROM THE TICK, NEVER STORED: the next second on the
-// 10 ms grid is `100 - tick % 100` ticks away, which is a function of the facts
-// and of nothing this module remembers. That is §6.10's "the tick is the state"
-// at its smallest - a clock parked through a long command re-arms from the fire
-// rather than catching up on the seconds it slept through.
-constexpr int module_time(const state& facts, sink& out, const void*) {
-	append_two_digits(out, facts.hours);
-	out.append(":");
-	append_two_digits(out, facts.minutes);
-	out.append(":");
-	append_two_digits(out, facts.seconds);
-	out.wake_in(100 - facts.tick % 100);
-	return code(element_status::ready);
-}
-
-// Under this, the last command was fast enough that saying so is noise. Two
-// seconds is starship's default and prmt's, and agreeing with them costs
-// nothing.
-inline constexpr std::uint64_t kDurationFloorMs = 2000;
-
-// How long the last command took, humanized. Integer seconds throughout: a
-// prompt that reported `2.317s` would be inviting the eye to read a digit that
-// changes every run and means nothing.
-constexpr int module_duration(const state& facts, sink& out, const void*) {
-	if (facts.duration_ms < kDurationFloorMs)
-		return code(element_status::omitted);
-
-	const std::uint64_t total = facts.duration_ms / 1000;
-	if (total < 60) {
-		out.append(decimal{total}.view());
-		out.append("s");
-	} else if (total < 3600) {
-		out.append(decimal{total / 60}.view());
-		out.append("m");
-		out.append(decimal{total % 60}.view());
-		out.append("s");
-	} else {
-		out.append(decimal{total / 3600}.view());
-		out.append("h");
-		out.append(decimal{(total / 60) % 60}.view());
-		out.append("m");
-		out.append(decimal{total % 60}.view());
-		out.append("s");
-	}
-	return code(element_status::ready);
-}
-
-// One environment variable, by name. The name is the module's ARGUMENT, which
-// is where the two authoring sides differ and the only place they do: the NTTP
-// form bakes it in, the runtime form reads it out of the binding.
-//
-// AN EMPTY VALUE OMITS. `{env:HOST}@` should vanish on a machine with no
-// `$HOST` rather than render a bare `@`, and "set but empty" is what that
-// machine actually has.
-constexpr int render_env(const state& facts, sink& out, std::string_view name) {
-	if (name.empty() || facts.getvar == nullptr)
-		return code(element_status::omitted);
-
-	std::string_view value;
-	if (!facts.getvar(facts.getvar_ctx, name, value) || value.empty())
-		return code(element_status::omitted);
-	out.append(value);
-	return code(element_status::ready);
-}
-
-constexpr int module_env(const state& facts, sink& out, const void* data) {
-	return render_env(facts, out, arg_of(data));
-}
-
-// The branch, or the short object name on a detached HEAD - v1's one budgeted
-// module.
-//
-// THE GUARD IS FIRST AND IT IS TWO THINGS AT ONCE. At runtime it is §6.10's
-// floor rule: a caller that has not allowed filesystem work gets no syscall,
-// not a fast one. During constant evaluation it is what makes this function
-// legal at all - C++23 permits a `constexpr` function to CONTAIN a call it never
-// evaluates, and `fs_allowed` false is what keeps the evaluation off the
-// `read_git_head` line. One function, two worlds, no paper copy of the module
-// for the compile-time table to render instead.
-constexpr int module_git(const state& facts, sink& out, const void*) {
-	if (!facts.fs_allowed || facts.pwd.empty())
-		return code(element_status::omitted);
-
-	const git_head head = read_git_head(facts.pwd, git_probe_options{
-		.budget_ms = facts.fs_budget_ms,
-		.allow_spawn = true,
-		.git_command = "git",
-	});
-	if (!head.found)
-		return code(element_status::omitted);
-
-	out.append(head.detached ? head.short_sha : head.branch);
-	return code(element_status::ready);
-}
-
-// A literal placed at runtime: its bytes ARE its bound argument, so the ABI's
-// `add_literal` needs no second storage mechanism and no second element shape.
-constexpr int decoration_literal(const state&, sink& out, const void* data) {
-	out.append(arg_of(data));
-	return code(element_status::neutral);
-}
-
-// A style placed at runtime - `style_of<V>`'s twin, and the element the `styles`
-// flag has been waiting for since v1.
-//
-// ITS DATA IS THE PEN ITSELF, not a `binding`. A style has no argument and no
-// registration, so borrowing the binding's `arg` for it would be storing a
-// `style` in a `string_view`-shaped hole; the engine's node owns a `style` beside
-// its bytes and points `data` at that. Null data paints nothing rather than
-// reading through a pointer nobody set.
-constexpr int decoration_style(const state&, sink& out, const void* data) {
-	if (data != nullptr)
-		out.write_style(*static_cast<const style*>(data));
-	return code(element_status::neutral);
-}
-
-// ---------------------------------------------------------------------------
-// Authoring at compile time
-// ---------------------------------------------------------------------------
-
-// A string literal as a non-type template argument. Nothing in the repo had
-// one; this is the minimum that works - a char array, its size, and a view.
+// A string literal as a non-type template argument. Nothing in the repo had one;
+// this is the minimum that works - a char array, its size, and a view.
 template <std::size_t N>
 struct fixed_string {
 	char data[N]{};
@@ -600,237 +380,845 @@ struct fixed_string {
 template <std::size_t N>
 fixed_string(const char (&)[N]) -> fixed_string<N>;
 
-// Whether an element type PAINTS - the one trait a group needs beyond `kind`,
-// because a group that contained a style has to put the pen back when it ends.
-// Absent on every type that does not set it, which is all of them but one.
-template <class E, class = void>
-struct is_styling : std::false_type {};
-template <class E>
-struct is_styling<E, std::void_t<decltype(E::styles)>> : std::bool_constant<E::styles> {};
+// Bytes a module wants to keep in its params: `env`'s variable name, `status`'s
+// symbol, an ABI module's raw type slot.
+//
+// NO PADDING, DELIBERATELY. `char[N]` then a `uint8_t` is alignment 1 the whole
+// way down, which is what makes `std::bit_cast` through `params_blob` a constant
+// expression - a padding byte would be an indeterminate value read during
+// constant evaluation, which is an error rather than a warning.
+template <std::size_t N>
+struct fixed_text {
+	static_assert(N < 256, "the length is a byte");
 
-// The adapter from a type to a record. `data` is unused and stays null: the
-// whole reason a compile-time element is a type is that its argument is already
-// inside it.
-template <class E>
-constexpr int element_thunk(const state& facts, sink& out, const void*) {
-	return E::call(facts, out);
-}
+	char data[N]{};
+	std::uint8_t length = 0;
 
-template <class E>
-[[nodiscard]] constexpr element make() noexcept {
-	return element{&element_thunk<E>, nullptr, E::k};
-}
+	[[nodiscard]] constexpr std::string_view view() const noexcept {
+		return std::string_view{data, length};
+	}
 
-template <class... Es>
-[[nodiscard]] constexpr std::array<element, sizeof...(Es)> table() noexcept {
-	return std::array<element, sizeof...(Es)>{make<Es>()...};
-}
-
-// --- Decorations -----------------------------------------------------------
-
-template <fixed_string S>
-struct literal {
-	static constexpr element_kind k = element_kind::decoration;
-
-	static constexpr int call(const state&, sink& out) {
-		out.append(S.view());
-		return code(element_status::neutral);
+	// False when it would not fit, having changed nothing.
+	constexpr bool assign(std::string_view text) noexcept {
+		if (text.size() > N)
+			return false;
+		for (std::size_t i = 0; i < text.size(); ++i)
+			data[i] = text[i];
+		length = static_cast<std::uint8_t>(text.size());
+		return true;
 	}
 };
 
-// A style is an ABSOLUTE statement, emitted whole (see `emit_sgr`). `styles` is
-// the flag a group reads to know it owes a reset.
-template <style V>
-struct style_of {
-	static constexpr element_kind k = element_kind::decoration;
-	static constexpr bool styles = true;
+// A module's parsed type slot, as opaque bytes.
+//
+// WHY A BLOB AND NOT A VARIANT, A POINTER OR A STRING. Three reasons, and each
+// one on its own would have been enough:
+//
+//   1. THE MEMO IS A MEMCMP. §6.10's per-prompt memo is keyed on (module,
+//      params), and `{env::USER}` and `{env::HOST}` differ in bytes nobody here
+//      can interpret. A blob compares without knowing what it holds.
+//   2. THE COMPILED DEFAULT IS A VALUE. `compile<>()` returns a `constexpr`
+//      object out of a `consteval` function; anything with a pointer into
+//      itself, or an allocation, could not make that trip.
+//   3. A MODULE AUTHOR NEVER SEES IT. `typed_module<Params>` is the one place
+//      the bridge lives, and it is nine lines.
+//
+// The capacity fits every built-in with room over - `env`'s 64-byte name is the
+// largest at 65 bytes - and a module whose params would not fit is a compile
+// error at its `typed_module` instantiation rather than a truncation at runtime.
+struct params_blob {
+	static constexpr std::size_t capacity = 96;
 
-	static constexpr int call(const state&, sink& out) {
-		out.write_style(V);
-		return code(element_status::neutral);
+	std::array<std::byte, capacity> data{};
+	std::uint32_t size = 0;
+
+	// AN EMPTY PARAMS TYPE STORES NOTHING. `sizeof(no_params)` is 1 and that one
+	// byte is padding, which `bit_cast` may not read during constant evaluation;
+	// storing zero bytes for it is both correct and the only thing that compiles.
+	template <class Params>
+	constexpr void store(const Params& value) {
+		if constexpr (std::is_empty_v<Params>) {
+			size = 0;
+		} else {
+			const auto raw = std::bit_cast<std::array<std::byte, sizeof(Params)>>(value);
+			for (std::size_t i = 0; i < sizeof(Params); ++i)
+				data[i] = raw[i];
+			size = static_cast<std::uint32_t>(sizeof(Params));
+		}
+	}
+
+	template <class Params>
+	[[nodiscard]] constexpr Params as() const {
+		if constexpr (std::is_empty_v<Params>) {
+			return Params{};
+		} else {
+			std::array<std::byte, sizeof(Params)> raw{};
+			for (std::size_t i = 0; i < sizeof(Params); ++i)
+				raw[i] = data[i];
+			return std::bit_cast<Params>(raw);
+		}
+	}
+
+	// The USED bytes only. Two blobs of different modules are never compared -
+	// the memo checks the module pointer first - so this is exactly the question
+	// "is this the same placement, argument and all".
+	[[nodiscard]] constexpr bool operator==(const params_blob& other) const noexcept {
+		if (size != other.size)
+			return false;
+		for (std::uint32_t i = 0; i < size; ++i)
+			if (data[i] != other.data[i])
+				return false;
+		return true;
 	}
 };
 
-// --- Modules ---------------------------------------------------------------
+// A module that takes no type slot at all. `git`, `jobs`, `mode`, `duration`.
+struct no_params {};
+
+// Why a type slot was refused, from the module that refused it.
 //
-// Trailing underscores on `time_` and `mode_` and a leading module-ish `_t` on
-// the rest: `::time_t` and `::mode_t` are macros' and headers' names that a
-// bare `time` or `mode` in this namespace would collide with the moment
-// somebody included <sys/types.h> before this file. The names are ugly on
-// purpose - a header that only compiles depending on include order is the
-// defect the self-containment build exists to catch.
-
-struct path_t {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_path(s, o, nullptr); }
-};
-
-struct status_t {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_status(s, o, nullptr); }
-};
-
-struct jobs_t {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_jobs(s, o, nullptr); }
-};
-
-struct mode_t_ {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_mode(s, o, nullptr); }
-};
-
-struct time_t_ {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_time(s, o, nullptr); }
-};
-
-struct duration_t {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_duration(s, o, nullptr); }
-};
-
-struct git_t {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return module_git(s, o, nullptr); }
-};
-
-template <fixed_string Name>
-struct env {
-	static constexpr element_kind k = element_kind::module;
-	static constexpr int call(const state& s, sink& o) { return render_env(s, o, Name.view()); }
-};
-
-// --- Combinators -----------------------------------------------------------
-
-// §6.10's group: shown iff a module inside it is ready, decorations do not vote,
-// and evaluation is two-phase so a module that will not be shown is never asked
-// for its bytes.
+// `at` IS AN OFFSET WITHIN THE TYPE SLOT, so a placement in the middle of a long
+// template still points at the byte the author has to fix; the scanner adds the
+// slot's own offset. `length` is how much of the slot to quote back - zero for a
+// refusal with nothing to name (`git takes no argument`), the whole slot for one
+// that has something (`path: unknown variant 'medum'`).
 //
-// PHASE ONE renders only the module children, each into its own scratch. PHASE
-// TWO runs at all only if one of them said `ready` - and then it runs every
-// child in DECLARED ORDER, splicing the module bytes phase one already produced
-// and executing the decorations now. That ordering is the whole trick: it is why
-// `seg<style_of<kMagenta>, literal<" on ">, git_t>` renders ` on main` in a repo
-// and NOTHING outside one, the literal and the style vanishing with the module,
-// while still emitting the style before the bytes it colours.
+// THREE FIELDS AND NOT TWO. `at` alone cannot say whether there is a token to
+// quote: a module that wanted no quote would have to point `at` past the end of
+// the slot, and then the byte offset in the message would name the wrong byte.
+// Two questions, two fields.
 //
-// `pending` DOES NOT COUNT AS READY in v1, and that is a decision rather than an
-// oversight: there is no completion path to resolve a pending element (§6.10 -
-// v1's loop-integration surface is timers only), so treating it as ready would
-// show a group whose module has nothing to say and no way to say it later. When
-// #156 brings the completion event, this predicate is the one line that changes.
+// `what` IS THE MODULE'S OWN WORDS, INCLUDING ITS SEPARATOR, and the module owns
+// the whole predicate: " takes no argument", " needs a variable name",
+// ": unknown variant". The sentence is `<module name><what>[' <token>']`, so
+// there is no table of message shapes anywhere - the module that knows what went
+// wrong is the one that says it.
+struct parse_error {
+	std::size_t at = 0;
+	std::size_t length = 0;
+	std::string_view what;
+};
+
+// ---------------------------------------------------------------------------
+// The module interface
+// ---------------------------------------------------------------------------
+
+// A module: a NAMED SINGLETON that turns a type slot into params once, and the
+// facts plus those params into bytes every render.
 //
-// A GROUP THAT CONTAINED A STYLE ENDS WITH A RESET. A seg is a styled span; the
-// alternative - leaving the pen set for whatever follows - would make the next
-// element's appearance depend on whether an unrelated group happened to render.
-template <class... Children>
-struct seg {
-	static constexpr element_kind k = element_kind::group;
+// VIRTUAL, WHICH THE FIRST CUT OF THIS FILE WAS NOT, and the trade is worth
+// stating. What was here before was `int (*)(const state&, sink&, const void*)`
+// - one indirect call, no vtable - and the price was that a function pointer
+// carries no traits: it cannot be asked its name, it cannot be asked to validate
+// an argument, and every question of that kind had to become a table somewhere
+// else that the registration had to be kept in step with. A `module*` answers
+// all three itself. The cost is one indirect call to render a placement, which
+// is exactly what the function pointer cost; the second one, `parse`, happens
+// once per placement at SET time and replaces a table lookup the old design paid
+// there anyway.
+//
+// CONSTEXPR THROUGHOUT, so the built-in singletons can be `inline constexpr`
+// objects and `compile<>()` can call them during constant evaluation (C++20
+// P1064: a virtual call whose target the compiler can see is a constant
+// expression). A module registered at run time is an ordinary object and pays
+// nothing for this.
+class module {
+public:
+	constexpr virtual ~module() = default;
 
-	static constexpr int call(const state& facts, sink& out) {
-		std::array<sink, sizeof...(Children)> scratch{};
-		std::array<int, sizeof...(Children)> answered{};
-		bool any_ready = false;
+	module(const module&) = delete;
+	module& operator=(const module&) = delete;
 
-		std::size_t at = 0;
-		const auto vote = [&](auto tag) {
-			using Child = typename decltype(tag)::type;
-			if constexpr (Child::k == element_kind::module) {
-				answered[at] = Child::call(facts, scratch[at]);
-				if (status_of(answered[at]) == element_status::ready)
-					any_ready = true;
-			}
-			++at;
-		};
-		(vote(std::type_identity<Children>{}), ...);
+	[[nodiscard]] constexpr virtual std::string_view name() const noexcept = 0;
 
-		if (!any_ready)
+	// The type slot, parsed ONCE at set time into `out`. False with `err` filled
+	// in refuses the placement, and refusing is the point: a mistyped variant is
+	// told to its author at the moment they wrote it, not rendered as the default
+	// for the rest of the session.
+	//
+	// `type` is ALREADY UNESCAPED and is borrowed for the call only.
+	constexpr virtual bool parse(std::string_view type, params_blob& out,
+	                             parse_error& err) const = 0;
+
+	// The bytes, and a LESH_PROMPT_* status. Pure in the facts and the params;
+	// anything else a module remembers between renders breaks §6.10's replay.
+	constexpr virtual int render(const state& facts, const params_blob& params,
+	                             sink& out) const = 0;
+
+protected:
+	constexpr module() = default;
+};
+
+// The ONE place the blob is bridged, and a module author never sees it.
+//
+// The two `parse` overloads and the two `render` overloads differ only in their
+// middle parameter, so a derived class that overrides the typed pair HIDES the
+// blob pair for anyone holding the derived type. That is fine and deliberate:
+// every caller in this engine holds a `const module*`, which is exactly the type
+// whose lookup finds the blob pair.
+template <class Params>
+class typed_module : public module {
+public:
+	static_assert(std::is_trivially_copyable_v<Params>,
+	              "a module's params travel as bytes and live in a constexpr value");
+	static_assert(sizeof(Params) <= params_blob::capacity,
+	              "params_blob::capacity is the ceiling; raise it or shrink the params");
+
+	constexpr bool parse(std::string_view type, params_blob& out, parse_error& err) const final {
+		Params value{};
+		if (!parse(type, value, err))
+			return false;
+		out.store(value);
+		return true;
+	}
+
+	constexpr int render(const state& facts, const params_blob& params, sink& out) const final {
+		return render(facts, params.template as<Params>(), out);
+	}
+
+protected:
+	constexpr virtual bool parse(std::string_view type, Params& out, parse_error& err) const = 0;
+	constexpr virtual int render(const state& facts, const Params& params, sink& out) const = 0;
+};
+
+// The refusal every parameterless module gives, in one place so that four
+// modules cannot come to word it four ways.
+constexpr bool refuse_any_type(std::string_view type, parse_error& err) noexcept {
+	if (type.empty())
+		return true;
+	err.at = 0;
+	err.length = 0;
+	err.what = " takes no argument";
+	return false;
+}
+
+// ---------------------------------------------------------------------------
+// The built-in modules
+//
+// Every one is a pure function of `state` and of its parsed params, `constexpr`
+// throughout - `git` included, see its comment - so the compiled default renders
+// at compile time and the running shell calls exactly the same code.
+//
+// THE OMISSION RULE IS EACH MODULE'S OWN, and it is checked BEFORE any bytes are
+// written. `status` omits on zero, `jobs` omits on none, `duration` omits under
+// its floor. That is what makes a placement able to vanish its own affixes: the
+// module said nothing at all, so there is nothing to unsay.
+//
+// THE TYPE-SLOT SPELLINGS ARE prmt's, which is the leading example §6.10 names.
+// A one-letter alias beside each long one, because a prompt string is typed by
+// hand and `{path:cyan:s}` is what a person actually writes.
+// ---------------------------------------------------------------------------
+
+// --- path ------------------------------------------------------------------
+
+struct path_params {
+	enum class kind : std::uint8_t {
+		relative,   // `$HOME`-contracted, full path outside home. The default.
+		absolute,   // uncontracted
+		short_,     // the last component only
+		initials,   // every component but the last cut to its first byte
+		unvowel,    // every component but the last with its vowels removed
+	};
+
+	kind which = kind::relative;
+};
+
+// Whether `pwd` is `home` or lives under it, BY COMPONENT: `/home/user`
+// contracts under `/home/user`, and so does `/home/user/src`, but
+// `/home/username` does not. The cheap `starts_with` would have turned the third
+// into `~name`, which is a path that does not exist.
+[[nodiscard]] constexpr bool under_home(std::string_view pwd, std::string_view home) noexcept {
+	return !home.empty() && pwd.size() >= home.size() && pwd.substr(0, home.size()) == home
+	       && (pwd.size() == home.size() || pwd[home.size()] == '/');
+}
+
+[[nodiscard]] constexpr bool is_ascii_vowel(char one) noexcept {
+	switch (one) {
+		case 'a': case 'e': case 'i': case 'o': case 'u':
+		case 'A': case 'E': case 'I': case 'O': case 'U':
+			return true;
+		default:
+			return false;
+	}
+}
+
+// The component-reducing forms, over the CONTRACTED path without ever building
+// it. `head` is `~` or empty and `rest` is what follows; the two are read as one
+// logical string through `byte`, because materializing the join would be a
+// `std::string` on the render path for no answer it does not already have.
+//
+// THE LAST COMPONENT IS ALWAYS WHOLE. That is the entire point of both forms:
+// `~/p/g/lesh` and `~/prvt/gthb/lesh` tell you where you are while giving the
+// width back to the shell, and a directory whose own name has been eaten tells
+// you nothing.
+constexpr void emit_reduced_path(sink& out, std::string_view head, std::string_view rest,
+                                 bool initials) {
+	const std::size_t total = head.size() + rest.size();
+	const auto byte = [&](std::size_t i) {
+		return i < head.size() ? head[i] : rest[i - head.size()];
+	};
+
+	// Where the last component starts: one past the last `/`, or the beginning.
+	std::size_t last_start = 0;
+	for (std::size_t i = 0; i < total; ++i)
+		if (byte(i) == '/')
+			last_start = i + 1;
+
+	std::size_t i = 0;
+	while (i < total) {
+		if (byte(i) == '/') {
+			out.append_byte('/');
+			++i;
+			continue;
+		}
+
+		std::size_t end = i;
+		while (end < total && byte(end) != '/')
+			++end;
+
+		if (i == last_start) {
+			for (std::size_t k = i; k < end; ++k)
+				out.append_byte(byte(k));
+		} else if (initials) {
+			out.append_byte(byte(i));
+		} else {
+			bool wrote = false;
+			for (std::size_t k = i; k < end; ++k)
+				if (!is_ascii_vowel(byte(k))) {
+					out.append_byte(byte(k));
+					wrote = true;
+				}
+			// A COMPONENT THAT WOULD VANISH KEEPS ITS FIRST BYTE. `~/aeiou/x`
+			// reducing to `~//x` would be a path that reads as a mistake; one
+			// letter is the smallest honest answer.
+			if (!wrote)
+				out.append_byte(byte(i));
+		}
+		i = end;
+	}
+}
+
+class module_path final : public typed_module<path_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "path"; }
+
+protected:
+	constexpr bool parse(std::string_view type, path_params& out,
+	                     parse_error& err) const override {
+		using kind = path_params::kind;
+		if (type.empty() || type == "relative" || type == "r") { out.which = kind::relative; return true; }
+		if (type == "absolute" || type == "a" || type == "f")  { out.which = kind::absolute; return true; }
+		if (type == "short" || type == "s")                    { out.which = kind::short_; return true; }
+		if (type == "initials" || type == "i")                 { out.which = kind::initials; return true; }
+		if (type == "unvowel" || type == "u")                  { out.which = kind::unvowel; return true; }
+
+		err.at = 0;
+		err.length = type.size();
+		err.what = ": unknown variant";
+		return false;
+	}
+
+	constexpr int render(const state& facts, const path_params& params, sink& out) const override {
+		if (facts.pwd.empty())
 			return code(element_status::omitted);
 
-		bool styled = false;
-		at = 0;
-		const auto emit = [&](auto tag) {
-			using Child = typename decltype(tag)::type;
-			if constexpr (Child::k == element_kind::module) {
-				// An omitted sibling contributes no bytes, but a wake it asked
-				// for still travels: a module may be silent and still want to be
-				// asked again.
-				if (status_of(answered[at]) != element_status::omitted)
-					out.splice(scratch[at]);
-				else if (scratch[at].wake() != 0)
-					out.wake_in(scratch[at].wake());
-			} else {
-				if constexpr (is_styling<Child>::value)
-					styled = true;
-				Child::call(facts, out);
-			}
-			++at;
-		};
-		(emit(std::type_identity<Children>{}), ...);
+		if (params.which == path_params::kind::absolute) {
+			out.append(facts.pwd);
+			return code(element_status::ready);
+		}
 
-		if (styled)
-			out.write_style(style{});
+		const bool home = under_home(facts.pwd, facts.home);
+		const std::string_view head = home ? std::string_view{"~"} : std::string_view{};
+		const std::string_view rest = home ? facts.pwd.substr(facts.home.size()) : facts.pwd;
+
+		switch (params.which) {
+			case path_params::kind::relative:
+				out.append(head);
+				out.append(rest);
+				break;
+			case path_params::kind::short_: {
+				// The last component of the CONTRACTED path, so that home itself is
+				// `~` rather than the name of the directory it happens to live in.
+				const std::size_t slash = rest.rfind('/');
+				if (slash == std::string_view::npos)
+					out.append(rest.empty() ? head : rest);
+				else if (slash + 1 == rest.size())
+					// A trailing slash: the root, or a path somebody wrote with one.
+					out.append("/");
+				else
+					out.append(rest.substr(slash + 1));
+				break;
+			}
+			case path_params::kind::initials:
+				emit_reduced_path(out, head, rest, true);
+				break;
+			case path_params::kind::unvowel:
+				emit_reduced_path(out, head, rest, false);
+				break;
+			case path_params::kind::absolute:
+				break;   // answered above
+		}
 		return code(element_status::ready);
 	}
 };
 
-// A gate: the children run, all of them and in order, exactly when the predicate
-// says so, and NOTHING runs otherwise.
-//
-// Not a `seg` with a condition bolted on. The two compose differently and
-// deliberately: `seg` asks its modules and lets them decide, `when` asks the
-// facts and does not ask its children at all. `when<in_a_repo, seg<...>>` is the
-// spelling for both at once.
-//
-// Its answer is `ready` when a module child was ready and `neutral` otherwise,
-// so a `when` nested in a `seg` neither votes (it is a group, and groups do not)
-// nor lies to a composer that reads statuses.
-template <bool (*Pred)(const state&), class... Children>
-struct when {
-	static constexpr element_kind k = element_kind::group;
+// --- status ----------------------------------------------------------------
 
-	static constexpr int call(const state& facts, sink& out) {
-		if (!Pred(facts))
-			return code(element_status::omitted);
+struct status_params {
+	enum class form : std::uint8_t { code, symbol };
 
-		bool any_ready = false;
-		const auto run = [&](auto tag) {
-			using Child = typename decltype(tag)::type;
-			if (status_of(Child::call(facts, out)) == element_status::ready)
-				any_ready = true;
-		};
-		(run(std::type_identity<Children>{}), ...);
-
-		return code(any_ready ? element_status::ready : element_status::neutral);
-	}
+	form which = form::code;
+	fixed_text<16> symbol{};
 };
 
-// A fallback: `A` if it is ready, otherwise `B`, whatever `B` has to say.
-//
-// `A` RENDERS INTO SCRATCH AND IS DISCARDED WHOLE when it is not ready, which is
-// why this is a combinator rather than something a caller could write with two
-// placements: half of `A`'s bytes reaching the prompt before it decided it had
-// nothing is exactly the failure the two-phase group exists to prevent, and it
-// would happen here too without the scratch.
-template <class A, class B>
-struct either {
-	static constexpr element_kind k = element_kind::group;
+class module_status final : public typed_module<status_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "status"; }
 
-	static constexpr int call(const state& facts, sink& out) {
-		sink first;
-		if (status_of(A::call(facts, first)) == element_status::ready) {
-			out.splice(first);
+protected:
+	// AN UNRECOGNIZED TYPE IS NOT AN ERROR HERE, and this is the one module where
+	// that is right: the slot's content IS the symbol. `{status:red:✗}` means
+	// "show ✗ when the last command failed", and there is no vocabulary of
+	// variants for a typo to fall outside of - only `code`, which is the default
+	// spelled out.
+	constexpr bool parse(std::string_view type, status_params& out,
+	                     parse_error& err) const override {
+		if (type.empty() || type == "code") {
+			out.which = status_params::form::code;
+			return true;
+		}
+		out.which = status_params::form::symbol;
+		if (!out.symbol.assign(type)) {
+			err.at = 0;
+			err.length = 0;
+			err.what = ": symbol is too long";
+			return false;
+		}
+		return true;
+	}
+
+	// `$?`, and nothing at all when the last command succeeded - the module the
+	// whole omission machinery exists for, because the brackets around it are
+	// affixes that have to vanish with it.
+	constexpr int render(const state& facts, const status_params& params,
+	                     sink& out) const override {
+		if (facts.status == 0)
+			return code(element_status::omitted);
+
+		if (params.which == status_params::form::symbol) {
+			out.append(params.symbol.view());
 			return code(element_status::ready);
 		}
 
-		sink second;
-		const int answered = B::call(facts, second);
-		if (status_of(answered) != element_status::omitted)
-			out.splice(second);
-		else if (second.wake() != 0)
-			out.wake_in(second.wake());
-		return answered;
+		// A negative status is not a shell exit status, but a `state` filled from
+		// somewhere unusual can hold one, and printing `18446744073709551615` for
+		// it would be a worse answer than a minus sign.
+		std::uint64_t magnitude = 0;
+		if (facts.status < 0) {
+			out.append("-");
+			magnitude = static_cast<std::uint64_t>(-static_cast<std::int64_t>(facts.status));
+		} else {
+			magnitude = static_cast<std::uint64_t>(facts.status);
+		}
+		out.append(decimal{magnitude}.view());
+		return code(element_status::ready);
+	}
+};
+
+// --- jobs ------------------------------------------------------------------
+
+class module_jobs final : public typed_module<no_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "jobs"; }
+
+protected:
+	constexpr bool parse(std::string_view type, no_params&, parse_error& err) const override {
+		return refuse_any_type(type, err);
+	}
+
+	constexpr int render(const state& facts, const no_params&, sink& out) const override {
+		if (facts.jobs == 0)
+			return code(element_status::omitted);
+		out.append(decimal{static_cast<std::uint64_t>(facts.jobs)}.view());
+		return code(element_status::ready);
+	}
+};
+
+// --- mode ------------------------------------------------------------------
+
+// The vi-mode indicator (F-40). The TEXT arrives on the facts rather than being
+// chosen here: #117 says the indicator is whatever the topmost keymap declares,
+// so a module that mapped modes to strings would be a second, disagreeing answer
+// to that question.
+class module_mode final : public typed_module<no_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "mode"; }
+
+protected:
+	constexpr bool parse(std::string_view type, no_params&, parse_error& err) const override {
+		return refuse_any_type(type, err);
+	}
+
+	constexpr int render(const state& facts, const no_params&, sink& out) const override {
+		if (facts.mode.empty())
+			return code(element_status::omitted);
+		out.append(facts.mode);
+		return code(element_status::ready);
+	}
+};
+
+// --- time ------------------------------------------------------------------
+
+struct time_params {
+	enum class form : std::uint8_t {
+		h24,    // HH:MM, the default
+		h24s,   // HH:MM:SS
+		h12,    // HH:MM on a twelve-hour clock
+		h12s,   // HH:MM:SS on a twelve-hour clock
+	};
+
+	form which = form::h24;
+};
+
+constexpr void append_two_digits(sink& out, unsigned value) {
+	out.append_byte(static_cast<char>('0' + (value / 10u) % 10u));
+	out.append_byte(static_cast<char>('0' + value % 10u));
+}
+
+class module_time final : public typed_module<time_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "time"; }
+
+protected:
+	constexpr bool parse(std::string_view type, time_params& out,
+	                     parse_error& err) const override {
+		using form = time_params::form;
+		if (type.empty() || type == "24h") { out.which = form::h24; return true; }
+		if (type == "24hs")                { out.which = form::h24s; return true; }
+		if (type == "12h")                 { out.which = form::h12; return true; }
+		if (type == "12hs")                { out.which = form::h12s; return true; }
+
+		err.at = 0;
+		err.length = type.size();
+		err.what = ": unknown variant";
+		return false;
+	}
+
+	// The one v1 module that asks to be woken.
+	//
+	// THE REQUEST IS DERIVED FROM THE TICK, NEVER STORED: the next second on the
+	// 10 ms grid is `100 - tick % 100` ticks away, and the next MINUTE is that
+	// plus the whole seconds left in this one - both functions of the facts and
+	// of nothing this module remembers. That is §6.10's "the tick is the state"
+	// at its smallest: a clock parked through a long command re-arms from the
+	// fire rather than catching up on the minutes it slept through.
+	//
+	// AND THE CADENCE FOLLOWS THE FORM. A prompt showing HH:MM has no business
+	// waking sixty times a minute to redraw bytes that did not move; §6.10's
+	// "unchanged output produces no write" would have caught the write, but not
+	// the wakeup, and the wakeup is what costs a laptop its battery.
+	constexpr int render(const state& facts, const time_params& params,
+	                     sink& out) const override {
+		const bool twelve = params.which == time_params::form::h12
+		                    || params.which == time_params::form::h12s;
+		const bool seconds = params.which == time_params::form::h24s
+		                     || params.which == time_params::form::h12s;
+
+		unsigned hours = facts.hours;
+		if (twelve) {
+			// NO am/pm SUFFIX. prmt has none, the hour is unambiguous to somebody
+			// looking at their own terminal, and two more columns of a line's width
+			// is a real price for a fact the user already knows.
+			hours %= 12u;
+			if (hours == 0)
+				hours = 12u;
+		}
+
+		append_two_digits(out, hours);
+		out.append_byte(':');
+		append_two_digits(out, facts.minutes);
+		if (seconds) {
+			out.append_byte(':');
+			append_two_digits(out, facts.seconds);
+		}
+
+		const std::uint64_t to_next_second = 100 - facts.tick % 100;
+		out.wake_in(seconds ? to_next_second
+		                    : (59u - facts.seconds) * 100u + to_next_second);
+		return code(element_status::ready);
+	}
+};
+
+// --- duration --------------------------------------------------------------
+
+// Under this, the last command was fast enough that saying so is noise. Two
+// seconds is starship's default and prmt's, and agreeing with them costs
+// nothing.
+inline constexpr std::uint64_t kDurationFloorMs = 2000;
+
+class module_duration final : public typed_module<no_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "duration"; }
+
+protected:
+	constexpr bool parse(std::string_view type, no_params&, parse_error& err) const override {
+		return refuse_any_type(type, err);
+	}
+
+	// How long the last command took, humanized. Integer seconds throughout: a
+	// prompt that reported `2.317s` would be inviting the eye to read a digit that
+	// changes every run and means nothing.
+	constexpr int render(const state& facts, const no_params&, sink& out) const override {
+		if (facts.duration_ms < kDurationFloorMs)
+			return code(element_status::omitted);
+
+		const std::uint64_t total = facts.duration_ms / 1000;
+		if (total < 60) {
+			out.append(decimal{total}.view());
+			out.append("s");
+		} else if (total < 3600) {
+			out.append(decimal{total / 60}.view());
+			out.append("m");
+			out.append(decimal{total % 60}.view());
+			out.append("s");
+		} else {
+			out.append(decimal{total / 3600}.view());
+			out.append("h");
+			out.append(decimal{(total / 60) % 60}.view());
+			out.append("m");
+			out.append(decimal{total % 60}.view());
+			out.append("s");
+		}
+		return code(element_status::ready);
+	}
+};
+
+// --- env -------------------------------------------------------------------
+
+struct env_params {
+	fixed_text<64> name{};
+};
+
+class module_env final : public typed_module<env_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "env"; }
+
+protected:
+	// THE ONE BUILT-IN WHOSE TYPE SLOT IS REQUIRED. `{env}` names no variable and
+	// there is no default one to mean; refusing at set time is the difference
+	// between a typo and a prompt that silently lost a segment.
+	constexpr bool parse(std::string_view type, env_params& out,
+	                     parse_error& err) const override {
+		if (type.empty()) {
+			err.at = 0;
+			err.length = 0;
+			err.what = " needs a variable name";
+			return false;
+		}
+		if (!out.name.assign(type)) {
+			err.at = 0;
+			err.length = 0;
+			err.what = ": variable name is too long";
+			return false;
+		}
+		return true;
+	}
+
+	// AN EMPTY VALUE OMITS. `{env::HOST}@` should vanish on a machine with no
+	// `$HOST` rather than render a bare `@`, and "set but empty" is what that
+	// machine actually has.
+	constexpr int render(const state& facts, const env_params& params,
+	                     sink& out) const override {
+		if (facts.getvar == nullptr)
+			return code(element_status::omitted);
+
+		std::string_view value;
+		if (!facts.getvar(facts.getvar_ctx, params.name.view(), value) || value.empty())
+			return code(element_status::omitted);
+		out.append(value);
+		return code(element_status::ready);
+	}
+};
+
+// --- git -------------------------------------------------------------------
+
+class module_git final : public typed_module<no_params> {
+public:
+	[[nodiscard]] constexpr std::string_view name() const noexcept override { return "git"; }
+
+protected:
+	constexpr bool parse(std::string_view type, no_params&, parse_error& err) const override {
+		return refuse_any_type(type, err);
+	}
+
+	// The branch, or the short object name on a detached HEAD - v1's one budgeted
+	// module.
+	//
+	// THE GUARD IS FIRST AND IT IS TWO THINGS AT ONCE. At runtime it is §6.10's
+	// floor rule: a caller that has not allowed filesystem work gets no syscall,
+	// not a fast one. During constant evaluation it is what makes this function
+	// legal at all - C++23 permits a `constexpr` function to CONTAIN a call it
+	// never evaluates, and `fs_allowed` false is what keeps the evaluation off the
+	// `read_git_head` line. One module, two worlds, no paper copy of it for the
+	// compiled default to render instead.
+	constexpr int render(const state& facts, const no_params&, sink& out) const override {
+		if (!facts.fs_allowed || facts.pwd.empty())
+			return code(element_status::omitted);
+
+		const git_head head = read_git_head(facts.pwd, git_probe_options{
+			.budget_ms = facts.fs_budget_ms,
+			.allow_spawn = true,
+			.git_command = "git",
+		});
+		if (!head.found)
+			return code(element_status::omitted);
+
+		out.append(head.detached ? head.short_sha : head.branch);
+		return code(element_status::ready);
+	}
+};
+
+// --- the singletons and the table ------------------------------------------
+
+// ONE OBJECT PER MODULE, FOR THE WHOLE PROCESS. §6.10's "modules are singletons
+// in the registry with free placement" is not a convention here, it is the
+// storage: there is exactly one `path`, every `{path…}` in every surface points
+// at it, and the memo can therefore compare identity rather than names.
+inline constexpr module_path kModulePath{};
+inline constexpr module_status kModuleStatus{};
+inline constexpr module_jobs kModuleJobs{};
+inline constexpr module_mode kModuleMode{};
+inline constexpr module_time kModuleTime{};
+inline constexpr module_duration kModuleDuration{};
+inline constexpr module_env kModuleEnv{};
+inline constexpr module_git kModuleGit{};
+
+struct builtin_module {
+	std::string_view name;
+	const module* which;
+};
+
+// The eight `engine()` registers, as a compile-time table. It is a SECOND
+// statement of the constructor's list, and deliberately so: the constructor is
+// the live registry, this is what a template compiled inside a `static_assert`
+// is allowed to assume, and a `constexpr` walk cannot consult a `std::map`. The
+// two agreeing is asserted at runtime (`TheValidatorsBuiltInTableIsTheRegistrys`).
+inline constexpr builtin_module kBuiltinModules[] = {
+	{"duration", &kModuleDuration},
+	{"env", &kModuleEnv},
+	{"git", &kModuleGit},
+	{"jobs", &kModuleJobs},
+	{"mode", &kModuleMode},
+	{"path", &kModulePath},
+	{"status", &kModuleStatus},
+	{"time", &kModuleTime},
+};
+
+[[nodiscard]] constexpr const module* builtin_module_named(std::string_view name) noexcept {
+	for (const builtin_module& one : kBuiltinModules)
+		if (one.name == name)
+			return one.which;
+	return nullptr;
+}
+
+// THE STANDALONE STYLED LITERAL, spelled like a placement because everything
+// with a style is spelled like a placement - and it is NOT a module.
+//
+// A `{literal:blue::hi}` builds a placement with a NULL CORE: its affixes are its
+// text, its pen paints them, and it reports `neutral`, so it never votes. That is
+// the same record every other placement is, with the one field that would have
+// made it vote left empty - which is why there is no pseudo-module here and no
+// second kind of thing for a group to have an opinion about.
+//
+// Its text rides the AFFIX slots and never the type slot: the slot order is
+// uniform across the grammar (slot 3 is always the type), so `{literal:blue::hi}`
+// is simply the placement with no value in the middle - `{literal:blue:x:hi}` is
+// refused for the same reason `{git::x}` is. The name shadows any module
+// registered under it, which is the one thing the spelling costs and is worth
+// saying out loud.
+inline constexpr std::string_view kLiteralPlacement = "literal";
+
+// ---------------------------------------------------------------------------
+// The placement, the group, and the program
+// ---------------------------------------------------------------------------
+
+// A run of bytes in the program's arena.
+//
+// AN OFFSET, NOT A POINTER, and that single choice is what lets one
+// representation serve compile time and run time. The compiled default is a
+// `constexpr` value returned out of a `consteval` function, which nothing
+// pointing into itself could survive; the runtime program is a vector beside a
+// `std::string` that grows as verbs arrive, which no view into it could survive
+// either. Offsets survive both.
+struct bytes {
+	std::uint32_t at = 0;
+	std::uint32_t length = 0;
+
+	[[nodiscard]] constexpr bool empty() const noexcept { return length == 0; }
+};
+
+[[nodiscard]] constexpr std::string_view view_of(const bytes& span, const char* arena) noexcept {
+	return span.length == 0 ? std::string_view{} : std::string_view{arena + span.at, span.length};
+}
+
+// §6.10'S ELEMENT, AND THERE IS ONLY ONE. The template's five parts as one
+// record: which module (null for a literal), what it was configured with, the
+// pen, and the two affixes.
+//
+// THE PEN'S DEFAULT IS UNSTYLED, and `pen == style{}` is how that is asked. No
+// separate flag, because no non-empty style spec parses to `style{}` - every
+// item of the grammar sets a colour or an attribute - so "the default pen" and
+// "no style slot" are the same value and cannot disagree.
+struct placement {
+	const module* core = nullptr;   // null for `{literal:…}` and for a free literal run
+	params_blob params{};           // the parsed type slot, opaque here, typed inside the module
+	style pen{};                    // default = unstyled: no SGR emitted, no reset
+	bytes prefix{};
+	bytes postfix{};
+};
+
+// One entry of the flat program: a placement, or a group over the entries that
+// follow it.
+//
+// FLAT AND PRE-ORDER RATHER THAN A TREE OF NODES. A group's children are the
+// `span` entries immediately after it, so the whole program is one contiguous
+// array - trivially copyable, `constexpr`-constructible, and indexable, which is
+// what lets a scratch buffer be found by step index instead of hung off a node.
+// The old node tree needed a `unique_ptr` per element to keep a `string_view`
+// from dangling; nothing here has a pointer to keep alive.
+struct step {
+	placement place{};
+	std::uint32_t span = 0;   // a group: how many following steps are its subtree
+	bool group = false;
+};
+
+// How many steps one item occupies - itself, plus a group's whole subtree.
+[[nodiscard]] constexpr std::size_t step_extent(std::span<const step> steps,
+                                                std::size_t at) noexcept {
+	return steps[at].group ? 1 + steps[at].span : 1;
+}
+
+// A program and the arena its affixes live in.
+struct program_view {
+	std::span<const step> steps{};
+	const char* arena = nullptr;
+};
+
+// Two sinks per step, and what the step last answered.
+//
+// TWO AND NOT ONE: a group's phase one has to keep a child's whole contribution
+// while that child's own module buffer is being reused, so the ITEM's bytes and
+// the module's bytes cannot share a buffer. Indexed by step, because the program
+// is flat - which is what replaced the old `sink` hung off every heap node.
+struct step_scratch {
+	sink item;
+	sink core;
+	element_status answered = element_status::omitted;
+
+	constexpr void reset() noexcept {
+		item.reset();
+		core.reset();
+		answered = element_status::omitted;
 	}
 };
 
@@ -838,66 +1226,168 @@ struct either {
 // The composer
 // ---------------------------------------------------------------------------
 
-// A flat walk: every element runs, and one that answers `omitted` contributes
-// no bytes.
+// Running a placement's module, as a policy.
 //
-// TOP-LEVEL LITERALS ARE UNCONDITIONAL, BY DESIGN. `> ` at the end of the
-// default prompt is there whatever the modules did, because binding is explicit
-// grouping and never inferred from adjacency (§6.10). A literal that should
-// vanish with a module goes INSIDE that module's `seg`, and there is no other
-// way to say it - which is the point.
-constexpr void render_table(std::span<const element> elements, const state& facts, sink& out) {
-	// One scratch for the whole walk, rewound per element: it keeps its capacity
-	// at runtime, so a warm render allocates nothing here.
-	sink scratch;
-	for (const element& one : elements) {
-		scratch.reset();
-		const element_status answered = status_of(one.fn(facts, scratch, one.data));
-		if (answered != element_status::omitted)
-			out.splice(scratch);
-		else if (scratch.wake() != 0)
-			out.wake_in(scratch.wake());
+// TWO OF THESE EXIST AND THE COMPOSER IS WRITTEN ONCE. The compile-time one just
+// calls `render`; the engine's consults §6.10's per-prompt memo first. Templating
+// over them is what keeps "a group built across the ABI" and "a group compiled
+// from a string" from being two behaviours that drift - the drift the first cut
+// of this engine had, with a `seg<>` composer beside a node-tree one.
+struct direct_core {
+	constexpr element_status operator()(const placement& one, const state& facts,
+	                                    sink& into) const {
+		return status_of(one.core->render(facts, one.params, into));
 	}
+};
+
+// ONE PLACEMENT, RENDERED - the two-phase span, inlined.
+//
+// A NULL CORE EMITS ITS AFFIXES AND REPORTS NEUTRAL. It is decoration: it always
+// paints, and it never votes in an enclosing group. That is `{literal:dim::on}`
+// and it is also every free literal run between placements.
+//
+// A CORE THAT SAID NOTHING TAKES ITS AFFIXES WITH IT. The module is asked FIRST,
+// into `scratch`, and the pen and the affixes are written only once it has
+// answered `ready` - which is why `{status:red::[:]}` is a pair of red brackets
+// after a failure and nothing whatsoever after a success. A wake it asked for
+// still travels even when it said nothing: a module may be silent and still want
+// to be asked again.
+template <class RunCore>
+constexpr element_status render_placement(const placement& one, const char* arena,
+                                          const state& facts, sink& out, sink& scratch,
+                                          RunCore& run_core) {
+	const bool styled = !(one.pen == style{});
+
+	if (one.core == nullptr) {
+		if (styled)
+			out.write_style(one.pen);
+		out.append(view_of(one.prefix, arena));
+		out.append(view_of(one.postfix, arena));
+		if (styled)
+			out.write_style(style{});
+		return element_status::neutral;
+	}
+
+	scratch.reset();
+	const element_status answered = run_core(one, facts, scratch);
+	if (answered != element_status::ready) {
+		// `pending` is not-ready in v1 and paints nothing; see `element_status`.
+		if (scratch.wake() != 0)
+			out.wake_in(scratch.wake());
+		return answered;
+	}
+
+	if (styled)
+		out.write_style(one.pen);
+	out.append(view_of(one.prefix, arena));
+	out.splice(scratch);
+	out.append(view_of(one.postfix, arena));
+	if (styled)
+		out.write_style(style{});
+	return element_status::ready;
 }
 
-// ---------------------------------------------------------------------------
-// The default prompt
-// ---------------------------------------------------------------------------
+template <class RunCore>
+constexpr element_status render_item(const program_view& program, std::size_t at,
+                                     std::span<step_scratch> scratch, const state& facts,
+                                     sink& out, RunCore& run_core);
 
-inline constexpr style kCyan = style{.fg = color::of_index(6)};
-inline constexpr style kMagenta = style{.fg = color::of_index(5)};
-inline constexpr style kRed = style{.fg = color::of_index(1)};
-
-// `~/src> `: the working directory, `$HOME` contracted to `~`, and an arrow.
-// Nothing else - no colour, no branch, no status (owner's ruling on #157).
+// §6.10's group, and `(…)` IS THE ONLY COMBINATOR THERE IS. Shown iff at least
+// one child reported `ready`; decorations do not vote; evaluation is two-phase so
+// a child that will not be shown never has its bytes spliced anywhere.
 //
-// THE QUIET ONE, DELIBERATELY. A shipped default is the prompt of every user who
-// has not decided yet, and the one thing it must not do is decide for them: a
-// shell that arrives already wearing three coloured segments has spent their
-// terminal's width and their attention on choices they never made, and every
-// starship segment they DO want is one `add_module` away. The machinery is not
-// being hedged on - the seg composer, the omission vote, the affixes that vanish
-// with their module are all still here and still proved, in the standalone
-// `seg` asserts in `selftest` below rather than in this table. What is small
-// here is the default, not the engine.
+// THE VOTE RECURSES THROUGH WHAT A CHILD REPORTS, and that is the whole rule. A
+// placement reports its module's status; a nested group reports `ready` or
+// `omitted` exactly as a placement does; a null-core placement reports `neutral`.
+// So `({git} ({path}))` lives or dies on `git` OR on the inner group - and the
+// inner group is itself alive only if `path` said something. There is no separate
+// question of "what kind of thing is this child", because there is only one kind
+// of thing.
 //
-// A `constexpr std::array` of records: no initializer runs at startup and no
-// allocation happens for the default configuration, which is the configuration
-// almost every session has - and, since #157's precedence flip, the one almost
-// every session SHOWS.
-inline constexpr auto kDefaultLeft = table<path_t, literal<"> ">>();
+// PHASE ONE SKIPS NULL-CORE PLACEMENTS BECAUSE THERE IS NOTHING TO COMPUTE. A
+// literal's bytes are already in the placement; running it early would mean
+// writing them into a scratch buffer only to throw them away when the vote fails.
+// So a group whose module says nothing costs its decorations neither bytes nor a
+// call, which is the property the old design needed a `kind` tag to get and this
+// one gets from the shape.
+//
+// A WAKE ASKED FOR BY A CHILD OF A VANISHED GROUP IS DROPPED, deliberately: the
+// group is not on screen, so there is nothing for a wake to redraw. When #156's
+// completion path arrives and `pending` starts counting, this is the line that
+// changes with it.
+//
+// A STYLED CHILD PUTS THE PEN BACK ITSELF, so a group owes no reset of its own:
+// every pen this engine emits is closed by the placement that opened it.
+template <class RunCore>
+constexpr element_status render_group(const program_view& program, std::size_t at,
+                                      std::span<step_scratch> scratch, const state& facts,
+                                      sink& out, RunCore& run_core) {
+	const std::size_t first = at + 1;
+	const std::size_t last = first + program.steps[at].span;
 
-inline constexpr auto kDefaultContinuation = table<literal<"> ">>();
+	bool any_ready = false;
+	for (std::size_t c = first; c < last; c += step_extent(program.steps, c)) {
+		const step& child = program.steps[c];
+		if (!child.group && child.place.core == nullptr)
+			continue;   // decoration: nothing to compute, and it does not vote
 
-// THE SAME TWO PROMPTS AS TEMPLATE SOURCE. `use_default` remembers these as the
-// surface's template text, so `prompt` on a fresh shell prints the prompt it is
-// actually showing rather than an empty line - and the equivalence is not a
-// claim, it is a test: `set_template("{path}> ")` renders byte-identically to
-// `kDefaultLeft` (`TheDefaultTableAndItsTemplateAgree`). What a table buys over
-// the string is that it costs no parse and no allocation at startup; what the
-// string buys is that a user can read it, edit one byte of it, and hand it back.
-inline constexpr std::string_view kDefaultLeftTemplate = "{path}> ";
-inline constexpr std::string_view kDefaultContinuationTemplate = "> ";
+		scratch[c].item.reset();
+		const element_status answered =
+			render_item(program, c, scratch, facts, scratch[c].item, run_core);
+		scratch[c].answered = answered;
+		if (answered == element_status::ready)
+			any_ready = true;
+	}
+
+	if (!any_ready)
+		return element_status::omitted;
+
+	for (std::size_t c = first; c < last; c += step_extent(program.steps, c)) {
+		const step& child = program.steps[c];
+		if (!child.group && child.place.core == nullptr) {
+			render_placement(child.place, program.arena, facts, out, scratch[c].core, run_core);
+			continue;
+		}
+		if (scratch[c].answered != element_status::omitted)
+			out.splice(scratch[c].item);
+		else if (scratch[c].item.wake() != 0)
+			out.wake_in(scratch[c].item.wake());
+	}
+
+	return element_status::ready;
+}
+
+template <class RunCore>
+constexpr element_status render_item(const program_view& program, std::size_t at,
+                                     std::span<step_scratch> scratch, const state& facts,
+                                     sink& out, RunCore& run_core) {
+	if (program.steps[at].group)
+		return render_group(program, at, scratch, facts, out, run_core);
+	return render_placement(program.steps[at].place, program.arena, facts, out,
+	                        scratch[at].core, run_core);
+}
+
+// A flat walk of the top level: every item runs, and one that answers `omitted`
+// contributes no bytes.
+//
+// TOP-LEVEL LITERALS ARE UNCONDITIONAL, BY DESIGN. `> ` at the end of the default
+// prompt is there whatever the modules did, because binding is explicit grouping
+// and never inferred from adjacency (§6.10). A literal that should vanish with a
+// module goes in that placement's affix slot or inside its group, and there is no
+// other way to say it - which is the point.
+template <class RunCore>
+constexpr void render_program(const program_view& program, std::span<step_scratch> scratch,
+                              const state& facts, sink& out, RunCore& run_core) {
+	for (std::size_t at = 0; at < program.steps.size(); at += step_extent(program.steps, at)) {
+		sink& into = scratch[at].item;
+		into.reset();
+		const element_status answered = render_item(program, at, scratch, facts, into, run_core);
+		if (answered != element_status::omitted)
+			out.splice(into);
+		else if (into.wake() != 0)
+			out.wake_in(into.wake());
+	}
+}
 
 // ---------------------------------------------------------------------------
 // The template language
@@ -922,6 +1412,12 @@ inline constexpr std::string_view kDefaultContinuationTemplate = "> ";
 // affix: colons in bytes are escaped, colons between slots are not, and there is
 // no counting rule to remember.
 //
+// THE TYPE SLOT IS THE MODULE'S, AND THE SCANNER DOES NOT READ IT. It unescapes
+// the bytes and hands them to `module::parse`, which answers yes or no with the
+// byte to look at. That is why `{path:cyan:s}` and `{path:cyan:medum}` are told
+// apart here at all, and why a module a binding registered gets the same
+// treatment as a built-in without this file knowing anything about its grammar.
+//
 // FREE LITERAL RUNS ARE UNCONDITIONAL; binding a literal to a module is always
 // explicit - an affix slot or a group, never adjacency (§6.10). `{path}( on
 // {git})> ` is the whole of that rule: the arrow always paints, ` on ` paints
@@ -940,10 +1436,10 @@ inline constexpr std::string_view kDefaultContinuationTemplate = "> ";
 //      answer that can tell a user their typo at the moment they made it.
 //   2. prmt BORROWS its bytes (`Cow`) because the template outlives the render.
 //      Ours outlive the builtin's argv by the whole session, so every byte is
-//      copied into engine-owned storage as it is parsed.
-//   3. prmt emits a flat token vector for a later pass to interpret. We build the
-//      engine's nodes directly, through the same paths the ABI verbs use, so
-//      there is no intermediate AST to keep in step with the element vocabulary.
+//      copied into the program's own arena as it is parsed.
+//   3. prmt emits a flat token vector for a later pass to interpret. We build
+//      placements directly, through the same hook the ABI's `place` verb uses,
+//      so there is no intermediate AST to keep in step with the vocabulary.
 
 // What went wrong, as a value. The runtime path words these into a sentence
 // (`describe_template_error` in prompt.cpp); the compile-time path only needs to
@@ -959,22 +1455,28 @@ enum class template_error : std::uint8_t {
 	unknown_module,
 	bad_style,
 	bad_escape,
-	needs_argument,
-	takes_no_argument,
+	bad_type,
 	literal_needs_text,
 	literal_takes_no_type,
 };
 
 // The scan's answer. `error_at` is a byte offset INTO THE TEMPLATE and points at
-// the byte a user has to look at - the offending brace, colon, backslash, name or
-// style item, never at the start of the line. `what` names the offending token
-// where there is one to name (`gti`, `blod`, `\q`), as a view into the caller's
-// own bytes.
+// the byte a user has to look at - the offending brace, colon, backslash, name,
+// style item or type byte, never at the start of the line. `what` names the
+// offending token where there is one to name (`gti`, `blod`, `\q`, `medum`), as a
+// view into the caller's own bytes.
+//
+// `subject` AND `detail` ARE `bad_type`'S, and they are how a module's refusal
+// travels without a `std::string` in a `constexpr` walk: the module's name and
+// the module's own words, both static, assembled into one sentence on the side
+// that has a user to talk to.
 struct template_check {
 	bool ok = true;
 	std::size_t error_at = 0;
 	template_error error = template_error::none;
 	std::string_view what{};
+	std::string_view subject{};
+	std::string_view detail{};
 };
 
 // One slot or one literal run, as the scanner found it: the RAW bytes, still
@@ -1004,8 +1506,8 @@ struct template_slice {
 
 // AN UNKNOWN ESCAPE IS AN ERROR, not two literal bytes. The alternative - keep
 // `\q` as a backslash and a `q` - makes a mistyped `\n` a prompt that silently
-// says `\n` forever, and this parser's whole posture is that a mistake is told
-// to its author at the moment it is written.
+// says `\n` forever, and this parser's whole posture is that a mistake is told to
+// its author at the moment it is written.
 constexpr void unescape_into(const template_slice& piece, std::string& out) {
 	if (!piece.escaped) {
 		// The common case, and the reason the flag exists: no inspection, no loop.
@@ -1024,83 +1526,27 @@ constexpr void unescape_into(const template_slice& piece, std::string& out) {
 	}
 }
 
-// What a name resolves to, and the whole of v1's argument validation.
-//
-// KEYED ON WHAT THE NAME RESOLVES TO, NOT ON THE SPELLING. The built-ins' type
-// slots are decided here because v1 gives them none - `path`'s `short`/`full`
-// variants and `git`'s status flags are recorded future work (#156) and the
-// wording deliberately does not promise them - while a module that came in
-// across the ABI parses its own argument, so this grammar has nothing to say
-// about it. The runtime policy therefore asks the REGISTRY, and a user who
-// replaced `path` with a module of their own gets `free_argument`: they own its
-// argument grammar as surely as they own its bytes.
-enum class module_rule : std::uint8_t {
-	unknown,
-	no_argument,
-	needs_argument,
-	free_argument,
-};
-
-struct builtin_module_name {
-	std::string_view name;
-	module_rule rule;
-};
-
-// The eight `engine()` registers, as a compile-time table. It is a SECOND
-// statement of the constructor's list, and deliberately so: the constructor is
-// the live registry, this is what a template validated inside a `static_assert`
-// is allowed to assume, and a `constexpr` walk cannot consult a `std::map`. The
-// two agreeing is asserted at runtime (`TheValidatorKnowsEveryBuiltIn`).
-inline constexpr builtin_module_name kBuiltinModules[] = {
-	{"duration", module_rule::no_argument},
-	{"env", module_rule::needs_argument},
-	{"git", module_rule::no_argument},
-	{"jobs", module_rule::no_argument},
-	{"mode", module_rule::no_argument},
-	{"path", module_rule::no_argument},
-	{"status", module_rule::no_argument},
-	{"time", module_rule::no_argument},
-};
-
-[[nodiscard]] constexpr module_rule builtin_module_rule(std::string_view name) noexcept {
-	for (const builtin_module_name& one : kBuiltinModules)
-		if (one.name == name)
-			return one.rule;
-	return module_rule::unknown;
-}
-
-// THE STANDALONE STYLED LITERAL, spelled like a placement because everything
-// with a style is spelled like a placement.
-//
-// Its text rides the AFFIX slots and never the type slot: the slot order is
-// uniform across the grammar (slot 3 is always the type), so `{literal:blue::hi}`
-// is simply the placement with no value in the middle - `{literal:blue:x:hi}` is
-// refused for the same reason `{path:cyan:x}` is. Both affixes render, in order,
-// with nothing invented between them, which makes `{literal:red::[:]}` a pair of
-// brackets around nothing rather than an error.
-//
-// IT IS STAMPED A DECORATION. `({literal:dim::on} {git})` vanishes outside a
-// repository, because a literal - however it was spelled - is grammar and grammar
-// does not vote (§6.10). The name shadows any module registered under it, which
-// is the one thing the pseudo-module costs and is worth saying out loud.
-inline constexpr std::string_view kLiteralPlacement = "literal";
-
-// The one grammar walk. `build` is a POLICY, not an interface: two of them exist,
-// one that builds nodes and one that does nothing at all, and templating over
-// them is what keeps the compile-time validator and the set-time builder from
-// being two walks that drift (#156's rule).
+// The one grammar walk. `build` is a POLICY, not an interface: three of them
+// exist - one that measures, one that builds, one that does nothing at all - and
+// templating over them is what keeps the compile-time validator, the compile-time
+// builder and the set-time builder from being three walks that drift (#156's rule
+// that a second walk is a second grammar).
 //
 // A policy provides:
-//   module_rule resolve(std::string_view name) const;
-//   void on_literal(const template_slice& run);
+//   const module* resolve(std::string_view name) const;   // null: nobody has that name
+//   void on_placement(const module* core, const params_blob& params, const style& pen,
+//                     std::string_view prefix, std::string_view postfix);
 //   void on_open_group();
 //   void on_close_group();
-//   void on_placement(std::string_view name, const style& pen, bool styled,
-//                     const template_slice& type, const template_slice& prefix,
-//                     const template_slice& postfix);
-//   void on_literal_placement(const style& pen, bool styled,
-//                             const template_slice& prefix,
-//                             const template_slice& postfix);
+//
+// ONE HOOK FOR EVERY ELEMENT, because there is one element. A literal run, a
+// `{literal:…}` and a `{git:magenta:: on :}` all arrive through `on_placement`;
+// the first two with a null core. That is the model showing through the parser:
+// there is no `on_literal` to forget to keep in step, because a literal is not a
+// separate thing.
+//
+// THE VIEWS HANDED TO A HOOK ARE THE SCANNER'S OWN BUFFERS and live only for the
+// call. A policy that keeps bytes copies them.
 //
 // NOTHING IS EMITTED PAST THE FIRST ERROR: the scan returns at the byte that
 // failed, so a policy that built half a prompt has built only that half - which
@@ -1125,6 +1571,12 @@ template <class Builder>
 	std::size_t outermost_open_at = 0;
 	std::size_t i = 0;
 
+	// Reused across placements. Declared out here so a template with twenty
+	// placements does not allocate twenty times over at set time.
+	std::string type_bytes;
+	std::string prefix_bytes;
+	std::string postfix_bytes;
+
 	while (i < text.size()) {
 		// --- a literal run, by structural jumps rather than byte by byte ---
 		const std::size_t run_start = i;
@@ -1148,9 +1600,15 @@ template <class Builder>
 			run_escaped = true;
 			i = at + 2;
 		}
-		if (run_end > run_start)
-			build.on_literal(template_slice{text.substr(run_start, run_end - run_start),
-			                                run_start, run_escaped});
+		if (run_end > run_start) {
+			// A DECORATION-ONLY PLACEMENT, which is all a literal run is: no module,
+			// no style, its bytes in the prefix.
+			prefix_bytes.clear();
+			unescape_into(template_slice{text.substr(run_start, run_end - run_start), run_start,
+			                             run_escaped},
+			              prefix_bytes);
+			build.on_placement(nullptr, params_blob{}, style{}, prefix_bytes, std::string_view{});
+		}
 		if (i >= text.size())
 			break;
 
@@ -1164,9 +1622,9 @@ template <class Builder>
 			continue;
 		}
 		if (text[i] == ')') {
-			// `)` is structural everywhere, so a literal one is `\)`. `}` is not -
-			// it means nothing outside a placement - which is why a bare `}` needs
-			// no escape even though `\}` is accepted for symmetry.
+			// `)` is structural everywhere, so a literal one is `\)`. `}` is not - it
+			// means nothing outside a placement - which is why a bare `}` needs no
+			// escape even though `\}` is accepted for symmetry.
 			if (depth == 0)
 				return fail(template_error::unbalanced_close, i, text.substr(i, 1));
 			--depth;
@@ -1206,8 +1664,8 @@ template <class Builder>
 				field[filled++] = piece;
 			else if (!piece.empty())
 				// The trailing colon is legal and an empty sixth field is what it
-				// leaves behind; bytes in that field are a slot this grammar does
-				// not have.
+				// leaves behind; bytes in that field are a slot this grammar does not
+				// have.
 				return fail(template_error::too_many_fields, sixth_at, piece.raw);
 			escaped = false;
 			start = k + 1;
@@ -1228,8 +1686,8 @@ template <class Builder>
 			return fail(template_error::unclosed_placement, open_at, text.substr(open_at, 1));
 
 		// A module name is snake_case, so nothing in one ever needs an escape and
-		// the raw bytes are the name. An escape there simply makes it a name
-		// nobody registered.
+		// the raw bytes are the name. An escape there simply makes it a name nobody
+		// registered.
 		const std::string_view name = field[0].raw;
 		if (name.empty())
 			return fail(template_error::empty_name, field[0].at, name);
@@ -1240,16 +1698,15 @@ template <class Builder>
 		const template_slice& postfix = field[4];
 
 		style pen{};
-		const bool styled = !style_slot.empty();
-		if (styled) {
+		if (!style_slot.empty()) {
 			// NOT UNESCAPED FIRST: a style spec is names, digits, `#`, `+`, `.` and
-			// `-`, and none of the eight escapes can appear in a valid one, so the
-			// raw bytes are the spec and an escaped byte simply fails to parse.
+			// `-`, and none of the eight escapes can appear in a valid one, so the raw
+			// bytes are the spec and an escaped byte simply fails to parse.
 			const style_parse parsed = parse_style(style_slot.raw);
 			if (!parsed.ok) {
-				// The failing ITEM, not the whole spec: `bad style 'blod'` is what
-				// the author has to fix, and the offset is absolute so they can find
-				// it in a long line.
+				// The failing ITEM, not the whole spec: `bad style 'blod'` is what the
+				// author has to fix, and the offset is absolute so they can find it in
+				// a long line.
 				std::string_view item = style_slot.raw.substr(parsed.error_at);
 				const std::size_t dot = item.find('.');
 				if (dot != std::string_view::npos)
@@ -1259,32 +1716,48 @@ template <class Builder>
 			pen = parsed.value;
 		}
 
+		prefix_bytes.clear();
+		unescape_into(prefix, prefix_bytes);
+		postfix_bytes.clear();
+		unescape_into(postfix, postfix_bytes);
+
 		if (name == kLiteralPlacement) {
 			if (!type_slot.empty())
 				return fail(template_error::literal_takes_no_type, type_slot.at, name);
 			if (prefix.empty() && postfix.empty())
 				return fail(template_error::literal_needs_text, field[0].at, name);
-			build.on_literal_placement(pen, styled, prefix, postfix);
+			build.on_placement(nullptr, params_blob{}, pen, prefix_bytes, postfix_bytes);
 			i = k;
 			continue;
 		}
 
-		switch (build.resolve(name)) {
-			case module_rule::unknown:
-				return fail(template_error::unknown_module, field[0].at, name);
-			case module_rule::needs_argument:
-				if (type_slot.empty())
-					return fail(template_error::needs_argument, field[0].at, name);
-				break;
-			case module_rule::no_argument:
-				if (!type_slot.empty())
-					return fail(template_error::takes_no_argument, type_slot.at, name);
-				break;
-			case module_rule::free_argument:
-				break;
+		const module* core = build.resolve(name);
+		if (core == nullptr)
+			return fail(template_error::unknown_module, field[0].at, name);
+
+		type_bytes.clear();
+		unescape_into(type_slot, type_bytes);
+
+		params_blob params;
+		parse_error why;
+		if (!core->parse(type_bytes, params, why)) {
+			// THE MODULE'S REFUSAL, POINTED AT A BYTE. An empty slot has no byte of
+			// its own to point at, so the name is what a user has to look at - `{env}`
+			// is wrong at `env`, not at the brace after it.
+			template_check refused;
+			refused.ok = false;
+			refused.error = template_error::bad_type;
+			refused.error_at = type_slot.empty() ? field[0].at : type_slot.at + why.at;
+			refused.subject = name;
+			refused.detail = why.what;
+			if (why.length != 0 && why.at < type_slot.raw.size()) {
+				const std::size_t room = type_slot.raw.size() - why.at;
+				refused.what = type_slot.raw.substr(why.at, why.length < room ? why.length : room);
+			}
+			return refused;
 		}
 
-		build.on_placement(name, pen, styled, type_slot, prefix, postfix);
+		build.on_placement(core, params, pen, prefix_bytes, postfix_bytes);
 		i = k;
 	}
 
@@ -1297,27 +1770,197 @@ template <class Builder>
 // The do-nothing policy: the same walk, resolving against the built-in table and
 // building nothing at all.
 struct template_validator {
-	[[nodiscard]] constexpr module_rule resolve(std::string_view name) const noexcept {
-		return builtin_module_rule(name);
+	[[nodiscard]] constexpr const module* resolve(std::string_view name) const noexcept {
+		return builtin_module_named(name);
 	}
-	constexpr void on_literal(const template_slice&) const noexcept {}
+
+	constexpr void on_placement(const module*, const params_blob&, const style&, std::string_view,
+	                            std::string_view) const noexcept {}
 	constexpr void on_open_group() const noexcept {}
 	constexpr void on_close_group() const noexcept {}
-	constexpr void on_placement(std::string_view, const style&, bool, const template_slice&,
-	                            const template_slice&, const template_slice&) const noexcept {}
-	constexpr void on_literal_placement(const style&, bool, const template_slice&,
-	                                    const template_slice&) const noexcept {}
 };
 
-// A template's structure, its styles and its built-in argument rules, checked
-// wherever the bytes are known at compile time - a shipped default, a test, a
-// literal in a future C++-authored configuration. It cannot see a module the ABI
-// registered at run time, which is the one thing the set-time walk has that this
-// does not; everything else is the same code and the same errors.
-[[nodiscard]] constexpr template_check validate_template(std::string_view text) noexcept {
+// A template's structure, its styles and its built-in modules' type grammars,
+// checked wherever the bytes are known at compile time. It cannot see a module
+// the ABI registered at run time, which is the one thing the set-time walk has
+// that this does not; everything else is the same code, the same `parse` methods
+// and the same errors.
+[[nodiscard]] constexpr template_check validate_template(std::string_view text) {
 	template_validator only_checking;
 	return scan_template(text, only_checking);
 }
+
+// ---------------------------------------------------------------------------
+// Compiling a template at compile time
+// ---------------------------------------------------------------------------
+
+// A compiled template: the steps, and the arena their affix bytes live in.
+//
+// A PURE VALUE WITH NOTHING POINTING INTO ITSELF, which is what lets it come out
+// of a `consteval` function and be a `constexpr` variable. That is the whole
+// reason `bytes` is an offset.
+template <std::size_t Steps, std::size_t Bytes>
+struct compiled_template {
+	// `Bytes` is zero for a template with no literal bytes at all; a zero-length
+	// array is not a thing, and one spare byte is cheaper than a special case.
+	std::array<step, Steps> steps{};
+	std::array<char, (Bytes == 0 ? 1 : Bytes)> arena{};
+
+	[[nodiscard]] constexpr program_view view() const noexcept {
+		return program_view{std::span<const step>{steps}, arena.data()};
+	}
+};
+
+namespace compile_detail {
+
+struct sizes {
+	std::size_t steps = 0;
+	std::size_t bytes = 0;
+};
+
+// Pass one: how many steps, and how many affix bytes.
+struct measuring_policy {
+	sizes counted;
+
+	[[nodiscard]] constexpr const module* resolve(std::string_view name) const noexcept {
+		return builtin_module_named(name);
+	}
+
+	constexpr void on_placement(const module*, const params_blob&, const style&,
+	                            std::string_view prefix, std::string_view postfix) noexcept {
+		++counted.steps;
+		counted.bytes += prefix.size() + postfix.size();
+	}
+
+	constexpr void on_open_group() noexcept { ++counted.steps; }
+	constexpr void on_close_group() const noexcept {}
+};
+
+// Pass two: the steps themselves, into storage pass one sized.
+//
+// THE SAME POLICY SHAPE THE ENGINE'S BUILDER HAS, and the two are deliberately
+// near-identical - a `std::array` and a `std::vector` of the same `step`, an
+// arena that is an array here and a `std::string` there. What differs is where
+// the storage came from, which is the only thing that can differ between compile
+// time and run time once the element is a value.
+template <std::size_t Steps, std::size_t Bytes>
+struct building_policy {
+	compiled_template<Steps, Bytes> made{};
+	std::size_t used_steps = 0;
+	std::size_t used_bytes = 0;
+	std::array<std::size_t, (Steps == 0 ? 1 : Steps)> open{};
+	std::size_t depth = 0;
+	bool overflowed = false;
+
+	[[nodiscard]] constexpr const module* resolve(std::string_view name) const noexcept {
+		return builtin_module_named(name);
+	}
+
+	constexpr bytes intern(std::string_view text) {
+		const bytes span{static_cast<std::uint32_t>(used_bytes),
+		                 static_cast<std::uint32_t>(text.size())};
+		for (const char one : text) {
+			if (used_bytes >= made.arena.size()) {
+				overflowed = true;
+				return bytes{};
+			}
+			made.arena[used_bytes++] = one;
+		}
+		return span;
+	}
+
+	constexpr void on_placement(const module* core, const params_blob& params, const style& pen,
+	                            std::string_view prefix, std::string_view postfix) {
+		if (used_steps >= Steps) {
+			overflowed = true;
+			return;
+		}
+		step& one = made.steps[used_steps++];
+		one.place.core = core;
+		one.place.params = params;
+		one.place.pen = pen;
+		one.place.prefix = intern(prefix);
+		one.place.postfix = intern(postfix);
+	}
+
+	constexpr void on_open_group() {
+		if (used_steps >= Steps) {
+			overflowed = true;
+			return;
+		}
+		open[depth++] = used_steps;
+		made.steps[used_steps++].group = true;
+	}
+
+	constexpr void on_close_group() {
+		const std::size_t at = open[--depth];
+		made.steps[at].span = static_cast<std::uint32_t>(used_steps - at - 1);
+	}
+};
+
+template <fixed_string Template>
+[[nodiscard]] consteval sizes measure() {
+	measuring_policy counting;
+	const template_check checked = scan_template(Template.view(), counting);
+	if (!checked.ok)
+		// A CONSTEVAL FUNCTION THAT CANNOT ANSWER IS A BUILD FAILURE, which is the
+		// entire point: `compile<"{gti}">()` does not compile, and a shipped default
+		// that stopped parsing is caught by the compiler rather than by a user whose
+		// prompt went blank.
+		throw "lesh: the prompt template does not parse";
+	return counting.counted;
+}
+
+} // namespace compile_detail
+
+// A TEMPLATE, COMPILED - the same scanner and the same `module::parse` methods a
+// `prompt` builtin runs, at compile time, into a value.
+//
+// This is §6.10's "one grammar, two evaluation times" arriving at its end state:
+// the shipped default is not a table that has to be kept in step with the string
+// `prompt` prints for it, it IS that string compiled.
+// `TheDefaultTableAndItsTemplateAgree` still runs, because an assertion is
+// cheaper than trusting the sentence above.
+template <fixed_string Template>
+[[nodiscard]] consteval auto compile() {
+	constexpr compile_detail::sizes counted = compile_detail::measure<Template>();
+	compile_detail::building_policy<counted.steps, counted.bytes> building;
+	const template_check checked = scan_template(Template.view(), building);
+	if (!checked.ok || building.overflowed)
+		throw "lesh: the prompt template does not parse";
+	return building.made;
+}
+
+// ---------------------------------------------------------------------------
+// The default prompt
+// ---------------------------------------------------------------------------
+
+inline constexpr style kCyan = style{.fg = color::of_index(6)};
+inline constexpr style kMagenta = style{.fg = color::of_index(5)};
+inline constexpr style kRed = style{.fg = color::of_index(1)};
+
+// `~/src> `: the working directory, `$HOME` contracted to `~`, and an arrow.
+// Nothing else - no colour, no branch, no status (owner's ruling on #157).
+//
+// THE QUIET ONE, DELIBERATELY. A shipped default is the prompt of every user who
+// has not decided yet, and the one thing it must not do is decide for them: a
+// shell that arrives already wearing three coloured segments has spent their
+// terminal's width and their attention on choices they never made, and every
+// starship segment they DO want is one `prompt` away. The machinery is not being
+// hedged on - the group vote, the omission rule, the affixes that vanish with
+// their module are all still here and still proved, in the standalone asserts in
+// `selftest` below rather than in this prompt. What is small here is the default,
+// not the engine.
+//
+// COMPILED FROM ITS OWN SPELLING, so there is no second statement of it to drift:
+// no initializer runs at startup, no allocation happens for the configuration
+// almost every session has, and `prompt` on a fresh shell prints the string this
+// line is written in.
+inline constexpr std::string_view kDefaultLeftTemplate = "{path}> ";
+inline constexpr std::string_view kDefaultContinuationTemplate = "> ";
+
+inline constexpr auto kDefaultLeft = compile<"{path}> ">();
+inline constexpr auto kDefaultContinuation = compile<"> ">();
 
 // ---------------------------------------------------------------------------
 // The engine
@@ -1331,21 +1974,31 @@ enum class surface_id : std::uint8_t {
 	count_,
 };
 
+// What a configuration verb answered. Three failures, and they are different
+// questions: nobody has that name, that style spec does not parse, that module
+// will not take that type.
+enum class place_result : std::uint8_t {
+	ok,
+	unknown_module,
+	bad_style,
+	bad_type,
+};
+
 // The registry, the configuration verbs, the output slots and the tick wheel.
 //
 // RECALCULATION BY CAUSE (§6.10) is the reason this object exists at all rather
-// than a `render_table` call per prompt. Every TOP-LEVEL element owns an output
-// slot; a render re-invokes only the elements with a reason and splices every
-// other slot unchanged. v1 has two of the three causes - a new prompt, and an
-// element's own wake tick - because v1's loop-integration surface is timers
-// only; the third (an event an element declared interest in) arrives with #156's
-// completion path and is a third entry point, not a change to these two.
+// than a `render_program` call per prompt. Every TOP-LEVEL item owns an output
+// slot; a render re-invokes only the items with a reason and splices every other
+// slot unchanged. v1 has two of the three causes - a new prompt, and an item's
+// own wake tick - because v1's loop-integration surface is timers only; the third
+// (an event an element declared interest in) arrives with #156's completion path
+// and is a third entry point, not a change to these two.
 //
-// THE TICK PATH'S CONTRACT, and the caller owns it: `render_tick` may be handed
-// a `state` that differs from the last `render_full`'s only in `tick`, `hours`,
+// THE TICK PATH'S CONTRACT, and the caller owns it: `render_tick` may be handed a
+// `state` that differs from the last `render_full`'s only in `tick`, `hours`,
 // `minutes` and `seconds`. Nothing else may have moved, because nothing else is
-// re-read - a slot that is not due is memcpy'd, not recomputed. A changed `$?`
-// or a changed `$PWD` is a NEW PROMPT and goes through `render_full`.
+// re-read - a slot that is not due is copied, not recomputed. A changed `$?` or a
+// changed `$PWD` is a NEW PROMPT and goes through `render_full`.
 //
 // LOOP-THREAD ONLY, like every other registry here (#93). No locking anywhere,
 // and the rule is really "one thread at a time": #157's wiring calls
@@ -1365,23 +2018,30 @@ public:
 
 	// Registers a module under `name`, REPLACING any existing registration -
 	// #101's rule, so re-sourcing an rc file is idempotent rather than an error.
-	// Names are snake_case; anything else is LESH_ERR_INVAL, and a null `fn` is
+	// Names are snake_case; anything else is LESH_ERR_INVAL, and a null `which` is
 	// too. LESH_OK otherwise.
 	//
+	// THE MODULE IS BORROWED, NOT OWNED. A `module` is a singleton (§6.10) and the
+	// built-ins are `constexpr` objects with static storage; a caller registering
+	// its own keeps it alive for the engine's life, which is the same contract
+	// every other registry here has.
+	//
 	// A REGISTRATION IS NOT A PLACEMENT. Registering a module puts it in the
-	// table; where it appears in the prompt, and how many times, is
-	// `add_module`'s (§6.10: singletons with free placement).
-	std::int32_t register_module(std::string_view name, element_fn fn, void* userdata);
+	// table; where it appears in the prompt, and how many times, is `place`'s
+	// (§6.10: singletons with free placement).
+	std::int32_t register_module(std::string_view name, const module* which);
 
-	// The same, for a module that came across the C ABI: the trampoline and the
-	// owned `{fn, userdata}` pair are this file's, so `abi.h` needs no C++ type.
+	// The same, for a module that came across the C ABI: the trampoline object and
+	// its `{fn, validate, userdata}` triple are this file's, so `abi.h` needs no
+	// C++ type. A null `validate` means "accepts any type", which is what the
+	// unchecked registration verb promises.
 	std::int32_t register_abi_module(std::string_view name, lesh_prompt_module_fn fn,
-	                                 void* userdata);
+	                                 lesh_prompt_validate_fn validate, void* userdata);
 
 	[[nodiscard]] bool module_exists(std::string_view name) const;
 
-	// Sorted, because the table is a `std::map` and a caller listing modules
-	// wants an order that does not depend on registration history.
+	// Sorted, because the table is a `std::map` and a caller listing modules wants
+	// an order that does not depend on registration history.
 	void module_names(std::vector<std::string>& out) const;
 
 	// --- Configuration ---
@@ -1389,31 +2049,36 @@ public:
 	void clear(surface_id which);
 	void use_default(surface_id which);
 
-	// False when no module of that name is registered - the one failure a
-	// configuration verb has, and it is a miss rather than a crash.
+	// ONE PLACEMENT VERB, which is what the model change bought the ABI. What was
+	// `add_module`, `add_literal` and `add_style` - three verbs that between them
+	// could say things the template language cannot, and could not say things it
+	// can - is one call that places exactly what `{name:style:type:prefix:postfix}`
+	// spells, and nothing else.
 	//
-	// `arg` is COPIED into engine-owned storage. The caller's bytes are its own
-	// (the ABI's copy-in convention, and the only convention that survives a
-	// binding whose strings are garbage-collected).
-	bool add_module(surface_id which, std::string_view name, std::string_view arg);
-
-	void add_literal(surface_id which, std::string_view bytes);
-
-	// A style decoration, from the string grammar (`style_grammar.h`). False is a
-	// spec that would not parse, and it places nothing when it answers so.
+	// An empty `name` places a LITERAL: a placement with no module, its bytes in
+	// the affixes, its pen painting them. That is the same record and not a
+	// special case.
 	//
-	// THIS IS THE VERB `node::styles` HAS BEEN NAMING. A style inside a group is
-	// what makes the group owe a reset at its end; a style at top level paints
-	// from there on, exactly as an `add_literal` of the same escape sequence would
-	// - the difference being that this one is a value the engine understands and
-	// can re-emit, rather than bytes it forwards.
-	bool add_style(surface_id which, std::string_view spec);
+	// The bytes of every argument are COPIED into the surface's arena (the ABI's
+	// copy-in convention, and the only convention that survives a binding whose
+	// strings are garbage-collected).
+	place_result place(surface_id which, std::string_view name, std::string_view style_spec,
+	                   std::string_view type, std::string_view prefix, std::string_view postfix);
 
-	// GROUPS DO NOT NEST IN v1, ACROSS THE ABI. A second open while one is open
-	// is refused rather than silently flattened or silently nested: the verbs are
-	// a linear stream and a caller that lost track of its own nesting should hear
-	// so. Nesting arrives with the template language, whose parser has the
-	// structure to express it and the set-time validation to check it (§6.10).
+	// `place` with only a module and its type - what the runtime console's
+	// assembly verb maps onto. False for a name nobody registered OR a type the
+	// module refused, which is the one bool a console with no message channel can
+	// carry.
+	bool add_module(surface_id which, std::string_view name, std::string_view type);
+
+	// `place` with only bytes: a decoration-only placement.
+	void add_literal(surface_id which, std::string_view text);
+
+	// GROUPS DO NOT NEST IN v1, ACROSS THE ABI. A second open while one is open is
+	// refused rather than silently flattened or silently nested: the verbs are a
+	// linear stream and a caller that lost track of its own nesting should hear
+	// so. Nesting is the template language's, whose parser has the structure to
+	// express it and the set-time validation to check it (§6.10).
 	bool open_group(surface_id which);
 
 	// False when none is open.
@@ -1421,174 +2086,140 @@ public:
 
 	// The template language, parsed ONCE and swapped ATOMICALLY.
 	//
-	// On success the surface holds the elements the template describes and
-	// remembers its source; on failure `error_out` holds one human sentence with
-	// a byte offset and THE SURFACE IS UNTOUCHED - its elements, its slots and its
+	// On success the surface holds the placements the template describes and
+	// remembers its source; on failure `error_out` holds one human sentence with a
+	// byte offset and THE SURFACE IS UNTOUCHED - its steps, its slots and its
 	// remembered text are all exactly what they were, because the parse builds
 	// into its own storage and only a complete parse reaches the surface. That is
 	// the promise `prompt_console::set` documents on the runtime side, and it is
 	// kept here rather than there because only a parser can keep it.
 	//
-	// A FAILED SET CONFIGURED NOTHING, `add_module`'s rule for a name nobody
-	// registered: `configured()` does not move, so a shell whose only prompt verb
-	// was a typo still has `$PS1`.
+	// A FAILED SET CONFIGURED NOTHING: `configured()` does not move, so a shell
+	// whose only prompt verb was a typo still has `$PS1`.
 	bool set_template(surface_id which, std::string_view text, std::string& error_out);
 
 	// The source string the surface was last set from, or empty.
 	//
 	// EMPTY IS AN HONEST ANSWER, NOT A MISSING ONE. `use_default` remembers the
 	// shipped template (`kDefaultLeftTemplate`), and `set_template` remembers what
-	// it was handed - but the assembly verbs cannot: a prompt built out of
-	// `add_module` and `add_literal` calls has no template string, and inventing
-	// one by walking the elements back into a spelling would put the element
-	// vocabulary on the far side of a boundary §6.10 closed. So every one of those
-	// verbs, and `clear`, empties it.
+	// it was handed - but the assembly verbs cannot: a prompt built out of `place`
+	// calls has no template string, and inventing one by walking the placements
+	// back into a spelling would put the element vocabulary on the far side of a
+	// boundary §6.10 closed. So every one of those verbs, and `clear`, empties it.
 	[[nodiscard]] std::string_view template_text(surface_id which) const;
 
 	// Whether anything has configured this engine - false until the first of the
-	// six verbs above has run, from C++ or across the ABI, and true from then on.
+	// verbs above has run, from C++ or across the ABI, and true from then on.
 	//
 	// ONE HALF OF THE PRECEDENCE RULE, and since #157's ruling it is no longer the
-	// whole of it. §6.10 makes `PS1`/`PS2` a transitional stub, rendered as
-	// literal bytes "as it does today", superseded by the native prompt rather
-	// than grown into a POSIX expansion vocabulary; the owner's ruling is that the
+	// whole of it. §6.10 makes `PS1`/`PS2` a transitional stub, rendered as literal
+	// bytes "as it does today", superseded by the native prompt rather than grown
+	// into a POSIX expansion vocabulary; the owner's ruling is that the
 	// supersession has arrived, so the native prompt is what a fresh shell shows
-	// and `$PS1` is the opt-out. What this flag still decides is the case where
-	// the two disagree: a user who set `$PS1` gets the stub UNTIL something
-	// configures the engine, and from that moment the native composer owns both
-	// surfaces for the rest of the session. The rest of the rule - "an untouched
-	// `$PS1` is not a preference" - is a question about the shell's variables and
-	// is asked at the wiring site, which is the only side that can see them. See
+	// and `$PS1` is the opt-out. What this flag still decides is the case where the
+	// two disagree: a user who set `$PS1` gets the stub UNTIL something configures
+	// the engine, and from that moment the native composer owns both surfaces for
+	// the rest of the session. The rest of the rule - "an untouched `$PS1` is not a
+	// preference" - is a question about the shell's variables and is asked at the
+	// wiring site, which is the only side that can see them. See
 	// `session::refresh_prompt` in read.cpp.
 	//
 	// NOT REGAINED. There is no un-configure: `clear` and `use_default` are
 	// themselves configuration, and `use_default` in particular is how a user asks
-	// for the shipped prompt back - which is a native prompt and emphatically not
-	// a request to be handed `$PS1` again.
+	// for the shipped prompt back - which is a native prompt and emphatically not a
+	// request to be handed `$PS1` again.
 	[[nodiscard]] bool configured() const noexcept { return _configured; }
 
 	// --- Rendering ---
 
-	// The new-prompt cause: every element runs, every slot is rewritten, and the
-	// per-render `(module, arg)` memo starts empty.
+	// The new-prompt cause: every item runs, every slot is rewritten, and the
+	// per-render (module, params) memo starts empty.
 	void render_full(const state& facts);
 
-	// The tick cause: only the elements whose deadline has come are re-invoked,
-	// every other slot is spliced unchanged, and the answer is whether the
-	// surface bytes actually moved. False means no terminal write is owed - which
-	// is the point of asking (§6.10: unchanged output produces no write).
+	// The tick cause: only the items whose deadline has come are re-invoked, every
+	// other slot is spliced unchanged, and the answer is whether the surface bytes
+	// actually moved. False means no terminal write is owed - which is the point
+	// of asking (§6.10: unchanged output produces no write).
 	bool render_tick(const state& facts);
 
 	[[nodiscard]] std::string_view output(surface_id which) const;
 
-	// The earliest armed deadline over both surfaces, as an absolute tick. Zero
-	// is NO TIMER AT ALL, not "now": an empty deadline list means a static prompt
+	// The earliest armed deadline over both surfaces, as an absolute tick. Zero is
+	// NO TIMER AT ALL, not "now": an empty deadline list means a static prompt
 	// causes zero idle wakeups.
 	[[nodiscard]] std::uint64_t next_wake() const;
 
 private:
-	// One placement. A tree rather than a flat list because a group owns its
-	// children, and `std::unique_ptr` rather than a vector of values because
-	// `binding::arg` is a view into `arg` on the same node - a vector that
-	// reallocated would dangle it.
-	struct node {
-		// Null IFF the ENGINE drives this node's children rather than the node
-		// answering for itself - a runtime group, and the styled span a
-		// `{literal:blue::hi}` desugars to. Everything else - a built-in module,
-		// an ABI module, a runtime literal or style, and every element copied out
-		// of the default table, `seg` included - is opaque and answers for itself.
-		//
-		// `kind` is what tells the three apart, and it answers "what is this to the
-		// group AROUND it", never "how is it built":
-		//   * a null-`fn` GROUP is a user's `(…)`: it runs the two-phase vote
-		//     inside, and like every group it does not vote in its own parent;
-		//   * a null-`fn` MODULE is a desugared placement, `{git:magenta}`: the
-		//     same vote inside, and it DOES vote in its parent, because it is one
-		//     placement and putting a colour on it must not change that;
-		//   * a null-`fn` DECORATION is a span, `{literal:blue::hi}`: no vote in
-		//     either direction, because it is grammar.
-		element_fn fn = nullptr;
-		const void* data = nullptr;
-		element_kind kind = element_kind::module;
+	// No group open on the verb stream. v1 refuses a second open, so one index is
+	// a stack of one.
+	static constexpr std::size_t kNoGroup = static_cast<std::size_t>(-1);
 
-		// Whether this child is a style decoration, and therefore whether the
-		// group owes a reset at its end. Set by `add_style` and by the template
-		// parser's style slot - the verb this flag waited for through v1, which
-		// had the two-phase rule but no string grammar to give a style an
-		// argument.
-		bool styles = false;
-
-		std::string arg;   // engine-owned bytes; `bound.arg` views these
-		binding bound;
-
-		// A style decoration's value, and `data` points HERE rather than at
-		// `bound` for those nodes. A node is heap-owned and never moves, so the
-		// pointer is stable for the configuration's whole life - the same
-		// reasoning `bound.arg` viewing `arg` rests on.
-		style pen{};
-
-		// Rendering scratch, per node, kept warm. On the node rather than in a
-		// pool because a group's phase one needs one per module child at once,
-		// and a node's lifetime is exactly the configuration's.
-		sink scratch;
-		element_status answered = element_status::omitted;
-
-		std::vector<std::unique_ptr<node>> children;
-	};
-
-	// What a top-level element last produced. `wake_at` is ABSOLUTE - the tick
-	// the element asked to be woken at, zero for no deadline - because a relative
-	// request is only meaningful at the instant it was made.
+	// What a top-level item last produced. `wake_at` is ABSOLUTE - the tick the
+	// item asked to be woken at, zero for no deadline - because a relative request
+	// is only meaningful at the instant it was made.
 	struct slot {
 		std::string bytes;
 		element_status status = element_status::omitted;
 		std::uint64_t wake_at = 0;
 	};
 
+	// One configured prompt.
+	//
+	// THE PROGRAM AND ITS ARENA TRAVEL TOGETHER, and the arena is the reason a
+	// reconfiguration is a swap of two containers rather than a walk of a tree
+	// freeing nodes. Nothing in `program` points at anything; `arena` is the only
+	// storage, and `view()` is what turns the pair into something the composer can
+	// walk.
 	struct surface {
-		std::vector<std::unique_ptr<node>> nodes;
-		// May be LONGER than `nodes`: entries past the end are stale and never
-		// read, and keeping them is what stops a reconfiguration from giving back
-		// the strings' capacity.
+		std::vector<step> program;
+		std::string arena;
+
+		// One per step, kept warm across renders. The capacity is what makes a warm
+		// render allocate nothing.
+		std::vector<step_scratch> scratch;
+
+		// One per TOP-LEVEL item. `slots` may be LONGER than `tops`: entries past
+		// the end are stale and never read, and keeping them is what stops a
+		// reconfiguration from giving back the strings' capacity.
 		std::vector<slot> slots;
+		std::vector<std::size_t> tops;   // step index of each top-level item
+
 		std::string bytes;
-		node* open = nullptr;
+
+		// The group the verb stream has open, as a step index.
+		std::size_t open = kNoGroup;
 
 		// What `template_text` answers: the source `set_template` was handed, or
 		// the shipped default's own spelling, or empty. See `template_text`.
 		std::string text;
+
+		[[nodiscard]] program_view view() const noexcept {
+			return program_view{std::span<const step>{program}, arena.data()};
+		}
 	};
 
-	// The BUILDING policy for `scan_template`, defined in prompt.cpp. A nested
-	// class because it makes `node` - and it is the only thing outside the engine
-	// that does, which is how the "one shape, built through one set of paths"
-	// rule stays checkable by looking at one file.
+	// The BUILDING policy for `scan_template`, defined in prompt.cpp. It builds
+	// into its own `std::vector` and `std::string` and hands both over only at the
+	// end, which is the whole of the atomicity promise: there is no partial
+	// application to undo because nothing was applied.
 	struct builder;
 
-	struct module_entry {
-		element_fn fn = nullptr;
-		void* userdata = nullptr;
-	};
+	// The C function, its optional validator and its registration context, for a
+	// module that came in across the ABI. A `module` like any other - it parses
+	// its type slot through the validator and renders through the trampoline - so
+	// the composer has one kind of thing in it and not two.
+	struct abi_module;
 
-	// The C function and its registration context, for a module that came in
-	// across the ABI. Owned by name so a re-registration replaces it rather than
-	// stacking another one up.
-	struct abi_module {
-		lesh_prompt_module_fn fn = nullptr;
-		void* userdata = nullptr;
-	};
-
-	// One entry of the per-render `(module, arg)` memo (§6.10: `{env:USER}` and
-	// `{env:HOST}` are two elements computed once each, and one module placed
-	// twice with the same argument is computed once).
+	// One entry of the per-render (module, params) memo (§6.10: `{env::USER}` and
+	// `{env::HOST}` are two placements computed once each, and one module placed
+	// twice with the same params is computed once).
 	//
 	// A LINEAR VECTOR, and a used-count instead of `clear()`: a prompt has a
 	// handful of modules, so a scan beats a hash, and reusing the entries keeps
 	// their strings' capacity across renders.
 	struct memo_entry {
-		element_fn fn = nullptr;
-		void* userdata = nullptr;
-		std::string arg;
+		const module* which = nullptr;
+		params_blob params{};
 		std::string bytes;
 		element_status status = element_status::omitted;
 		std::uint64_t wake = 0;
@@ -1597,34 +2228,33 @@ private:
 	[[nodiscard]] surface& at(surface_id which);
 	[[nodiscard]] const surface& at(surface_id which) const;
 
-	// The one bridge from the C ABI into the composer: it builds the per-call
-	// context, calls the registered function, and kills the handle on the way
-	// out. A member so that `abi_module` can stay private - nothing outside this
-	// class has any business knowing the pair exists.
-	static int abi_trampoline(const state& facts, sink& out, const void* data);
+	// The memoizing core runner - the engine's half of the composer's one template
+	// parameter. A struct rather than a lambda so both render paths name the same
+	// type.
+	struct memoizing_core {
+		engine* owner = nullptr;
+		element_status operator()(const placement& one, const state& facts, sink& into);
+	};
 
-	node& place(surface& into, std::unique_ptr<node> made);
-	[[nodiscard]] sink& scratch_at(std::size_t depth);
+	void adopt(surface& target, std::vector<step>&& program, std::string&& arena);
+	void refit(surface& target);
+	[[nodiscard]] bytes intern(surface& target, std::string_view text);
+	[[nodiscard]] step& append_step(surface& target);
+	void touched(surface& target);
 
-	element_status invoke(node& one, const state& facts, sink& out, std::size_t depth);
-	element_status render_group(node& group, const state& facts, sink& out, std::size_t depth);
 	void render_surface(surface& target, const state& facts);
 	void rebuild(surface& target);
 
-	std::map<std::string, module_entry, std::less<>> _modules;
+	std::map<std::string, const module*, std::less<>> _modules;
 	std::map<std::string, std::unique_ptr<abi_module>, std::less<>> _abi_modules;
 	std::array<surface, static_cast<std::size_t>(surface_id::count_)> _surfaces;
 
 	std::vector<memo_entry> _memo;
 	std::size_t _memo_used = 0;
 
-	// Rewound, never freed. Depth 0 is a top-level element's, depth 1 a group
-	// child's; v1 cannot go deeper, and the vector grows if a later nesting rule
-	// makes it possible.
-	std::vector<sink> _scratch;
 	sink _top;
 
-	// See `configured()`. The constructor's own seeding of the default table
+	// See `configured()`. The constructor's own seeding of the default
 	// deliberately does not set it - that is the engine arriving with something to
 	// render, not a user asking for it.
 	bool _configured = false;
@@ -1670,16 +2300,16 @@ static_assert(timer_interval_ms(100, 6100) == 10);
 // ---------------------------------------------------------------------------
 // Compile-time selftests
 //
-// The discipline `lesh::args`'s constexpr scan set: the properties that must
-// hold are asserted by the compiler, against synthetic facts, on the REAL
-// default table rather than on a copy of it. A failure here is a build failure,
-// not a red test - which is what one wants for "the composer omits correctly",
-// because a composer that has stopped omitting is not a behaviour worth shipping
-// far enough to run.
+// The discipline `lesh::args`'s constexpr scan set: the properties that must hold
+// are asserted by the compiler, against synthetic facts, on the REAL compiled
+// default rather than on a copy of it. A failure here is a build failure, not a
+// red test - which is what one wants for "the composer omits correctly", because
+// a composer that has stopped omitting is not a behaviour worth shipping far
+// enough to run.
 //
 // The runtime tests cover what a constant expression cannot see: invocation
-// COUNTS (the memo, the tick wheel's recalculation-by-cause), and everything
-// that goes through the ABI.
+// COUNTS (the memo, the tick wheel's recalculation-by-cause), allocation counts,
+// and everything that goes through the ABI.
 // ---------------------------------------------------------------------------
 
 namespace selftest {
@@ -1695,20 +2325,30 @@ struct rendered {
 	}
 };
 
-template <std::size_t N = 128>
-[[nodiscard]] constexpr rendered<N> run(std::span<const element> elements, const state& facts) {
+template <std::size_t N = 160, std::size_t Steps, std::size_t Bytes>
+[[nodiscard]] constexpr rendered<N> run(const compiled_template<Steps, Bytes>& program,
+                                        const state& facts) {
+	std::array<step_scratch, (Steps == 0 ? 1 : Steps)> scratch{};
 	sink out;
-	render_table(elements, facts, out);
+	direct_core plainly;
+	render_program(program.view(), std::span<step_scratch>{scratch}, facts, out, plainly);
+
 	rendered<N> copied;
 	for (const char one : out.bytes())
 		copied.bytes[copied.length++] = one;
 	return copied;
 }
 
-template <class... Es, std::size_t N = 128>
-[[nodiscard]] constexpr rendered<N> run_of(const state& facts) {
-	const std::array<element, sizeof...(Es)> made = table<Es...>();
-	return run<N>(std::span<const element>{made}, facts);
+// The wake the whole program asked for, which is the other half of what a render
+// answers and the half a byte comparison cannot see.
+template <std::size_t Steps, std::size_t Bytes>
+[[nodiscard]] constexpr std::uint64_t wake_of(const compiled_template<Steps, Bytes>& program,
+                                              const state& facts) {
+	std::array<step_scratch, (Steps == 0 ? 1 : Steps)> scratch{};
+	sink out;
+	direct_core plainly;
+	render_program(program.view(), std::span<step_scratch>{scratch}, facts, out, plainly);
+	return out.wake();
 }
 
 // The facts of a session in `~/src`, in no repo, after a successful command.
@@ -1721,68 +2361,113 @@ template <class... Es, std::size_t N = 128>
 	return facts;
 }
 
-// 1. Omission propagates through the group: the style and the literal vanish
-//    with the module, and what is left is not "almost nothing" but nothing.
-static_assert(run_of<seg<style_of<kMagenta>, literal<" on ">, git_t>>(quiet()).view().empty());
-
-// 5. The same assertion read the other way, which is how a constant expression
-//    can see that phase two never ran: no style byte and no literal byte is
-//    present anywhere in the output, so neither decoration executed.
-static_assert(run_of<seg<style_of<kMagenta>, literal<" on ">, git_t>>(quiet()).length == 0);
-
-// 2. The whole default table: the contracted path and the arrow, and nothing
-//    else. `> ` is unconditional because it is top-level.
-static_assert(run(std::span<const element>{kDefaultLeft}, quiet()).view() == "~/src> ");
-
 [[nodiscard]] constexpr state failed() noexcept {
 	state facts = quiet();
 	facts.status = 2;
 	return facts;
 }
 
-// 2b. THE SAME BYTES AFTER A FAILURE, and that identity is the assertion. Since
-//     #157's ruling the default carries no `status` seg, so a non-zero `$?`
-//     changes nothing about what the default prompt paints; the proof that an
-//     affix vanishes with the module it belongs to has not moved out of the
-//     suite, only out of this table - see 1, 5 and 2c, which run the segs
-//     standalone and are what the composer is actually held to.
-static_assert(run(std::span<const element>{kDefaultLeft}, failed()).view() == "~/src> ");
+// 1. THE WHOLE SHIPPED DEFAULT, compiled from the string it prints for itself:
+//    the contracted path and the arrow, and nothing else. `> ` is unconditional
+//    because it is top-level.
+static_assert(run(kDefaultLeft, quiet()).view() == "~/src> ");
+static_assert(run(kDefaultContinuation, quiet()).view() == "> ");
 
-// 2c. The `status` seg standalone, both ways round: it brings its colour and its
-//     brackets with it when there is something to say, and takes both away when
-//     there is not. This is the seg the default table used to carry.
-static_assert(
-	run_of<seg<style_of<kRed>, literal<" [">, status_t, literal<"]">>>(quiet()).view().empty());
-static_assert(run_of<seg<style_of<kRed>, literal<" [">, status_t, literal<"]">>>(failed()).view()
-              == "\x1b[31m [2]\x1b[0m");
+// 1b. THE SAME BYTES AFTER A FAILURE, and that identity is the assertion. Since
+//     #157's ruling the default carries no `status` placement, so a non-zero `$?`
+//     changes nothing about what it paints; the proof that an affix vanishes with
+//     the module it belongs to is 3 and 4 below.
+static_assert(run(kDefaultLeft, failed()).view() == "~/src> ");
 
-static_assert(run(std::span<const element>{kDefaultContinuation}, quiet()).view() == "> ");
+// 2. THE OWNER'S EXAMPLE, which is the one the ticket is written around: a short
+//    cyan path, and a magenta branch inside a group that vanishes with it.
+//    `fs_allowed` is false here, so `git` says nothing and the group goes.
+inline constexpr auto kExample = compile<"{path:cyan:s}( on {git:magenta})">();
+static_assert(run(kExample, quiet()).view() == "\x1b[36msrc\x1b[0m");
 
-// 3a. `status` omits on zero and speaks otherwise - the module the whole
-//     omission machinery exists for.
-static_assert(run_of<status_t>(quiet()).view().empty());
-static_assert(run_of<status_t>(failed()).view() == "2");
+// 3. OMISSION PROPAGATES THROUGH THE GROUP: the literal and the style vanish with
+//    the module, and what is left is not "almost nothing" but nothing. Read the
+//    other way, this is how a constant expression sees that phase two never ran -
+//    no style byte and no literal byte is present anywhere.
+inline constexpr auto kBranch = compile<"({literal:magenta:: on }{git:magenta})">();
+static_assert(run(kBranch, quiet()).view().empty());
+static_assert(run(kBranch, quiet()).length == 0);
 
-// The home contraction respects components: a sibling directory whose name
-// merely starts with the home directory's is not under it.
+// 4. THE `status` PLACEMENT, both ways round: it brings its colour and its
+//    brackets with it when there is something to say, and takes both away when
+//    there is not. One placement, five parts, one vote.
+inline constexpr auto kStatus = compile<"{status:red:: [:]}">();
+static_assert(run(kStatus, quiet()).view().empty());
+static_assert(run(kStatus, failed()).view() == "\x1b[31m [2]\x1b[0m");
+
+// 4b. AND A COLOUR ON A PLACEMENT DOES NOT CHANGE HOW IT VOTES, which is the
+//     regression this whole model change exists to make unsayable. The two
+//     spellings differ by one word and must differ by one SGR pair.
+inline constexpr auto kVotePlain = compile<"({literal:::[}{status}{literal:::]})">();
+inline constexpr auto kVoteColoured = compile<"({literal:::[}{status:red}{literal:::]})">();
+static_assert(run(kVotePlain, failed()).view() == "[2]");
+static_assert(run(kVoteColoured, failed()).view() == "[\x1b[31m2\x1b[0m]");
+static_assert(run(kVotePlain, quiet()).view().empty());
+static_assert(run(kVoteColoured, quiet()).view().empty());
+
+// 5. `status` omits on zero and speaks otherwise - the module the whole omission
+//    machinery exists for - and its symbol form says a mark instead of a number.
+static_assert(run(compile<"{status}">(), quiet()).view().empty());
+static_assert(run(compile<"{status}">(), failed()).view() == "2");
+static_assert(run(compile<"{status::x}">(), quiet()).view().empty());
+static_assert(run(compile<"{status::x}">(), failed()).view() == "x");
+
+// 6. THE FIVE `path` VARIANTS, on one set of facts, so the differences are the
+//    assertion rather than five separate claims.
+[[nodiscard]] constexpr state deep() noexcept {
+	state facts = quiet();
+	facts.pwd = "/home/u/private/github/lesh";
+	return facts;
+}
+static_assert(run(compile<"{path}">(), deep()).view() == "~/private/github/lesh");
+static_assert(run(compile<"{path::relative}">(), deep()).view() == "~/private/github/lesh");
+static_assert(run(compile<"{path::r}">(), deep()).view() == "~/private/github/lesh");
+static_assert(run(compile<"{path::absolute}">(), deep()).view() == "/home/u/private/github/lesh");
+static_assert(run(compile<"{path::a}">(), deep()).view() == "/home/u/private/github/lesh");
+static_assert(run(compile<"{path::f}">(), deep()).view() == "/home/u/private/github/lesh");
+static_assert(run(compile<"{path::short}">(), deep()).view() == "lesh");
+static_assert(run(compile<"{path::s}">(), deep()).view() == "lesh");
+static_assert(run(compile<"{path::initials}">(), deep()).view() == "~/p/g/lesh");
+static_assert(run(compile<"{path::i}">(), deep()).view() == "~/p/g/lesh");
+static_assert(run(compile<"{path::unvowel}">(), deep()).view() == "~/prvt/gthb/lesh");
+static_assert(run(compile<"{path::u}">(), deep()).view() == "~/prvt/gthb/lesh");
+
+// The home contraction respects components: a sibling directory whose name merely
+// starts with the home directory's is not under it.
 [[nodiscard]] constexpr state elsewhere() noexcept {
 	state facts = quiet();
 	facts.pwd = "/home/username/x";
 	return facts;
 }
-static_assert(run_of<path_t>(elsewhere()).view() == "/home/username/x");
-static_assert(run_of<path_t>(quiet()).view() == "~/src");
+static_assert(run(compile<"{path}">(), elsewhere()).view() == "/home/username/x");
+static_assert(run(compile<"{path}">(), quiet()).view() == "~/src");
 
 [[nodiscard]] constexpr state at_home() noexcept {
 	state facts = quiet();
 	facts.pwd = "/home/u";
 	return facts;
 }
-static_assert(run_of<path_t>(at_home()).view() == "~");
+// AT HOME, THE SHORT FORM IS `~` AND NOT THE NAME OF THE DIRECTORY. Contracting
+// first and then taking the last component is what makes that fall out rather
+// than needing a rule of its own.
+static_assert(run(compile<"{path::s}">(), at_home()).view() == "~");
+static_assert(run(compile<"{path::i}">(), at_home()).view() == "~");
+static_assert(run(compile<"{path::u}">(), at_home()).view() == "~");
 
-// 3b. `either` picks the first ready alternative and discards the other whole.
-//     A fake variable table, constexpr so the function pointer is callable
-//     inside a constant expression.
+// A component that is all vowels keeps its first byte rather than vanishing.
+[[nodiscard]] constexpr state vowelly() noexcept {
+	state facts = quiet();
+	facts.pwd = "/home/u/aeiou/x";
+	return facts;
+}
+static_assert(run(compile<"{path::u}">(), vowelly()).view() == "~/a/x");
+
+// 7. `env` reads the variable its type slot names, and an empty value omits.
 constexpr bool fake_getvar(const void*, std::string_view name, std::string_view& out) {
 	if (name == "USER") {
 		out = "u";
@@ -1801,42 +2486,29 @@ constexpr bool fake_getvar(const void*, std::string_view name, std::string_view&
 	return facts;
 }
 
-static_assert(run_of<env<"USER">>(with_variables()).view() == "u");
-static_assert(run_of<env<"EMPTY">>(with_variables()).view().empty());
-static_assert(run_of<env<"NOPE">>(with_variables()).view().empty());
-static_assert(run_of<env<"USER">>(quiet()).view().empty());
+static_assert(run(compile<"{env::USER}">(), with_variables()).view() == "u");
+static_assert(run(compile<"{env::EMPTY}">(), with_variables()).view().empty());
+static_assert(run(compile<"{env::NOPE}">(), with_variables()).view().empty());
+static_assert(run(compile<"{env::USER}">(), quiet()).view().empty());
 
-static_assert(run_of<either<env<"NOPE">, env<"USER">>>(with_variables()).view() == "u");
-static_assert(run_of<either<env<"USER">, env<"NOPE">>>(with_variables()).view() == "u");
-static_assert(run_of<either<git_t, literal<"(no repo)">>>(quiet()).view() == "(no repo)");
-
-// 3c. `when` gates on the facts and runs nothing at all when it is closed.
-constexpr bool has_jobs(const state& facts) { return facts.jobs != 0; }
-
-[[nodiscard]] constexpr state busy() noexcept {
-	state facts = quiet();
-	facts.jobs = 3;
-	return facts;
-}
-
-static_assert(run_of<when<has_jobs, literal<"jobs:">, jobs_t>>(quiet()).view().empty());
-static_assert(run_of<when<has_jobs, literal<"jobs:">, jobs_t>>(busy()).view() == "jobs:3");
-
-// `duration`'s floor and its three formats.
+// 8. `duration`'s floor and its three formats.
 [[nodiscard]] constexpr state took(std::uint64_t milliseconds) noexcept {
 	state facts = quiet();
 	facts.duration_ms = milliseconds;
 	return facts;
 }
-static_assert(run_of<duration_t>(took(1999)).view().empty());
-static_assert(run_of<duration_t>(took(2000)).view() == "2s");
-static_assert(run_of<duration_t>(took(59'999)).view() == "59s");
-static_assert(run_of<duration_t>(took(60'000)).view() == "1m0s");
-static_assert(run_of<duration_t>(took(3'599'000)).view() == "59m59s");
-static_assert(run_of<duration_t>(took(3'600'000)).view() == "1h0m0s");
-static_assert(run_of<duration_t>(took(7'384'000)).view() == "2h3m4s");
+inline constexpr auto kDuration = compile<"{duration}">();
+static_assert(run(kDuration, took(1999)).view().empty());
+static_assert(run(kDuration, took(2000)).view() == "2s");
+static_assert(run(kDuration, took(59'999)).view() == "59s");
+static_assert(run(kDuration, took(60'000)).view() == "1m0s");
+static_assert(run(kDuration, took(3'599'000)).view() == "59m59s");
+static_assert(run(kDuration, took(3'600'000)).view() == "1h0m0s");
+static_assert(run(kDuration, took(7'384'000)).view() == "2h3m4s");
 
-// `time` is zero-padded and always ready.
+// 9. `time`'s four forms, and the cadence each asks for. The 24-hour minute form
+//    is the default and wakes once a MINUTE; only the forms that show seconds
+//    wake once a second.
 [[nodiscard]] constexpr state clock_at(unsigned h, unsigned m, unsigned s) noexcept {
 	state facts = quiet();
 	facts.hours = static_cast<std::uint8_t>(h);
@@ -1844,11 +2516,21 @@ static_assert(run_of<duration_t>(took(7'384'000)).view() == "2h3m4s");
 	facts.seconds = static_cast<std::uint8_t>(s);
 	return facts;
 }
-static_assert(run_of<time_t_>(clock_at(9, 5, 3)).view() == "09:05:03");
+static_assert(run(compile<"{time}">(), clock_at(9, 5, 3)).view() == "09:05");
+static_assert(run(compile<"{time::24h}">(), clock_at(9, 5, 3)).view() == "09:05");
+static_assert(run(compile<"{time::24hs}">(), clock_at(9, 5, 3)).view() == "09:05:03");
+static_assert(run(compile<"{time::12h}">(), clock_at(13, 5, 3)).view() == "01:05");
+static_assert(run(compile<"{time::12hs}">(), clock_at(0, 5, 3)).view() == "12:05:03");
+static_assert(run(compile<"{time::12h}">(), clock_at(12, 5, 3)).view() == "12:05");
+// Three seconds into a minute, thirty-seven ticks into a second: the seconds form
+// wants the next second, the minute form the next minute, both derived and
+// neither stored.
+static_assert(wake_of(compile<"{time::24hs}">(), clock_at(9, 5, 3)) == 100);
+static_assert(wake_of(compile<"{time::24h}">(), clock_at(9, 5, 3)) == 56 * 100 + 100);
 
-// 4. The SGR round trip. `emit_sgr` is the inverse of `sgr.h`'s `apply_sgr`, and
-//    these are what say so - each style emitted from reset semantics and read
-//    back into the style it was.
+// 10. THE SGR ROUND TRIP. `emit_sgr` is the inverse of `sgr.h`'s `apply_sgr`, and
+//     these are what say so - each style emitted from reset semantics and read
+//     back into the style it was.
 constexpr bool round_trips(const style& pen) {
 	std::string bytes;
 	emit_sgr(pen, bytes);
@@ -1875,14 +2557,39 @@ constexpr bool emits(const style& pen, std::string_view expected) {
 	return bytes == expected;
 }
 
-// 6. THE TEMPLATE GRAMMAR, AT THE OTHER OF ITS TWO EVALUATION TIMES. The same
-//    `scan_template` the engine builds with, walked with the do-nothing policy:
-//    what these prove is the grammar itself - the omission table, the affix
-//    slots, the escapes and every refusal - and that it is one walk, because
-//    there is only one to fail.
+static_assert(emits(style{}, "\x1b[0m"));
+static_assert(emits(kCyan, "\x1b[36m"));
+static_assert(emits(style{.fg = color::of_index(12)}, "\x1b[94m"));
+static_assert(emits(style{.fg = color::of_index(200)}, "\x1b[38;5;200m"));
+static_assert(emits(style{.bg = color::of_index(9)}, "\x1b[101m"));
+static_assert(emits(style{.attrs = attribute::undercurl}, "\x1b[4:3m"));
+
+// 11. THE PARAMS BLOB, which the memo's correctness rests on: the same module
+//     with different params is a different question, and the round trip through
+//     the bytes is lossless.
+constexpr params_blob params_for(const module& which, std::string_view type) {
+	params_blob made;
+	parse_error why;
+	if (!which.parse(type, made, why))
+		throw "the selftest handed a module a type it refuses";
+	return made;
+}
+static_assert(params_for(kModulePath, "s") == params_for(kModulePath, "short"));
+static_assert(!(params_for(kModulePath, "s") == params_for(kModulePath, "i")));
+static_assert(params_for(kModuleEnv, "USER").as<env_params>().name.view() == "USER");
+static_assert(!(params_for(kModuleEnv, "USER") == params_for(kModuleEnv, "HOST")));
+static_assert(params_for(kModuleGit, "").size == 0);
+
+// 12. THE TEMPLATE GRAMMAR, AT THE OTHER OF ITS TWO EVALUATION TIMES. The same
+//     `scan_template` the engine builds with, walked with the do-nothing policy:
+//     what these prove is the grammar itself - the omission table, the affix
+//     slots, the escapes and every refusal - and that it is one walk, because
+//     there is only one to fail.
 //
-//    THE SHIPPED DEFAULTS PARSE, and that is the assertion that would catch a
-//    grammar change breaking the string `use_default` hands back.
+//     THE SHIPPED DEFAULTS PARSE, and that is the assertion that would catch a
+//     grammar change breaking the string `use_default` hands back. (That they
+//     COMPILE is proved harder, one screen up: `kDefaultLeft` is that string put
+//     through `consteval`, so a grammar change that broke it would not build.)
 static_assert(validate_template(kDefaultLeftTemplate).ok);
 static_assert(validate_template(kDefaultContinuationTemplate).ok);
 static_assert(validate_template("{path}> ").ok);
@@ -1891,7 +2598,7 @@ static_assert(validate_template("").ok);
 // prmt's omission table, row by row: every legal spelling of an empty slot.
 static_assert(validate_template("{git}").ok);
 static_assert(validate_template("{git:magenta}").ok);
-static_assert(validate_template("{git:}").ok);            // trailing colon
+static_assert(validate_template("{git:}").ok);                // trailing colon
 static_assert(validate_template("{git:magenta::on :}").ok);   // default type, prefix only
 static_assert(validate_template("{git::::!}").ok);            // postfix only
 static_assert(validate_template("{status:red::[:]}").ok);     // both affixes
@@ -1931,12 +2638,33 @@ static_assert(validate_template("(a)(b").error_at == 3);
 static_assert(validate_template("x)").error == template_error::unbalanced_close);
 static_assert(validate_template("x)").error_at == 1);
 
-static_assert(validate_template("{env}").error == template_error::needs_argument);
+// THE TYPE SLOT'S REFUSALS ARE THE MODULES' OWN, and each one carries the words
+// that module chose. `env` has no default variable to mean, `git` has no type at
+// all, and `path` has five variants of which `medum` is not one.
+static_assert(validate_template("{env}").error == template_error::bad_type);
 static_assert(validate_template("{env}").error_at == 1);
-static_assert(validate_template("{env:cyan}").error == template_error::needs_argument);
+static_assert(validate_template("{env}").subject == "env");
+static_assert(validate_template("{env}").detail == " needs a variable name");
+static_assert(validate_template("{env:cyan}").error == template_error::bad_type);
 
-static_assert(validate_template("{path::short}").error == template_error::takes_no_argument);
-static_assert(validate_template("{path::short}").error_at == 7);
+static_assert(validate_template("{git::x}").error == template_error::bad_type);
+static_assert(validate_template("{git::x}").error_at == 6);
+static_assert(validate_template("{git::x}").detail == " takes no argument");
+static_assert(validate_template("{git::x}").what.empty());
+
+static_assert(validate_template("{path::medum}").error == template_error::bad_type);
+static_assert(validate_template("{path::medum}").error_at == 7);
+static_assert(validate_template("{path::medum}").subject == "path");
+static_assert(validate_template("{path::medum}").detail == ": unknown variant");
+static_assert(validate_template("{path::medum}").what == "medum");
+// AND THE FIVE THAT ARE. What used to be `path takes no argument` is now a
+// grammar `path` owns, which is the model change visible from the outside.
+static_assert(validate_template("{path::short}").ok);
+static_assert(validate_template("{path:cyan:s}").ok);
+static_assert(validate_template("{time::24hs}").ok);
+static_assert(validate_template("{time::13h}").error == template_error::bad_type);
+// `status` has no vocabulary to fall outside of: the slot IS the symbol.
+static_assert(validate_template("{status::anything}").ok);
 
 static_assert(validate_template("{path:blod}").error == template_error::bad_style);
 static_assert(validate_template("{path:blod}").what == "blod");
@@ -1956,8 +2684,15 @@ static_assert(validate_template("a\\qb").error_at == 1);
 static_assert(validate_template("a\\").error == template_error::bad_escape);
 static_assert(validate_template("{env::a\\qb}").error == template_error::bad_escape);
 
-// The unescape, which is the other half of the escape rule: the flag is what
-// says whether the loop runs at all, and the bytes are the same either way.
+// A BAD DEFAULT IS A BUILD FAILURE, and there is no assertion for it because the
+// assertion would BE the failure. `compile<"{gti}">()` throws out of a `consteval`
+// function, which is ill-formed at the point of the call - so a shipped default
+// that stopped parsing, or a `path` variant renamed out from under one, stops the
+// build here rather than blanking somebody's prompt. Try it by hand if you doubt
+// it; it cannot be left in the file.
+
+// The unescape, which is the other half of the escape rule: the flag is what says
+// whether the loop runs at all, and the bytes are the same either way.
 constexpr bool unescapes(std::string_view raw, bool escaped, std::string_view expected) {
 	std::string out;
 	unescape_into(template_slice{raw, 0, escaped}, out);
@@ -1967,13 +2702,6 @@ static_assert(unescapes("plain", false, "plain"));
 static_assert(unescapes("a\\:b", true, "a:b"));
 static_assert(unescapes("\\{\\}\\(\\)", true, "{}()"));
 static_assert(unescapes("a\\nb\\tc\\\\d", true, "a\nb\tc\\d"));
-
-static_assert(emits(style{}, "\x1b[0m"));
-static_assert(emits(kCyan, "\x1b[36m"));
-static_assert(emits(style{.fg = color::of_index(12)}, "\x1b[94m"));
-static_assert(emits(style{.fg = color::of_index(200)}, "\x1b[38;5;200m"));
-static_assert(emits(style{.bg = color::of_index(9)}, "\x1b[101m"));
-static_assert(emits(style{.attrs = attribute::undercurl}, "\x1b[4:3m"));
 
 } // namespace selftest
 
