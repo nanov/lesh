@@ -425,13 +425,13 @@ TEST(LeshperHighlight, AStaleHighlightHasNowhereToBeApplied) {
 
 	s.buffer.replace(s.buffer.end_position(), s.buffer.end_position(), std::string("!"));
 	s.gen.bump();
-	EXPECT_FALSE(fixture.loop.apply(s, std::move(batches[0])));
-	EXPECT_TRUE(fixture.loop.applied().empty());
+	EXPECT_FALSE(apply_batch(s, batches[0]));
+	EXPECT_TRUE(s.marks.layers().empty());
 
 	batches = fixture.loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 	ASSERT_EQ(batches.size(), 1u);
-	EXPECT_TRUE(fixture.loop.apply(s, std::move(batches[0])));
-	EXPECT_EQ(fixture.loop.applied().size(), 1u);
+	EXPECT_TRUE(apply_batch(s, batches[0]));
+	EXPECT_EQ(s.marks.layers().size(), 1u);
 }
 
 TEST(LeshperHighlight, TheComputePathTakesNothingFromTheHeap) {

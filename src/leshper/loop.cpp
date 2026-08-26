@@ -740,10 +740,11 @@ void event_loop::fire_timers(input_instant now, turn_result& result) {
 }
 
 void event_loop::take_batch(reactor_batch& answer) {
-	// THE DROP RULE, and this is the only place it is decided (N-4, ADR-0008).
-	// A batch computed against a generation the editor has moved past is not
-	// rejected so much as it has nowhere to go: nothing else applies batches.
-	if (!(answer.computed_against == _state.gen)) {
+	// THE DROP RULE lives in `apply_batch` (N-4, ADR-0008), which is the one
+	// applier both this and the harness path go through (#144). A batch computed
+	// against a generation the editor has moved past is not rejected so much as
+	// it has nowhere to go: nothing else applies batches.
+	if (!apply_batch(_state, answer)) {
 		++_dropped;
 		LESH_LOG(log::level::debug, log::category::reactor,
 		         "dropped %s: gen=%llu editor=%llu", answer.reactor.c_str(),
@@ -752,24 +753,19 @@ void event_loop::take_batch(reactor_batch& answer) {
 		return;
 	}
 
-	// AND THIS IS WHERE IT LANDS (#141). The batch's spans and virtual text go
-	// into the editor's own `marks`, which is what `lay_out` reads - so the trail
-	// from a reactor's emit to a coloured cell ends here rather than in a vector
-	// beside the loop. #129 wrote that this is where the application would go
-	// when `state::decorations` gained a type, and this is that.
+	// AND IT HAS LANDED (#141, #144). Both halves of the batch went into the
+	// editor's own state: the spans and virtual text into `marks`, which is what
+	// `lay_out` reads, and the proposals into `proposals`, which is what
+	// `lesh_proposal_read` walks. So the trail from a reactor's emit runs to a
+	// coloured cell AND to what an accepting action puts in the buffer, and both
+	// end in the same object.
 	//
-	// The emitting reactor IS the decoration namespace (ADR-0008): a new batch
-	// replaces that reactor's previous one and touches nobody else's. `apply`
-	// SWAPS rather than copying, because the batch we are handed is pooled
-	// storage (#126's message pool, or the shell channel's recycler) and moving
-	// out of it would hand the pool back an empty vector with no capacity,
-	// defeating the pooling on the very path it was built for.
-	//
-	// THE PROPOSALS DO NOT COME WITH IT, and that is not an oversight. A
-	// proposal is what an action would ACCEPT (#133), not something anchored to
-	// a buffer position, and `lesh_proposal_read` reads it from the applied
-	// batches the dispatching harness holds. This is the decoration store.
-	_state.marks.apply(answer.reactor, answer.spans, answer.texts);
+	// #141 left the second half out, on the reading that proposals belong to the
+	// dispatching harness rather than to the decoration store. The first half of
+	// that is right - a proposal is what an action would ACCEPT, not something
+	// anchored to a buffer position - and the second half was the defect #144
+	// fixed: the harness the loop dispatches through was not the harness that
+	// held them, so the shell painted a suggestion no action could read.
 	++_applied;
 	_needs_render = true;
 }
@@ -980,7 +976,9 @@ void event_loop::apply_outcome(const action_result& what, turn_result& result) {
 				write_all(_fds.output, "^C\r\n");
 			apply_edit(_state, position{}, _state.buffer.end_position(), "");
 			_state.undo.break_coalescing();
-			_state.marks.clear();   // the same rule accept follows
+			// The same rule accept follows, on both halves of what was applied.
+			_state.marks.clear();
+			_state.proposals.clear();
 			_have_previous = false;
 			_needs_render = true;
 			finish_cancelled_line();
@@ -1134,7 +1132,12 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	// anchored to BYTE OFFSETS in a buffer that is about to be emptied, and a
 	// suggestion left standing over an empty prompt is a suggestion for a line
 	// that has already run.
+	//
+	// The offers go with them (#144). A proposal carries no offsets, so the first
+	// reason does not reach it - but the second does, and more plainly: a
+	// proposal is what this line would BECOME, and this line has just run.
 	_state.marks.clear();
+	_state.proposals.clear();
 
 	// A fresh line: the accepted text is gone, and it is gone as ONE edit so
 	// that undo does not walk back into a command that has already run.

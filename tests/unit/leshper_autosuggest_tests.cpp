@@ -65,9 +65,11 @@ struct suggest_fixture {
 	}
 
 	// React and apply, which is the state the accepting actions run against.
+	// `apply_batch` is the loop's own applier (#144), so what these tests read
+	// back through the ABI is what the running shell would have applied.
 	void show(lesh::leshper::state& s) {
 		for (reactor_batch& one : loop.react(s, LESH_EVENT_BUFFER_CHANGED))
-			loop.apply(s, std::move(one));
+			apply_batch(s, one);
 	}
 
 	[[nodiscard]] std::string style_name(std::uint32_t id) {
@@ -429,11 +431,13 @@ TEST(LeshperAutosuggest, DismissingTakesTheWholeBatchOffTheScreen) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
-	ASSERT_EQ(fixture.loop.applied().size(), 1u);
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	ASSERT_EQ(s.marks.texts().size(), 1u) << "the drawn half is the virtual text";
 
 	EXPECT_EQ(fixture.loop.invoke(s, "dismiss_autosuggestion", invocation{}).status,
 	          LESH_OK);
-	EXPECT_TRUE(fixture.loop.applied().empty());
+	EXPECT_TRUE(s.proposals.empty());
+	EXPECT_TRUE(s.marks.texts().empty()) << "and it goes with the batch that carried it";
 	EXPECT_EQ(s.buffer.text(), "git");
 
 	// And accepting afterwards has nothing to accept.
@@ -450,8 +454,8 @@ TEST(LeshperAutosuggest, DismissingWithNothingShowingIsNotAnError) {
 	// The reactor's batch is still applied - it is simply empty. Dismissal drops
 	// the batches that CARRY a proposal of the kind, and a batch that proposed
 	// nothing was never showing anything to dismiss.
-	for (const reactor_batch& one : fixture.loop.applied())
-		EXPECT_TRUE(one.proposals.empty());
+	for (const applied_proposals::layer& one : s.proposals.layers())
+		EXPECT_TRUE(one.items.empty());
 }
 
 TEST(LeshperAutosuggest, ADismissedSuggestionComesBackOnTheNextEvent) {
@@ -462,10 +466,10 @@ TEST(LeshperAutosuggest, ADismissedSuggestionComesBackOnTheNextEvent) {
 	fixture.show(s);
 	EXPECT_EQ(fixture.loop.invoke(s, "dismiss_autosuggestion", invocation{}).status,
 	          LESH_OK);
-	ASSERT_TRUE(fixture.loop.applied().empty());
+	ASSERT_TRUE(s.proposals.empty());
 
 	fixture.show(s);
-	ASSERT_EQ(fixture.loop.applied().size(), 1u);
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
 	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "git status");
 }
@@ -493,7 +497,7 @@ TEST(LeshperAutosuggest, AStaleBatchIsNeverAcceptable) {
 	s.buffer.replace(s.buffer.end_position(), s.buffer.end_position(), std::string_view{"x"});
 	s.cursor = s.buffer.end_position();
 	s.gen.bump();
-	EXPECT_FALSE(fixture.loop.apply(s, std::move(batches[0])));
+	EXPECT_FALSE(apply_batch(s, batches[0]));
 
 	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "gitx");

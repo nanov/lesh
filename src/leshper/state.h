@@ -2,6 +2,7 @@
 
 #include "leshper/decoration.h"
 #include "leshper/kill_store.h"
+#include "leshper/proposal.h"
 #include "leshper/text.h"
 #include "leshper/undo.h"
 #include "substrate/assert.h"
@@ -461,6 +462,12 @@ struct state {
 	//
 	// DERIVED, AND DELIBERATELY OUT OF `operator==` - see the argument there.
 	decorations marks;
+	// The OTHER half of the same applied batches (#133, #144): what an accepting
+	// action would put in the buffer, which nothing paints. Written by the same
+	// applier as `marks`, dropped by the same dismissal, and cleared with it at
+	// the line boundary - they are two halves of one thing and giving them two
+	// owners is how they drift apart. Out of `operator==` for `marks`'s reason.
+	applied_proposals proposals;
 	pending_input pending;
 	pager_state pager; // #138
 	generation gen;
@@ -589,7 +596,8 @@ struct state {
 	// N-3's equality: one operator over every field a replay must reproduce,
 	// rather than a comparison of whichever fields a test remembered to check.
 	//
-	// `marks` IS NOT IN IT, and that is a decision rather than an omission.
+	// `marks` IS NOT IN IT, nor is `proposals` - the two halves of one applied
+	// batch, in or out together - and that is a decision rather than an omission.
 	//
 	// N-3 replays a RECORDED EVENT SEQUENCE against a fresh state and demands an
 	// equal state at the end. Decorations are not in that sequence: they are what
@@ -610,9 +618,10 @@ struct state {
 	// state, but it is DERIVED from environment and not from input. What
 	// `operator==` compares is what the typed input determines.
 	//
-	// `decorations::operator==` still exists, so a test that wants to assert on
-	// the applied spans compares them directly and says so - which is what the
-	// decoration tests do.
+	// `decorations::operator==` still exists, and so does
+	// `applied_proposals::operator==`, so a test that wants to assert on what was
+	// applied compares them directly and says so - which is what the decoration
+	// and proposal tests do.
 	friend bool operator==(const state& a, const state& b) noexcept {
 		return a.buffer == b.buffer && a.cursor == b.cursor && a._selected == b._selected
 		    && a.keymaps == b.keymaps && a.pending == b.pending

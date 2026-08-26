@@ -21,11 +21,12 @@
 //   it applies only what is still current - so N-4's "a stale result cannot be
 //   applied" is structural (ADR-0008).
 //
-// THE LOOP HERE IS A HARNESS FAKE. `loop_harness` runs reactors synchronously
-// on the calling thread and keeps applied batches in a member. The real loop -
-// worker pool, arenas, latest-wins slots (#90) - is later work, and the seam it
-// will arrive at is the three operations below. What is NOT fake is everything
-// under them: staging, commit, generation binding, the drop rule.
+// THE HARNESS IS A FAKE SCHEDULER AND NOTHING ELSE NOW. `loop_harness` runs
+// reactors synchronously on the calling thread instead of on #126's pool, and
+// dispatches an action by name. It no longer holds what it applied: applying is
+// `apply_batch` below, the one implementation the real loop calls too, and what
+// it applies lands in the state (#144). What was never fake is everything under
+// that: staging, commit, generation binding, the drop rule.
 
 #include "leshper/abi.h"
 #include "leshper/complete.h"
@@ -45,11 +46,11 @@ namespace lesh::leshper {
 
 // What a reactor emits. `decoration_span` and `virtual_text` are NOT declared
 // here any more: they are `decoration.h`'s, which `state.h` includes, because
-// `state::decorations` holds them (#141). The proposal stays - it is the loop's
-// vocabulary and no state field carries one.
-struct proposal;
-// One reactor's whole answer. The editor handle points at the applied ones so
-// an accepting action can read a proposal back (#133); defined below.
+// `state::marks` holds them (#141). `proposal` went the same way for the same
+// reason (#144): `state::proposals` holds the applied ones, so the type belongs
+// under `state.h` rather than over it, and it is `proposal.h`'s.
+//
+// One reactor's whole answer, carrying both halves; defined below.
 struct reactor_batch;
 
 // The memo behind lesh_request_command_kind (#135), one per request.
@@ -193,14 +194,18 @@ struct lesh_editor {
 	// through the keymap after the action's edits have landed.
 	std::string pushed_input;
 
-	// What the loop currently has applied, for lesh_proposal_read (#133, F-25).
+	// WHAT THE LOOP HAS APPLIED IS REACHED THROUGH `target` (#144). There was a
+	// borrowed `applied` pointer here, re-pointed on every `invoke` at a vector
+	// the harness owned - and the real loop, whose applier is `take_batch`, never
+	// pointed it anywhere, so `lesh_proposal_read` in the running shell walked an
+	// empty view while the suggestion was on screen. The view lives in
+	// `state::proposals` now, beside the decorations it is the other half of, and
+	// the field that has to be set for an action to see it is the one every
+	// dispatch path already sets.
 	//
-	// A borrowed pointer, never owned, and READ-ONLY from the ABI's side: there
-	// is no emit function on this handle, so an accepting action can learn what
-	// was proposed and can reach the buffer only by staging a write (A-12). Null
-	// when the loop has nothing applied, which reads as "no proposal" rather
-	// than as an error.
-	const std::vector<lesh::leshper::reactor_batch>* applied = nullptr;
+	// Still READ-ONLY from the ABI's side: there is no emit function on this
+	// handle, so an accepting action can learn what was proposed and can reach
+	// the buffer only by staging a write (A-12).
 
 	// A dismissal the action REQUESTED (lesh_proposal_dismiss), honoured by the
 	// loop after the action's writes have been committed - the same shape the
@@ -323,22 +328,14 @@ struct action_result {
 
 // A reactor's output is copied at the emit call site: nothing in a batch points
 // into the worker's arena, which is what lets #90 reset it under us.
-// `decoration_span` and `virtual_text` are in `decoration.h`; the proposal is
-// here, with the batch that carries it.
-//
-// The one thing the two files must agree on, made a build failure rather than a
-// comment: `decoration.h` spells "no style" as a literal 0 so that it need not
-// include abi.h, and this is where the two spellings are checked against each
-// other.
+// `decoration_span` and `virtual_text` are in `decoration.h`; `proposal` is in
+// `proposal.h`, beside the store that holds the applied ones (#144). Neither
+// includes abi.h, so both spell a defaulted constant as a literal, and this is
+// where the spellings are checked against each other rather than commented on.
 static_assert(LESH_STYLE_NONE == 0u,
               "decoration.h defaults style_id to 0 and means LESH_STYLE_NONE");
-
-struct proposal {
-	std::uint32_t kind = LESH_PROPOSAL_AUTOSUGGESTION;
-	std::string bytes;
-
-	friend bool operator==(const proposal&, const proposal&) noexcept = default;
-};
+static_assert(LESH_PROPOSAL_AUTOSUGGESTION == 0u,
+              "proposal.h defaults kind to 0 and means LESH_PROPOSAL_AUTOSUGGESTION");
 
 // One reactor's answer to one event.
 //
@@ -356,8 +353,32 @@ struct reactor_batch {
 };
 
 // ---------------------------------------------------------------------------
-// The loop's three operations.
+// The loop's three operations. Applying is the first of them, and it is a free
+// function rather than a member because there is exactly ONE of it (#144).
 // ---------------------------------------------------------------------------
+
+// Applies a batch, if and only if it was computed against the generation the
+// editor is still at. Answers whether it was applied.
+//
+// N-4, AND THE ONLY PLACE IT IS DECIDED. There is no other applier and no other
+// way in, so a stale batch is not rejected here so much as it has nowhere else
+// to go: `event_loop::take_batch` is this plus a log line and a repaint, and the
+// harness path is this and nothing else.
+//
+// THERE USED TO BE TWO. `loop_harness::apply` kept whole batches in a member and
+// `take_batch` wrote `state::marks`, which was survivable while the harness was
+// the only thing anybody dispatched through - and stopped being survivable the
+// moment the real loop ran actions, because the halves had drifted: the loop
+// painted the suggestion and the accessor read the harness's empty vector (#144,
+// returned by #141). #118 retired the enum path the same way, and for the same
+// reason: one implementation, reached by both callers.
+//
+// SWAPS, never copies, on both halves. The batch is pooled storage (#126's
+// message pool, or the shell channel's recycler) and moving out of it would hand
+// the pool back vectors with no capacity, defeating the pooling on the very path
+// it was built for. What comes back in the batch is the previous layer's
+// storage, which is what the pool wants and what `release` clears.
+bool apply_batch(state& target, reactor_batch& batch);
 
 // A stand-in for the event loop, sufficient to exercise every rule the ABI
 // makes and honest about being a stand-in.
@@ -383,14 +404,9 @@ public:
 	// reactor receives is the real one, generation-bound and emit-only.
 	[[nodiscard]] std::vector<reactor_batch> react(const state& target, std::uint32_t kinds);
 
-	// Applies a batch, if and only if it was computed against the generation the
-	// editor is still at. Answers whether it was applied.
-	bool apply(const state& target, reactor_batch batch);
-
-	[[nodiscard]] const std::vector<reactor_batch>& applied() const noexcept {
-		return _applied;
-	}
-	void clear_applied() noexcept { _applied.clear(); }
+	// APPLYING IS NOT A MEMBER any more, and neither is the store it wrote to:
+	// `apply_batch` above is the one applier and `state::proposals` is where the
+	// proposals land. See the argument there.
 
 	// Supersedes whatever is in flight. Called by the loop when the buffer moves
 	// on; called by a test from inside a reactor to watch the poll notice.
@@ -440,7 +456,6 @@ private:
 	registry* _registry;
 	editor_handle _handle;
 	std::atomic<bool> _superseded{false};
-	std::vector<reactor_batch> _applied;
 	const shell_knowledge* _knowledge = nullptr;
 	requested_outcome _requested;
 };

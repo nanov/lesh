@@ -2452,15 +2452,15 @@ TEST(LeshperAbiReactors, AStaleBatchIsNotAppliedBecauseThereIsNowhereToApplyIt) 
 
 	// The user typed while the worker was thinking.
 	fixture.type_all(s, "!");
-	EXPECT_FALSE(loop.apply(s, batches[0]));
-	EXPECT_TRUE(loop.applied().empty());
+	EXPECT_FALSE(apply_batch(s, batches[0]));
+	EXPECT_TRUE(s.marks.layers().empty());
 
 	// Recomputed against the buffer as it now is, the same reactor applies.
 	batches = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 	ASSERT_EQ(batches.size(), 1u);
-	EXPECT_TRUE(loop.apply(s, batches[0]));
-	ASSERT_EQ(loop.applied().size(), 1u);
-	EXPECT_EQ(loop.applied()[0].spans.size(), 1u);
+	EXPECT_TRUE(apply_batch(s, batches[0]));
+	ASSERT_EQ(s.marks.layers().size(), 1u);
+	EXPECT_EQ(s.marks.layers()[0].spans.size(), 1u);
 }
 
 TEST(LeshperAbiReactors, TheSupersededPollIsCooperativeAndTheAnswerIsDroppedAnyway) {
@@ -2509,23 +2509,26 @@ TEST(LeshperAbiReactors, TheEmittingReactorIsTheDecorationNamespace) {
 	loop_harness loop(reg);
 
 	for (reactor_batch& one : loop.react(s, LESH_EVENT_BUFFER_CHANGED))
-		EXPECT_TRUE(loop.apply(s, std::move(one)));
-	ASSERT_EQ(loop.applied().size(), 2u);
+		EXPECT_TRUE(apply_batch(s, one));
+	ASSERT_EQ(s.marks.layers().size(), 2u);
 
 	// A new batch from one reactor replaces that reactor's and touches nobody
-	// else's, which is the whole of what a namespace has to do here.
+	// else's, which is the whole of what a namespace has to do here. Both halves
+	// of a batch are namespaced the same way (#144), so the proposal count is
+	// asserted beside the span and text counts rather than separately.
 	for (reactor_batch& one : loop.react(s, LESH_EVENT_BUFFER_CHANGED))
-		EXPECT_TRUE(loop.apply(s, std::move(one)));
-	EXPECT_EQ(loop.applied().size(), 2u);
+		EXPECT_TRUE(apply_batch(s, one));
+	EXPECT_EQ(s.marks.layers().size(), 2u);
 
 	size_t proposals = 0;
 	size_t texts = 0;
 	size_t spans = 0;
-	for (const reactor_batch& one : loop.applied()) {
-		proposals += one.proposals.size();
+	for (const decorations::layer& one : s.marks.layers()) {
 		texts += one.texts.size();
 		spans += one.spans.size();
 	}
+	for (const applied_proposals::layer& one : s.proposals.layers())
+		proposals += one.items.size();
 	EXPECT_EQ(proposals, 1u);
 	EXPECT_EQ(texts, 1u);
 	EXPECT_EQ(spans, 1u);

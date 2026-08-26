@@ -1387,22 +1387,15 @@ int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index, cha
 	if (length_out == nullptr)
 		return LESH_ERR_INVAL;
 	*length_out = 0;
-	if (editor->applied == nullptr)
+	// WHAT IS ON SCREEN, reached through the handle's own `target` (#144). The
+	// walk - emission order across the applied batches, and within one batch the
+	// order the reactor proposed in - is `applied_proposals::find`, so the rule
+	// abi.h documents has one implementation and the pager's 0, 1, 2 and the
+	// autosuggester's single candidate at 0 come out of the same code.
+	const proposal* const found = editor->target->proposals.find(kind, index);
+	if (found == nullptr)
 		return LESH_ERR_NOTFOUND;
-	// Emission order across the applied batches. Within one batch that is the
-	// order the reactor proposed in, which is what makes the search UI's list
-	// (#118) index 0, 1, 2 and the autosuggester's single candidate index 0.
-	std::size_t seen = 0;
-	for (const lesh::leshper::reactor_batch& batch : *editor->applied) {
-		for (const proposal& one : batch.proposals) {
-			if (one.kind != kind)
-				continue;
-			if (seen++ != index)
-				continue;
-			return copy_out(one.bytes, out, capacity, length_out);
-		}
-	}
-	return LESH_ERR_NOTFOUND;
+	return copy_out(found->bytes, out, capacity, length_out);
 }
 
 // --- Completion, from the action side (#139, F-28/F-30) --------------------
@@ -1727,10 +1720,8 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.staged_selection_active = target.selection_active();
 	_handle.selection_written = false;
 	_handle.pushed_input.clear();
-	// What is on screen, for an accepting action to read (#133). A pointer to
-	// what the loop already holds: no copy, and nothing for the keystroke path
-	// to allocate.
-	_handle.applied = &_applied;
+	// What is on screen, for an accepting action to read (#133), needs no field
+	// here: it is `target.proposals`, and `target` is set above (#144).
 	_handle.dismissed_kind = 0;
 	_handle.dismiss_requested = false;
 	// Cleared per call and not per Tab: an action that did not ask for a
@@ -1810,20 +1801,16 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	// The dismissal, honoured after the commit (#133). The WHOLE batch goes, not
 	// the proposal alone: the drawn half of a suggestion is its virtual text, and
 	// a dismissal that left that on screen would have dismissed nothing the user
-	// can see.
-	if (_handle.dismiss_requested) {
-		const std::uint32_t kind = _handle.dismissed_kind;
-		for (auto it = _applied.begin(); it != _applied.end();) {
-			bool carries = false;
-			for (const proposal& one : it->proposals) {
-				if (one.kind == kind) {
-					carries = true;
-					break;
-				}
-			}
-			it = carries ? _applied.erase(it) : it + 1;
-		}
-	}
+	// can see - so `dismiss` takes the decorations too, in one call rather than
+	// in two a caller has to remember to pair.
+	//
+	// AND IT ASKS FOR A REPAINT (#144). A dismissal that dropped something
+	// changed what is on screen while changing neither the buffer nor the cursor,
+	// so the rule below - which asks by comparing those two - would have left the
+	// suggestion painted until something else happened to redraw.
+	if (_handle.dismiss_requested
+	    && target.proposals.dismiss(_handle.dismissed_kind, target.marks))
+		result.produced.push_back(render_request{});
 
 	result.outcome = static_cast<loop_outcome>(_handle.outcome);
 	result.exit_status = _handle.exit_status;
@@ -1835,10 +1822,11 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 		_requested = requested_outcome{result.outcome, result.exit_status};
 	result.cursor_moved = target.cursor != cursor_before;
 	_handle.target = nullptr;
-	_handle.applied = nullptr;
 	// The handle is dead, and so is what it was pointing an ABI reader at. The
 	// candidates went to the pager while the action was running; what is cleared
-	// here is the flag that would let a stashed handle read them back.
+	// here is the flag that would let a stashed handle read them back. (The
+	// borrowed `applied` pointer this also used to null is gone - #144 moved the
+	// proposal view onto `state`, where every dispatch path already points.)
 	_handle.completion_ran = false;
 
 	// The same rule the enum path follows: an action that changed nothing asks
@@ -1896,21 +1884,19 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 	return batches;
 }
 
-bool loop_harness::apply(const state& target, reactor_batch batch) {
+// The one applier (#144). See the argument in registry.h.
+bool apply_batch(state& target, reactor_batch& batch) {
 	// N-4, and the only place it is decided. There is no other applier and no
 	// other way in, so a stale batch is not rejected here so much as it has
 	// nowhere else to go.
 	if (!(batch.computed_against == target.gen))
 		return false;
-	// The emitting reactor is the decoration namespace: a new batch from a
-	// reactor replaces that reactor's previous one and touches nobody else's.
-	for (auto it = _applied.begin(); it != _applied.end(); ++it) {
-		if (it->reactor == batch.reactor) {
-			*it = std::move(batch);
-			return true;
-		}
-	}
-	_applied.push_back(std::move(batch));
+	// THE EMITTING REACTOR IS THE NAMESPACE, on both halves (ADR-0008): a new
+	// batch from a reactor replaces that reactor's decorations and that reactor's
+	// offers, and touches nobody else's. Both stores swap rather than copy, so
+	// the batch goes back to the pool carrying the storage the layer had.
+	target.marks.apply(batch.reactor, batch.spans, batch.texts);
+	target.proposals.apply(batch.reactor, batch.proposals);
 	return true;
 }
 

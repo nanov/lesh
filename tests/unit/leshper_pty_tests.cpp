@@ -474,3 +474,45 @@ TEST(LeshperPty, ATerminalBelowTheFloorIsRefusedInOneLine) {
 		<< "saw: " << shell.seen();
 	EXPECT_EQ(shell.count_of(kPrompt), 0u) << "it started anyway";
 }
+
+TEST(LeshperPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
+	// F-25 ON A REAL TERMINAL (#144): the autosuggester proposes off the session's
+	// own history, the loop applies the batch, and a key the rc BOUND runs an
+	// action that reads the proposal back through `lesh_proposal_read` and stages
+	// it. Every seam in that sentence is a different ticket's, and this is the
+	// only test that has all of them at once.
+	//
+	// NO DEFAULT BINDING IS ASSERTED, and none exists: #140 decides which key
+	// accepts, and fish's answer overloads a MOTION at end of buffer, which is not
+	// a decision to make from here. The rc binds `<C-y>`, which is what a user
+	// does today.
+	//
+	// THE ARITHMETIC IS THE ASSERTION. `42` is nowhere in what is typed and
+	// nowhere in what is painted - not in the suggestion's virtual text either -
+	// so a second `42` on the wire can only be a second RUN of the remembered
+	// line. Had the accept read nothing, `echo $((6*` would have gone to the
+	// continuation prompt instead, which is what this test saw while #144 was
+	// open.
+	//
+	// `<C-g>` AND NOT `<C-y>`, which is what fish's accept-ish keys are near:
+	// `enter_raw` clears ICANON and ECHO and nothing else, so IEXTEN is still on
+	// and the BSD driver eats Ctrl-Y as VDSUSP before any byte reaches the shell.
+	// Ctrl-G is no `c_cc` entry on either platform. Whether the editor should
+	// clear IEXTEN is #98's question and not this test's.
+	const scratch_home home{"PS1='lesh-test>'\nbind '<C-g>' accept_autosuggestion\n"};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("echo $((6*7))\r");
+	ASSERT_TRUE(shell.wait_for("42")) << "saw: " << shell.seen();
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
+
+	// A prefix of the remembered line, then the bound key, then Enter.
+	shell.type("echo $((6*");
+	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	shell.type("\x07\r");
+
+	EXPECT_TRUE(shell.wait_for("42", 2)) << "the accept never reached the buffer; saw: "
+	                                     << shell.seen();
+}

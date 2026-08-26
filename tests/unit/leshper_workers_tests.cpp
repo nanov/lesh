@@ -322,8 +322,8 @@ TEST(LeshperWorkers, AWorkersAnswerMeetsTheExistingDropRuleUnchanged) {
 
 	// The user typed while the worker was thinking.
 	s.gen.bump();
-	EXPECT_FALSE(loop.apply(s, drained[0].batch()));
-	EXPECT_TRUE(loop.applied().empty());
+	EXPECT_FALSE(apply_batch(s, drained[0].batch()));
+	EXPECT_TRUE(s.marks.layers().empty());
 }
 
 // ---------------------------------------------------------------------------
