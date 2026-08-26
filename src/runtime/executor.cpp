@@ -64,6 +64,47 @@ int status_from_wait(int wait_status) noexcept {
 	return 0;
 }
 
+// The same question one answer wider, for a FOREGROUND job: exited, killed, or
+// STOPPED (#161, and #98 decision 4 which specified it).
+//
+// THE ONE PLACE THE THIRD ANSWER LIVES, and it is one rather than three on
+// purpose. Three foreground waits reach it - a simple command, a `( )` subshell,
+// and each member of a pipeline - and they read their status through here so
+// that the seam job control eventually slots into is a single function rather
+// than three copies to find and keep in step. #98 draws that line by name: the
+// plumbing (process groups, the terminal handoff, `WUNTRACED` reaping) lands and
+// the UI (`fg`, `bg`, `jobs`) stays out, and this is where the UI would attach.
+//
+// 128 + WSTOPSIG, NOT 128 + SIGTSTP, AND THAT IS A DELIBERATE GENERALIZATION OF
+// THE SPEC. #98 decision 4 says "128+SIGTSTP" because Ctrl-Z is the case it was
+// written for, but SIGTSTP is not the only signal that stops a child: SIGSTOP
+// (which cannot be caught or ignored), SIGTTIN and SIGTTOU all do, and after
+// #159 a foreground child carries the default disposition for every one of them.
+// Answering 128+SIGTSTP for a child stopped by SIGSTOP would be a lie the user
+// can check - `kill -l $?` names the signal - so the child's own stopping signal
+// is reported. This is exactly the generalization `status_from_wait` above
+// already makes for a KILLED child, where POSIX says 128+the signal rather than
+// 128+SIGINT, and it is what every shell with job control answers.
+//
+// The wait status of a stop is safe to keep carrying afterwards:
+// `note_interrupt_after_handoff` reads it through WIFSIGNALED, which is false
+// for a stop, so a stopped child cannot synthesize an interrupt.
+int foreground_status(pid_t pid, int wait_status) {
+	if (!WIFSTOPPED(wait_status))
+		return status_from_wait(wait_status);
+	// #98 decision 4's wording, kept verbatim, and the parenthesis is the load
+	// bearing half: it is the shell saying why nothing more will come back for
+	// this pid on its own. There is no job table to name the process by - that is
+	// the half of job control deliberately left out - so the PID is the handle,
+	// which is why the pid is in the text and not just in the shell's head.
+	// `kill -CONT` of it is the way out, for the determined.
+	//
+	// Through `report` and not a `fprintf` of its own: this is a shell diagnostic
+	// like every other, and it carries the same position prefix they do.
+	report("stopped: pid %d (job control not implemented)", static_cast<int>(pid));
+	return 128 + WSTOPSIG(wait_status);
+}
+
 // The path `command -p` searches: the one the system guarantees finds the standard
 // utilities, whatever $PATH holds. That is the whole point of the option -
 // `PATH= command -p cat` must still run cat, which is command-p.tst's 'executing
@@ -674,6 +715,11 @@ int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
 	const ssize_t got = read(result_pipe[0], &result, sizeof(result));
 	close(result_pipe[0]);
 	int wait_status = 0;
+	// NO WUNTRACED, deliberately (#161). This helper child is not a job: it opens
+	// the redirections, writes one struct back and `_exit`s without ever running a
+	// command or reaching an exec, so nothing the user typed is in it to stop and
+	// there is no pid they could have named. Reaping a stop here would report a
+	// "stopped: pid N" the shell then had no way to explain.
 	waitpid(pid, &wait_status, 0);
 	const int status = status_from_wait(wait_status);
 	if (status != 0)
@@ -1868,11 +1914,17 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	}
 	setpgid(pid, pid);
 	int wait_status = 0;
-	waitpid(pid, &wait_status, 0);
+	// A `( )` IS A FOREGROUND JOB, so it reaps like one (#158 decision 5, which
+	// names "the foreground subshell waits" beside the simple command and the
+	// pipeline). One process, waited on by a shell with nothing else to do, and a
+	// stop here hangs the shell exactly as it did at the simple-command wait -
+	// today only from a deliberate `kill -STOP`, and from Ctrl-Z once #160 hands
+	// this fork the terminal the way #159 hands it to a simple command.
+	waitpid(pid, &wait_status, WUNTRACED);
 	// A subshell is a command in its own right: `set -e; (false && echo a)` exits
 	// even though the same list would not inside a brace group.
 	_status_tested = false;
-	return status_from_wait(wait_status);
+	return foreground_status(pid, wait_status);
 }
 
 bool tree_walking_executor::build_argv(const tree& t, node_index n,
@@ -2731,6 +2783,14 @@ int tree_walking_executor::run_wait(char* const* argv) {
 		// POSIX: with no operands, `wait` waits for ALL known children and its
 		// status is ZERO - not the last child's. Reporting the last one made
 		// `false & wait` fail, and under `set -e` that would exit the shell.
+		//
+		// NO WUNTRACED IN EITHER FORM OF `wait`, and that is POSIX rather than
+		// caution (#161). XCU `wait` waits for TERMINATION; a stopped background job
+		// has not terminated, and returning at its stop would both report a status
+		// for a process that has not got one yet and drop the pid from
+		// `_background`, so it could never be waited for again. `&` children are
+		// also the one child set that never receives the terminal (#158 decision 3),
+		// so nothing here can be the stop-and-return-to-a-prompt case #161 is about.
 		for (const pid_t pid : _background) {
 			int wait_status = 0;
 			(void)waitpid(pid, &wait_status, 0);
@@ -2761,6 +2821,7 @@ int tree_walking_executor::run_wait(char* const* argv) {
 		}
 		const pid_t target = static_cast<pid_t>(parsed.value);
 		int wait_status = 0;
+		// No WUNTRACED, for the reason given at the no-operand form above.
 		if (waitpid(target, &wait_status, 0) > 0) {
 			status = status_from_wait(wait_status);
 		} else {
@@ -3093,17 +3154,31 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		return 1;
 
 	int wait_status = 0;
-	waitpid(pid, &wait_status, 0);
+	// WUNTRACED, AND WITHOUT IT THIS WAIT NEVER RETURNS (#161). #159 handed the
+	// terminal to this child and reset its SIGTSTP to default, which is what makes
+	// Ctrl-Z genuinely stop a foreground command - and a plain `waitpid` does not
+	// report a stop, so the shell blocked here forever on a process that was never
+	// going to exit. This is the one wait in the file that Ctrl-Z can reach.
+	waitpid(pid, &wait_status, WUNTRACED);
 	// IMMEDIATELY, not at end of line (#158 decision 2). `nvim .; read x` is the
 	// case: the loop's reclaim in resume_after_execution runs once the whole line
 	// is done, and by then `read` has already met EIO on a terminal it was not the
 	// foreground group of.
+	//
+	// ON THE STOPPED PATH TOO, and that is why it stays here rather than moving
+	// beside the status. A stopped child still owns the terminal it was handed, so
+	// without this the prompt we are about to return to would be reading from a
+	// terminal whose foreground group is a process that is not running - every
+	// keystroke lost, which is the same defect as `nvim .; read x` wearing a
+	// different hat. Before the diagnostic below, so the diagnostic is not itself
+	// a background write.
 	reclaim_terminal();
 	// And the interrupt the shell was excluded from by the very handoff above. The
 	// flag only; the between-commands boundary decides what it means, with `$?`
-	// already this command's 130.
+	// already this command's 130. A stopped status passes through harmlessly -
+	// WIFSIGNALED is false for a stop.
 	note_interrupt_after_handoff(wait_status);
-	return status_from_wait(wait_status);
+	return foreground_status(pid, wait_status);
 }
 
 // One simple-command pipeline stage, in the process forked for it, with the pipe
@@ -3313,12 +3388,37 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 	// pipeline's status as its LAST command's - unless `set -o pipefail`, which
 	// makes it the status of the RIGHTMOST member that failed, and zero when none
 	// did. `exit 1 | exit 2 | exit 0` is 0 without the option and 2 with it.
+	//
+	// WUNTRACED HERE TOO, AND THE LOOP KEEPS GOING (#161). A pipeline is a
+	// foreground job, and a member of it can stop: today only by a deliberate
+	// `kill -STOP`/`-TSTP` from elsewhere, because the stages inherit this shell's
+	// ignored SIGTSTP and are not the terminal's foreground group, and once #160
+	// hands the group leader the terminal Ctrl-Z will reach them the way it
+	// reaches a simple command. Either way, a plain wait on a stopped member is a
+	// permanent hang.
+	//
+	// THE DECISION IS THAT A STOPPED MEMBER DOES NOT END THE LOOP. `break`ing out
+	// would leave the other stages unwaited, and the first of them to exit becomes
+	// a zombie the shell never reaps - the leak this ticket's acceptance criteria
+	// forbid by name, and one no job table exists to clean up after. So every pid
+	// is still waited exactly once, a stopped one contributes 128+WSTOPSIG as its
+	// member status, and the pipeline's status is composed from those as usual.
+	//
+	// It does NOT follow that the prompt comes back: if an EARLY stage stops, the
+	// stage after it blocks on a pipe that will never close, and the wait below
+	// blocks with it. That is the floor and not a regression - measured on this
+	// machine, `sleep 30 | cat` with either stage sent SIGSTOP hangs dash, zsh AND
+	// bash outright, none of them reporting anything. lesh at least names the pid
+	// that stopped before it waits, and where the LAST stage is the one that stops
+	// (the earlier ones already reaped) it returns to the prompt where the other
+	// three still do not. Getting further than that needs the job table #98 keeps
+	// out of scope, which is the seam `foreground_status` marks.
 	int last_status = 0;
 	int rightmost_failure = 0;
 	for (size_t i = 0; i < pids.size(); ++i) {
 		int wait_status = 0;
-		waitpid(pids[i], &wait_status, 0);
-		const int status = status_from_wait(wait_status);
+		waitpid(pids[i], &wait_status, WUNTRACED);
+		const int status = foreground_status(pids[i], wait_status);
 		if (status != 0)
 			rightmost_failure = status;
 		if (i + 1 == pids.size())
@@ -3438,6 +3538,13 @@ substitution_result tree_walking_executor::capture(std::string_view code,
 	close(pipe_fds[0]);
 
 	int wait_status = 0;
+	// NO WUNTRACED (#161). A command substitution never receives the terminal -
+	// #158 decision 3 forbids it by name, since a `$(read x)` stealing the tty from
+	// the line editor would be its own bug - so Ctrl-Z cannot reach this child, and
+	// there is no prompt to return to either: the substitution's output is a word
+	// the shell is still in the middle of expanding, and a stop has no status the
+	// enclosing command could be finished with. The read above has already drained
+	// the pipe to EOF, so by here the child is on its way out regardless.
 	waitpid(pid, &wait_status, 0);
 	_state.set_last_status(status_from_wait(wait_status));
 	++_substitutions;
