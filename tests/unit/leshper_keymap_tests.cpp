@@ -266,18 +266,20 @@ TEST(LeshperKeymap, AKeymapIsDataAndACopyDivergesFromItsOriginal) {
 // The registry: the name is the identity (#117 decision 8).
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKeymapRegistry, TheDefaultsAreTheModesPlusVisSubModes) {
-	// Three when #118 wrote this, seven since #119 filled the vi repertoire in:
-	// the two vi MODES gained the four sub-modes they push - operator-pending,
-	// visual, and the two one-shot maps that catch the argument key of `f` and
-	// `r`. Every one of them is an ordinary keymap, which is the point: nothing
-	// in dispatch knows that four of these are pushed rather than swapped.
+TEST(LeshperKeymapRegistry, TheDefaultsAreTheModesPlusTheirSubModes) {
+	// Three when #118 wrote this, seven since #119 filled the vi repertoire in,
+	// eight since #138 added the pager's: the two vi MODES gained the four
+	// sub-modes they push - operator-pending, visual, and the two one-shot maps
+	// that catch the argument key of `f` and `r` - and the pager pushes a fifth.
+	// Every one of them is an ordinary keymap, which is the point: nothing in
+	// dispatch knows that five of these are pushed rather than swapped.
 	keymap_registry maps;
 	maps.install_defaults();
 	std::vector<std::string> names;
 	maps.names(names);
-	EXPECT_EQ(names, (std::vector<std::string>{"emacs", "vi_command", "vi_find_char",
-	                                           "vi_insert", "vi_operator_pending",
+	EXPECT_EQ(names, (std::vector<std::string>{"emacs", "pager", "vi_command",
+	                                           "vi_find_char", "vi_insert",
+	                                           "vi_operator_pending",
 	                                           "vi_replace_char", "vi_visual"}));
 }
 
@@ -925,8 +927,8 @@ TEST(LeshperKeymapBind, ListsTheKeymapsItHas) {
 	const bind_run ran = run_bind({"bind", "-l"});
 	EXPECT_EQ(ran.status, 0);
 	EXPECT_EQ(ran.output,
-	          "emacs\nvi_command\nvi_find_char\nvi_insert\nvi_operator_pending\n"
-	          "vi_replace_char\nvi_visual\n");
+	          "emacs\npager\nvi_command\nvi_find_char\nvi_insert\n"
+	          "vi_operator_pending\nvi_replace_char\nvi_visual\n");
 }
 
 TEST(LeshperKeymapBind, BindsAndThenAnswersWhatItBound) {

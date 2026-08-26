@@ -1,5 +1,6 @@
 #include "leshper/layout.h"
 
+#include "leshper/pager.h"
 #include "leshper/sgr.h"
 #include "substrate/assert.h"
 #include "substrate/measure.h"
@@ -142,7 +143,7 @@ private:
 
 			// What happens AT an offset, before the cluster that starts
 			// there: the cursor, and then any virtual text drawn here. The
-			// order is the rule - see layout.h, decision 6.
+			// order is the rule - see layout.h, decision 7.
 			if (marks == annotate::yes)
 				at_offset(i, cursor_at);
 
@@ -382,15 +383,34 @@ layout lay_out(cluster_pool& pool, const layout_input& in) {
 	if (in.columns == 0 || in.rows == 0)
 		return made;
 
+	// THE PAGER FIRST, and that ordering is the decision (#138, layout.h note 6).
+	// Its rows come off the terminal's height BEFORE the edit view is windowed,
+	// so a long list narrows the window the buffer scrolls in rather than
+	// pushing the edit line off the screen. It renders into a surface of its own
+	// (A-6); this file only copies it.
+	surface page;
+	if (in.pager != nullptr && in.pager->showing()) {
+		const pager_grid grid =
+			measure_pager(*in.pager, in.columns, pager_row_budget(in.rows), in.width);
+		if (!grid.empty())
+			page = render_pager(pool, *in.pager, grid, in.pager_pen, in.width);
+	}
+	const std::uint16_t pager_rows = page.rows();
+	// `pager_row_budget` never takes the last row, so this is at least one.
+	const std::uint16_t edit_rows = static_cast<std::uint16_t>(in.rows - pager_rows);
+	LESH_ASSERT(edit_rows >= 1);
+
 	const geometry content =
 		walker{in, [](std::uint16_t, std::uint16_t, std::string_view, const style&) {}}.run();
 
 	made.content_rows = content.content_rows;
 	made.cursor_row = content.cursor_row;
 	made.cursor_column = content.cursor_column;
-	made.first_visible_row = first_visible_row(content, in.rows);
+	made.first_visible_row = first_visible_row(content, edit_rows);
 
-	made.screen.resize(in.columns, std::min(content.content_rows, in.rows));
+	const std::uint16_t shown = std::min(content.content_rows, edit_rows);
+	made.screen.resize(in.columns, static_cast<std::uint16_t>(shown + pager_rows));
+	made.pager_rows = pager_rows;
 
 	surface& screen = made.screen;
 	const std::uint16_t top = made.first_visible_row;
@@ -399,14 +419,23 @@ layout lay_out(cluster_pool& pool, const layout_input& in) {
 		       if (row < top)
 			       return;
 		       const std::uint16_t on_screen = static_cast<std::uint16_t>(row - top);
-		       if (on_screen >= screen.rows())
+		       if (on_screen >= shown)
 			       return;
 		       screen.write(pool, on_screen, column, text, pen, in.width);
 	       }}.run();
 
+	// The pager's cells, copied in under the edit line. Cell for cell rather
+	// than through `write`, because the pager already decided what every one of
+	// them is - re-deriving them here would be a second layout engine, and the
+	// two would disagree the first time a candidate was two columns wide.
+	for (std::uint16_t row = 0; row < pager_rows; ++row) {
+		for (std::uint16_t column = 0; column < page.columns(); ++column)
+			screen.at(static_cast<std::uint16_t>(shown + row), column) = page.at(row, column);
+	}
+
 	// The window is derived FROM the cursor, so it contains it by construction.
 	LESH_ASSERT(made.cursor_row >= top
-	            && static_cast<std::uint16_t>(made.cursor_row - top) < screen.rows());
+	            && static_cast<std::uint16_t>(made.cursor_row - top) < shown);
 	screen.cursor().row = static_cast<std::uint16_t>(made.cursor_row - top);
 	screen.cursor().column = made.cursor_column;
 	screen.cursor().visible = true;

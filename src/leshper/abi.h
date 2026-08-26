@@ -732,6 +732,126 @@ int32_t lesh_last_change_keys(lesh_editor* editor, char* out, size_t capacity,
  * answer, not an error - pressing `.` after `ciwfoo` is the documented no-op. */
 int32_t lesh_last_change_replayable(lesh_editor* editor, int32_t* out);
 
+/* ------------------------------------------------------------------------- */
+/* The pager (#138, F-28 to F-30, spec 6.9)                                   */
+/*                                                                            */
+/* ONE PAGER, THREE CLIENTS: tab completion, history search (F-32) and the     */
+/* autosuggestion candidate view are one surface with one keymap, and the      */
+/* doors below are how any of them fills it. Nothing here names a client, and  */
+/* nothing here generates a candidate - a completer (native or bound) decides  */
+/* WHAT to offer and calls these to offer it.                                  */
+/*                                                                            */
+/* THE PROTOCOL IS THREE CALLS: open a span, add candidates, commit.           */
+/*                                                                            */
+/*     lesh_pager_open(editor, from, to);                                      */
+/*     for each candidate: lesh_pager_add(editor, bytes, length, kind);        */
+/*     lesh_pager_commit(editor, &outcome);                                    */
+/*                                                                            */
+/* COMMIT IS WHERE F-30 LIVES, and that is the decision worth naming. The      */
+/* client does not choose between inserting a common prefix and opening a      */
+/* list: it hands over what it found and the editor answers, so that every     */
+/* client - the completer, the search UI, a plugin - gets the same rule and    */
+/* nobody re-implements "is this unambiguous" three times. An unambiguous      */
+/* extension INSERTS and the pager never opens; an ambiguous set opens and     */
+/* pushes the pager's keymap.                                                  */
+/*                                                                            */
+/* WRITTEN THROUGH, NOT STAGED, like the mode and the keymap stack and for the */
+/* same two reasons: the pager is not in the undo history, and dispatch has to */
+/* see the pushed keymap the instant the action returns. The ONE thing that is */
+/* staged is the only thing that touches the buffer - the insertion            */
+/* `lesh_pager_commit` and `lesh_pager_accept` perform, which stages a write    */
+/* exactly as `lesh_buffer_replace` does, so A-12 holds: a candidate becomes   */
+/* buffer text through an accepting action, as one undo entry, and by no other */
+/* route.                                                                      */
+/* ------------------------------------------------------------------------- */
+
+/* What a candidate IS, in `ls -F`'s vocabulary - the marker drawn after it and
+ * what follows it into the buffer. The only description v1 has (#137).
+ *
+ * PLAIN and WORD are both marker-less and differ in the trailer: a history line
+ * is PLAIN and nothing follows it, a command name or a plain file is WORD and a
+ * space does, because an argument comes next. Appended to, never reordered. */
+#define LESH_PAGER_PLAIN 0u
+#define LESH_PAGER_WORD 1u
+#define LESH_PAGER_DIRECTORY 2u   /* `/`, and a `/` follows it */
+#define LESH_PAGER_EXECUTABLE 3u  /* `*` */
+#define LESH_PAGER_SYMLINK 4u     /* `@` */
+
+/* What `lesh_pager_commit` did. */
+#define LESH_PAGER_NOTHING 0u   /* no candidates; nothing changed */
+#define LESH_PAGER_INSERTED 1u  /* F-30: the span grew, the pager stayed closed */
+#define LESH_PAGER_OPENED 2u    /* the list is showing and its keymap is pushed */
+
+/* Which axis `lesh_pager_move` walks. A row is the grid's width at the current
+ * terminal size, which is why this is a question for the editor and not
+ * arithmetic a binding could do. */
+#define LESH_PAGER_BY_CANDIDATE 0u
+#define LESH_PAGER_BY_ROW 1u
+
+/* Begins a candidate set that will replace `[from, to)`. Discards whatever the
+ * pager held, closing it if it was open.
+ *
+ * The span is the client's statement of what it is completing: the token under
+ * the cursor, the whole buffer for a history search, `[cursor, cursor)` for a
+ * suggestion. Offsets clamp and snap to cluster boundaries like every other
+ * offset the ABI takes. */
+int32_t lesh_pager_open(lesh_editor* editor, size_t from, size_t to);
+
+/* Offers one candidate. `bytes` is the BARE text - `bin`, not `bin/` - and
+ * `kind` says the rest, so that what is filtered, what is shown and what is
+ * inserted are one string. LESH_ERR_INVAL for a kind this ABI does not define
+ * or for a null pointer with a non-zero length. */
+int32_t lesh_pager_add(lesh_editor* editor, const char* bytes, size_t length,
+                       uint32_t kind);
+
+/* F-30's decision point. `*outcome_out` receives one of the LESH_PAGER_NOTHING
+ * / _INSERTED / _OPENED constants; it may be NULL if the caller does not care.
+ *
+ * Committing an empty set closes the pager and answers NOTHING, which is what a
+ * completer with no candidates should do and is not an error. */
+int32_t lesh_pager_commit(lesh_editor* editor, uint32_t* outcome_out);
+
+/* Stages the selected candidate over the span the pager was opened on and
+ * closes it (A-12). LESH_ERR_NOTFOUND when nothing is selected, which is the
+ * answer for a closed pager rather than an error. */
+int32_t lesh_pager_accept(lesh_editor* editor);
+
+/* Closes it: the keymap it pushed is popped and the candidates are dropped.
+ * LESH_OK on a pager that was not open - closing a closed pager is what Escape
+ * pressed twice means. */
+int32_t lesh_pager_close(lesh_editor* editor);
+
+/* Whether it is showing, how many candidates the filter admits, and which one is
+ * selected. Any out pointer may be NULL. */
+int32_t lesh_pager_status(lesh_editor* editor, int32_t* open_out, size_t* count_out,
+                          size_t* selected_out);
+
+/* The span an accepted candidate would replace. LESH_ERR_NOTFOUND when the
+ * pager is not open. */
+int32_t lesh_pager_range(lesh_editor* editor, size_t* from_out, size_t* to_out);
+
+/* The selected candidate's text, copied out, and its kind. Copy-out like every
+ * other reader: `*length_out` is the full length whether or not it fit, and
+ * `out` may be NULL with `capacity` zero. `kind_out` may be NULL.
+ * LESH_ERR_NOTFOUND when nothing is selected. */
+int32_t lesh_pager_selected(lesh_editor* editor, char* out, size_t capacity,
+                            size_t* length_out, uint32_t* kind_out);
+
+/* Moves the selection by `by`, wrapping at both ends so that Tab is a cycle.
+ * `axis` is LESH_PAGER_BY_CANDIDATE or LESH_PAGER_BY_ROW. LESH_ERR_NOTFOUND
+ * when the pager is not showing. */
+int32_t lesh_pager_move(lesh_editor* editor, int64_t by, uint32_t axis);
+
+/* F-29: appends to the filter and narrows the list. The bytes are text the user
+ * typed, routed here by the pager keymap's default action; they never reach the
+ * buffer. */
+int32_t lesh_pager_filter_push(lesh_editor* editor, const char* bytes, size_t length);
+
+/* Drops the filter's last grapheme cluster. LESH_ERR_NOTFOUND - having changed
+ * nothing - when the filter was already empty, which is what lets a binding
+ * close the pager on the backspace that would have emptied it. */
+int32_t lesh_pager_filter_pop(lesh_editor* editor);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

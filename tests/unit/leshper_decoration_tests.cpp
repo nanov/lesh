@@ -486,7 +486,7 @@ TEST(LeshperDecorationLayout, VirtualTextInTheMiddleOfTheLinePushesTheTextAfterI
 }
 
 TEST(LeshperDecorationLayout, TheCursorLandsBeforeVirtualTextAtItsOwnOffset) {
-	// The rule (layout.h decision 6): an offset is a place in the BUFFER, so the
+	// The rule (layout.h decision 7): an offset is a place in the BUFFER, so the
 	// cursor is placed where the buffer's clusters put it and what is virtual
 	// there is drawn after. Here the cursor and the virtual text are at the same
 	// offset in the MIDDLE of the line, which is the case that distinguishes the
@@ -536,7 +536,7 @@ TEST(LeshperDecorationLayout, VirtualTextWrapsAtTheEdgeAndSplitsNoCluster) {
 }
 
 TEST(LeshperDecorationLayout, VirtualTextAtTheEndOfAFullRowPutsTheCursorOnTheNextRow) {
-	// Decision 3 and decision 6 meeting: the buffer ends exactly at the right
+	// Decision 3 and decision 7 meeting: the buffer ends exactly at the right
 	// edge, so the cursor cannot be in the phantom column, and the suggestion
 	// starts on the row it moved to.
 	cluster_pool pool;
@@ -579,7 +579,7 @@ TEST(LeshperDecorationLayout, AVirtualTextPastTheEndOfTheBufferIsNotDrawn) {
 }
 
 TEST(LeshperDecorationLayout, VirtualBytesAreBufferBytesAndAnEscapeInThemPaintsNothing) {
-	// layout.h decision 6's third rule. A reactor styles what it emits with a
+	// layout.h decision 7's third rule. A reactor styles what it emits with a
 	// style id; a second door made of literal escapes would make a reactor's
 	// output measure differently from how it paints, which is exactly the
 	// `%{ %}` folklore #114 exists to prevent.

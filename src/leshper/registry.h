@@ -428,6 +428,18 @@ private:
 // this module. Answers how many were registered.
 std::size_t register_builtin_actions(registry& reg);
 
+// Registers the pager's actions (#138) - cycling, filtering, accepting,
+// closing, and the three that fill it from a reactor's proposals.
+//
+// ITS OWN TRANSLATION UNIT, and that is the no-side-door rule showing where the
+// boundary is. src/leshper/pager.cpp renders and decides, and to do either it
+// must see `state` and `surface`; a file that has seen those cannot also be
+// held to the ABI by the compiler. So the actions live in
+// src/leshper/pager_actions.cpp, which includes abi.h and nothing else from
+// leshper - exactly builtin_actions.cpp's shape, declared here for the same
+// reason `register_builtin_actions` is. Answers how many were registered.
+std::size_t register_pager_actions(registry& reg);
+
 // The highlighter's registration-time context: its per-request arena and the
 // style ids it interned (#124). OPAQUE - defined in builtin_reactors.cpp, which
 // like builtin_actions.cpp includes abi.h and nothing else from this module, so
