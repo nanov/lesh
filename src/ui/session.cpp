@@ -1,6 +1,5 @@
-#include "leshper/read.h"
+#include "ui/session.h"
 
-#include "leshnici/prompt_modules.h"
 #include "leshper/abi.h"
 #include "leshper/complete.h"
 #include "leshper/keymap.h"
@@ -8,7 +7,7 @@
 #include "leshper/prompt/prompt.h"
 #include "leshper/registry.h"
 #include "leshper/shell_actor.h"
-#include "leshper/shell_state_knowledge.h"
+#include "ui/shell_state_knowledge.h"
 #include "leshper/tty.h"
 #include "leshper/workers.h"
 #include "runtime/builtins.h"
@@ -33,7 +32,7 @@
 #include <utility>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // ---------------------------------------------------------------------------
 // The providers
@@ -101,13 +100,14 @@ namespace {
 // ---------------------------------------------------------------------------
 
 // The runtime declares `binding_console` because `lesh_runtime` cannot call a
-// keymap function - `lesh` is built on `lesh_runtime lesh_syntax lesh_ui` plus,
-// since #134, `lesh_leshper`, and the editor must not be reachable from a
-// builtin or every `lesh -c` would link it. This is the implementation, and it
+// keymap function - `lesh_runtime` links `lesh_syntax` and nothing above it,
+// and the editor must not be reachable from a builtin or every `lesh -c` would
+// link it. `lesh_ui` links both halves. This is the implementation, and it
 // is the same twenty lines `leshper_keymap_tests.cpp` proved were enough.
 class leshper_binding_console final : public runtime::binding_console {
 public:
-	explicit leshper_binding_console(editing_context& context) noexcept : _context(&context) {}
+	explicit leshper_binding_console(leshper::editing_context& context) noexcept
+		: _context(&context) {}
 
 	void keymap_names(std::vector<std::string>& into) const override {
 		_context->keymaps().names(into);
@@ -120,11 +120,11 @@ public:
 
 	outcome bind_key(std::string_view name, std::string_view notation,
 	                 std::string_view action) override {
-		keymap* map = keymap_for(name);
+		leshper::keymap* map = keymap_for(name);
 		if (map == nullptr)
 			return outcome::no_such_keymap;
 		std::string encoded;
-		if (!parse_key_notation(notation, encoded))
+		if (!leshper::parse_key_notation(notation, encoded))
 			return outcome::bad_notation;
 		if (!action.empty()) {
 			// Bound to something that exists, or the binding is a typo that only
@@ -142,11 +142,11 @@ public:
 
 	outcome lookup_key(std::string_view name, std::string_view notation,
 	                   std::string& action_out) const override {
-		const keymap* map = keymap_for(name);
+		const leshper::keymap* map = keymap_for(name);
 		if (map == nullptr)
 			return outcome::no_such_keymap;
 		std::string encoded;
-		if (!parse_key_notation(notation, encoded))
+		if (!leshper::parse_key_notation(notation, encoded))
 			return outcome::bad_notation;
 		const std::string* bound = map->action_for(encoded);
 		action_out = bound != nullptr ? *bound : std::string{};
@@ -156,21 +156,21 @@ public:
 	outcome list_bindings(
 		std::string_view name,
 		std::vector<std::pair<std::string, std::string>>& into) const override {
-		const keymap* map = keymap_for(name);
+		const leshper::keymap* map = keymap_for(name);
 		if (map == nullptr)
 			return outcome::no_such_keymap;
 		into.clear();
-		for (const keymap::entry& one : map->entries())
-			into.emplace_back(render_key_notation(one.keys), one.action);
+		for (const leshper::keymap::entry& one : map->entries())
+			into.emplace_back(leshper::render_key_notation(one.keys), one.action);
 		return outcome::ok;
 	}
 
 private:
-	[[nodiscard]] keymap* keymap_for(std::string_view name) const {
-		return _context->keymaps().find(name.empty() ? keymap_registry::emacs : name);
+	[[nodiscard]] leshper::keymap* keymap_for(std::string_view name) const {
+		return _context->keymaps().find(name.empty() ? leshper::keymap_registry::emacs : name);
 	}
 
-	editing_context* _context;
+	leshper::editing_context* _context;
 };
 
 // ---------------------------------------------------------------------------
@@ -192,7 +192,7 @@ private:
 
 class leshper_prompt_console final : public runtime::prompt_console {
 public:
-	explicit leshper_prompt_console(prompt::engine& engine) noexcept : _engine(&engine) {}
+	explicit leshper_prompt_console(leshper::prompt::engine& engine) noexcept : _engine(&engine) {}
 
 	void module_names(std::vector<std::string>& into) const override {
 		_engine->module_names(into);
@@ -229,12 +229,12 @@ private:
 	// `surface_id` without the runtime including a leshper header, which is the
 	// link this whole arrangement exists to prevent; so the mapping is three lines
 	// at the one point that legitimately sees both.
-	[[nodiscard]] static prompt::surface_id surface_of(surface which) noexcept {
-		return which == surface::continuation ? prompt::surface_id::continuation
-		                                      : prompt::surface_id::left;
+	[[nodiscard]] static leshper::prompt::surface_id surface_of(surface which) noexcept {
+		return which == surface::continuation ? leshper::prompt::surface_id::continuation
+		                                      : leshper::prompt::surface_id::left;
 	}
 
-	prompt::engine* _engine;
+	leshper::prompt::engine* _engine;
 };
 
 // ---------------------------------------------------------------------------
@@ -264,8 +264,8 @@ struct prompt_facts {
 	bool (*getvar)(const void*, std::string_view, std::string_view&) = nullptr;
 	const void* getvar_ctx = nullptr;
 
-	[[nodiscard]] prompt::state view() const noexcept {
-		prompt::state facts;
+	[[nodiscard]] leshper::prompt::state view() const noexcept {
+		leshper::prompt::state facts;
 		facts.pwd = pwd;
 		facts.home = home;
 		// EMPTY, and deliberately: the vi-mode indicator's context tweak is v2's
@@ -324,10 +324,10 @@ void fill_wall_clock(prompt_facts& into) noexcept {
 // adapters all die together and in the reverse order they were built. Nothing
 // here is a global and nothing is leaked on any exit path, which is what lets
 // the leak gate expect zero.
-class session final : public shell_side {
+class session final : public leshper::shell_side {
 public:
 	session(runtime::shell_state& state, buffer_pool& pool, const provider_bundle& providers,
-	        int in, int out);
+	        int in, int out, prompt_extension_installer install_extensions);
 
 	~session() override;
 
@@ -371,7 +371,7 @@ private:
 
 	// The three line-reading actions, ON THE LOOP THREAD.
 	//
-	// REGISTERED AT THE WIRING SITE rather than in builtin_actions.cpp, and the
+	// REGISTERED IN THE UI LAYER rather than in builtin_actions.cpp, and the
 	// reason is their userdata: each needs the session - the syntax layer for
 	// F-35, the cancel flag for #98 decision 3 - where the ten built-ins are
 	// pure editor verbs registered with a null context because they have none to
@@ -394,25 +394,25 @@ private:
 	// because both borrow it: the actor raises it around `execute` and
 	// `port_call` below, and the adapter asserts it is down on every read. One
 	// flag, so the two cannot be talking about different windows.
-	shell_writing_flag _writing;
+	leshper::shell_writing_flag _writing;
 	shell_state_knowledge _knowledge;
-	owned_highlighter _highlighter;
-	owned_autosuggester _autosuggester;
-	worker_pool _helpers;
-	signal_hub _signals;
+	leshper::owned_highlighter _highlighter;
+	leshper::owned_autosuggester _autosuggester;
+	leshper::worker_pool _helpers;
+	leshper::signal_hub _signals;
 	// DECLARED BEFORE THE LOOP, and for the actor's reason one line down: the
 	// registry the loop owns holds a borrowed pointer to this engine (see the
 	// constructor), and members die in reverse - so the loop, and the registry
 	// with it, has to go first.
-	prompt::engine _prompt_engine;
+	leshper::prompt::engine _prompt_engine;
 	prompt_facts _prompt_facts;
 	// THE ACTOR IS DECLARED BEFORE THE LOOP, and it is not a style choice:
 	// `~event_loop` recycles the messages `drain` handed it back into the
 	// channel the ACTOR owns (ADR-0007), so an actor destroyed first would have
 	// the loop locking a mutex whose storage had gone. Members die in reverse,
 	// so declaring it first is how the loop dies first.
-	shell_actor _actor;
-	event_loop _loop;
+	leshper::shell_actor _actor;
+	leshper::event_loop _loop;
 	std::optional<leshper_binding_console> _console;
 	std::optional<leshper_prompt_console> _prompt_console;
 
@@ -467,15 +467,15 @@ private:
 	// blocks on for their whole duration. So while this call runs, nothing is
 	// writing - and `_writing` above is what says so out loud if that ever stops
 	// being true.
-	shell_completer _completer;
+	leshper::shell_completer _completer;
 };
 
 
 // The loop's options, built once. A function rather than an initializer list in
 // the member init, because half of it is environment reading and the ctor is
 // already long enough.
-loop_options options_for(const provider_bundle& providers, bool manage_terminal) {
-	loop_options options;
+leshper::loop_options options_for(const provider_bundle& providers, bool manage_terminal) {
+	leshper::loop_options options;
 	if (providers.prompt != nullptr) {
 		providers.prompt->left(options.prompt);
 		providers.prompt->continuation(options.continuation);
@@ -483,23 +483,25 @@ loop_options options_for(const provider_bundle& providers, bool manage_terminal)
 	// #97 decision 2, "assume first": the trivial environment reads and nothing
 	// else. Never terminfo, and no startup query - a DA1 round trip needs a
 	// timeout and that is a latency tax on everyone.
-	options.capabilities = terminal_capabilities::from_env(
+	options.capabilities = leshper::terminal_capabilities::from_env(
 		std::getenv("TERM"), std::getenv("COLORTERM"), std::getenv("NO_COLOR"));
 	options.manage_terminal = manage_terminal;
 	return options;
 }
 
 session::session(runtime::shell_state& state, buffer_pool& pool,
-                 const provider_bundle& providers, int in, int out)
+                 const provider_bundle& providers, int in, int out,
+                 prompt_extension_installer install_extensions)
 	: _state(state),
 	  _providers(providers),
 	  _executor(pool, state),
 	  _knowledge(state, &_writing),
 	  _autosuggester(providers.history),
 	  _actor(*this, &_knowledge, &_writing),
-	  _loop(loop_fds{in, out}, options_for(providers, true)),
+	  _loop(leshper::loop_fds{in, out}, options_for(providers, true)),
 	  _completer(&_knowledge) {
-	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163).
+	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163),
+	// THROUGH A HOOK THIS LAYER CANNOT NAME ITSELF (#164).
 	//
 	// FIRST THING, and the reason is precedence rather than taste: everything
 	// below this - `use_default`, `source_rc`, the first paint - may name a
@@ -508,9 +510,13 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// built-ins; this is where the ones lesh ships on top of them arrive, and
 	// leshper itself never learns their names.
 	//
-	// THE WIRING SITE IS THE ONLY CALLER, which is what makes an engine built by
-	// a test a bare one: `{git}` on it is an unknown module, refused at `set`.
-	leshnici::install_prompt_modules(_prompt_engine);
+	// INDIRECT, because leshnici is ABOVE this layer: `lesh_ui` links
+	// `lesh_leshper` and `lesh_runtime` and nothing else, so
+	// `install_prompt_modules` is a name only `main.cpp` may say. Null - what
+	// every unit test passes - is what makes an engine built by a test a bare
+	// one: `{git}` on it is an unknown module, refused at `set`.
+	if (install_extensions != nullptr)
+		install_extensions(_prompt_engine);
 
 	// The EXIT trap belongs to the session and not to the first line of it. See
 	// tree_walking_executor::defer_exit_trap; `run` runs it on the way out.
@@ -521,7 +527,7 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// a keystroke reaches have to be the same object - and they are, because this
 	// asks the loop's own editor state for its context rather than building a
 	// second one beside it.
-	editing_context& context = context_of(_loop.editor());
+	leshper::editing_context& context = context_of(_loop.editor());
 	// The ten built-in actions and the three default keymaps are the context's
 	// constructor's; what is added here is everything that needs a shell.
 	register_builtin_reactors(context.actions(), _highlighter.get());
@@ -590,7 +596,7 @@ session::~session() {
 }
 
 void session::register_line_actions() {
-	registry& actions = context_of(_loop.editor()).actions();
+	leshper::registry& actions = context_of(_loop.editor()).actions();
 	lesh_action_register(&actions, "accept_line", &session::accept_line, this);
 	lesh_action_register(&actions, "cancel_line", &session::cancel_line, this);
 	lesh_action_register(&actions, "end_of_file", &session::end_of_file, this);
@@ -603,12 +609,12 @@ void session::register_line_actions() {
 }
 
 void session::bind_line_keys() {
-	keymap_registry& maps = context_of(_loop.editor()).keymaps();
+	leshper::keymap_registry& maps = context_of(_loop.editor()).keymaps();
 	const auto bind = [&](std::string_view map_name, const char* notation,
 	                      std::string_view action) {
-		keymap* map = maps.find(map_name);
+		leshper::keymap* map = maps.find(map_name);
 		std::string encoded;
-		if (map == nullptr || !parse_key_notation(notation, encoded)) {
+		if (map == nullptr || !leshper::parse_key_notation(notation, encoded)) {
 			LESH_ASSERT(false && "a default binding does not parse");
 			return;
 		}
@@ -633,13 +639,14 @@ void session::bind_line_keys() {
 	// The autosuggestion accept keys are #140's and UNDECIDED, so nothing is bound
 	// to `accept_autosuggestion` - a registered name with no key, which is exactly
 	// what an rc file binds.
-	for (const std::string_view map_name :
-	     {keymap_registry::emacs, keymap_registry::vi_insert, keymap_registry::vi_command}) {
+	for (const std::string_view map_name : {leshper::keymap_registry::emacs,
+	                                        leshper::keymap_registry::vi_insert,
+	                                        leshper::keymap_registry::vi_command}) {
 		bind(map_name, "<C-m>", "accept_line");
 		bind(map_name, "<C-j>", "accept_line");
 	}
-	bind(keymap_registry::emacs, "<C-d>", "end_of_file");
-	bind(keymap_registry::vi_insert, "<C-d>", "end_of_file");
+	bind(leshper::keymap_registry::emacs, "<C-d>", "end_of_file");
+	bind(leshper::keymap_registry::vi_insert, "<C-d>", "end_of_file");
 
 	// TAB COMPLETES, and it is bound HERE rather than in keymap.cpp's default
 	// tables for the same reason `accept_line` is: a completion needs a
@@ -651,8 +658,8 @@ void session::bind_line_keys() {
 	// NOT IN `vi_command`: Tab there is not an insertion, and vi's own repertoire
 	// has no completion verb. Insert mode has it, which is where text is being
 	// entered.
-	bind(keymap_registry::emacs, "<Tab>", "complete_word");
-	bind(keymap_registry::vi_insert, "<Tab>", "complete_word");
+	bind(leshper::keymap_registry::emacs, "<Tab>", "complete_word");
+	bind(leshper::keymap_registry::vi_insert, "<Tab>", "complete_word");
 }
 
 bool session::prompt_variable(const void* ctx, std::string_view name, std::string_view& out) {
@@ -748,8 +755,8 @@ void session::refresh_prompt() {
 	                          && _prompt_continuation_scratch == kPosixContinuation);
 
 	if (_engine_owns_prompt) {
-		_loop.options().prompt = _prompt_engine.output(prompt::surface_id::left);
-		_loop.options().continuation = _prompt_engine.output(prompt::surface_id::continuation);
+		_loop.options().prompt = _prompt_engine.output(leshper::prompt::surface_id::left);
+		_loop.options().continuation = _prompt_engine.output(leshper::prompt::surface_id::continuation);
 	} else {
 		_loop.options().prompt = _prompt_left_scratch;
 		_loop.options().continuation = _prompt_continuation_scratch;
@@ -765,10 +772,10 @@ void session::reconcile_prompt_timer() {
 	// from `prompt_tick`, where it IS the loop. There is no third caller, and the
 	// two windows cannot overlap - which is what makes the registry's
 	// "loop-thread only" rule (ADR-0008) hold here rather than be bent.
-	registry& actions = context_of(_loop.editor()).actions();
+	leshper::registry& actions = context_of(_loop.editor()).actions();
 
 	const std::uint64_t desired =
-		prompt::timer_interval_ms(_prompt_engine.next_wake(), _prompt_facts.tick);
+		leshper::prompt::timer_interval_ms(_prompt_engine.next_wake(), _prompt_facts.tick);
 
 	// UNCHANGED CADENCE LEAVES THE TIMER ALONE, and this is the load-bearing
 	// branch rather than an optimisation: the loop rearms a timer from the moment
@@ -932,7 +939,7 @@ std::int32_t session::prompt_tick(lesh_editor*, const lesh_invocation*, void* se
 	me._prompt_facts.tick = tick_now();
 	fill_wall_clock(me._prompt_facts);
 
-	prompt::state facts = me._prompt_facts.view();
+	leshper::prompt::state facts = me._prompt_facts.view();
 
 	// AND THE VARIABLE DOOR IS SHUT. A tick may only re-invoke clock-derived
 	// elements (`engine::render_tick`'s contract says so), but the engine cannot
@@ -954,9 +961,9 @@ std::int32_t session::prompt_tick(lesh_editor*, const lesh_invocation*, void* se
 	// `refresh_prompt` decided, and asking it again from this thread is not
 	// available anyway - half the question is about `shell_state`.
 	if (moved && me._engine_owns_prompt) {
-		me._loop.options().prompt = me._prompt_engine.output(prompt::surface_id::left);
+		me._loop.options().prompt = me._prompt_engine.output(leshper::prompt::surface_id::left);
 		me._loop.options().continuation =
-			me._prompt_engine.output(prompt::surface_id::continuation);
+			me._prompt_engine.output(leshper::prompt::surface_id::continuation);
 		// DIRECTLY, and this is the one place an action calls it. The loop is the
 		// calling thread and is mid-turn with nothing staged, and what changed is
 		// an OPTION rather than editor state - so there is no generation to bump
@@ -998,10 +1005,10 @@ void session::source_rc(std::string_view path) {
 
 int session::run(std::string_view rc_path) {
 	// #98 decision 5: SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGABRT restore the
-	// terminal and re-raise. From the WIRING SITE and not from the loop, because
+	// terminal and re-raise. From THE UI LAYER and not from the loop, because
 	// process-wide dispositions belong to whoever owns the process - and only
 	// where the disposition is still SIG_DFL, so ASan keeps its own.
-	install_fatal_restore_handlers();
+	leshper::install_fatal_restore_handlers();
 
 	// #101 decision 3: state, then rc, THEN the first read. The editing context
 	// and the binding console already exist - this object's constructor built
@@ -1037,12 +1044,13 @@ int session::run(std::string_view rc_path) {
 
 int run_interactive_shell(runtime::shell_state& state, buffer_pool& pool,
                           const provider_bundle& providers, int in, int out,
-                          std::string_view rc_path) {
+                          std::string_view rc_path,
+                          prompt_extension_installer install_extensions) {
 	LESH_ASSERT(providers.syntax != nullptr);
 	LESH_ASSERT(providers.history != nullptr);
 	LESH_ASSERT(providers.prompt != nullptr);
-	session interactive{state, pool, providers, in, out};
+	session interactive{state, pool, providers, in, out, install_extensions};
 	return interactive.run(rc_path);
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

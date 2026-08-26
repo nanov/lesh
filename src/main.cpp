@@ -35,13 +35,14 @@ x .d88"               z`    ^%    .uef^"
 #include <unistd.h>
 #include <vector>
 
-#include "leshper/read.h"
+#include "leshnici/prompt_modules.h"
 #include "runtime/executor.h"
 #include "runtime/history_store.h"
 #include "runtime/invocation.h"
 #include "runtime/shell_state.h"
 #include "substrate/log.h"
 #include "syntax/parser.h"
+#include "ui/session.h"
 
 namespace {
 
@@ -119,7 +120,7 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	// courtesy of exec'ing /bin/sh instead; that is not taken here, because a
 	// shell that silently becomes a different shell is worse to debug than one
 	// that says why it stopped.
-	if (!lesh::leshper::terminal_meets_floor(term)) {
+	if (!lesh::ui::terminal_meets_floor(term)) {
 		std::fprintf(stderr,
 		             "lesh: %s is below the terminal floor (ANSI, 256 colours, "
 		             "bracketed paste)\n",
@@ -141,8 +142,8 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 
 	// The four providers (#94). Owned HERE, so they outlive the session that
 	// borrows them and are freed before main returns (ADR-0007).
-	const lesh::leshper::shell_syntax_layer syntax;
-	const lesh::leshper::shell_prompt_source prompt{state};
+	const lesh::ui::shell_syntax_layer syntax;
+	const lesh::ui::shell_prompt_source prompt{state};
 
 	// #101: a non-interactive shell touches no history file, and `history_store`
 	// has no way to know which kind of shell built it - so the decision is made
@@ -152,11 +153,11 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	if (const std::optional<std::string> path = lesh::runtime::history_store::default_path())
 		history.emplace(*path);
 	const lesh::leshper::vector_history_source empty_history;
-	std::optional<lesh::leshper::history_store_source> recorded;
+	std::optional<lesh::ui::history_store_source> recorded;
 	if (history.has_value())
 		recorded.emplace(*history);
 
-	lesh::leshper::provider_bundle providers;
+	lesh::ui::provider_bundle providers;
 	providers.syntax = &syntax;
 	providers.prompt = &prompt;
 	providers.history = recorded.has_value()
@@ -198,8 +199,14 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	if (tty_fd != -1)
 		state.set_tty_fd(tty_fd);
 
-	const int status = lesh::leshper::run_interactive_shell(state, pool, providers,
-	                                                        STDIN_FILENO, STDOUT_FILENO, rc);
+	// THE SHIPPED EXTENSION SET, NAMED HERE AND NOWHERE ELSE (#163, #164).
+	// `lesh_ui` does not link `lesh_leshnici` - leshnici is the layer above the
+	// session, not inside it - so the session takes an installer and this is the
+	// one caller that can supply the real one. A session built by a test passes
+	// nothing and gets the bare seven-module engine.
+	const int status = lesh::ui::run_interactive_shell(state, pool, providers,
+	                                                   STDIN_FILENO, STDOUT_FILENO, rc,
+	                                                   &lesh::leshnici::install_prompt_modules);
 	// The state outlives this function (main built it), so the borrowed fd is
 	// taken back before it is closed - ADR-0007's ownership, and it also means a
 	// late `tcsetpgrp` cannot reach a descriptor that has been reused.

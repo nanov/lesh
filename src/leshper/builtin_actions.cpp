@@ -572,7 +572,7 @@ constexpr builtin builtins[] = {
 	{"accept_suggestion_or_word_end_next", accept_suggestion_or, &to_vi_word_end},
 	// #149's sixth row. Registered like the other five, bound like none of them.
 	{"accept_suggestion_char_or_forward_char", accept_suggestion_or, &to_forward_char_by_one},
-	// #139's. Bound to Tab at the wiring site (read.cpp) rather than in
+	// #139's. Bound to Tab in the ui layer (`ui/session.cpp`) rather than in
 	// keymap.cpp's default tables, because it is only in a session that a
 	// completer exists to complete WITH - the same reason `accept_line` is bound
 	// there. zsh calls it `expand-or-complete`, readline `complete`, fish

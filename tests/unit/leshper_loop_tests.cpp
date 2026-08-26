@@ -573,7 +573,7 @@ TEST(LeshperLoopSignals, TheLoopNeverWritesADisposition) {
 	// the dispositions back used to happen on the LOOP thread, in `enter_read`
 	// and on the unpark - two threads writing one piece of process-wide state,
 	// the other being the shell thread's `trap` builtin. The re-assert moved to
-	// the shell side of the wiring site (`read.cpp`), and what is left here must
+	// the shell side of the ui layer (`ui/session.cpp`), and what is left here must
 	// call no `sigaction` at all: a foreign handler installed after `install()`
 	// survives a read entry and a turn untouched.
 	const every_hub_disposition guards;
