@@ -3,6 +3,7 @@
 #include "leshper/abi.h"
 #include "leshper/editor.h"
 #include "leshper/event.h"
+#include "leshper/history_search.h"
 #include "leshper/keymap.h"
 #include "leshper/kill_store.h"
 #include "leshper/registry.h"
@@ -13,6 +14,8 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // The vi repertoire (#99, #119), in its own file.
 //
@@ -64,6 +67,34 @@ bool kill_is_linewise(const state& s) {
 }
 
 constexpr char32_t escape_key = 0x1B;
+
+// A suggestion on screen, put there the way the loop puts one there (#140,
+// #147): a real autosuggester registered into the state's OWN context, one
+// react, one `apply_batch`. Nothing is written into `state::proposals` by hand,
+// because the question these tests ask is what a KEY does with a suggestion the
+// loop applied, and a hand-built one would not have gone through the applier
+// that decides whether it is stale.
+//
+// Declared BEFORE the state in every test that uses it, so the history and the
+// reactor outlive the registry that points at them (ADR-0007).
+class suggests {
+public:
+	explicit suggests(std::vector<std::string> entries) : _history(std::move(entries)) {}
+
+	suggests(const suggests&) = delete;
+	suggests& operator=(const suggests&) = delete;
+
+	void into(state& s) { register_autosuggester(context_of(s).actions(), _self.get()); }
+
+	void show(state& s) {
+		for (reactor_batch& one : context_of(s).loop().react(s, LESH_EVENT_BUFFER_CHANGED))
+			apply_batch(s, one);
+	}
+
+private:
+	vector_history_source _history;
+	owned_autosuggester _self{&_history};
+};
 
 } // namespace
 
@@ -1081,4 +1112,137 @@ TEST(LeshperViDispatch, TheChangeAccumulatorDoesNotGrowAcrossFinishedCommands) {
 	// And a change records exactly its own keys, not the two hundred before it.
 	type(s, "dw");
 	EXPECT_EQ(s.repeat.keys, "dw");
+}
+
+// ---------------------------------------------------------------------------
+// The suggestion and the operator (#140 decision 2, #147)
+//
+// The argument that decided the whole shape: vi operators drive motions, so a
+// motion that learned to accept would accept while deleting. These tests are
+// that argument, end to end through dispatch - which is the only way to ask it,
+// because what makes it safe is WHICH KEYMAP the key resolved in.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperViOperator, AnOperatorsMotionCannotAcceptASuggestion) {
+	suggests history{{"git status --short"}};
+	state s = vi_state("git", 3);
+	history.into(s);
+	history.show(s);
+	ASSERT_FALSE(s.proposals.empty()) << "no suggestion showing; the test proves nothing";
+
+	// `dw`. The `w` dispatches inside `vi_operator_pending`, which is OPAQUE and
+	// got its bindings from `bind_vi_motions` and from nowhere else - so it is
+	// `vi_word_next`, a pure motion, and there is no accepting action underneath
+	// it to fall through to.
+	press(s, U'd');
+	press(s, U'w');
+	EXPECT_EQ(text_of(s), "git") << "the operator's motion accepted the suggestion";
+	EXPECT_EQ(mode_of(s), keymap_registry::vi_command) << "the operator never finished";
+
+	// `d$`, the case #140 named. `$` is `end_of_line` in both maps and stays a
+	// pure motion in command mode too: there is no whole-line accept in vi.
+	history.show(s);
+	ASSERT_FALSE(s.proposals.empty());
+	press(s, U'd');
+	press(s, U'$');
+	EXPECT_EQ(text_of(s), "git") << "d$ accepted the suggestion while deleting";
+
+	// `cw` and `yw` for completeness - all three verbs push the same map, so a
+	// regression would take all three, but a reader should not have to know that.
+	history.show(s);
+	press(s, U'c');
+	press(s, U'w');
+	EXPECT_EQ(text_of(s), "git") << "cw accepted the suggestion";
+	press(s, escape_key);
+
+	// THE POSITIVE CONTROL, and the reason this is one test rather than two: the
+	// same `w`, dispatched from command mode instead of from under an operator,
+	// takes a word of the suggestion. One key, two keymaps, two meanings.
+	s.keymaps.set_mode(keymap_registry::vi_command);
+	s.cursor = s.buffer.end_position();
+	history.show(s);
+	ASSERT_FALSE(s.proposals.empty());
+	press(s, U'w');
+	EXPECT_EQ(text_of(s), "git status");
+}
+
+TEST(LeshperViMotion, WAndEAcceptAWordAtTheEndAndAreTheirOwnMotionsAnywhereElse) {
+	// #140's vi row: the two partial accepts zsh-autosuggestions binds, and no
+	// whole-line accept anywhere in command mode.
+	{
+		suggests history{{"git status --short"}};
+		state s = vi_state("git", 3);
+		history.into(s);
+		history.show(s);
+		press(s, U'w');
+		EXPECT_EQ(text_of(s), "git status");
+		EXPECT_EQ(cursor_of(s), 10u);
+	}
+	{
+		suggests history{{"git status --short"}};
+		state s = vi_state("git", 3);
+		history.into(s);
+		history.show(s);
+		press(s, U'e');
+		EXPECT_EQ(text_of(s), "git status");
+	}
+	{
+		// `b` is untouched: a suggestion is forward of the cursor, so backward has
+		// nothing to accept and the key stays the motion it was.
+		suggests history{{"git status --short"}};
+		state s = vi_state("git", 3);
+		history.into(s);
+		history.show(s);
+		press(s, U'b');
+		EXPECT_EQ(text_of(s), "git");
+		EXPECT_EQ(cursor_of(s), 0u);
+	}
+	{
+		// And no whole-line accept: `$` and `l` move, with a suggestion showing.
+		suggests history{{"git status --short"}};
+		state s = vi_state("git", 3);
+		history.into(s);
+		history.show(s);
+		press(s, U'$');
+		EXPECT_EQ(text_of(s), "git");
+		press(s, U'l');
+		EXPECT_EQ(text_of(s), "git");
+	}
+}
+
+TEST(LeshperViMotion, WithNothingSuggestedWAndEMoveExactlyAsTheyDidBefore) {
+	// The half a user notices: with an empty history the two wrapped keys are
+	// indistinguishable from the motions they wrap. Asserted against a state
+	// driven the same way with no autosuggester registered at all, so the
+	// expectation is the OLD behaviour rather than a number written out by hand.
+	state bare = vi_state("echo one two", 0);
+	press(bare, U'w');
+	press(bare, U'e');
+
+	suggests history{{}};
+	state wrapped = vi_state("echo one two", 0);
+	history.into(wrapped);
+	history.show(wrapped);
+	press(wrapped, U'w');
+	press(wrapped, U'e');
+
+	EXPECT_EQ(text_of(wrapped), text_of(bare));
+	EXPECT_EQ(cursor_of(wrapped), cursor_of(bare));
+	EXPECT_GT(cursor_of(wrapped), 0u) << "the motions did not move at all";
+}
+
+TEST(LeshperViMotion, AWrappedMotionStillTakesItsCount) {
+	// The invocation travels unchanged through `lesh_action_invoke`, so `3w` is
+	// still three words - the count is dispatch's and the wrapper never sees a
+	// reason to touch it.
+	state bare = vi_state("one two three four five", 0);
+	type(bare, "3w");
+
+	suggests history{{}};
+	state wrapped = vi_state("one two three four five", 0);
+	history.into(wrapped);
+	type(wrapped, "3w");
+
+	EXPECT_EQ(cursor_of(wrapped), cursor_of(bare));
+	EXPECT_EQ(cursor_of(wrapped), 14u);
 }

@@ -589,6 +589,28 @@ void bind_vi_motions(keymap& into) {
 	bind_notation(into, "<Down>", "vi_line_down");
 }
 
+// #140's accept table, in one place because emacs and vi_insert get the same
+// six keys - "same four, same two" is the resolution's own wording, and one
+// call is what keeps it from drifting into two tables that disagree.
+//
+// EVERY ONE OF THESE IS THE KEY IT ALWAYS WAS. `<Right>` is still forward-char
+// when nothing is suggested, `<End>` still end-of-line; what the wrapper adds
+// is a meaning at the end of the buffer with a suggestion showing, and the
+// action name a listing prints says so. The motion actions themselves are
+// untouched, which is what makes `d$` in command mode safe by construction.
+//
+// `<A-f>` and `<A-Right>` had NO emacs binding before this - emacs's
+// `forward-word` was a name nothing reached - so the word keys arrive bound to
+// the wrapper rather than being taken over from a motion.
+void bind_accept_by_fallthrough(keymap& into) {
+	bind_notation(into, "<Right>", "accept_suggestion_or_forward_char");
+	bind_notation(into, "<C-f>", "accept_suggestion_or_forward_char");
+	bind_notation(into, "<End>", "accept_suggestion_or_end_of_line");
+	bind_notation(into, "<C-e>", "accept_suggestion_or_end_of_line");
+	bind_notation(into, "<A-f>", "accept_suggestion_or_forward_word");
+	bind_notation(into, "<A-Right>", "accept_suggestion_or_forward_word");
+}
+
 // The text objects (#99 answer 2), in one place because operator-pending and
 // visual both want them: `diw` and `viw` are the same action reached from two
 // stacks, which is exactly what "an object is one action that sets the
@@ -628,14 +650,13 @@ void keymap_registry::install_defaults() {
 	bind_notation(*emacs_map, "<BSKey>", "delete_backward_char");
 	bind_notation(*emacs_map, "<C-w>", "delete_backward_word");
 	bind_notation(*emacs_map, "<C-a>", "beginning_of_line");
-	bind_notation(*emacs_map, "<C-e>", "end_of_line");
 	bind_notation(*emacs_map, "<C-b>", "backward_char");
-	bind_notation(*emacs_map, "<C-f>", "forward_char");
 	bind_notation(*emacs_map, "<C-_>", "undo");
 	bind_notation(*emacs_map, "<Left>", "backward_char");
-	bind_notation(*emacs_map, "<Right>", "forward_char");
 	bind_notation(*emacs_map, "<Home>", "beginning_of_line");
-	bind_notation(*emacs_map, "<End>", "end_of_line");
+	// The four forward keys and the two word keys are #140's, and they are the
+	// same six in vi_insert: see `bind_accept_by_fallthrough`.
+	bind_accept_by_fallthrough(*emacs_map);
 
 	// The emacs side of the ONE kill store (#99 answer 3): `C-y` reads what a
 	// kill wrote, which is the same table vi's `p` reads.
@@ -652,10 +673,13 @@ void keymap_registry::install_defaults() {
 	bind_notation(*insert_map, "<BSKey>", "delete_backward_char");
 	bind_notation(*insert_map, "<C-w>", "delete_backward_word");
 	bind_notation(*insert_map, "<Left>", "backward_char");
-	bind_notation(*insert_map, "<Right>", "forward_char");
 	bind_notation(*insert_map, "<Home>", "beginning_of_line");
-	bind_notation(*insert_map, "<End>", "end_of_line");
 	bind_notation(*insert_map, "<Esc>", "vi_command_mode");
+	// The same six as emacs (#140: "same four, same two"). Insert mode is where
+	// a suggestion is being typed into, so it is the mode the table matters most
+	// in - and the four emacs keys are what a vi user's fingers reach for there
+	// anyway, which is why zsh's `viins` carries them too.
+	bind_accept_by_fallthrough(*insert_map);
 
 	// --- vi_command: the repertoire (#99, #119, spec §6.5) ------------------
 	//
@@ -703,6 +727,24 @@ void keymap_registry::install_defaults() {
 	bind_notation(*command_map, "<C-r>", "redo");
 	bind_notation(*command_map, "<Home>", "beginning_of_line");
 	bind_notation(*command_map, "<End>", "end_of_line");
+
+	// #140's vi row, and it is deliberately the SHORT one: the two partial
+	// accepts zsh-autosuggestions binds, and no whole-line accept at all.
+	// Command mode is where you go to edit what is already there, not to take
+	// more of a suggestion; `$` and `l` stay pure motions for that reason and
+	// because vi's own `d$` must keep meaning what it means.
+	//
+	// AFTER `bind_vi_motions`, which bound these two to their motions a moment
+	// ago - binding replaces, so this is the one keymap where `w` and `e` mean
+	// the wrapper. `vi_operator_pending` calls the same `bind_vi_motions` and
+	// nothing else, so the `w` in `dw` is still `vi_word_next` and cannot
+	// accept. That is #140 decision 2's safety, and it is here as a fact about
+	// two lines of table rather than as a condition inside an action.
+	//
+	// `b` is untouched: a suggestion is forward of the cursor, so backward has
+	// nothing to accept.
+	bind_notation(*command_map, "w", "accept_suggestion_or_word_start_next");
+	bind_notation(*command_map, "e", "accept_suggestion_or_word_end_next");
 
 	// --- vi_operator_pending: zle's `viopp` ---------------------------------
 	//

@@ -590,3 +590,33 @@ TEST(LeshperPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
 	EXPECT_TRUE(shell.wait_for("42", 2))
 		<< "the Ctrl-V byte never reached the shell; saw: " << shell.seen();
 }
+
+TEST(LeshperPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
+	// #140's table on a real terminal, with NOTHING bound by the rc: `<Right>`
+	// is `accept_suggestion_or_forward_char` out of the box, the cursor is at
+	// the end of the buffer and a suggestion is showing, so the key accepts and
+	// Enter runs what it accepted. This is the switch-on test for the whole
+	// ticket - the keymap default, the wrapper, the composed accept and the
+	// loop's own apply, all at once.
+	//
+	// `\x1b[C` is what a terminal sends for the right arrow, and it is written as
+	// the bytes rather than as a name because that is what arrives on the wire.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("echo $((6*7))\r");
+	ASSERT_TRUE(shell.wait_for("42")) << "saw: " << shell.seen();
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
+
+	shell.type("echo $((6*");
+	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	// The suggestion is computed on a worker, so the ghost text lands a moment
+	// after the echo of what was typed. Long enough that it certainly has.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x1b[C\r");
+
+	EXPECT_TRUE(shell.wait_for("42", 2))
+		<< "the default Right did not accept; saw: " << shell.seen();
+}

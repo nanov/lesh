@@ -287,6 +287,12 @@ TEST(LeshperKeymapRegistry, TheEmacsDefaultsAreTheHardcodedTableMovedIn) {
 	// #107's switch, key for key. Two spellings of Backspace, because terminals
 	// disagree about which one they send and event.h binds both. Enter is
 	// deliberately absent - F-35 makes it a decision the parser takes part in.
+	//
+	// THE FOUR FORWARD KEYS RUN A WRAPPER NOW (#140 decision 2, #147), and that
+	// is the whole visible difference: `<Right>` is `forward_char` with nothing
+	// suggested and an accept at the end of the buffer, under one name that says
+	// both. The backward keys are untouched - a suggestion is forward of the
+	// cursor - and so is `<C-a>`.
 	keymap_registry maps;
 	maps.install_defaults();
 	const keymap* emacs = maps.find(keymap_registry::emacs);
@@ -295,11 +301,16 @@ TEST(LeshperKeymapRegistry, TheEmacsDefaultsAreTheHardcodedTableMovedIn) {
 	const std::pair<const char*, const char*> expected[] = {
 		{"<BS>", "delete_backward_char"},   {"<C-h>", "delete_backward_char"},
 		{"<BSKey>", "delete_backward_char"}, {"<C-w>", "delete_backward_word"},
-		{"<C-a>", "beginning_of_line"},     {"<C-e>", "end_of_line"},
-		{"<C-b>", "backward_char"},         {"<C-f>", "forward_char"},
+		{"<C-a>", "beginning_of_line"},
+		{"<C-e>", "accept_suggestion_or_end_of_line"},
+		{"<C-b>", "backward_char"},
+		{"<C-f>", "accept_suggestion_or_forward_char"},
 		{"<C-_>", "undo"},                  {"<Left>", "backward_char"},
-		{"<Right>", "forward_char"},        {"<Home>", "beginning_of_line"},
-		{"<End>", "end_of_line"},
+		{"<Right>", "accept_suggestion_or_forward_char"},
+		{"<Home>", "beginning_of_line"},
+		{"<End>", "accept_suggestion_or_end_of_line"},
+		{"<A-f>", "accept_suggestion_or_forward_word"},
+		{"<A-Right>", "accept_suggestion_or_forward_word"},
 	};
 	for (const auto& [written, action] : expected) {
 		const std::string* bound = emacs->action_for(keys(written));
@@ -309,6 +320,86 @@ TEST(LeshperKeymapRegistry, TheEmacsDefaultsAreTheHardcodedTableMovedIn) {
 	EXPECT_EQ(emacs->action_for(keys("<CR>")), nullptr);
 	EXPECT_FALSE(emacs->opaque);
 	EXPECT_TRUE(emacs->indicator.empty());
+}
+
+TEST(LeshperKeymapRegistry, TheAcceptTableIsTheSameSixInEmacsAndViInsert) {
+	// #140 decision 4's table, read off the tables themselves: "same four, same
+	// two" for the two INSERTING keymaps, and neither a whole-line accept nor a
+	// dismissal anywhere in vi_command.
+	keymap_registry maps;
+	maps.install_defaults();
+	const keymap* emacs = maps.find(keymap_registry::emacs);
+	const keymap* insert = maps.find(keymap_registry::vi_insert);
+	ASSERT_NE(emacs, nullptr);
+	ASSERT_NE(insert, nullptr);
+
+	for (const char* written : {"<Right>", "<C-f>", "<End>", "<C-e>", "<A-f>", "<A-Right>"}) {
+		const std::string* in_emacs = emacs->action_for(keys(written));
+		const std::string* in_insert = insert->action_for(keys(written));
+		ASSERT_NE(in_emacs, nullptr) << written;
+		ASSERT_NE(in_insert, nullptr) << written;
+		EXPECT_EQ(*in_emacs, *in_insert) << written << " differs between the two modes";
+	}
+}
+
+TEST(LeshperKeymapRegistry, ViCommandAcceptsWordsOnWAndEAndKeepsBPure) {
+	// #140's vi row. `w` and `e` are the wrappers zsh-autosuggestions binds for
+	// partial accept; `b` is a pure motion because a suggestion lives forward of
+	// the cursor; `$` and `l` are pure because command mode has no whole-line
+	// accept at all.
+	keymap_registry maps;
+	maps.install_defaults();
+	const keymap* command = maps.find(keymap_registry::vi_command);
+	ASSERT_NE(command, nullptr);
+
+	ASSERT_NE(command->action_for(keys("w")), nullptr);
+	EXPECT_EQ(*command->action_for(keys("w")), "accept_suggestion_or_word_start_next");
+	ASSERT_NE(command->action_for(keys("e")), nullptr);
+	EXPECT_EQ(*command->action_for(keys("e")), "accept_suggestion_or_word_end_next");
+	ASSERT_NE(command->action_for(keys("b")), nullptr);
+	EXPECT_EQ(*command->action_for(keys("b")), "vi_word_prev");
+	EXPECT_EQ(*command->action_for(keys("$")), "end_of_line");
+	EXPECT_EQ(*command->action_for(keys("l")), "vi_forward_char");
+}
+
+TEST(LeshperKeymapRegistry, TheOperatorPendingMapBindsPureMotionsAndNothingThatAccepts) {
+	// #140 decision 2's safety argument, as a fact about the table: the `w` in
+	// `dw` and the `$` in `d$` dispatch HERE, inside an opaque keymap that got
+	// its bindings from `bind_vi_motions` and from nowhere else. There is no
+	// condition inside an action to get wrong, so this is where the property
+	// lives and where it is asserted. The end-to-end proof is in the vi suite.
+	keymap_registry maps;
+	maps.install_defaults();
+	const keymap* pending = maps.find("vi_operator_pending");
+	ASSERT_NE(pending, nullptr);
+
+	for (const keymap::entry& one : pending->entries())
+		EXPECT_EQ(one.action.find("accept_suggestion"), std::string::npos)
+			<< render_key_notation(one.keys) << " can accept a suggestion mid-operator";
+
+	ASSERT_NE(pending->action_for(keys("w")), nullptr);
+	EXPECT_EQ(*pending->action_for(keys("w")), "vi_word_next");
+	ASSERT_NE(pending->action_for(keys("e")), nullptr);
+	EXPECT_EQ(*pending->action_for(keys("e")), "vi_word_end");
+	EXPECT_EQ(*pending->action_for(keys("$")), "end_of_line");
+}
+
+TEST(LeshperKeymapRegistry, DismissIsBoundInNoDefaultKeymapAtAll) {
+	// #140 decision 4, and it is a decision rather than an omission: a
+	// suggestion changes as you type and Ctrl-C clears the line, so the key is
+	// not spent. The action is registered and one `bind` away, which is what the
+	// note beside it in builtin_actions.cpp says.
+	keymap_registry maps;
+	maps.install_defaults();
+	std::vector<std::string> names;
+	maps.names(names);
+	for (const std::string& name : names) {
+		const keymap* map = maps.find(name);
+		ASSERT_NE(map, nullptr);
+		for (const keymap::entry& one : map->entries())
+			EXPECT_NE(one.action, "dismiss_autosuggestion")
+				<< name << " bound " << render_key_notation(one.keys) << " to the dismissal";
+	}
 }
 
 TEST(LeshperKeymapRegistry, ViCommandIsOpaqueAndViInsertIsNot) {
