@@ -432,6 +432,19 @@ public:
 	// #7770 - an action's shell code never gets ECHO back).
 	port_result call_port(std::string_view code);
 
+	// The enumeration read (#139, spec 6.9), from the loop's side: fill the
+	// `enumerate` slot and block on the same two topics until the copy comes
+	// back. Appends to `into`; answers false when there is no shell attached, or
+	// when the wait ended without the reply (a stop while a Tab was in flight).
+	//
+	// THE SAME ROUND TRIP `call_port` MAKES, and reusing it rather than inventing
+	// a mechanism is the point: ADR-0009 already has exactly one way for the loop
+	// to ask the shell a question and wait for the answer, and a Tab is that
+	// question with a different payload. What it does NOT reuse is the port
+	// itself - a port call runs shell CODE, and running code to read a table
+	// would put an arbitrary side effect on the completion path.
+	bool read_names(name_domain which, std::vector<std::string>& into);
+
 	// --- Rendering -----------------------------------------------------------
 
 	// Lays out and blits. `previous` is kept here, and a full repaint is what
@@ -475,7 +488,11 @@ private:
 	void apply_outcome(const action_result& what, turn_result& result);
 	// Blocks in poll on the `shell` and `signal` topics only, until a message of
 	// `until` (and, for a port call, of `sequence`) arrives.
-	std::optional<std::int32_t> wait_on_shell(shell_message::kind until, std::uint64_t sequence);
+	// `names`, when given, receives the `enumerate_done` payload - the one reply
+	// kind that carries more than a status. Defaulted, so the two existing call
+	// sites are untouched.
+	std::optional<std::int32_t> wait_on_shell(shell_message::kind until, std::uint64_t sequence,
+	                                          std::vector<std::string>* names = nullptr);
 	void handle_shell_message(shell_message& answer);
 	void refresh_size_from_terminal();
 

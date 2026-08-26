@@ -23,7 +23,10 @@
 #include "runtime/builtins.h"
 #include "runtime/shell_state.h"
 
+#include <cstddef>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace lesh::leshper {
 
@@ -69,7 +72,65 @@ public:
 		return _state->lookup(std::string_view{"PATH"}, out);
 	}
 
+	// The enumeration read (#139, spec 6.9). Copies, because the answer is about
+	// to cross to the loop thread - see the comment on the base class.
+	//
+	// ONE TABLE PER DOMAIN AND NO MERGING, so a candidate keeps the fact that
+	// decides its marker. Builtins come from the same `kBuiltinRegistry`
+	// `classify_builtin` reads, so the completer cannot offer a builtin the
+	// classifier would then call unknown. Nothing here touches the filesystem.
+	void enumerate(name_domain which, std::vector<std::string>& into) const override {
+		switch (which) {
+			case name_domain::builtin:
+				for (const runtime::builtin_descriptor& one : runtime::kBuiltinRegistry)
+					into.emplace_back(one.name);
+				break;
+			case name_domain::function:
+				for (std::string_view name : _state->function_names())
+					into.emplace_back(name);
+				break;
+			case name_domain::alias:
+				for (const runtime::shell_state::alias_row& row : _state->aliases())
+					into.emplace_back(row.name);
+				break;
+			case name_domain::variable:
+				for (const runtime::shell_state::variable_row& row : _state->variables()) {
+					// A name that was marked (`export x`) but never assigned is
+					// still a name the user can complete to: `$x` expands to
+					// nothing, which is what an unset variable does anyway, and
+					// hiding it would make `export FOO; echo $F<Tab>` offer less
+					// than `set` lists.
+					into.emplace_back(row.name);
+				}
+				break;
+			case name_domain::path_directory:
+				split_path(into);
+				break;
+		}
+	}
+
 private:
+	// `$PATH`, cut on `:`, with POSIX 2.6's rule applied HERE and nowhere else:
+	// an empty element means the current directory. An UNSET `PATH` yields no
+	// directories at all, which is not the same as an empty one - an empty
+	// `PATH` has exactly one element and that element is `.`, which is why the
+	// distinction survives this far rather than being flattened at `lookup`.
+	void split_path(std::vector<std::string>& into) const {
+		std::string_view value;
+		if (!path(value))
+			return;
+		for (std::size_t at = 0;;) {
+			const std::size_t colon = value.find(':', at);
+			const std::string_view element = colon == std::string_view::npos
+				? value.substr(at)
+				: value.substr(at, colon - at);
+			into.emplace_back(element.empty() ? std::string_view{"."} : element);
+			if (colon == std::string_view::npos)
+				break;
+			at = colon + 1;
+		}
+	}
+
 	const runtime::shell_state* _state;
 };
 

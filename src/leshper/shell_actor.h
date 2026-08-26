@@ -6,8 +6,9 @@
 // `shell_state`; leshper's loop is a spawned thread and owns editor state and
 // the terminal while editing. The shell reaches the loop through one wakeup
 // pipe - the loop's fifth topic - and the loop reaches the shell by filling one
-// of three LATEST-WINS SLOTS, checked in priority order: `execute`, `port_call`
-// (an action's shell code, #92), `highlight`. Each slot holds at most one item;
+// of four LATEST-WINS SLOTS, checked in priority order: `execute`, `port_call`
+// (an action's shell code, #92), `enumerate` (the completer's read-only name
+// list, #139), `highlight`. Each slot holds at most one item;
 // a newer highlight overwrites a pending one, and that overwrite IS the
 // cancellation. The shell thread waits on a condition variable, because while a
 // command line is being edited it has no descriptors to watch.
@@ -43,6 +44,7 @@
 
 #include "leshper/abi.h"
 #include "leshper/registry.h"
+#include "leshper/shell_knowledge.h"
 #include "leshper/state.h"
 #include "leshper/workers.h"
 
@@ -78,6 +80,10 @@ struct shell_message {
 		// An accepted line has finished executing. The loop reclaims the
 		// terminal, re-asserts its modes, resumes the helpers and redraws.
 		execute_done,
+		// The enumeration read (#139, spec 6.9): `names` holds the copy the
+		// completer asked for. Matched on `sequence`, exactly as a port call is,
+		// because the loop is blocked waiting for THIS answer.
+		enumerate_done,
 	};
 
 	kind which = kind::highlight_done;
@@ -100,6 +106,15 @@ struct shell_message {
 
 	// `highlight_done` only.
 	reactor_batch batch;
+
+	// `enumerate_done` only: the shell's names, COPIED (#139).
+	//
+	// A vector of strings on a recycled message, and the recycling is why it is
+	// here rather than in a variant: `recycle` clears the vector and keeps its
+	// capacity, so the second Tab of a session re-fills storage the first one
+	// already grew. The strings themselves are rebuilt - a copy-out door copies -
+	// and that is paid once per Tab, which is human frequency.
+	std::vector<std::string> names;
 };
 
 // The loop's `shell` topic: a pipe read end and a queue behind one mutex.
@@ -194,6 +209,31 @@ public:
 	// refused loudly. What this seam fixes is only that the call is synchronous
 	// from the action's point of view, which is #92's contract unchanged.
 	virtual std::int32_t port_call(std::string_view code) = 0;
+
+	// The enumeration read (#139, spec 6.9), APPENDED to `into`.
+	//
+	// A THIRD METHOD ON A SEAM WHOSE NARROWNESS WAS THE DECISION, so the
+	// argument has to be made. The rule above is "what is here is only what has
+	// to be a CALL: running code changes the world, and the world is the
+	// shell's". This is the other half of that rule, arriving with the first
+	// consumer that needs it: the completer runs on the LOOP thread (spec 6.9,
+	// owner's call) and the tables it reads are the shell thread's, exclusively,
+	// by ADR-0009. It cannot go through the request token the way `classify`
+	// does, because a token is read where the reactor runs and this reader is
+	// not a reactor. So it has to be a call, and it is one - read-only,
+	// copy-out, and running with nothing else of the shell's running.
+	//
+	// The IMPLEMENTATION is one line over `shell_knowledge::enumerate`; the
+	// shape is declared there and this is only its door across the threads.
+	//
+	// DEFAULTED, so the fakes that existed before this ticket still compile and
+	// so a shell with nothing to enumerate answers nothing rather than failing:
+	// the completer then falls back to paths, which is what a completer with no
+	// shell attached should do.
+	virtual void enumerate(name_domain which, std::vector<std::string>& into) {
+		(void)which;
+		(void)into;
+	}
 };
 
 // ---------------------------------------------------------------------------
@@ -226,6 +266,15 @@ public:
 	// Fills the `port_call` slot and answers the sequence number the reply will
 	// carry, which is what the blocked action matches on.
 	[[nodiscard]] std::uint64_t post_port_call(std::string_view code,
+	                                           generation computed_against);
+
+	// Fills the `enumerate` slot and answers the sequence number the reply will
+	// carry (#139). The loop blocks on it, exactly as it blocks on a port call.
+	//
+	// NOT A SUPERSEDE, and it is the one place in this file where filling a slot
+	// does not set the flag: the read changes nothing, so a highlight in flight
+	// against the same tables is still the right answer when it lands.
+	[[nodiscard]] std::uint64_t post_enumerate(name_domain which,
 	                                           generation computed_against);
 
 	// Fills the `highlight` slot, OVERWRITING whatever was pending and
@@ -271,6 +320,13 @@ private:
 		bool filled = false;
 	};
 
+	struct enumerate_slot {
+		name_domain which = name_domain::builtin;
+		generation computed_against;
+		std::uint64_t sequence = 0;
+		bool filled = false;
+	};
+
 	struct highlight_slot {
 		std::string reactor;
 		lesh_reactor_fn fn = nullptr;
@@ -281,6 +337,7 @@ private:
 
 	void serve_execute(execute_slot& job);
 	void serve_port_call(port_slot& job);
+	void serve_enumerate(enumerate_slot& job);
 	void serve_highlight(highlight_slot& job);
 
 	shell_side* _shell;
@@ -291,6 +348,11 @@ private:
 
 	execute_slot _execute;
 	port_slot _port;
+	// THIRD OF FOUR, above `highlight` and below `port_call` (#139). Above the
+	// highlight because the loop thread is BLOCKED on this reply and only
+	// waiting for the other one; below the port call because a port call may
+	// rewrite the very tables this read is about to copy.
+	enumerate_slot _enumerate;
 	highlight_slot _highlight;
 
 	// The cooperative cancellation the highlighter polls. Its address is stable

@@ -33,7 +33,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace lesh::leshper {
 
@@ -48,6 +50,36 @@ enum class command_kind : std::uint8_t {
 	builtin = 2,   // the static builtin registry
 	function = 3,  // a shell function
 	alias = 4,     // an alias
+};
+
+// WHICH NAMES the completer is asking for (#139, spec 6.9).
+//
+// FIVE DOMAINS AND NOT ONE MERGED LIST, and the argument is F-21's. The first
+// three are the same three tables the highlighter paints distinctly - a builtin
+// is not a function is not an alias - and the completion pager's only v1
+// description is a kind marker (spec 6.9), so a merged list would arrive with
+// the one fact the marker needs already thrown away. Re-deriving it would mean
+// `classify` per candidate, which is a second crossing per NAME instead of a
+// second crossing per TABLE.
+//
+// `path_directory` is here rather than as a `$PATH` walk on the shell side for
+// exactly #135's reason: the walk is a readdir per directory and it belongs
+// where the memo and the other readdir already are, which is the completer, on
+// the loop. What the shell contributes is the SPLIT of its own `$PATH` - the
+// value it already owns, cut on `:` with POSIX's empty-element-means-`.` rule
+// applied once, in the one place that knows whether the variable was unset or
+// merely empty.
+enum class name_domain : std::uint8_t {
+	builtin = 0,         // the static builtin registry
+	function = 1,        // shell functions
+	alias = 2,           // aliases
+	// Variable names, for a token that leads with `$`. The names only - a value
+	// is not a completion, and copying every value out would copy the
+	// environment on every Tab.
+	variable = 3,
+	// The elements of `$PATH`, in order, already split. Directories, not
+	// commands: what is IN them is the completer's readdir.
+	path_directory = 4,
 };
 
 // The shell's tables, asked one name at a time.
@@ -82,6 +114,37 @@ public:
 	// not the same as empty: POSIX gives an empty PATH one empty element, and an
 	// empty element means the current directory.
 	[[nodiscard]] virtual bool path(std::string_view& out) const = 0;
+
+	// --- The enumeration read (#130's third verb, #139, spec 6.9) -------------
+
+	// Every name of one domain, APPENDED to `into`. The caller clears.
+	//
+	// COPY-OUT, WHERE THE OTHER TWO BORROW, and that is the whole point of the
+	// method existing rather than an iterator or a view. `classify` and `path`
+	// are asked BY THE HIGHLIGHTER, which ADR-0009 put on the shell thread, so a
+	// view into the state's own storage cannot be invalidated under it. This one
+	// is asked BY THE COMPLETER, which spec 6.9 put on the LOOP thread: the
+	// answer crosses a thread boundary and has to be a copy, or it is a pointer
+	// into a table the shell owns and may rewrite the moment the reply is
+	// posted. The copy is per Tab, which is human frequency; #137 records a
+	// per-thread cached command list as the v2 that makes it free.
+	//
+	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
+	// out of `classify`: the walk is a readdir per directory and it belongs on
+	// the side that memoizes it - which is the completer, on the loop, where the
+	// directory walk it is already doing lives. `path_directory` hands over the
+	// SPLIT of the value and stops there. Folding the sweep in would put a
+	// filesystem walk on the shell thread, serialized ahead of the next
+	// execution, to answer a question the loop was about to walk anyway.
+	//
+	// A DEFAULTED BODY, not a pure virtual: this arrived after two
+	// implementations and several fakes, and #130's growth rule for this door is
+	// additive. A knowledge with no tables to walk answers nothing, which reads
+	// as an empty shell rather than as an error.
+	virtual void enumerate(name_domain which, std::vector<std::string>& into) const {
+		(void)which;
+		(void)into;
+	}
 };
 
 // The answer when no shell has been attached to the token.
