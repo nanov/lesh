@@ -404,6 +404,63 @@ protected:
 // no prompt engine, and the honest answer to configuring one is that there is
 // none.
 
+// ---------------------------------------------------------------------------
+// THE EXTENSION BUILTIN TABLE (#165), and the third thing installed console-style.
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM, once: the two `constexpr` tables above have no runtime
+// registration, deliberately - `registry_agrees_with_handlers()` is a
+// `static_assert`, and a table something can add to at runtime cannot be
+// asserted at compile time. leshnici ships coreutils clones (`ls`, `cat`,
+// `head`, `tail`) that want to run IN THIS PROCESS for the same reason `cd`
+// does, and `runtime` must not include `leshnici` any more than it may include
+// `leshper`.
+//
+// THE SHAPE IS `binding_console`'s AND `prompt_console`'s, one more time: the
+// runtime declares the row, `shell_state` holds a borrowed view of a table, and
+// the wiring site that links both halves - `src/main.cpp` - installs it. What is
+// different from the two consoles is only that this one is a table of functions
+// rather than an interface of verbs, because there is no state on the far side to
+// call back into: an extension builtin is handed exactly what a core one is.
+//
+// SPEC S6'S "one table asserted both ways" STAYS TRUE OF THE CORE, which is the
+// property that mattered: `kBuiltinRegistry` and `kBuiltins` are untouched, still
+// cross-checked, and still the only answer for every name POSIX names. This is a
+// SECOND table, consulted after them and only when `set -o leshnici` is on, whose
+// own guard is `set_extension_builtins` refusing any name the core already has.
+//
+// EVERY EXTENSION BUILTIN IS `builtin_kind::regular`. `ls` failing must never
+// end a non-interactive shell, and POSIX 2.14's special set is closed - nothing
+// outside it may join. `command -v` reports the bare NAME for one (the shell
+// really is what would run), which is what `builtin_report_of` already answers
+// for a name it does not know.
+struct extension_builtin {
+	std::string_view name;
+	builtin_result (*fn)(shell_state&, char**);
+};
+
+// The two registry questions that have to be asked of a SHELL rather than of
+// the tables.
+//
+// `builtin_home_of` and `builtin_report_of` need no such form: an extension
+// builtin is implemented in a table of functions and reported by its own name,
+// which is exactly what both already answer for a name they do not find.
+//
+// Each has a state-free form above that answers for the core alone; these
+// consult the extension table as well, and only when `set -o leshnici` is on. The
+// two forms are deliberately both present rather than one replacing the other:
+// the core answer is a property of the program - which is what the registry
+// tests and the `static_assert` are about - and the visible answer is a property
+// of one shell at one moment, which is what the command search needs.
+//
+// THE COMMAND SEARCH MUST USE THESE. `classify_builtin(name)` alone would send
+// `ls` to PATH while `try_run_builtin` ran the extension for it, and a lookup
+// that disagrees with the dispatch is exactly #35 in a new table.
+[[nodiscard]] builtin_kind classify_builtin(const shell_state& state,
+                                            std::string_view name) noexcept;
+[[nodiscard]] bool builtin_has_handler(const shell_state& state,
+                                       std::string_view name) noexcept;
+
 // Where a utility's OPERANDS begin, having discarded a leading `--`.
 //
 // POSIX XCU 1.4 Utility Description Defaults: a standard utility that accepts

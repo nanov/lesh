@@ -139,6 +139,23 @@ TEST_F(OptionsTest, SetMinusOListsEveryNamedOptionWithItsSetting) {
 		<< "POSIX gives -h no `-o` spelling, so `set -o` has no name to print";
 }
 
+TEST_F(OptionsTest, LeshniciIsListedAndTogglesLikeTheOthers) {
+	// LESH'S OWN OPTION (#165), and the reason it is in this file rather than only
+	// in the leshnici suite: what it gates lives above the runtime, but the option
+	// itself is a row of `shell_state::option_table()` like any other, and the
+	// three readers of that table - `set -o`, `set +o` and `$-` - must all have
+	// found it. A name that reached `apply_option_name` but not the listing would
+	// break set-p.tst's round trip, which reads the listing back as commands.
+	const std::string listing = capture("set -o leshnici; set -o");
+	EXPECT_NE(listing.find("leshnici        on\n"), std::string::npos) << listing;
+	EXPECT_TRUE(state.opts().leshnici);
+	EXPECT_EQ(run("set +o leshnici"), 0);
+	EXPECT_FALSE(state.opts().leshnici);
+	EXPECT_NE(capture("set +o").find("set +o leshnici\n"), std::string::npos);
+	// POSIX gives it no letter and neither does lesh, so `$-` must not grow one.
+	EXPECT_EQ(capture("set -o leshnici; echo $-").find('l'), std::string::npos);
+}
+
 TEST_F(OptionsTest, SetPlusOPrintsCommandsThatRestoreTheSettings) {
 	// POSIX requires the `+o` form to be RE-INPUTTABLE, and set-p.tst's round trip
 	// is the only test of it: save with `set +o`, change everything, read it back,

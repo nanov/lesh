@@ -557,6 +557,13 @@ shell_state::option_table() noexcept {
 		{'v', "verbose",   &options::verbose},
 		{'x', "xtrace",    &options::trace},
 		{'\0', "ignoreeof", &options::ignore_eof},
+		// `leshnici` is lesh's own and has no letter (#165). It sits with the
+		// letterless names, alphabetically among them, because that is the order
+		// this half of the table already keeps and set-p.tst's round trip only
+		// needs it STABLE. A name POSIX does not have is listed by `set -o` all
+		// the same: a shell that accepts an option must say what it holds, which
+		// is the rule the four inert POSIX ones above are here under.
+		{'\0', "leshnici",  &options::leshnici},
 		{'\0', "nolog",     &options::no_log},
 		{'\0', "pipefail",  &options::pipefail},
 		{'\0', "vi",        &options::vi},

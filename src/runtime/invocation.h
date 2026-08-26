@@ -37,6 +37,19 @@ struct invocation {
 	// interactiveness from isatty rather than from the command line, and this
 	// parser must not pretend to know.
 	std::optional<bool> interactive;
+	// `-o leshnici` / `+o leshnici`, and unset when neither appeared (#165).
+	//
+	// The SAME tri-state `interactive` above needs, for the same reason: the
+	// option's default is "on iff this shell is interactive", which is a question
+	// this parser cannot answer and main() can. A plain bool would make the two
+	// indistinguishable, so `lesh -o leshnici script.sh` would be silently undone
+	// by the default main() writes afterwards.
+	//
+	// Not derived from the two-seed probe that answers `interactive`: that probe
+	// copies the whole option struct across on every `-o` occurrence, so any OTHER
+	// `-o` word would make this look like it had been named. The `-o` branch
+	// records it directly instead.
+	std::optional<bool> leshnici;
 	shell_state::options options{};
 	// Non-null when the invocation cannot be honoured. The caller reports it and
 	// exits; a shell that cannot parse its own command line must not guess.

@@ -1343,14 +1343,21 @@ TEST(UiPty, TheShellsOwnPathDecidesWhetherAnExternalIsKnown) {
 	// not the process environment `getenv` would answer with. The assignment is
 	// RUN, not merely typed, because a typed prefix assignment has not happened
 	// yet - which is the distinction the highlighter is required to respect.
+	//
+	// `grep` AND NOT `ls`, since #165. This case needs a name that is an EXTERNAL
+	// COMMAND AND NOTHING ELSE, and `ls` stopped being one interactively the day
+	// leshnici's extension builtins arrived: `set -o leshnici` defaults on when
+	// the shell is interactive, and a builtin is runnable whatever `PATH` says -
+	// which is the correct answer and a useless subject for this test. `grep` is
+	// on PATH, in no builtin table, and not something this tree plans to ship.
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};
 	ASSERT_TRUE(shell.alive());
 	ASSERT_TRUE(shell.wait_for(kPrompt));
 
-	shell.type("ls");
+	shell.type("grep");
 	ASSERT_TRUE(shell.wait_for(kRunnable))
-		<< "`ls` was not found on the inherited PATH; saw: " << shell.seen();
+		<< "`grep` was not found on the inherited PATH; saw: " << shell.seen();
 
 	shell.type("\x03");
 	ASSERT_TRUE(shell.wait_for("^C"));
@@ -1360,9 +1367,29 @@ TEST(UiPty, TheShellsOwnPathDecidesWhetherAnExternalIsKnown) {
 	shell.type("PATH=/nonexistent\r");
 	ASSERT_TRUE(shell.wait_for(kPrompt, 3));
 
-	shell.type("ls");
+	shell.type("grep");
 	EXPECT_TRUE(shell.wait_for(kUnknown, unknown + 1))
-		<< "`ls` did not go unknown under an empty PATH; saw: " << shell.seen();
+		<< "`grep` did not go unknown under an empty PATH; saw: " << shell.seen();
 	EXPECT_EQ(shell.count_of(kRunnable), runnable)
 		<< "nothing on this line can be runnable any more; saw: " << shell.seen();
+}
+
+TEST(UiPty, AnExtensionBuiltinIsRunnableInAnInteractiveShellWithNoPath) {
+	// THE OTHER HALF OF THE CASE ABOVE, and #165's default asserted where it is
+	// actually decided: `src/main.cpp` turns `leshnici` on iff the shell is
+	// interactive, so a shell reached over a pty has `ls` in its command search
+	// and a `lesh -c` does not. `PATH=/nonexistent` is what makes this an
+	// assertion about the builtin table rather than about what is in /bin.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("PATH=/nonexistent\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	shell.type("ls");
+	EXPECT_TRUE(shell.wait_for(kRunnable))
+		<< "`ls` did not paint as a builtin with the option on by default; saw: "
+		<< shell.seen();
 }

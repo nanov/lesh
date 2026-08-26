@@ -110,6 +110,9 @@ enable_testing()
 #                                                                      │                       ▲
 #                                                                      └─► lesh_leshnici ──────┘
 #
+# `lesh_leshnici` links `lesh_ui` (prompt modules) and `lesh_runtime`
+# (extension builtins, #165); it is still named only by `src/main.cpp`.
+#
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
 #
 # THE EDITOR HANGS OFF THE SUBSTRATE AND NOTHING ELSE, since #168 Phase B. It
@@ -259,6 +262,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_substrate)
 
+
 # ui: THE HOST. The session that runs an interactive shell, the loop that drives
 # the editor, the terminal, the workers, the timers, and the adapters that carry
 # shell facts across (#164, #168).
@@ -319,17 +323,12 @@ target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
 
 # leshnici: the shipped extension set (#163).
 #
-# A layer ABOVE THE HOST, not inside it. What lives here is everything lesh ships
-# on top of the machinery below but does not owe it - prompt modules now,
+# A layer ABOVE leshper, not inside it. What lives here is everything lesh ships
+# on top of the editor's own machinery but does not owe it - prompt modules now,
 # builtins later - and the direction of the arrow is the whole point: leshnici
-# links lesh_ui, lesh_ui does not know leshnici exists, so a module that reached
-# back into the engine's internals would fail to link rather than fail review.
-# Nothing in leshper's or ui's own targets may name a symbol from here.
-#
-# IT LINKS `lesh_ui` AND NOT `lesh_leshper`, since #170: the prompt engine a
-# module installs into is `lesh::ui::prompt::engine` and lives in
-# `src/ui/prompt/`. leshper comes along transitively, which is what a module
-# that wants a `leshper::style` needs and no more.
+# links lesh_ui, and neither ui nor leshper knows leshnici exists, so a module
+# that reached back into the engine's internals would fail to link rather than
+# fail review. Nothing in leshper's own targets may name a symbol from here.
 #
 # `src/main.cpp` installs it, since #164: it passes
 # `leshnici::install_prompt_modules` to `run_interactive_shell` as the session's
@@ -337,12 +336,26 @@ target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
 # so an engine built anywhere else, a unit test or a tool, is the bare
 # seven-module one.
 add_library(lesh_leshnici STATIC
+	src/leshnici/builtin_cat.cpp
+	src/leshnici/builtin_head.cpp
+	src/leshnici/builtin_ls.cpp
+	src/leshnici/builtin_tail.cpp
+	src/leshnici/builtins.cpp
+	src/leshnici/builtins.h
+	src/leshnici/byte_stream.h
 	src/leshnici/git_head.cpp
 	src/leshnici/git_head.h
 	src/leshnici/module_git.h
 	src/leshnici/prompt_modules.cpp
 	src/leshnici/prompt_modules.h)
-target_link_libraries(lesh_leshnici PUBLIC lesh_ui)
+# BOTH HALVES OF THE TREE, and #165 is what added the second. The prompt modules
+# need `lesh_ui` (they register against `ui::prompt::engine`, #170); the extension builtins
+# need `lesh_runtime` (they are `builtin_result (*)(shell_state&, char**)` and
+# they install onto a `shell_state`). The direction of both arrows is unchanged
+# and is the whole point: leshnici names them, neither of them names leshnici, so
+# a builtin that reached back into the shell's own tables would fail to link
+# rather than fail review.
+target_link_libraries(lesh_leshnici PUBLIC lesh_ui lesh_runtime)
 
 add_subdirectory("tools")
 
@@ -382,6 +395,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_decoration_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
+	tests/unit/leshnici_builtins_tests.cpp
 	tests/unit/leshnici_git_tests.cpp
 	tests/unit/ui_prompt_tests.cpp
 	tests/unit/leshper_style_grammar_tests.cpp

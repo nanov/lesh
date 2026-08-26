@@ -126,6 +126,12 @@ invocation parse_invocation(int argc, char** argv) {
 			// `set -o monitor` cannot disagree about which names exist. The sigil is
 			// read off the word the stored view points into - `+o` clears.
 			const bool enable = cur[1][0] == '-';
+			// #165: whether the command line NAMED this one, which main() needs to
+			// know before it writes the interactive default over it. Recorded here
+			// rather than inferred from the value, because "off" and "not named"
+			// are two different answers on an interactive shell.
+			if (scan.name == "leshnici")
+				inv.leshnici = enable;
 			if (!shell_state::apply_option_name(scan, scan.name, enable)) {
 				inv.error = "invalid option name";
 				inv.error_operand = scan.name.data();

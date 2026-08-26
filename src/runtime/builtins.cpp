@@ -2721,6 +2721,72 @@ bool builtin_has_handler(std::string_view name) noexcept {
 	return has_handler(name);
 }
 
+// --- the extension table (#165) ---------------------------------------------
+//
+// Defined HERE rather than in shell_state.cpp for the reason `classify_builtin`
+// is: `kBuiltinRegistry` lives in this translation unit's header, and the
+// collision check is the whole content of the setter.
+
+bool shell_state::set_extension_builtins(std::span<const extension_builtin> table) {
+	// CORE WINS, AT INSTALL TIME AND WHOLE. A table naming a core builtin is
+	// refused entirely rather than filtered: a partially installed set is a shell
+	// whose behaviour depends on which row was wrong, and the honest answer to a
+	// build that shipped `cd` twice is to run without the extension set and say
+	// so. Every name is checked so one report names every collision.
+	bool collided = false;
+	for (const extension_builtin& one : table) {
+		for (const builtin_descriptor& core : kBuiltinRegistry) {
+			if (core.name != one.name)
+				continue;
+			report("leshnici: %.*s is already a shell builtin",
+			       static_cast<int>(one.name.size()), one.name.data());
+			collided = true;
+		}
+	}
+	if (collided)
+		return false;
+	_extension_builtins = table.data();
+	_extension_builtin_count = table.size();
+	return true;
+}
+
+std::span<const extension_builtin> shell_state::extension_builtins() const noexcept {
+	return {_extension_builtins, _extension_builtin_count};
+}
+
+namespace {
+
+// The one lookup, so the three questions below and the dispatch cannot disagree
+// about what is visible. Null when the option is off, when nothing is installed,
+// or when no row matches.
+[[nodiscard]] const extension_builtin* find_extension(const shell_state& state,
+                                                      std::string_view name) noexcept {
+	if (!state.extension_builtins_enabled())
+		return nullptr;
+	for (const extension_builtin& one : state.extension_builtins())
+		if (one.name == name)
+			return &one;
+	return nullptr;
+}
+
+} // namespace
+
+builtin_kind classify_builtin(const shell_state& state, std::string_view name) noexcept {
+	// The CORE first, always: `set_extension_builtins` has already refused any
+	// name that could reach this line twice, so the order is a statement rather
+	// than a tie-break - and it stays correct if the guard is ever weakened.
+	if (const builtin_kind core = classify_builtin(name); core != builtin_kind::none)
+		return core;
+	// Regular, never special. POSIX 2.14's set is closed and a failing `ls` must
+	// not end a script that turned the option on.
+	return find_extension(state, name) != nullptr ? builtin_kind::regular
+	                                              : builtin_kind::none;
+}
+
+bool builtin_has_handler(const shell_state& state, std::string_view name) noexcept {
+	return has_handler(name) || find_extension(state, name) != nullptr;
+}
+
 builtin_home builtin_home_of(std::string_view name) noexcept {
 	for (const auto& d : kBuiltinRegistry)
 		if (d.name == name)
@@ -2761,6 +2827,20 @@ bool try_run_builtin(shell_state& state, char** argv, builtin_result& out,
 		    out.failure == failure_kind::usage &&
 		    classify_builtin(name) == builtin_kind::special && !state.interactive())
 			out.flow = control_flow::exit_shell;
+		return true;
+	}
+
+	// AFTER the core tables and only when the option is on (#165). No special-
+	// builtin rule is applied to what comes back: an extension builtin is regular
+	// by construction (see classify_builtin's overload), so the block above has
+	// nothing to say about it, and `failure_kind` never turns into an exit.
+	//
+	// `demoted` is not consulted for the same reason. `command ls` demotes
+	// properties only a SPECIAL builtin has; a regular one has neither of them,
+	// and the executor has already taken the function table out of the question
+	// before it got here.
+	if (const extension_builtin* found = find_extension(state, name); found != nullptr) {
+		out = found->fn(state, argv);
 		return true;
 	}
 	return false;

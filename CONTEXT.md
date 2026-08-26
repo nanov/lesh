@@ -144,6 +144,22 @@ One of the POSIX-designated builtins (`break`, `:`, `continue`, `.`, `eval`, `ex
 whose failure exits the shell and whose assignments persist. Distinct from a
 **regular builtin**, where neither is true.
 
+**Extension builtin** _[lesh]_:
+A builtin lesh ships that POSIX does not name, contributed by **leshnici** rather
+than by the runtime and installed at startup instead of compiled into the
+registry. Always a **regular builtin**, never a special one, and always reported
+by `command -v` as its own bare name. It lives in a SECOND table — `runtime`
+declares the row (`extension_builtin`) and holds a borrowed view of it on shell
+state; `src/main.cpp` installs leshnici's; the core's two `constexpr` tables and
+the `static_assert` between them are untouched. The command search reaches it
+after special builtins, functions and core regular builtins, and only when
+`set -o leshnici` is on — which defaults to on interactively and off in every
+script, so a script sees the POSIX search unless it asks otherwise. A name that
+collides with a core builtin is refused at install time, whole and reported once;
+core always wins.
+_Avoid_: calling one a regular builtin without qualification when the point is
+where it came from; expecting one in a script that has not set the option.
+
 **Exit status** _[floor]_:
 The value a command reports on completion, readable as `$?`.
 
@@ -324,16 +340,21 @@ session, the loop, the reactors, the adapters or the prompt engine "leshper" —
 those are `src/ui/`.
 
 **leshnici** _[lesh]_:
-The shipped extension set: what lesh ships on top of the layers below but does
-not owe them — prompt modules now, builtins later. A layer ABOVE the host
-(`lesh_leshnici` links `lesh_ui` since #170, never the other way), because what a
-prompt module installs into is `ui::prompt::engine`, and it arrives on an engine
-by being installed: `src/main.cpp` hands `install_prompt_modules` to the session as its
-extension hook, so an engine built anywhere else is the bare built-in one. `git` is its first resident, and it is
-there rather than among the built-ins because it reads a filesystem where every
-built-in is a pure function of the facts struct.
-_Avoid_: calling a leshnici module a built-in; a template naming one on an
+The shipped extension set: what lesh ships on top of the host and the runtime but
+does not owe either — **prompt modules** and **extension builtins**. A layer ABOVE
+both (`lesh_leshnici` links `lesh_ui` and `lesh_runtime`, never the other
+way; what a prompt module installs into is `ui::prompt::engine`), and each half arrives by being INSTALLED rather than by being compiled in:
+`src/main.cpp` hands `install_prompt_modules` to the session as its extension
+hook and calls `install_builtins` on shell state before either mode runs, so an
+engine or a shell built anywhere else — a test's, a tool's — is the bare one.
+`git` is the first prompt module, there rather than among leshper's built-ins
+because it reads a filesystem where every built-in is a pure function of the
+facts struct. `ls`, `cat`, `head` and `tail` are the first builtins, behind
+`set -o leshnici` — on by default when the shell is interactive, off in every
+script — so the POSIX command search a script sees is unchanged.
+_Avoid_: calling a leshnici prompt module a built-in; a template naming one on an
 engine without leshnici is refused as an unknown module, like any other name.
+Assuming a leshnici builtin runs in a script: it does not until the option is on.
 
 **Prompt** _[lesh]_:
 What the shell draws before the line it is about to read, and the engine that
