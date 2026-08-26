@@ -2131,8 +2131,9 @@ TEST(LeshperAbiStaging, SettingTheWholeBufferLeavesTheCursorWhereTheUserPutIt) {
 
 TEST(LeshperAbiStaging, ARunOfSelfInsertsThroughTheAbiStillCoalesces) {
 	// F-4 survives the trip through the ABI. The loop has no action names to go
-	// by, so it decides from what the commit was: a single plain insertion
-	// continues the run, and anything else ends it.
+	// by, so it decides from what the commit WAS: one grapheme cluster, inserted
+	// at a point, whose bytes are the key that dispatched the action. Anything
+	// else ends the run.
 	abi_fixture fixture;
 	state s;
 	fixture.type_all(s, "abc");
@@ -2140,6 +2141,65 @@ TEST(LeshperAbiStaging, ARunOfSelfInsertsThroughTheAbiStillCoalesces) {
 	fixture.run(s, "backward_char");
 	fixture.type_all(s, "d");
 	EXPECT_EQ(s.undo.step_count(), 2u);
+}
+
+TEST(LeshperAbiStaging, AnActionsBlockWriteBreaksTheTypingRunOnBothSides) {
+	// #146, and #121's ruling reaching every action rather than only the paste
+	// branch: a staged write that is not the keystroke that dispatched it is its
+	// own undo step, however much like a plain insertion it looks. The rule is
+	// asserted here on an action nobody has written - which is the point of
+	// deciding it from the commit rather than from a list of names.
+	abi_fixture fixture;
+	ASSERT_EQ(lesh_action_register(&fixture.actions, "stamp",
+	          [](lesh_editor* editor, const lesh_invocation*, void*) -> int32_t {
+		          size_t at = 0;
+		          lesh_cursor_get(editor, &at);
+		          return lesh_buffer_replace(editor, at, at, "XY", 2);
+	          }, nullptr), LESH_OK);
+
+	state s;
+	fixture.type_all(s, "ab");
+	fixture.run(s, "stamp");
+	fixture.type_all(s, "cd");
+
+	EXPECT_EQ(std::string(s.buffer.text()), "abXYcd");
+	// Three steps, the same three a paste produces (#121): the run before, the
+	// block write, and the run after.
+	EXPECT_EQ(s.undo.step_count(), 3u);
+}
+
+TEST(LeshperAbiStaging, AOneCharacterBlockWriteBreaksTheRunToo) {
+	// The case length alone cannot catch, and the reason the discriminator asks
+	// whether the bytes ARE the keystroke. This action writes ONE cluster at the
+	// cursor - byte for byte what `self_insert` writes - and is still not typing.
+	abi_fixture fixture;
+	ASSERT_EQ(lesh_action_register(&fixture.actions, "bang",
+	          [](lesh_editor* editor, const lesh_invocation*, void*) -> int32_t {
+		          size_t at = 0;
+		          lesh_cursor_get(editor, &at);
+		          return lesh_buffer_replace(editor, at, at, "!", 1);
+	          }, nullptr), LESH_OK);
+
+	state s;
+	fixture.type_all(s, "ab");
+	fixture.run(s, "bang");
+	fixture.type_all(s, "cd");
+
+	EXPECT_EQ(std::string(s.buffer.text()), "ab!cd");
+	EXPECT_EQ(s.undo.step_count(), 3u);
+}
+
+TEST(LeshperAbiStaging, SelfInsertOfAMultiByteClusterStillCoalesces) {
+	// The other end of the cluster test: `e` and a combining acute arrive as two
+	// keystrokes and one cluster each, and neither is a block write. A rule that
+	// counted BYTES rather than clusters would have broken the run here.
+	abi_fixture fixture;
+	state s;
+	fixture.type_one(s, "e");
+	fixture.type_one(s, "\xcc\x81");   // U+0301 COMBINING ACUTE ACCENT
+	fixture.type_one(s, "\xc3\xa9");   // U+00E9, two bytes, one cluster
+	EXPECT_EQ(std::string(s.buffer.text()), "e\xcc\x81\xc3\xa9");
+	EXPECT_EQ(s.undo.step_count(), 1u);
 }
 
 // ---------------------------------------------------------------------------
