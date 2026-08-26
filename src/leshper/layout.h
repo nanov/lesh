@@ -1,6 +1,7 @@
 #pragma once
 
 #include "leshper/event.h"
+#include "leshper/pager.h"
 #include "leshper/state.h"
 #include "leshper/surface.h"
 #include "leshper/text.h"
@@ -88,11 +89,24 @@ namespace lesh::leshper {
 //      the buffer, which starts from `text_pen` again, and a continuation
 //      prompt starts from `prompt_pen` on every logical line.
 //
-// WHAT IT DOES NOT DECIDE. The right prompt (F-40 declares widths first), the
-// pager (completion-engine fog), prompt expansion (#94 left it lesh-side and
-// undecided), and any mapping from a theme's NAMES to colours - `sgr.h` reads
-// the literal colours a prompt's bytes carry, where #93's interned semantic
-// styles are a different path and stay one.
+//   6. THE PAGER GOES BELOW, AND TAKES ITS ROWS FIRST (#138, F-28). When one is
+//      open, `pager.h` measures and renders it into a surface OF ITS OWN (A-6),
+//      and this file COPIES that surface into the rows under the edit line. The
+//      pager's rows come off the terminal's height before the edit view is
+//      windowed, so the edit line is never pushed off the screen by a list of
+//      candidates - `pager_row_budget` never claims the last row.
+//
+//      Copied rather than painted straight in, and that is the A-6 decision
+//      rather than an inefficiency: the pager's coordinates are the pager's, so
+//      a test asserts a grid with no prompt in it, the day the §8 surface API
+//      exists this is already the object it hands out, and nothing about the
+//      pager's picture can depend on what the prompt happened to be.
+//
+// WHAT IT DOES NOT DECIDE. The right prompt (F-40 declares widths first),
+// prompt expansion (#94 left it lesh-side and undecided), and any mapping from
+// a theme's NAMES to colours - `sgr.h` reads the literal colours a prompt's
+// bytes carry, where #93's interned semantic styles are a different path and
+// stay one.
 
 // Everything the picture depends on. Inputs only - no output parameters, no
 // handles, nothing this function may mutate.
@@ -136,6 +150,17 @@ struct layout_input {
 	style prompt_pen{};
 	style text_pen{};
 
+	// The pager (#138, F-28), composited below the edit line. Borrowed and
+	// never freed here (ADR-0007). Null - the default - is no pager, and so is a
+	// pager that is not showing, which is why every call site that predates this
+	// field is unchanged and why `input_for` can hand the state's own along
+	// unconditionally.
+	const pager_state* pager = nullptr;
+
+	// Its two pens, beside the other two and for the same reason: theming is
+	// configuration (#101) and no ticket has decided it.
+	pager_pens pager_pen{};
+
 	// #108's width seam, passed through to every measurement and to the
 	// surface, so one policy answers for the layout and the cells alike.
 	grapheme::width_policy width{};
@@ -152,6 +177,7 @@ struct layout_input {
 	in.buffer = s.buffer.text();
 	in.cursor = s.cursor;
 	in.marks = &s.marks;
+	in.pager = &s.pager;
 	in.columns = s.columns;
 	in.rows = s.rows;
 	return in;
@@ -186,8 +212,18 @@ struct layout {
 	std::uint16_t cursor_row = 0;
 	std::uint16_t cursor_column = 0;
 
+	// Rows at the BOTTOM of `screen` that belong to the pager rather than to
+	// the edit line (#138). Zero when no pager is showing, which is what keeps
+	// every reader that predates it correct.
+	std::uint16_t pager_rows = 0;
+
+	// Rows of `screen` the edit line has: everything the pager did not take.
+	[[nodiscard]] std::uint16_t edit_rows() const noexcept {
+		return static_cast<std::uint16_t>(screen.rows() - pager_rows);
+	}
+
 	// True when the view is a window rather than the whole content.
-	[[nodiscard]] bool scrolled() const noexcept { return content_rows > screen.rows(); }
+	[[nodiscard]] bool scrolled() const noexcept { return content_rows > edit_rows(); }
 
 	friend bool operator==(const layout&, const layout&) noexcept = default;
 };
