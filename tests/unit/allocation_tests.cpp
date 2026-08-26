@@ -402,4 +402,57 @@ TEST_F(AllocationTest, ALoopRepaintCostsAConstantThatDoesNotGrow) {
 	EXPECT_GT(fifty, 0u) << "a zero here would mean the hook, not the loop, is broken";
 	EXPECT_EQ(hundred_and_fifty, fifty * 3) << "the per-repaint cost is a constant";
 }
+
+TEST_F(AllocationTest, PaintingDecorationsAddsNothingToWhatALayoutAlreadyCosts) {
+	// #141's half of the repaint pin above, and the reason `decoration.h`
+	// normalizes at application time rather than in the walk.
+	//
+	// `lay_out` is not zero and never was - it mints a fresh surface, which is
+	// layout-as-value. What must be true is that HIGHLIGHTING IS FREE ON TOP OF
+	// IT: the spans arrive sorted and disjoint, so the walk resolves a pen with a
+	// cursor that only moves forward and needs no scratch structure, and the
+	// virtual text is painted straight out of the storage the batch already
+	// carries. So the same picture with a dozen spans and a suggestion in it must
+	// cost EXACTLY what the bare one costs. A difference would mean the walk grew
+	// a container.
+	leshper::cluster_pool pool;
+
+	std::vector<leshper::decoration_span> spans;
+	for (std::size_t word = 0; word < 12; ++word)
+		spans.push_back(leshper::decoration_span{word * 3, word * 3 + 2, 1});
+	// One nested pair as well, so the normal form is doing real work.
+	spans.push_back(leshper::decoration_span{4, 20, 1});
+	std::vector<leshper::virtual_text> texts{leshper::virtual_text{38, " --colour", 1}};
+	leshper::decorations marks;
+	marks.apply("highlighter", spans, texts);
+
+	leshper::style_table table;
+	table.bind(1, leshper::style{leshper::color::of_rgb(0x5F, 0xAF, 0x5F)});
+
+	leshper::layout_input plain;
+	plain.columns = 40;
+	plain.rows = 6;
+	plain.buffer = "echo one two three four five six seven";
+	plain.cursor = leshper::position::from_byte_offset(38);
+	leshper::layout_input decorated = plain;
+	decorated.marks = &marks;
+	decorated.theme = &table;
+
+	for (int i = 0; i < 4; ++i) {
+		(void)lay_out(pool, plain);
+		(void)lay_out(pool, decorated);
+	}
+
+	const auto cost = [&](const leshper::layout_input& in) {
+		return mallocs_during([&] {
+			for (int i = 0; i < 20; ++i)
+				(void)lay_out(pool, in);
+		});
+	};
+	const size_t bare = cost(plain);
+	const size_t painted = cost(decorated);
+
+	EXPECT_GT(bare, 0u) << "a zero here would mean the hook, not the layout, is broken";
+	EXPECT_EQ(painted, bare) << "painting the decorations reached the heap";
+}
 #endif
