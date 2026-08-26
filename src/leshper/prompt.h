@@ -816,7 +816,7 @@ struct either {
 // A flat walk: every element runs, and one that answers `omitted` contributes
 // no bytes.
 //
-// TOP-LEVEL LITERALS ARE UNCONDITIONAL, BY DESIGN. `$ ` at the end of the
+// TOP-LEVEL LITERALS ARE UNCONDITIONAL, BY DESIGN. `> ` at the end of the
 // default prompt is there whatever the modules did, because binding is explicit
 // grouping and never inferred from adjacency (§6.10). A literal that should
 // vanish with a module goes INSIDE that module's `seg`, and there is no other
@@ -843,15 +843,24 @@ inline constexpr style kCyan = style{.fg = color::of_index(6)};
 inline constexpr style kMagenta = style{.fg = color::of_index(5)};
 inline constexpr style kRed = style{.fg = color::of_index(1)};
 
-// `~/src on main [2]$ `, with each half present only when it has something to
-// say. A `constexpr std::array` of records: no initializer runs at startup and
-// no allocation happens for the default configuration, which is the
-// configuration almost every session has.
-inline constexpr auto kDefaultLeft = table<
-	seg<style_of<kCyan>, path_t>,
-	seg<style_of<kMagenta>, literal<" on ">, git_t>,
-	seg<style_of<kRed>, literal<" [">, status_t, literal<"]">>,
-	literal<"$ ">>();
+// `~/src> `: the working directory, `$HOME` contracted to `~`, and an arrow.
+// Nothing else - no colour, no branch, no status (owner's ruling on #157).
+//
+// THE QUIET ONE, DELIBERATELY. A shipped default is the prompt of every user who
+// has not decided yet, and the one thing it must not do is decide for them: a
+// shell that arrives already wearing three coloured segments has spent their
+// terminal's width and their attention on choices they never made, and every
+// starship segment they DO want is one `add_module` away. The machinery is not
+// being hedged on - the seg composer, the omission vote, the affixes that vanish
+// with their module are all still here and still proved, in the standalone
+// `seg` asserts in `selftest` below rather than in this table. What is small
+// here is the default, not the engine.
+//
+// A `constexpr std::array` of records: no initializer runs at startup and no
+// allocation happens for the default configuration, which is the configuration
+// almost every session has - and, since #157's precedence flip, the one almost
+// every session SHOWS.
+inline constexpr auto kDefaultLeft = table<path_t, literal<"> ">>();
 
 inline constexpr auto kDefaultContinuation = table<literal<"> ">>();
 
@@ -948,16 +957,18 @@ public:
 	// Whether anything has configured this engine - false until the first of the
 	// six verbs above has run, from C++ or across the ABI, and true from then on.
 	//
-	// THIS IS WHAT LETS `$PS1` STAY THE DEFAULT WITHOUT BEING THE FUTURE. §6.10
-	// makes `PS1`/`PS2` a transitional stub, rendered as literal bytes "as it does
-	// today", superseded by the native prompt rather than grown into a POSIX
-	// expansion vocabulary. Supersession is a trajectory, and in v1 - with the
-	// configuration builtin still a follow-up and the ABI the only way in - a
-	// shell nobody has configured must still print the `PS1` its user set, or the
-	// stub would have been removed rather than kept. So the wiring site asks this
-	// one question: an untouched engine leaves the prompt to `PS1`, and the moment
-	// anything configures one the native engine owns it, for the rest of the
-	// session.
+	// ONE HALF OF THE PRECEDENCE RULE, and since #157's ruling it is no longer the
+	// whole of it. §6.10 makes `PS1`/`PS2` a transitional stub, rendered as
+	// literal bytes "as it does today", superseded by the native prompt rather
+	// than grown into a POSIX expansion vocabulary; the owner's ruling is that the
+	// supersession has arrived, so the native prompt is what a fresh shell shows
+	// and `$PS1` is the opt-out. What this flag still decides is the case where
+	// the two disagree: a user who set `$PS1` gets the stub UNTIL something
+	// configures the engine, and from that moment the native composer owns both
+	// surfaces for the rest of the session. The rest of the rule - "an untouched
+	// `$PS1` is not a preference" - is a question about the shell's variables and
+	// is asked at the wiring site, which is the only side that can see them. See
+	// `session::refresh_prompt` in read.cpp.
 	//
 	// NOT REGAINED. There is no un-configure: `clear` and `use_default` are
 	// themselves configuration, and `use_default` in particular is how a user asks
@@ -1201,11 +1212,9 @@ static_assert(run_of<seg<style_of<kMagenta>, literal<" on ">, git_t>>(quiet()).v
 //    present anywhere in the output, so neither decoration executed.
 static_assert(run_of<seg<style_of<kMagenta>, literal<" on ">, git_t>>(quiet()).length == 0);
 
-// 2. The whole default table, both ways round. The `git` seg is gone entirely;
-//    the `status` seg appears only when there is a status to show, bringing its
-//    brackets with it; `$ ` is unconditional because it is top-level.
-static_assert(run(std::span<const element>{kDefaultLeft}, quiet()).view()
-              == "\x1b[36m~/src\x1b[0m$ ");
+// 2. The whole default table: the contracted path and the arrow, and nothing
+//    else. `> ` is unconditional because it is top-level.
+static_assert(run(std::span<const element>{kDefaultLeft}, quiet()).view() == "~/src> ");
 
 [[nodiscard]] constexpr state failed() noexcept {
 	state facts = quiet();
@@ -1213,8 +1222,21 @@ static_assert(run(std::span<const element>{kDefaultLeft}, quiet()).view()
 	return facts;
 }
 
-static_assert(run(std::span<const element>{kDefaultLeft}, failed()).view()
-              == "\x1b[36m~/src\x1b[0m\x1b[31m [2]\x1b[0m$ ");
+// 2b. THE SAME BYTES AFTER A FAILURE, and that identity is the assertion. Since
+//     #157's ruling the default carries no `status` seg, so a non-zero `$?`
+//     changes nothing about what the default prompt paints; the proof that an
+//     affix vanishes with the module it belongs to has not moved out of the
+//     suite, only out of this table - see 1, 5 and 2c, which run the segs
+//     standalone and are what the composer is actually held to.
+static_assert(run(std::span<const element>{kDefaultLeft}, failed()).view() == "~/src> ");
+
+// 2c. The `status` seg standalone, both ways round: it brings its colour and its
+//     brackets with it when there is something to say, and takes both away when
+//     there is not. This is the seg the default table used to carry.
+static_assert(
+	run_of<seg<style_of<kRed>, literal<" [">, status_t, literal<"]">>>(quiet()).view().empty());
+static_assert(run_of<seg<style_of<kRed>, literal<" [">, status_t, literal<"]">>>(failed()).view()
+              == "\x1b[31m [2]\x1b[0m");
 
 static_assert(run(std::span<const element>{kDefaultContinuation}, quiet()).view() == "> ");
 

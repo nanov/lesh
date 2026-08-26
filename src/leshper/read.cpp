@@ -67,12 +67,12 @@ bool shell_syntax_layer::line_is_complete(std::string_view line) const {
 
 void shell_prompt_source::left(std::string& into) const {
 	std::string_view value;
-	into.assign(_state->lookup(std::string_view{"PS1"}, value) ? value : std::string_view{"$ "});
+	into.assign(_state->lookup(std::string_view{"PS1"}, value) ? value : kPosixPrompt);
 }
 
 void shell_prompt_source::continuation(std::string& into) const {
 	std::string_view value;
-	into.assign(_state->lookup(std::string_view{"PS2"}, value) ? value : std::string_view{"> "});
+	into.assign(_state->lookup(std::string_view{"PS2"}, value) ? value : kPosixContinuation);
 }
 
 void history_store_source::for_each_newest_first(
@@ -423,8 +423,27 @@ private:
 	std::atomic<bool> _cancelled{false};
 	// Loop-thread scratch for the accept action; shell-thread scratch for the
 	// prompt. Members so neither path allocates once the session is warm.
+	//
+	// TWO PROMPT SCRATCHES AND NOT ONE, since #157: the precedence rule compares
+	// the stub's two surfaces against the POSIX defaults in the same breath, so
+	// both sets of bytes have to be in hand at once.
 	std::string _accept_scratch;
-	std::string _prompt_scratch;
+	std::string _prompt_left_scratch;
+	std::string _prompt_continuation_scratch;
+
+	// Whether the engine is the surface the loop is showing - the precedence rule's
+	// answer, cached rather than re-asked. `refresh_prompt` is the only writer and
+	// `prompt_tick` the only other reader, which is the SAME serialization every
+	// other option write here has (ADR-0009): the shell thread writes it in the
+	// window where the loop is blocked in `wait_on_shell`, and the loop thread
+	// reads it afterwards, on the far side of the channel mutex that published the
+	// reply. Cached rather than recomputed because recomputing it on the tick path
+	// would mean reading `shell_state` from the loop thread, which is the one thing
+	// ADR-0009 forbids outright.
+	//
+	// TRUE TO BEGIN WITH, and the constructor's `refresh_prompt` settles it before
+	// the loop starts.
+	bool _engine_owns_prompt = true;
 
 	// How long the last command took, measured around `run_input` in `execute`
 	// and read by the next `fill_prompt_facts`. The `duration` module's fact, and
@@ -531,6 +550,24 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// holds a pointer to state it does not own; see `event_loop`'s note where
 	// `attach_shell_knowledge` used to be.
 	LESH_ASSERT(_actor.knowledge() == &_knowledge);
+
+	// THE FIRST PAINT, and it needs saying here or the first prompt of every
+	// session is the wrong one. `options_for` seeded the loop's options from the
+	// provider, which was the whole story while `$PS1` was the default; since the
+	// flip it is the fallback, and a shell with no rc file would otherwise paint
+	// `$ ` once and go native only after the first command. `source_rc` cannot
+	// cover it - it returns immediately when there is no rc to read.
+	//
+	// AFTER THE CONSOLES AND THE ENGINE, BEFORE `run`. After, because this renders
+	// the engine and writes `_loop.options()`, and both have to exist and be wired
+	// to the registry the loop attached; before, because `run` sources the rc and
+	// then starts the loop, and the loop's first render must find the answer
+	// already there. The rc's own `refresh_prompt` still runs after the rc, so a
+	// `PS1=` set in `~/.leshrc` takes the surface back before anything is painted.
+	//
+	// ADR-0009 IS TRIVIALLY SATISFIED HERE: this is the shell thread, and the loop
+	// thread does not exist yet - `_loop.start()` is two calls away, in `run`.
+	refresh_prompt();
 }
 
 session::~session() {
@@ -663,20 +700,50 @@ void session::refresh_prompt() {
 	fill_prompt_facts();
 	_prompt_engine.render_full(_prompt_facts.view());
 
-	// THE PRECEDENCE RULE, and it is the whole of how §6.10's supersession lands
-	// without a flag day. An engine nobody has configured leaves the prompt to
-	// `$PS1` - the transitional stub, rendered as literal bytes exactly as it was
-	// yesterday - and the first configuration verb hands the surface to the native
-	// composer for the rest of the session. There is no setting: the question
-	// "has anyone configured a prompt" answers itself.
-	if (_prompt_engine.configured()) {
+	// The stub's bytes, read whether or not they are used: the rule below is a
+	// question ABOUT them, so they have to be in hand before it can be asked.
+	if (_providers.prompt != nullptr) {
+		_providers.prompt->left(_prompt_left_scratch);
+		_providers.prompt->continuation(_prompt_continuation_scratch);
+	}
+
+	// THE PRECEDENCE RULE, TURNED ROUND BY THE OWNER'S RULING ON #157. This is
+	// §6.10's supersession arriving: `PS1`/`PS2` were always "a transitional stub
+	// ... the native prompt supersedes them", and the ruling is that it does so
+	// now. The ENGINE renders unless the user expressed a `$PS1` preference.
+	//
+	// AN UNTOUCHED `$PS1` IS NOT A PREFERENCE. `shell_state`'s constructor seeds
+	// `PS1='$ '` and `PS2='> '` because POSIX says those are the defaults, so
+	// every session starts holding bytes nobody typed. Reading them back as a
+	// choice would mean no shell ever gets the native prompt, and the flip would
+	// have shipped as a no-op. So the stub wins only when what it produces DIFFERS
+	// from those defaults - which is exactly the set of users who set the variable
+	// - and a null provider (no shell behind the editor at all) is the engine's
+	// too.
+	//
+	// BOTH SURFACES TOGETHER, never one each. A shell whose `$PS1` was set but
+	// whose `$PS2` was not would otherwise paint a user prompt and a native
+	// continuation: two prompts arguing, from one line to the next, about which
+	// shell this is. One question, one answer, both surfaces.
+	//
+	// `PS1='$ '` TYPED DELIBERATELY READS AS "NO PREFERENCE", and that is accepted
+	// imprecision rather than an oversight. Telling it from the seeded value needs
+	// `shell_state` to remember whether an assignment ever happened - a bit on
+	// every variable, carried forever, to be more precise about a mechanism that
+	// is documented to be dropped. The user who wanted a bare `$ ` and got the
+	// native prompt has one `PS1='$ '`-shaped complaint and several ways to say it
+	// (`PS1='$ '` with any other byte, or the prompt console); the design debt of
+	// the alternative would outlive the feature it serves.
+	_engine_owns_prompt = _providers.prompt == nullptr || _prompt_engine.configured()
+	                      || (_prompt_left_scratch == kPosixPrompt
+	                          && _prompt_continuation_scratch == kPosixContinuation);
+
+	if (_engine_owns_prompt) {
 		_loop.options().prompt = _prompt_engine.output(prompt::surface_id::left);
 		_loop.options().continuation = _prompt_engine.output(prompt::surface_id::continuation);
-	} else if (_providers.prompt != nullptr) {
-		_providers.prompt->left(_prompt_scratch);
-		_loop.options().prompt = _prompt_scratch;
-		_providers.prompt->continuation(_prompt_scratch);
-		_loop.options().continuation = _prompt_scratch;
+	} else {
+		_loop.options().prompt = _prompt_left_scratch;
+		_loop.options().continuation = _prompt_continuation_scratch;
 	}
 
 	reconcile_prompt_timer();
@@ -871,11 +938,13 @@ std::int32_t session::prompt_tick(lesh_editor*, const lesh_invocation*, void* se
 	const bool moved = me._prompt_engine.render_tick(facts);
 
 	// ONLY IF THE BYTES ACTUALLY MOVED, and only if the engine is what the loop is
-	// showing. A tick against a `$PS1` prompt is possible - a module can be
-	// registered and placed by the ABI while the surface is still the default one
-	// - and writing the engine's output over `$PS1` there would hand the surface
-	// over without anybody having configured it.
-	if (moved && me._prompt_engine.configured()) {
+	// showing. A tick against a `$PS1` prompt is possible - a module can register
+	// and arm a wake while the user's own `$PS1` owns the surface - and writing the
+	// engine's output over it here would hand the surface over behind the rule's
+	// back. THE SAME RULE, NOT A SECOND ONE: `_engine_owns_prompt` is what
+	// `refresh_prompt` decided, and asking it again from this thread is not
+	// available anyway - half the question is about `shell_state`.
+	if (moved && me._engine_owns_prompt) {
 		me._loop.options().prompt = me._prompt_engine.output(prompt::surface_id::left);
 		me._loop.options().continuation =
 			me._prompt_engine.output(prompt::surface_id::continuation);

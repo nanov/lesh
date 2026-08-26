@@ -112,7 +112,23 @@ public:
 	virtual void continuation(std::string& into) const = 0;
 };
 
-// `$PS1` and `$PS2`, AS LITERAL BYTES.
+// The POSIX defaults `shell_state`'s constructor sets. NAMED, because since
+// #157 something asks about them: `session::refresh_prompt` treats a `$PS1` that
+// still holds these exact bytes as a variable nobody chose, and gives the
+// surface to the native prompt. One statement of what the bytes are, read by the
+// source below and by the rule that compares against it.
+inline constexpr std::string_view kPosixPrompt = "$ ";
+inline constexpr std::string_view kPosixContinuation = "> ";
+
+// `$PS1` and `$PS2`, AS LITERAL BYTES - and, since #157, AS THE OPT-OUT.
+//
+// NOT WHAT AN INTERACTIVE SHELL SHOWS BY DEFAULT, not any more. §6.10 called
+// `PS1`/`PS2` a transitional stub that the native prompt supersedes, and the
+// owner's ruling on #157 is that the supersession has arrived: a fresh shell
+// paints the native prompt, and this class is what a user who set `$PS1` to
+// something of their own keeps getting. The precedence rule itself lives at the
+// wiring site (`session::refresh_prompt` in read.cpp), which is the only side
+// that can see both the engine and the variables.
 //
 // NO EXPANSION, and it is a decision rather than an omission. #94 put "PS1
 // expansion, and the owner's caching and pre-compilation ambitions" lesh-side
@@ -120,8 +136,9 @@ public:
 // else when it lands. Until then `PS1='$ '` prints `$ ` and `PS1='\w$ '` prints
 // `\w$ ` - the bytes the variable holds, unaltered - so nobody can come to
 // depend on a half-implemented expansion vocabulary that the real one would then
-// have to keep. The POSIX defaults (`$ ` and `> `) are shell_state's, set in its
-// constructor, so an unset variable is already impossible here.
+// have to keep. That decision is UNCHANGED by the flip above, and outlives it:
+// an expansion vocabulary is exactly what one does not build for a mechanism
+// that is now the fallback and is documented to be dropped.
 class shell_prompt_source final : public prompt_source {
 public:
 	explicit shell_prompt_source(const runtime::shell_state& state) noexcept

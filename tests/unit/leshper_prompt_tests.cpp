@@ -308,8 +308,11 @@ TEST(LeshperPromptEngine, RegistrationReplacesAndValidatesTheName) {
 TEST(LeshperPromptEngine, DefaultAndClearRoundTrip) {
 	engine which;
 
+	// THE SHIPPED PROMPT, ALL OF IT (owner's ruling on #157): the working
+	// directory with `$HOME` contracted, and an arrow. No colour, no branch, no
+	// status - the quiet default a user has not yet decided against.
 	which.render_full(quiet());
-	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m$ ");
+	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
 	EXPECT_EQ(which.output(surface_id::continuation), "> ");
 
 	which.clear(surface_id::left);
@@ -318,12 +321,23 @@ TEST(LeshperPromptEngine, DefaultAndClearRoundTrip) {
 
 	which.use_default(surface_id::left);
 	which.render_full(quiet());
-	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m$ ");
+	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
 
+	// The path is a real module and follows the facts: a different `$PWD` is a
+	// different prompt, which is the whole of what the default promises.
+	prompt::state moved = quiet();
+	moved.pwd = "/etc";
+	which.render_full(moved);
+	EXPECT_EQ(which.output(surface_id::left), "/etc> ");
+
+	// AND A FAILURE CHANGES NOTHING. The default carries no `status` seg since the
+	// ruling; that the segment machinery still omits and still takes its affixes
+	// with it is asserted on the seg itself - `prompt.h`'s selftests 1, 2c and 5,
+	// and `AGroupVanishesWithItsModule` below over the ABI.
 	prompt::state failed = quiet();
 	failed.status = 2;
 	which.render_full(failed);
-	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m\x1b[31m [2]\x1b[0m$ ");
+	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
 }
 
 TEST(LeshperPromptEngine, AddModuleAnswersFalseForAnUnknownName) {
@@ -1266,14 +1280,26 @@ TEST_F(LeshperPromptGit, AHungFallbackIsKilledAndTheProbeReturns) {
 // does with it, which is a different question and the one §6.10's performance
 // floor rests on.
 
-TEST_F(LeshperPromptGit, TheDefaultTableRendersTheBranchItIsStandingIn) {
+TEST_F(LeshperPromptGit, APlacedGitSegRendersTheBranchItIsStandingIn) {
 	const std::string repo = make_repo("composed", "ref: refs/heads/topic\n");
 	write_text(repo + "/.git/refs/heads/topic", sha40('d') + "\n");
 
-	// The shipped table, unconfigured, against a real repository - so this is the
-	// whole path a user gets on a fresh shell: `seg<magenta, " on ", git>` votes
-	// ready, brings its literal with it, and the branch appears.
+	// A `git` seg, PLACED, against a real repository: the group votes ready, brings
+	// its literal with it, and the branch appears.
+	//
+	// PLACED RATHER THAN SHIPPED, since the owner's ruling on #157 took `git` out
+	// of the default table - the default is a path and an arrow now, and a user who
+	// wants a branch asks for one. What is asserted is unchanged and so is its
+	// strength: the same reader, the same real `.git`, the same composer, and the
+	// group here is the runtime form of the `seg` the table used to hold, which
+	// means this now exercises the ABI's two-phase group as well.
 	engine which;
+	which.clear(surface_id::left);
+	ASSERT_TRUE(which.open_group(surface_id::left));
+	which.add_literal(surface_id::left, " on ");
+	ASSERT_TRUE(which.add_module(surface_id::left, "git", ""));
+	ASSERT_TRUE(which.close_group(surface_id::left));
+
 	prompt::state facts = quiet();
 	facts.pwd = repo;
 	facts.home = std::string_view{};
@@ -1284,8 +1310,8 @@ TEST_F(LeshperPromptGit, TheDefaultTableRendersTheBranchItIsStandingIn) {
 	const std::string_view left = which.output(surface_id::left);
 	EXPECT_NE(left.find(" on topic"), std::string_view::npos) << left;
 
-	// And the same table outside a repository says nothing at all about git - the
-	// seg's literal vanishing with the module, which the compile-time selftests
+	// And the same placement outside a repository says nothing at all about git -
+	// the seg's literal vanishing with the module, which the compile-time selftests
 	// check against synthetic facts and this checks against a real filesystem.
 	const std::string bare = at("not_a_repo");
 	make_dirs(bare);
