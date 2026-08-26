@@ -1897,7 +1897,32 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	if (pid == 0) {
 		setpgid(0, 0);
 		// POSIX: a subshell resets traps to default, except those set to ignore.
-		_state.enter_subshell();
+		//
+		// `foreground_job` IS #160's SCOPE DECISION FOR `( )`, and it is the one
+		// fork site in the file that claims it: this is a job the shell is waiting
+		// on with nothing between them, so the saved tty fd survives here where
+		// `&`, `$( )` and a pipeline stage all clear it. What survives is the fd and
+		// not a handoff - the command inside a subshell forks AGAIN, so only a live
+		// fd at that inner fork can make `(nvim .)` the terminal's foreground group.
+		// See shell_state::enter_subshell for why a pipeline stage is different.
+		_state.enter_subshell(subshell_role::foreground_job);
+		// And then the subshell takes the terminal for its OWN group, so that work
+		// it does IN PROCESS - `(read x)`, a builtin, a function - reads the
+		// terminal as a foreground process rather than meeting EIO on it. Measured:
+		// `(read v; echo $v)` returns nothing without this line and reads the user's
+		// typing with it.
+		//
+		// THE SAME ENTRY POINT A COMMAND'S FORK USES, which it can be only because
+		// the signal reset no longer lives inside it. While `take_terminal_in_child`
+		// still carried the reset, a subshell could not call it: this process stays a
+		// shell, and it calls `reclaim_terminal` after every foreground command it
+		// runs - from a group that is NOT the foreground one by then, because the
+		// command it just waited for took the terminal. With SIGTTOU at its default
+		// that reclaim STOPS the subshell, and the parent's WUNTRACED wait would
+		// report a stop nothing is ever going to continue. The reset now runs on the
+		// exec path in `become_command`, which a subshell never reaches, so the
+		// hazard is gone and the special case with it.
+		take_terminal_in_child(_state.tty_fd());
 		// The subshell gets its own EXIT trap, and the flag must be cleared for it:
 		// a subshell forked from INSIDE the parent's EXIT trap inherits a raised
 		// flag and would skip its own. `trap '(trap "echo x" EXIT)' EXIT` is exactly
@@ -1917,10 +1942,24 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	// A `( )` IS A FOREGROUND JOB, so it reaps like one (#158 decision 5, which
 	// names "the foreground subshell waits" beside the simple command and the
 	// pipeline). One process, waited on by a shell with nothing else to do, and a
-	// stop here hangs the shell exactly as it did at the simple-command wait -
-	// today only from a deliberate `kill -STOP`, and from Ctrl-Z once #160 hands
-	// this fork the terminal the way #159 hands it to a simple command.
+	// stop here would hang the shell exactly as it did at the simple-command wait -
+	// which Ctrl-Z can now reach, because #160 gave this fork the terminal the way
+	// #159 gave it to a simple command.
 	waitpid(pid, &wait_status, WUNTRACED);
+	// The same two debts the simple-command and pipeline waits pay, in the same
+	// order (#158 decisions 2 and 3, #160). `(nvim .); read x` needs the first for
+	// the reason `nvim .; read x` does, and the second is what keeps `(sleep 5);
+	// echo after` from printing `after` after a Ctrl-C.
+	//
+	// The subshell reaches this note ALREADY KILLED BY SIGINT rather than exited
+	// 130, and that is not an accident of timing - it is what
+	// `note_interrupt_after_handoff` arranges one level down. The subshell's own
+	// foreground wait synthesizes the interrupt it was excluded from, finds no
+	// disposition in a subshell that will act on the flag, and takes SIGINT's
+	// actual default action; so the wait status here says WIFSIGNALED and this
+	// note fires, exactly as it would have if the terminal had never moved.
+	reclaim_terminal();
+	note_interrupt_after_handoff(wait_status);
 	// A subshell is a command in its own right: `set -e; (false && echo a)` exits
 	// even though the same list would not inside a brace group.
 	_status_tested = false;
@@ -2038,9 +2077,8 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 }
 
 void tree_walking_executor::take_terminal_in_child(int tty_fd) noexcept {
-	// No terminal means no handoff AND no reset - see the header. The two are one
-	// decision, and splitting them would make a non-interactive shell's children
-	// lose an ignored-on-entry SIGTSTP that #37 says they keep.
+	// No terminal, no handoff. See the header for why this gate rather than an
+	// `interactive()` test at each site.
 	if (tty_fd < 0)
 		return;
 
@@ -2051,9 +2089,27 @@ void tree_walking_executor::take_terminal_in_child(int tty_fd) noexcept {
 	// way, and there is no place to report from - the shell's stderr is the very
 	// surface a message would corrupt.
 	(void)tcsetpgrp(tty_fd, getpgrp());
+}
 
-	// Then, and only then, the dispositions this shell's editing loop imposed and
-	// which execve would otherwise carry into the command.
+void tree_walking_executor::reset_job_control_signals(int tty_fd) noexcept {
+	// SAME GATE, SAME REASON. No terminal means there were no self-inflicted
+	// ignores to undo: a non-interactive shell's dispositions are its invoker's and
+	// #37 says they stand, so a child of one must keep an ignored-on-entry SIGTSTP.
+	if (tty_fd < 0)
+		return;
+
+	// The dispositions this shell's editing loop imposed on itself, dropped before
+	// execve carries them into the command (#158 decision 4). SIG_IGN is the one
+	// disposition that survives exec, so without this every command lesh runs is a
+	// command that cannot be suspended and whose background tty access silently
+	// succeeds - the #158 defect itself.
+	//
+	// PER PROCESS, WHERE THE HANDOFF IS PER GROUP, and #160 is where the difference
+	// stopped being academic. While these two lived in one function a pipeline got
+	// one call - to the group leader, because one handoff covers a job - and stages
+	// 2..N exec'd with all three signals still ignored: `ls | less` handed `less` an
+	// ignored SIGTSTP, and `sleep 30 | sleep 30` under Ctrl-Z stopped the first
+	// stage while the second ignored the stop and the shell blocked on it.
 	struct sigaction dfl{};
 	dfl.sa_handler = SIG_DFL;
 	sigemptyset(&dfl.sa_mask);
@@ -2100,7 +2156,57 @@ void tree_walking_executor::note_interrupt_after_handoff(int wait_status) {
 	// INT` is inherited as SIG_IGN across the exec, so the child cannot die of a
 	// signal it ignores and this line is never reached; were it reached, the flag
 	// would be dropped by run_pending_traps' own disposition test.
-	_state.signals().note_pending(SIGINT);
+	//
+	// ONE THING IS ASKED BEFORE THE FLAG IS SET, and only #160 made it reachable:
+	// whether anything in THIS shell will act on it. A shell that reads commands
+	// always will - a user trap is a `handler`, and with no trap #52's interactive
+	// default makes `interrupts_command` true - so for the shell #159 was written
+	// for this is always the branch taken and its behaviour is unchanged.
+	if (_state.signals().disposition_of(SIGINT) == disposition::handler ||
+	    _state.signals().interrupts_command(SIGINT)) {
+		_state.signals().note_pending(SIGINT);
+		return;
+	}
+
+	// A FOREGROUND `( )` IS THE SHELL THAT WILL NOT, and #160 is what put one here.
+	// `enter_subshell` drops #52's interactive defaults - a subshell is not the
+	// process that reads commands and has a prompt to return to - so SIGINT is back
+	// at `default_action` with no trap, and `run_pending_traps` drops a flag in that
+	// state on the floor. Setting it would be a no-op, the subshell would exit 130
+	// of its own accord, and the PARENT's note keys on WIFSIGNALED and would not
+	// fire: `(sleep 5); echo after` would print `after`.
+	//
+	// So take SIGINT's ACTUAL DEFAULT ACTION, which is death, and which is what the
+	// kernel would have done to this process had the terminal not moved out from
+	// under it. Measured on this machine with `(sleep 5); echo after` and Ctrl-C on
+	// a pty: dash, zsh and bash all abandon the line and report 130, and lesh did
+	// too before the subshell had a handoff to be excluded by. Unanimous, and
+	// matching lesh's own prior behaviour - the same grounds on which #159 widened
+	// its trap-only synthesis to the interactive default.
+	//
+	// This is also the discipline every shell keeps for a subshell whose foreground
+	// child was killed by a signal: it re-raises rather than translating the death
+	// into a status, because a status cannot be told from `exit 130` by the parent
+	// that has to decide whether a line was interrupted.
+	if (_state.signals().disposition_of(SIGINT) != disposition::default_action)
+		return;
+	// Flushed first: this process is about to stop existing without running an EXIT
+	// trap or an `_exit`, which is what a signal death means, and anything a
+	// command in the subshell buffered would go with it.
+	std::fflush(nullptr);
+	// Unblocked and defaulted, in that order, so the raise below cannot be merely
+	// recorded. A forked child has one thread, so `sigprocmask` is the right call
+	// here and `pthread_sigmask` would say nothing extra.
+	sigset_t just_int;
+	sigemptyset(&just_int);
+	sigaddset(&just_int, SIGINT);
+	(void)sigprocmask(SIG_UNBLOCK, &just_int, nullptr);
+	struct sigaction dfl{};
+	dfl.sa_handler = SIG_DFL;
+	sigemptyset(&dfl.sa_mask);
+	dfl.sa_flags = 0;
+	(void)sigaction(SIGINT, &dfl, nullptr);
+	(void)raise(SIGINT);
 }
 
 void tree_walking_executor::become_command(arena_array<char*>& argv,
@@ -2114,6 +2220,32 @@ void tree_walking_executor::become_command(arena_array<char*>& argv,
 	// is every `target=child` case in sigquit5/sigterm5-p.tst, 120 assertions per
 	// file. Dropped in the child, after the fork, so the shell itself keeps them.
 	_state.signals().drop_interactive_defaults();
+
+	// And the stop signals, which are the same thought about a different set and so
+	// sit beside it - but NOT inside it, because #158 decision 4 is explicit that
+	// this is a separate child-only reset: `drop_interactive_defaults` keeps #37's
+	// rule that an inherited SIG_IGN stands, and these ignores are self-inflicted by
+	// `ignore_background_write_signals` rather than inherited, so they must always
+	// drop. The two sets are disjoint (INT/QUIT/TERM against TTOU/TTIN/TSTP), so the
+	// order between them says nothing.
+	//
+	// HERE BECAUSE THIS IS THE EXEC PATH, and that is the whole of the #160 fix.
+	// This function is the ONE place a process becomes a command - `spawn`'s child
+	// reaches it for a simple command, `run_pipeline_stage` reaches it for a stage
+	// that execs in place - so a reset here runs once per process that needs it,
+	// which is every one of them, rather than once per process group. It also
+	// EXCLUDES exactly the right process by construction: a compound stage
+	// (`{ ...; } | cat`) never becomes a command, so it never reaches this line and
+	// keeps its SIGTTOU ignore - which it needs for the same reason a foreground
+	// `( )` needs it, because it goes on running shell code and will hand the
+	// terminal to a command of its own and take it back afterwards.
+	//
+	// AFTER THE HANDOFF, ALWAYS, and the ordering is #158 decision 4's: a child's
+	// own `tcsetpgrp` from a background group is only legal while the inherited
+	// SIGTTOU ignore still stands. The handoff happens on the fork path - in
+	// `spawn` for a simple command, in `run_pipeline` for a stage - and every path
+	// to here passes through one of those first.
+	reset_job_control_signals(_state.tty_fd());
 
 	// Redirections are applied AFTER the pipeline's fds, so an explicit
 	// `> file` on a pipeline stage overrides the pipe - which is what POSIX
@@ -3148,6 +3280,13 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// substitution through run_substitution, and both cleared the saved tty on the
 	// way past `enter_subshell`, so neither can reach this even though both end up
 	// in this function one process further down.
+	//
+	// "THIS SHELL" INCLUDES A FOREGROUND `( )` SINCE #160, and that is the point of
+	// the exception `enter_subshell` makes for one: the subshell kept the fd, so the
+	// command inside it reaches this line with a live terminal and `(nvim .)` takes
+	// the screen. Everything below - the handoff, the per-job reclaim, the
+	// interrupt note - then runs in the subshell exactly as it runs here, because
+	// a subshell waiting on a foreground child IS this situation.
 	const pid_t pid = spawn(argv, {.foreground = true}, &expanded, &t, n,
 	                        cmd.standard_path);
 	if (pid == -1)
@@ -3323,6 +3462,32 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 		const pid_t pid = fork();
 		if (pid == 0) {
 			setpgid(0, group);
+			// ONE HANDOFF FOR THE WHOLE PIPELINE (#160, #158 decision 3): a pipeline
+			// is ONE foreground job, so the terminal goes to its process group and
+			// the later stages inherit it by joining that group. `group == 0` is
+			// exactly "I am the leader" - the parent sets `group` to the first
+			// surviving child's pid below - which is a truer test than `i == 0`,
+			// because if the first fork failed the second stage is the leader and
+			// owes the handoff instead. `ls | less` pages because of this line.
+			//
+			// THE HANDOFF IS PER GROUP; THE SIGNAL RESET IS PER PROCESS, and the two
+			// are separate functions for exactly that reason. This line is the whole
+			// of what the leader owes on behalf of the job. Every stage that execs -
+			// leader or not - drops SIGTTOU/SIGTTIN/SIGTSTP for ITSELF in
+			// `become_command`, on the exec path, which is what keeps `less` at the
+			// far end of a pipeline suspendable. Guarding the reset with this same
+			// `group == 0` was the review defect: stages 2..N exec'd with all three
+			// still ignored, which is the #158 defect surviving one stage over.
+			//
+			// Ordering, #158 decision 1's and both still held: after the `setpgid`
+			// above, because the child hands the terminal to the group it is IN, and
+			// before the dup2s further down - and the reset in `become_command` comes
+			// after this, which is the constraint that matters, since a child's own
+			// `tcsetpgrp` from a background group is legal only while the inherited
+			// SIGTTOU ignore stands. Reading the SAVED fd rather than fd 0 is what
+			// makes the position safe either way: fd 0 is about to become a pipe.
+			if (group == 0)
+				take_terminal_in_child(_state.tty_fd());
 			// A stage is a SUBSHELL ENVIRONMENT, and this is the one place per stage
 			// that is already inside it - after the fork, before anything in the
 			// stage is evaluated. So the traps reset here, exactly as they do for
@@ -3338,7 +3503,22 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 			// reads commands and has a prompt to return to and not to a stage; and it
 			// leaves #37's ignored-on-entry rule alone, which is why a signal the
 			// shell was invoked ignoring is still untrappable in a stage.
-			_state.enter_subshell();
+			//
+			// `foreground_job` (#160): A STAGE OF A FOREGROUND PIPELINE IS PART OF A
+			// FOREGROUND JOB, so it keeps the saved tty fd. Two things need it. The
+			// per-process signal reset in `become_command` is gated on that fd, and
+			// without it every stage would exec with the shell's ignored SIGTSTP -
+			// the review defect this whole split is here to fix. And a nested
+			// foreground command inside a COMPOUND stage (`{ nvim; } | cat`) can now
+			// take the terminal and give it back, which it could not before.
+			//
+			// THIS IS SAFE ONLY BECAUSE THE RESET LEFT THE FORK PATH. While the
+			// leader's handoff also reset its own SIGTTOU, a stage that kept the fd
+			// could hand the terminal to a nested command and then be STOPPED by
+			// SIGTTOU on its own reclaim. Now a compound stage never execs, never
+			// reaches the reset, and keeps the ignore that makes that reclaim legal -
+			// the same reasoning as the foreground `( )` in run_subshell.
+			_state.enter_subshell(subshell_role::foreground_job);
 			// The stage gets its OWN EXIT trap, and the flag must be cleared for it -
 			// the same reason run_subshell clears it, for a stage forked from inside
 			// the parent's EXIT trap.
@@ -3415,20 +3595,71 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 	// out of scope, which is the seam `foreground_status` marks.
 	int last_status = 0;
 	int rightmost_failure = 0;
+	// The WAIT status beside each derived one, for the interrupt note below. The
+	// derived `int` cannot answer its question: 130 from a child killed by SIGINT
+	// and 130 from `exit 130` are the same number, and only WIFSIGNALED tells them
+	// apart. Kept in step with the two above rather than recomputed, so the member
+	// the note asks about is by construction the member `$?` came from.
+	int last_wait = 0;
+	int rightmost_failure_wait = 0;
 	for (size_t i = 0; i < pids.size(); ++i) {
 		int wait_status = 0;
 		waitpid(pids[i], &wait_status, WUNTRACED);
 		const int status = foreground_status(pids[i], wait_status);
-		if (status != 0)
+		if (status != 0) {
 			rightmost_failure = status;
-		if (i + 1 == pids.size())
+			rightmost_failure_wait = wait_status;
+		}
+		if (i + 1 == pids.size()) {
 			last_status = status;
+			last_wait = wait_status;
+		}
 	}
 	// The option is read AFTER the pipeline ran, so a stage that turns it on cannot
 	// change the status of the pipeline it belongs to - pipeline-p.tst's 'pipeline
 	// enabling pipefail does not affect itself'. Every stage forks, so it could not
 	// anyway, but the read order is what says so rather than the process model.
-	return _state.opts().pipefail ? rightmost_failure : last_status;
+	// ONCE, into a local, because the interrupt note below has to be answered by
+	// the same option the status is.
+	const bool pipefail = _state.opts().pipefail;
+
+	// THE OTHER TWO THINGS A FOREGROUND WAIT OWES (#158 decisions 2 and 3, #160),
+	// in the same order and for the same reasons as the simple-command wait: the
+	// terminal comes back per JOB and not per line, and the SIGINT the shell was
+	// excluded from by its own handoff is recorded. Without the first, `ls | less;
+	// read x` reads from a terminal it is not the foreground group of; without the
+	// second, `sleep 5 | cat; echo after` prints `after` after a Ctrl-C, which
+	// dash, zsh and bash all refuse to do and which lesh refused to do before the
+	// pipeline had a handoff to be excluded by.
+	reclaim_terminal();
+	// WHICH MEMBER'S DEATH COUNTS: the one whose status became the PIPELINE's.
+	// Under the default rule that is the last member, and under `pipefail` the
+	// rightmost that failed - the same composition two lines down, asked of the
+	// wait status instead of the derived one.
+	//
+	// The alternative was "any member died of SIGINT", and it is the wrong answer
+	// for a reason worth writing down: it would abandon the line while `$?` said
+	// the pipeline SUCCEEDED. `sleep 5 | true` reports 0 whatever happens to
+	// `sleep`, and a shell that reported success and then silently dropped the
+	// rest of the line would break the contract #159 established for the simple
+	// command, where a 130 from an actual kill is exactly what abandons the line
+	// and a cooperative exit does not. Keying on the deciding member keeps
+	// "abandoned iff `$?` is 128+SIGINT from a kill" true for every job shape.
+	//
+	// Under `pipefail` with nothing failed, `rightmost_failure_wait` is still 0:
+	// WIFSIGNALED(0) is false, so a pipeline that succeeded notes nothing, which
+	// is what it should do.
+	//
+	// Measured on this machine, `trap 'echo T' INT; sleep 5 | cat` with Ctrl-C on
+	// a pty: dash fires the trap, zsh fires it, bash does not, and all three
+	// report 130 and abandon the rest of the line. That is the same three-shell
+	// split #159 resolved for the simple command, so it gets the same answer -
+	// ADR-0001's dash floor and #98 decision 3's zsh override compose to "fires",
+	// and bash's silence is the divergence #98 declined by name. In `sleep 5 |
+	// cat` both members are in the foreground group and both die of SIGINT, so the
+	// deciding member is a killed one and the two candidate rules agree there.
+	note_interrupt_after_handoff(pipefail ? rightmost_failure_wait : last_wait);
+	return pipefail ? rightmost_failure : last_status;
 }
 
 substitution_result tree_walking_executor::capture(std::string_view code,

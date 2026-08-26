@@ -502,9 +502,37 @@ private:
 	// dispositions are its invoker's, and #37 says they stand.
 	//
 	// Static because it runs after a fork and must reach nothing but its argument:
-	// only `tcsetpgrp`, `getpgrp` and `sigaction`, all async-signal-safe. #160
-	// calls it from the foreground pipeline and subshell forks unchanged.
+	// only `tcsetpgrp` and `getpgrp`, both async-signal-safe.
+	//
+	// THE HANDOFF ONLY, since #160. It used to also reset SIGTTOU/SIGTTIN/SIGTSTP,
+	// and the two halves have different arities: the handoff is ONE PER PROCESS
+	// GROUP - a pipeline's leader makes it on behalf of every stage - while the
+	// reset is ONE PER PROCESS THAT EXECS. Fused, the leader-only call left stages
+	// 2..N exec'ing with all three signals still ignored, so `less` at the end of a
+	// pipeline could not be suspended. `reset_job_control_signals` is the other
+	// half and `become_command` is where it runs.
+	//
+	// Splitting them is also what lets a foreground `( )` call this: a subshell
+	// wants the terminal but must NOT drop its own SIGTTOU ignore, because it will
+	// hand the terminal to commands of its own and take it back afterwards.
 	static void take_terminal_in_child(int tty_fd) noexcept;
+
+	// The other half of the old fused call (#158 decision 4): the dispositions this
+	// shell's editing loop imposed on itself, dropped before execve carries them
+	// into the command. SIG_IGN is the one disposition that survives exec.
+	//
+	// PER PROCESS THAT EXECS, which is why it lives on the exec path in
+	// `become_command` and not beside the handoff at a fork. Every process that
+	// becomes a command needs it - a simple command's child and each pipeline stage
+	// that execs in place - and every process that goes on running SHELL code must
+	// not have it, because it will hand the terminal over and take it back and needs
+	// the SIGTTOU ignore to do so. A compound stage and a foreground `( )` are both
+	// the second kind, and both are excluded by construction rather than by a test.
+	//
+	// Same `tty_fd < 0` gate as the handoff, and for the reason #37 gives: with no
+	// terminal there were no self-inflicted ignores to undo, and a non-interactive
+	// shell's children keep the dispositions their invoker chose.
+	static void reset_job_control_signals(int tty_fd) noexcept;
 
 	// The other half, on the shell thread: takes the terminal back the instant a
 	// foreground job's wait returns (#158 decision 2).
@@ -540,10 +568,18 @@ private:
 	// time, and matching lesh's own prior behaviour - so a synthesis that covered
 	// only the trap was under-correcting rather than being careful.
 	//
-	// SO IT DECIDES NOTHING. It records a pending SIGINT and lets the
+	// SO IT DECIDES ALMOST NOTHING. It records a pending SIGINT and lets the
 	// between-commands machinery answer exactly as it answers a real arrival: the
 	// trap body, or #52's `interrupts_command` unwind. That is #33's discipline,
 	// and a second route would be a second timing to get wrong.
+	//
+	// THE ONE THING IT DECIDES is what to do in a shell where that machinery will
+	// answer NOTHING, which #160 made reachable by giving a foreground `( )` the
+	// terminal. A subshell has no interactive default and, absent a trap, no
+	// disposition that acts on the flag - so it takes SIGINT's real default action
+	// and dies of it, which is both what the kernel would have done and the only
+	// thing the waiting parent can tell apart from `exit 130`. A shell that reads
+	// commands never reaches that branch: it always has a trap or #52's default.
 	//
 	// GATED ON THE HANDOFF HAVING HAPPENED - the same `tty_fd` test
 	// reclaim_terminal makes, at the same point, and that gate is load bearing
