@@ -4,6 +4,7 @@
 #include "leshper/state.h"
 #include "leshper/surface.h"
 #include "leshper/text.h"
+#include "leshper/theme.h"
 #include "substrate/grapheme.h"
 
 #include <cstdint>
@@ -88,6 +89,36 @@ namespace lesh::leshper {
 //      the buffer, which starts from `text_pen` again, and a continuation
 //      prompt starts from `prompt_pen` on every logical line.
 //
+//   6. THE DECORATIONS ARE PAINTED (#141). A span over buffer bytes moves the
+//      pen for the clusters inside it, through `theme.h`'s id-to-pen table, and
+//      the virtual text #133's autosuggester emits is drawn at its offset as
+//      cells that are not in the buffer.
+//
+//      Three rules, and each of them is a decision:
+//
+//      THE SPANS ARRIVE NORMALIZED. `decoration.h` flattens the layers into one
+//      sorted, non-overlapping list at application time, so the walk answers
+//      "what pen is this byte" with a cursor that only moves forward. That is
+//      what keeps this function allocation-free with highlighting in it - the
+//      alternative, resolving nested spans per cluster, is a scan per cluster
+//      and a scratch structure per call.
+//
+//      THE CURSOR GOES DOWN BEFORE THE VIRTUAL TEXT AT ITS OFFSET. Decision 3
+//      says the cursor is always on a cell the terminal can reach, and virtual
+//      text must not be able to push it: an offset is a place in the BUFFER, so
+//      the cursor is placed where the buffer's clusters put it and the virtual
+//      text is drawn after. At the end of the line - the live case, an
+//      autosuggestion - that puts the cursor exactly where the user's next
+//      keystroke will land, with the muted rest of the suggestion trailing to
+//      its right, which is what fish does and what makes the suggestion
+//      readable as a suggestion.
+//
+//      VIRTUAL BYTES ARE PAINTED LIKE BUFFER BYTES, not like prompt bytes: an
+//      ESC in them is a control the surface drops rather than a pen change.
+//      A reactor styles what it emits with a style id (#133's `_styled` emit),
+//      which is the door that exists; a second door made of literal escapes
+//      would make a reactor's output measure differently from how it paints.
+//
 // WHAT IT DOES NOT DECIDE. The right prompt (F-40 declares widths first), the
 // pager (completion-engine fog), prompt expansion (#94 left it lesh-side and
 // undecided), and any mapping from a theme's NAMES to colours - `sgr.h` reads
@@ -113,11 +144,23 @@ struct layout_input {
 	std::string_view buffer;
 	position cursor;
 
-	// #93's annotations (A-7). Borrowed and never freed here (ADR-0007);
-	// nothing reads it yet, because `decorations` is still the placeholder
-	// state.h documents. The field exists so the highlighter's ticket fills a
-	// type in rather than threading a new parameter through this signature.
+	// #93's annotations (A-7), and #141 is the ticket that filled the type in.
+	// Borrowed and never freed here (ADR-0007), and read exactly as `spans()`
+	// and `texts()` present them: sorted, and in the spans' case disjoint.
+	// Null - the default - is a picture with no highlighting in it, which is
+	// what every test that is about geometry passes.
 	const decorations* marks = nullptr;
+
+	// What a span's interned semantic id LOOKS like (#124, theme.h). Borrowed,
+	// never owned, and SEPARATE from `marks` because they answer different
+	// questions and change on different clocks: the marks change on every
+	// keystroke, the table only when a binding interns a name.
+	//
+	// Null - the default - means the spans are known but unthemed, and the
+	// picture is the undecorated one. That is not a degenerate case to be
+	// tolerated; it is what `input_for` produces before the loop attaches a
+	// registry, and it must be a legible line rather than a blank one.
+	const style_table* theme = nullptr;
 
 	// The terminal, as the last resize event reported it (A-3). Zero in either
 	// axis means the loop has not asked yet, and the answer is an empty layout:

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace lesh::leshper {
 
@@ -66,7 +67,8 @@ public:
 	walker(const layout_input& in, Emit emit) : _in(in), _emit(std::move(emit)) {}
 
 	geometry run() {
-		place(_in.prompt, _in.prompt_pen, escapes::skip, no_cursor, secondary::no);
+		place(_in.prompt, _in.prompt_pen, escapes::skip, no_cursor, secondary::no,
+		      annotate::no);
 
 		// THE WIDTH INVARIANT, checked rather than only tested. #131 made a
 		// prompt's SGR set a pen instead of being merely skipped, and the thing
@@ -87,7 +89,7 @@ public:
 		// (text.h: every such call is a site #88 must revisit). It is a
 		// comparison against buffer offsets and never arithmetic on them.
 		place(_in.buffer, _in.text_pen, escapes::paint, _in.cursor.byte_offset(),
-		      secondary::yes);
+		      secondary::yes, annotate::yes);
 		flush();
 
 		// A cursor past the last cluster - the empty buffer, and every buffer
@@ -106,6 +108,12 @@ public:
 private:
 	enum class escapes { skip, paint };
 	enum class secondary { no, yes };
+	// Whether this text is the BUFFER, and therefore the text the decorations
+	// are anchored to. The prompt, the continuation prompt and a virtual text's
+	// own bytes are all `no`: a span's offsets are buffer offsets and mean
+	// nothing anywhere else, and a virtual text that could carry virtual text
+	// would be a recursion with no bottom.
+	enum class annotate { no, yes };
 
 	// `pen` BY VALUE, and that is the whole of #131 on this side: an SGR in
 	// prompt bytes moves it, and it moves for the clusters that FOLLOW. One
@@ -113,7 +121,7 @@ private:
 	// belongs to - the prompt's colours cannot bleed into the buffer, because
 	// the buffer's `place` starts from `text_pen` again.
 	void place(std::string_view text, style pen, escapes on_escape,
-	           std::size_t cursor_at, secondary continuations) {
+	           std::size_t cursor_at, secondary continuations, annotate marks) {
 		std::size_t i = 0;
 		while (i < text.size()) {
 			// Prompt bytes only. #114's measurer decides what an escape IS, and
@@ -131,6 +139,12 @@ private:
 					continue;
 				}
 			}
+
+			// What happens AT an offset, before the cluster that starts
+			// there: the cursor, and then any virtual text drawn here. The
+			// order is the rule - see layout.h, decision 6.
+			if (marks == annotate::yes)
+				at_offset(i, cursor_at);
 
 			const std::size_t end = grapheme::next_boundary(text, i);
 			const std::string_view cluster = text.substr(i, end - i);
@@ -154,19 +168,89 @@ private:
 				break_line();
 				if (continuations == secondary::yes)
 					place(_in.continuation, _in.prompt_pen, escapes::skip, no_cursor,
-					      secondary::no);
+					      secondary::no, annotate::no);
 				i = end;
 				continue;
 			}
 
-			open_run(text, i, pen);
+			// #141: a span over these bytes moves the pen, and a run belongs to
+			// ONE pen - so a span's edge ends the run in flight exactly as an
+			// SGR in prompt bytes does.
+			const style ink = marks == annotate::yes ? span_pen(i, pen) : pen;
+			if (_run_open && !(_run_pen == ink))
+				flush();
+
+			open_run(text, i, ink);
 			_run_end = end;
 			advance(width);
 			i = end;
 		}
+		// The end of the buffer is an offset like any other, and it is the one
+		// an autosuggestion is emitted at (#133): the cursor lands after what
+		// was typed, and the suggestion is drawn from there.
+		if (marks == annotate::yes)
+			at_offset(text.size(), cursor_at);
 		// A run belongs to one source view and one pen, and the next `place`
 		// brings both.
 		flush();
+	}
+
+	// The pen a buffer byte is painted in: the text pen, unless a span covers
+	// the byte and the theme knows what its interned id means.
+	//
+	// ONE CURSOR, MOVING FORWARD ONLY, which is what `decoration.h`'s normal
+	// form buys: the spans are sorted and disjoint, `place` visits buffer
+	// offsets in increasing order, and no other `place` on the stack touches
+	// this cursor because only the buffer is annotated. So the whole of
+	// highlighting costs one comparison per cluster and allocates nothing.
+	[[nodiscard]] style span_pen(std::size_t offset, style under) {
+		if (_in.marks == nullptr || _in.theme == nullptr)
+			return under;
+		const std::vector<decoration_span>& spans = _in.marks->spans();
+		while (_span_at < spans.size() && spans[_span_at].end <= offset)
+			++_span_at;
+		if (_span_at >= spans.size() || spans[_span_at].start > offset)
+			return under;
+		return _in.theme->over(spans[_span_at].style_id, under);
+	}
+
+	// The two things that happen at a buffer offset before its cluster does.
+	//
+	// It returns immediately unless a virtual text is due here, and that early
+	// return is load bearing: the cursor is ordinarily recorded further down,
+	// AFTER `reserve` has wrapped for the cluster it sits on, because a cluster
+	// that wraps takes the cursor with it. Recording it up here would move the
+	// cursor a row too early - so it is only done up here when there is virtual
+	// text at this offset to keep it away from, and then the column it is
+	// recorded at is the one right after the real text, which is where a buffer
+	// offset is.
+	void at_offset(std::size_t offset, std::size_t cursor_at) {
+		if (_in.marks == nullptr)
+			return;
+		const std::vector<virtual_text>& texts = _in.marks->texts();
+		// Sorted by offset, so `<=` and not `==`: a text whose offset landed
+		// inside a cluster - or inside an escape the prompt walk skipped - is
+		// drawn at the next boundary rather than lost. A text past the end of a
+		// buffer that has since been shortened is simply never reached, which
+		// is the right answer for a decoration the editor has moved past.
+		if (_text_at >= texts.size() || texts[_text_at].at > offset)
+			return;
+
+		if (cursor_at != no_cursor && cursor_at <= offset && !_cursor_placed)
+			record_cursor();
+
+		while (_text_at < texts.size() && texts[_text_at].at <= offset) {
+			const virtual_text& one = texts[_text_at];
+			++_text_at;
+			if (one.bytes.empty())
+				continue;
+			flush();
+			const style ink = _in.theme == nullptr
+			                      ? _in.text_pen
+			                      : _in.theme->over(one.style_id, _in.text_pen);
+			place(one.bytes, ink, escapes::paint, no_cursor, secondary::no,
+			      annotate::no);
+		}
 	}
 
 	// Make room for a cluster `width` columns wide, wrapping if it does not fit
@@ -262,6 +346,11 @@ private:
 	bool _cursor_placed = false;
 	std::uint16_t _cursor_row = 0;
 	std::uint16_t _cursor_column = 0;
+
+	// The two monotone cursors into the normalized decorations, reset by
+	// construction on each of the two passes.
+	std::size_t _span_at = 0;
+	std::size_t _text_at = 0;
 
 	bool _run_open = false;
 	std::string_view _run_source;
