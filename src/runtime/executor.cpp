@@ -1960,6 +1960,15 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 		// documented way to avoid the race.
 		setpgid(0, ctx.group);
 
+		// FIRST THING AFTER THE GROUP EXISTS, and before the dup2s below (#158
+		// decision 1). The group has to be settled - the child hands the terminal to
+		// the group it is in - and the fd has to still be the terminal, which is why
+		// this reads the saved tty rather than fd 0: the dup2s underneath may be
+		// about to make fd 0 a pipe. See take_terminal_in_child for why the handoff
+		// comes before the signal reset it also does.
+		if (ctx.foreground)
+			take_terminal_in_child(_state.tty_fd());
+
 		if (ctx.input_fd != STDIN_FILENO) {
 			dup2(ctx.input_fd, STDIN_FILENO);
 			close(ctx.input_fd);
@@ -1974,6 +1983,72 @@ pid_t tree_walking_executor::spawn(arena_array<char*>& argv, const spawn_context
 
 	setpgid(pid, ctx.group == 0 ? pid : ctx.group);
 	return pid;
+}
+
+void tree_walking_executor::take_terminal_in_child(int tty_fd) noexcept {
+	// No terminal means no handoff AND no reset - see the header. The two are one
+	// decision, and splitting them would make a non-interactive shell's children
+	// lose an ignored-on-entry SIGTSTP that #37 says they keep.
+	if (tty_fd < 0)
+		return;
+
+	// The whole of decision 1. No error path: the four outcomes tty.h's
+	// `set_foreground_pgrp` distinguishes are the SHELL's problem, where "somebody
+	// else owns the terminal" is worth a diagnostic and a retry. Here the only
+	// answers are "we have it" and "we do not", the child is about to exec either
+	// way, and there is no place to report from - the shell's stderr is the very
+	// surface a message would corrupt.
+	(void)tcsetpgrp(tty_fd, getpgrp());
+
+	// Then, and only then, the dispositions this shell's editing loop imposed and
+	// which execve would otherwise carry into the command.
+	struct sigaction dfl{};
+	dfl.sa_handler = SIG_DFL;
+	sigemptyset(&dfl.sa_mask);
+	dfl.sa_flags = 0;
+	for (const int signo : {SIGTTOU, SIGTTIN, SIGTSTP})
+		(void)sigaction(signo, &dfl, nullptr);
+}
+
+void tree_walking_executor::reclaim_terminal() noexcept {
+	const int tty_fd = _state.tty_fd();
+	if (tty_fd < 0)
+		return;
+	// SIGTTOU is ignored in the shell for the whole interactive session
+	// (`ignore_background_write_signals`, re-asserted at every read entry), so
+	// this cannot stop the process it is trying to give the terminal back to.
+	(void)tcsetpgrp(tty_fd, getpgrp());
+}
+
+void tree_walking_executor::note_interrupt_after_handoff(int wait_status) {
+	// The gate, in the order that costs least: no terminal means no handoff means
+	// the shell was signalled itself and owes nothing here.
+	if (_state.tty_fd() < 0)
+		return;
+	// THE KEY IS "KILLED BY", not "reported 130". A child that CATCHES SIGINT and
+	// exits normally has handled its own interrupt, and the line it was part of
+	// carries on - the cooperative-exit discipline every shell keeps. WIFSIGNALED
+	// is what tells the two apart, and it is the whole of the distinction.
+	if (!WIFSIGNALED(wait_status) || WTERMSIG(wait_status) != SIGINT)
+		return;
+	// AND THEN NOTHING ELSE IS ASKED. The disposition is `run_pending_traps`'s
+	// business, exactly as it is for a signal that really arrived: a user trap
+	// runs its body and the line continues, and the interactive default takes
+	// #52's route instead - `interrupts_command` sets `control_flow::interrupted`
+	// and the list loop abandons the rest of the line with 130.
+	//
+	// Deciding it here was the bug this replaced. A trap-only synthesis left
+	// `sleep 5; echo after` printing `after` after a Ctrl-C, which no shell does:
+	// dash, zsh AND bash all abandon the line, and so did lesh before the handoff
+	// excluded it from the signal. Unanimity, and lesh's own prior behaviour, on
+	// the same answer - so the narrow gate was a regression of the handoff rather
+	// than a conservative reading of it.
+	//
+	// The two dispositions that are neither are unreachable and harmless. `trap ''
+	// INT` is inherited as SIG_IGN across the exec, so the child cannot die of a
+	// signal it ignores and this line is never reached; were it reached, the flag
+	// would be dropped by run_pending_traps' own disposition test.
+	_state.signals().note_pending(SIGINT);
 }
 
 void tree_walking_executor::become_command(arena_array<char*>& argv,
@@ -3006,12 +3081,28 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	if (!expand_prefix(assignments, expanded))
 		return kExpansionError;
 
-	const pid_t pid = spawn(argv, {}, &expanded, &t, n, cmd.standard_path);
+	// `foreground`: this is the one call site that has the shell waiting on the
+	// child with nothing between them, so it is the one that hands over the
+	// terminal (#158 decision 3). A background job forks through run_async and a
+	// substitution through run_substitution, and both cleared the saved tty on the
+	// way past `enter_subshell`, so neither can reach this even though both end up
+	// in this function one process further down.
+	const pid_t pid = spawn(argv, {.foreground = true}, &expanded, &t, n,
+	                        cmd.standard_path);
 	if (pid == -1)
 		return 1;
 
 	int wait_status = 0;
 	waitpid(pid, &wait_status, 0);
+	// IMMEDIATELY, not at end of line (#158 decision 2). `nvim .; read x` is the
+	// case: the loop's reclaim in resume_after_execution runs once the whole line
+	// is done, and by then `read` has already met EIO on a terminal it was not the
+	// foreground group of.
+	reclaim_terminal();
+	// And the interrupt the shell was excluded from by the very handoff above. The
+	// flag only; the between-commands boundary decides what it means, with `$?`
+	// already this command's 130.
+	note_interrupt_after_handoff(wait_status);
 	return status_from_wait(wait_status);
 }
 

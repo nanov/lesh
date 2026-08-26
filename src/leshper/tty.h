@@ -9,6 +9,31 @@
 // `tcsetpgrp`, `tcgetpgrp` and `TIOCGWINSZ` appear in tty.cpp and nowhere else
 // in the tree above the runtime.
 //
+// THE RULE'S SCOPE, clarified by #158 decision 1 and landed by #159: *outside
+// the loop, IN THE SHELL PROCESS*, is a defect. There is one sanctioned seam
+// outside it, and it is a seam rather than a second owner because both halves
+// of it are pinned to a single moment.
+//
+//   THE FORKED CHILD, between fork and exec, hands ITSELF the terminal -
+//   `tcsetpgrp(saved_tty, getpgrp())` after its own `setpgid`, then SIGTTOU,
+//   SIGTTIN and SIGTSTP back to SIG_DFL. That process is no longer the shell,
+//   it is microseconds from being a different program, and the handoff is only
+//   legal there: it works because the SIGTTOU-ignore it inherited still stands,
+//   and it races nothing because it touches the tty only after owning it. This
+//   is zsh's `entersubsh` and fish's pattern, not lesh's invention. It lives in
+//   `tree_walking_executor::take_terminal_in_child`.
+//
+//   THE RUNTIME'S POST-WAIT RECLAIM is part of the same seam. The terminal has
+//   to come back the instant a foreground job's wait returns, not at the end of
+//   the line, or `nvim .; read x` reads a terminal it is background on. The
+//   loop's unconditional reclaim in `resume_after_execution` stays as the
+//   backstop; it is not the only one. `tree_walking_executor::reclaim_terminal`.
+//
+// What the rule still forbids, and what the grep is still for: a mode change, a
+// winsize query or a `tcsetpgrp` in the SHELL process anywhere but here and
+// those two named functions. leshper itself is unchanged by all of this - it
+// consumes events and emits a render buffer, and never an ioctl.
+//
 // SEPARATE FROM loop.cpp on purpose. The loop is a poll and a dispatch; this is
 // a set of rules about a device, and eleven of the fifteen fish pitfalls
 // researched for #128 live in it. Keeping them together means the rules can be

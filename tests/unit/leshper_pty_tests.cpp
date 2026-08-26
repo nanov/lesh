@@ -447,6 +447,47 @@ TEST(LeshperPty, ControlCDuringAForegroundCommandStillYields130AndFiresTheTrap) 
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
+TEST(LeshperPty, ControlCDuringAForegroundCommandAbandonsTheRestOfTheLine) {
+	// THE OTHER HALF of the case above, and the half nothing was watching. With no
+	// trap set, #52's interactive default is what answers SIGINT: the shell stops
+	// running the line rather than merely surviving it. `sleep 5; echo after` must
+	// print nothing after the Ctrl-C - dash, zsh and bash all agree, and lesh
+	// agreed too before #159 handed the terminal to the child.
+	//
+	// That handoff is exactly what put this at risk: the child's group becomes the
+	// terminal's foreground group, so the keyboard interrupt no longer reaches the
+	// shell at all, and BOTH of the dispositions' answers - the trap body above,
+	// and this unwind - stop happening unless the reap synthesizes the delivery.
+	// The first version of #159's synthesis covered only the trap, `echo after`
+	// ran, and no test in this file noticed. This is that test.
+	//
+	// THE MARKER IS COMPUTED, not typed. The editor renders the line as it is
+	// keyed, so any literal in the command text is already on the terminal before
+	// anything runs; `$((1 + 1))` is on screen as five characters and can only
+	// become `2` by being executed.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("sleep 5; echo $((1 + 1))-ran-anyway\r");
+	// Long enough that `sleep` is certainly the foreground job and the editor
+	// parked, which is what makes this the during-a-command path and not the
+	// at-the-prompt one the cancel-line tests cover.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x03");
+
+	// A second prompt is the line being over, however it ended. Waiting on it
+	// rather than on a timeout is what keeps the absence assertion below honest:
+	// `echo` would have run long before the shell asked for input again.
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "no prompt after the interrupt; saw: " << shell.seen();
+	EXPECT_EQ(shell.count_of("2-ran-anyway"), 0u)
+		<< "the interrupt did not abandon the rest of the line; saw: " << shell.seen();
+
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
+}
+
 TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};

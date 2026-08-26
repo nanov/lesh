@@ -70,6 +70,24 @@ public:
 	[[nodiscard]] bool take_pending(int& signo);
 	[[nodiscard]] bool any_pending() const;
 
+	// Records a signal the shell must ACT ON but did not RECEIVE (#159).
+	//
+	// One caller, and it should stay one: a foreground child that died of SIGINT
+	// after the terminal was handed to it (#158 decision 1). The keyboard
+	// interrupt went to the child's process group, which no longer contains the
+	// shell, so the handler never ran - and everything the shell owed that signal
+	// went unpaid with it. Both halves: a user's INT trap, which dash and zsh fire
+	// and #98 decision 3 already chose to fire; and, with no trap set, #52's
+	// interactive default abandoning the rest of the line, which dash, zsh and
+	// bash all do. What is owed is decided by the DISPOSITION, not here - see
+	// tree_walking_executor::note_interrupt_after_handoff.
+	//
+	// THE SAME FLAG THE HANDLER WRITES, on purpose. #33's discipline is that the
+	// body runs between commands and nowhere else, so a synthesized delivery that
+	// took any other route would be a second timing to get wrong. This one is
+	// indistinguishable from a real arrival by the time run_pending_traps sees it.
+	void note_pending(int signo);
+
 	// A subshell resets traps to default EXCEPT those set to ignore, which stay
 	// ignored. That asymmetry is easy to miss and is exactly what several
 	// conformance cases test.

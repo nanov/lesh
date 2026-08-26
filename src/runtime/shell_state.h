@@ -490,6 +490,15 @@ public:
 	void enter_subshell() {
 		_signals.reset_for_subshell();
 		_trap_entry_status.reset();
+		// A THIRD fact about the same event (#159): a subshell does not manage the
+		// terminal. The fd is what gates the handoff in `spawn`, so dropping it here
+		// is what keeps `nvim &`, `$(nvim)` and a pipeline stage from taking the
+		// terminal away from the editor - #158 decision 3 scopes the handoff to
+		// FOREGROUND jobs, and every one of those constructs reaches the same
+		// `run_simple_command` a foreground command does, one fork further down.
+		// Gating on `interactive()` instead would not do: an async child is still an
+		// interactive shell's child, and it stays one all the way to its own exec.
+		_tty_fd = -1;
 	}
 
 	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
@@ -504,6 +513,24 @@ public:
 		_interactive = v;
 		_signals.set_interactive(v);
 	}
+
+	// THE TERMINAL THIS SHELL MANAGES (#158 decision 6, #159), or -1 for a shell
+	// that manages none.
+	//
+	// A `dup` of the tty taken once at interactive startup; NON-OWNING here, like
+	// the binding console below - the interactive wiring site (src/main.cpp) took
+	// it and closes it. Two things follow from it being a saved dup rather than
+	// fd 0. It is still a terminal in a child whose stdin has been replaced by a
+	// pipe, which is exactly when the handoff runs; and it survives `exec 3>&-`
+	// and friends, because it lives above the descriptors shell code can name.
+	//
+	// -1 IS THE GATE, and it is the only one the runtime asks. A non-interactive
+	// shell never sets it, so every tty syscall added by #159 is skipped by
+	// construction rather than by an `interactive()` test repeated at each site;
+	// and `enter_subshell` clears it, which is what scopes the handoff to
+	// foreground jobs. See the note there.
+	void set_tty_fd(int fd) noexcept { _tty_fd = fd; }
+	[[nodiscard]] int tty_fd() const noexcept { return _tty_fd; }
 
 	// The keymap registry `bind` reaches, or null when there is no line editor
 	// (#118, #134). NON-OWNING and per-shell: the interactive wiring site owns
@@ -570,6 +597,9 @@ private:
 	size_t _getopts_offset = 0;
 	options _options;
 	bool _interactive = false;
+	// Non-owning; see set_tty_fd. -1 in every non-interactive shell and in every
+	// subshell, which is what makes the terminal handoff opt-in.
+	int _tty_fd = -1;
 	// Non-owning; see set_binding_console. Null in every non-interactive shell,
 	// which is what makes `bind` say "no line editor" rather than pretend.
 	binding_console* _binding_console = nullptr;
