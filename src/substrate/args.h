@@ -604,6 +604,24 @@ template <class T, std::size_t N>
 	return out;
 }
 
+// The same parse, into a struct the CALLER already holds.
+//
+// `parse` default-constructs its result, which is what a utility wants when the
+// member initializers ARE the defaults. Three callers want the other thing:
+//
+//   - `set` and the shell's own command line parse INTO the live option state, so
+//     a word that is refused half way leaves the options it had already applied
+//     applied - which is what the loops they replace did, and what dash does.
+//   - a caller stepping through argv one option word at a time (see
+//     `next_option_word` in runtime/builtins.cpp) accumulates across the steps.
+//
+// It is the same erased core and the same table; only the seed differs. Nothing
+// about the grammar is reachable from here.
+template <class T, std::size_t N>
+[[nodiscard]] scan_result parse_into(const spec_table<T, N>& s, char** argv, T& into) noexcept {
+	return detail::parse_core(s.view(), argv, &into);
+}
+
 // ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------

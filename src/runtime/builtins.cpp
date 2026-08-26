@@ -39,6 +39,80 @@ size_t argc_of(char** argv) noexcept {
 void print_single_quoted(std::string_view text);
 bool is_name(std::string_view text);
 
+// ONE OPTION WORD AT A TIME, through the shared parser (#148).
+//
+// `args::parse` reads every option word in one call, which is what a utility
+// wants when its options are independent switches. Three here are not:
+//
+//   - `set` and the shell's own command line apply `-o NAME` AS IT ARRIVES. A
+//     string_view field holds one name, and `set -o allexport -o noglob` gives it
+//     two - dash applies both, and so must this. The sigil is per occurrence too:
+//     `set -o errexit +o xtrace` turns one on and the other off.
+//   - `kill` re-reads a word the table REFUSES as a signal name, because `-TERM`
+//     and `-9` are signals standing in option position. It needs to know which
+//     word was refused, which a whole-argv parse cannot say - it reports the
+//     letter and stops.
+//
+// THE GRAMMAR IS STILL THE PARSER'S, and that is the whole point of showing it a
+// window rather than writing a second loop: clustering, `-dX` and `-d X`, `--`,
+// the lone `-`, the `+` sigil, and every diagnostic come from the same table and
+// the same code as `cd`'s. This decides only HOW MUCH of argv the parser is shown
+// at a time, never what any of it means.
+//
+// THE WINDOW IS ONE WORD, WIDENED TO TWO only when the first word ends in an
+// option that needs an argument - which the parser itself says, by answering
+// `missing_argument`. A two-word window offered up front would be wrong: in
+// `set -x -o errexit` the parser would take `-o` for the second word's own
+// business and find nothing after it, and in `kill -l -s TERM` the same. Widening
+// only on demand means the second word can ONLY be an option-argument, never a
+// second option word - so no word is ever read as the wrong thing.
+//
+// Re-parsing the first word inside the widened window applies its rows a second
+// time. Every setter these tables use is idempotent (`set_bool`, `toggle`,
+// `set_enum_value`, `store_view` all write a value rather than accumulate); a
+// `count` row would not be, and no table here has one.
+struct option_word {
+	args::error err{};
+	// Words the group consumed: 0 when `cur[1]` is an operand, 1 for a plain
+	// option word or `--`, 2 when the option-argument was the following word.
+	size_t consumed = 0;
+	// The options are over. Either `cur[1]` was an operand (consumed 0) or it was
+	// `--` (consumed 1, `separator` set).
+	bool done = false;
+	bool separator = false;
+};
+
+// `cur[1]` is the next unread word; `cur[2]` is offered only as an argument. On
+// return, advance by `consumed` and the operands begin at `cur[1]` once `done`.
+template <class T, size_t N>
+[[nodiscard]] option_word next_option_word(const args::spec_table<T, N>& spec, char** cur,
+                                           T& into) {
+	char* const word = cur[1];
+	if (word == nullptr)
+		return option_word{{}, 0, true, false};
+	// `--` IS THE UTILITY'S BUSINESS as well as the parser's: `set --` clears the
+	// positional parameters where a bare `set` leaves them, so the caller has to
+	// know the separator was there and not merely that the options ended. The
+	// parser would consume it silently and report the same `done` either way.
+	if (std::string_view{word} == "--")
+		return option_word{{}, 1, true, true};
+
+	char* one[3] = {cur[0], word, nullptr};
+	const args::scan_result first = args::parse_into(spec, one, into);
+	if (!first.err)
+		return option_word{{}, first.rest == one + 1 ? 0u : 1u, first.rest == one + 1, false};
+	// The parser asked for an argument the window did not hold. If argv has a next
+	// word, it is that argument; if it does not, the error is real.
+	if (first.err.kind != args::error_kind::missing_argument || cur[2] == nullptr)
+		return option_word{first.err, 0, false, false};
+
+	char* two[4] = {cur[0], word, cur[2], nullptr};
+	const args::scan_result second = args::parse_into(spec, two, into);
+	if (second.err)
+		return option_word{second.err, 0, false, false};
+	return option_word{{}, 2, false, false};
+}
+
 // --- regular builtins --------------------------------------------------------
 
 builtin_result builtin_true(shell_state&, char**) { return {0}; }
@@ -1209,43 +1283,38 @@ bool is_unsigned_integer(std::string_view text) {
 	return {status, control_flow::normal, 1, failure_kind::operational};
 }
 
+// `trap`'s one option. The OPERAND grammar after it - a lone `-` for reset, a
+// numeric first operand making every operand a condition - is untouched and stays
+// below; only the option scan moved into the table.
+struct trap_opts {
+	bool print_defaults = false;  // -p
+};
+
+constexpr auto kTrap = args::spec<trap_opts>(
+	args::option{'p', args::field<&trap_opts::print_defaults>}
+		.help("include conditions left at their default disposition"));
+
 builtin_result builtin_trap(shell_state& state, char** argv) {
 	signal_state& sigs = state.signals();
 
 	// Options first. `-p` prints defaults too; `--` ends the options, which is what
 	// lets `trap -- '- trapped' USR1` set a command that starts with a hyphen.
-	size_t i = 1;
-	bool include_default = false;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg == "-p") {
-			include_default = true;
-			continue;
-		}
-		// AN OPTION `trap` DOES NOT HAVE (#73). The loop used to break here, so `-Z`
-		// silently became the ACTION STRING and `trap -Z x INT` went on to read `x`
-		// as a condition and report `x: bad signal` at status 1 - a diagnostic about
-		// the wrong operand, and not fatal. dash and yash both report a usage error.
-		//
-		// POSIX XCU 2.8.1 makes that a UTILITY SYNTAX ERROR, which in a SPECIAL
-		// builtin exits a non-interactive shell; `failure_kind` defaults to `usage`,
-		// so returning 2 is the whole of it. Same wording and same status as the
-		// `unset` and `export` loops, which is the shape this one was missing.
-		//
-		// `arg.size() >= 2` is what keeps a BARE HYPHEN out of it: `-` is `trap`'s
-		// reset ACTION, not an option, and every `trap - SIG` in both test suites
-		// depends on it. Anything after `--` never reaches here at all.
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("trap: Illegal option %.*s",
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
-	}
+	//
+	// AN OPTION `trap` DOES NOT HAVE is a usage error (#73), and the table is now
+	// what says so: the loop this replaces broke out here, so `-Z` silently became
+	// the ACTION STRING and `trap -Z x INT` went on to read `x` as a condition and
+	// report `x: bad signal` at status 1 - a diagnostic about the wrong operand,
+	// and not fatal. POSIX XCU 2.8.1 makes it a UTILITY SYNTAX ERROR, which in a
+	// SPECIAL builtin exits a non-interactive shell.
+	//
+	// A BARE HYPHEN is `trap`'s reset ACTION and not an option, and every
+	// `trap - SIG` in both test suites depends on it - the parser knows a one-
+	// character word is an operand, so this no longer needs its own guard.
+	const auto parsed = args::parse(kTrap, argv);
+	if (parsed.err)
+		return {report_option_error("trap", parsed.err)};
+	const bool include_default = parsed.opts.print_defaults;
+	size_t i = static_cast<size_t>(parsed.rest - argv);
 
 	// `trap`, `trap -p` and `trap -p SIG...` all PRINT rather than set. Only the
 	// presence of an action operand makes this a setting call, and after `-p` there
@@ -1414,43 +1483,60 @@ static_assert(std::numeric_limits<pid_t>::max() >=
 // the old reading looked at argv[1] and argv[2] by hand and had no notion of
 // where the OPERANDS began, which is why `kill -s` took the `s` for a signal name
 // and `kill -s TERM --` sent SIGTERM to the shell's process group.
+// `kill`'s two real options. `-SIGNAME` and `-9` are NOT among them: they are
+// signals standing in option position, which is why yash and zsh both refuse to
+// route `kill` through their shared parsers at all (research S4.1, S4.2).
+//
+// THIS TREE ROUTES IT, and the fall-through is explicit rather than a hole in a
+// loop: the table owns `-l`, `-s NAME` in both attachment forms, `--` and the
+// operand boundary, and a word the table REFUSES is re-read as the signal. That
+// is a per-utility policy on ONE error kind - unknown_option - and `kill` is the
+// only utility in the tree that has it. Everything else the table refuses (a
+// missing argument to `-s`) is still a usage error.
+struct kill_opts {
+	bool list = false;            // -l
+	std::string_view signal{};    // -s NAME, attached or separate
+};
+
+constexpr auto kKill = args::spec<kill_opts>(
+	args::option{'l', args::field<&kill_opts::list>}
+		.help("write the signal names rather than send one"),
+	args::option{'s', args::field<&kill_opts::signal>, args::value("SIGNAL")}
+		.help("the signal to send, by name or by number"));
+
 builtin_result builtin_kill(shell_state&, char** argv) {
 	const char* signal_operand = nullptr;
 	bool list = false;
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		// POSIX XCU 1.4: `--` ends the options. first_operand cannot serve here -
-		// it answers for a utility whose `--` can only be argv[1], and `kill`'s
-		// comes after the signal option.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg.size() < 2 || arg.front() != '-')
-			break;  // the operands start here
-		if (arg == "-l") {
-			list = true;
-			continue;
-		}
-		if (arg == "-s") {
+	// POSIX XCU 1.4: `--` ends the options. `first_operand` cannot serve here - it
+	// answers for a utility whose `--` can only be argv[1], and `kill`'s comes
+	// after the signal option - which is why this walks the words.
+	char** cur = argv;
+	for (;;) {
+		kill_opts o;
+		const option_word step = next_option_word(kKill, cur, o);
+		if (step.err) {
+			if (step.err.kind == args::error_kind::unknown_option) {
+				// `-TERM`, `-15`, and also `kill -x 1` or `kill -n 9 $$`: the word is
+				// taken as a signal and VALIDATED below, so an option this tree does
+				// not have is refused by name rather than silently taken for a pid.
+				signal_operand = cur[1] + 1;
+				cur += 1;
+				continue;
+			}
 			// `kill -s` with nothing after it names no signal. It used to fall
-			// through to the `-NAME` reading below, which took the `s` for the name
-			// and reported `s: bad signal` - a diagnostic about the wrong thing.
-			if (argv[i + 1] == nullptr)
-				return kill_usage();
-			signal_operand = argv[++i];
-			continue;
+			// through to the `-NAME` reading, which took the `s` for the name and
+			// reported `s: bad signal` - a diagnostic about the wrong thing.
+			return kill_usage();
 		}
-		if (arg.substr(0, 2) == "-s") {
-			signal_operand = argv[i] + 2;  // `kill -sTERM`, which dash accepts too
-			continue;
-		}
-		// `-TERM`, `-15`. Validated below, so an option this reading does not know -
-		// `kill -x 1`, `kill -n 9 $$` - is refused by name rather than silently
-		// taken for a pid.
-		signal_operand = argv[i] + 1;
+		if (o.list)
+			list = true;
+		if (!o.signal.empty())
+			signal_operand = o.signal.data();  // a view into argv, nul-terminated
+		cur += step.consumed;
+		if (step.done)
+			break;
 	}
+	size_t i = static_cast<size_t>(cur + 1 - argv);
 
 	if (list) {
 		// dash reads only the first operand and ignores the rest.
@@ -1614,48 +1700,38 @@ std::vector<line_field> split_line(const input_line& line, std::string_view ifs)
 	return fields;
 }
 
+// `read`'s options. `-d` is POSIX Issue 8 and the reason read-p.tst scores 32
+// rather than 31 on a shell that has it: dash predates the addition and fails
+// that one case. The divergence is deliberate and recorded, per ADR-0001.
+//
+// The delimiter is a VIEW rather than a char, because that is what the table can
+// store; `read` takes its first byte. A default of `\n` cannot live in the view -
+// an absent `-d` and `-d ''` have to stay distinguishable, and the second means
+// NUL - so the view starts unset and the newline is applied where it is read.
+struct read_opts {
+	bool raw = false;                 // -r
+	std::string_view delimiter{"\n"}; // -d
+};
+
+constexpr auto kRead = args::spec<read_opts>(
+	args::option{'r', args::field<&read_opts::raw>}
+		.help("do not treat a backslash as an escape"),
+	args::option{'d', args::field<&read_opts::delimiter>, args::value("DELIM")}
+		.help("read up to DELIM's first byte rather than to a newline"));
+
 builtin_result builtin_read(shell_state& state, char** argv) {
 	// POSIX: reads ONE line, splits it on IFS, and assigns to the named variables
 	// with the LAST one receiving everything that remains - which is what makes
 	// `read first rest` work.
-	bool raw = false;
-	// `-d` is POSIX Issue 8 and the reason read-p.tst scores 32 rather than 31 on a
-	// shell that has it: dash predates the addition and fails that one case. The
-	// divergence is deliberate and recorded, per ADR-0001.
-	char delimiter = '\n';
-	size_t first = 1;
-	for (; argv[first] != nullptr && argv[first][0] == '-' && argv[first][1] != '\0';
-	     ++first) {
-		if (std::strcmp(argv[first], "--") == 0) {
-			++first;
-			break;
-		}
-		const char* opt = argv[first] + 1;
-		while (*opt != '\0') {
-			if (*opt == 'r') {
-				raw = true;
-				++opt;
-				continue;
-			}
-			if (*opt != 'd') {
-				report("read: illegal option -%c", *opt);
-				return {2};
-			}
-			// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`).
-			// An empty one means NUL, as it does in bash.
-			++opt;
-			if (*opt == '\0') {
-				if (argv[first + 1] == nullptr) {
-					report("read: -d: missing delimiter");
-					return {2};
-				}
-				++first;
-				opt = argv[first];
-			}
-			delimiter = *opt;
-			break;
-		}
-	}
+	const auto parsed = args::parse(kRead, argv);
+	if (parsed.err)
+		return {report_option_error("read", parsed.err)};
+	const bool raw = parsed.opts.raw;
+	// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`) - the
+	// table takes both, as XBD 12.2 Guideline 7 requires and as this loop already
+	// did. An EMPTY one means NUL, as it does in bash.
+	const char delimiter = parsed.opts.delimiter.empty() ? '\0' : parsed.opts.delimiter.front();
+	size_t first = static_cast<size_t>(parsed.rest - argv);
 
 	const input_line line = read_input_line(delimiter, raw);
 
