@@ -1,6 +1,7 @@
 #include "leshper/read.h"
 
 #include "leshper/abi.h"
+#include "leshper/complete.h"
 #include "leshper/keymap.h"
 #include "leshper/loop.h"
 #include "leshper/registry.h"
@@ -196,6 +197,14 @@ public:
 	std::int32_t execute(std::string_view line) override;
 	std::int32_t port_call(std::string_view code) override;
 
+	// The enumeration read (#139, spec 6.9). One line over the SAME adapter the
+	// highlighter's tokens read through, which is the point: there is one
+	// statement anywhere in the tree of what leshper may see of `shell_state`,
+	// and this is its door across the threads rather than a second window.
+	void enumerate(name_domain which, std::vector<std::string>& into) override {
+		_knowledge.enumerate(which, into);
+	}
+
 	// --- the loop thread's side ---------------------------------------------
 
 	[[nodiscard]] const syntax_layer& syntax() const noexcept { return *_providers.syntax; }
@@ -247,6 +256,31 @@ private:
 	// prompt. Members so neither path allocates once the session is warm.
 	std::string _accept_scratch;
 	std::string _prompt_scratch;
+
+	// --- The completer's door to the shell (#139) ----------------------------
+
+	// `name_source`, answered by the round trip ADR-0009 already has.
+	//
+	// ON THE LOOP THREAD, always: `complete` is called from inside an action,
+	// which is dispatched by the loop, and `read_names` fills the actor's
+	// `enumerate` slot and blocks on the reply. That block is spec 6.9's
+	// "synchronously, on the loop thread" - the loop stops turning for the
+	// duration of one read-only request, which is a few microseconds by #115's
+	// numbers, and no key is dropped because none is read while it waits.
+	class loop_names final : public name_source {
+	public:
+		explicit loop_names(event_loop& loop) noexcept : _loop(&loop) {}
+
+		bool names(name_domain which, std::vector<std::string>& into) const override {
+			return _loop->read_names(which, into);
+		}
+
+	private:
+		event_loop* _loop;
+	};
+
+	loop_names _names;
+	shell_completer _completer;
 };
 
 
@@ -276,7 +310,9 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _knowledge(state),
 	  _autosuggester(providers.history),
 	  _actor(*this),
-	  _loop(loop_fds{in, out}, options_for(providers, true)) {
+	  _loop(loop_fds{in, out}, options_for(providers, true)),
+	  _names(_loop),
+	  _completer(&_names) {
 	// The EXIT trap belongs to the session and not to the first line of it. See
 	// tree_walking_executor::defer_exit_trap; `run` runs it on the way out.
 	_executor.defer_exit_trap(true);
@@ -294,6 +330,11 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	register_line_actions();
 	bind_line_keys();
 	context.loop().set_shell_knowledge(&_knowledge);
+	// #94's `Completer` override point, filled (#139). The bundle's field wins
+	// when a caller supplied one - which is what makes it an override point and
+	// not a hard-wired provider - and the session's own trio is the default.
+	context.actions().completion =
+		providers.completion != nullptr ? providers.completion : &_completer;
 
 	_console.emplace(context);
 	// `bind` reaches the keymaps through here and by no other route, and only for
@@ -361,6 +402,19 @@ void session::bind_line_keys() {
 	}
 	bind(keymap_registry::emacs, "<C-d>", "end_of_file");
 	bind(keymap_registry::vi_insert, "<C-d>", "end_of_file");
+
+	// TAB COMPLETES, and it is bound HERE rather than in keymap.cpp's default
+	// tables for the same reason `accept_line` is: a completion needs a
+	// completer, and a completer needs a shell. keymap.cpp builds the tables an
+	// editor has with no session at all - `vared` (#102) will pass a bundle whose
+	// completer is a different one, and a Tab hard-wired into the default emacs
+	// map would have decided that for it.
+	//
+	// NOT IN `vi_command`: Tab there is not an insertion, and vi's own repertoire
+	// has no completion verb. Insert mode has it, which is where text is being
+	// entered.
+	bind(keymap_registry::emacs, "<Tab>", "complete_word");
+	bind(keymap_registry::vi_insert, "<Tab>", "complete_word");
 }
 
 void session::refresh_prompt() {

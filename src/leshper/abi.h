@@ -558,6 +558,60 @@ int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index,
 int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind);
 
 /* ------------------------------------------------------------------------- */
+/* Completion, from the ACTION side (#139, F-28/F-30, 6.9)                    */
+/*                                                                            */
+/* THE `Completer` PROVIDER, PULLED. #94 gave leshper four providers and two   */
+/* trigger shapes: reactors receive tokens on EVENTS, providers on DEMAND.     */
+/* Tab is the demand, and these three are the door abi.h recorded as a future  */
+/* one ("provider access (#94)") arriving with its first consumer.             */
+/*                                                                            */
+/* WHY NOT A REACTOR. A reactor runs when the buffer changed; completion runs  */
+/* when a key was pressed, and it must have finished before the action that    */
+/* pressed it returns. There is no event to subscribe to and no batch to wait  */
+/* for - which is also why the work is synchronous on the loop thread and why  */
+/* 6.9 records that as the deviation from F-31 rather than hiding it.          */
+/*                                                                            */
+/* WHAT THEY DO NOT DO. They do not decide anything and they do not edit. F-30 */
+/* lives in `lesh_pager_commit` so that every client of the pager gets one     */
+/* rule (see the pager block below), and the one buffer write is the pager's   */
+/* staged insertion. A completion action reads these three, feeds the pager,   */
+/* and commits - which is the whole of it.                                     */
+/* ------------------------------------------------------------------------- */
+
+/* Runs the completer over the buffer as it stands and answers how many
+ * candidates it found.
+ *
+ * LESH_ERR_NOTFOUND when no completer is wired up, which is not an error a
+ * binding should report: a leshper embedded with no completer answers no
+ * candidates. Calling it twice in one action recomputes; the previous set is
+ * discarded. */
+int32_t lesh_complete(lesh_editor* editor, size_t* count_out);
+
+/* The half-open byte range of the buffer the candidates replace - what
+ * `lesh_pager_open` wants.
+ *
+ * It is the COMPONENT under the cursor, not the whole word: for `~/Doc` it
+ * starts at the `D` so the `~` stays in the buffer (6.9), and for `$HOM` it
+ * starts at the `H`. LESH_ERR_NOTFOUND before `lesh_complete` has run in this
+ * call. */
+int32_t lesh_completion_range(lesh_editor* editor, size_t* from_out, size_t* to_out);
+
+/* Copies out the `index`-th candidate and its LESH_PAGER_* kind - the two
+ * arguments `lesh_pager_add` takes, in the order it takes them.
+ *
+ * The bytes are the candidate as it goes INTO the buffer, quoted where the
+ * shell would not read the name back literally (6.9's "needs-quoting applied to
+ * the inserted part only" - the range above is the inserted part, so a `~` or a
+ * directory prefix outside it is never re-quoted). They are bare of the kind's
+ * trailer, because that is the pager's to append.
+ *
+ * Copy-out like every other reader: `*length_out` is the full length whether or
+ * not it fit, and `out` may be NULL with `capacity` zero to ask the length
+ * first. `kind_out` may be NULL. LESH_ERR_NOTFOUND past the last candidate. */
+int32_t lesh_completion_candidate(lesh_editor* editor, size_t index, char* out,
+                                  size_t capacity, size_t* length_out, uint32_t* kind_out);
+
+/* ------------------------------------------------------------------------- */
 /* Modes and the keymap stack (#117 decision 5, #119)                         */
 /*                                                                            */
 /* THE DECISION #118 LEFT OPEN, and it is decided here. The actions that enter */

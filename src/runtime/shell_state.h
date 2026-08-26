@@ -452,6 +452,16 @@ public:
 	// is nothing to report and nothing to return.
 	void unset_function(std::string_view name);
 
+	// Every function's name, sorted, for the completer's enumeration read
+	// (#139, spec 6.9). Sorted for the same reason `aliases()` and `variables()`
+	// are: the map is unordered and a stable order is what makes a listing
+	// reproducible.
+	//
+	// NAMES ONLY, and deliberately: the bodies are trees this state keeps alive
+	// and the caller is on the other side of a thread boundary, so what crosses
+	// is a copy of the names and nothing that points back in here.
+	[[nodiscard]] std::vector<std::string_view> function_names() const;
+
 	// Keeps a parsed tree alive for as long as this state, and hands back the copy
 	// it now owns. The read loop calls it for every command it parses, because the
 	// command may define a function whose body is a node in that tree - and the

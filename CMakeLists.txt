@@ -191,6 +191,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/blit.h
 	src/leshper/abi.h
 	src/leshper/builtin_actions.cpp
+	src/leshper/complete.cpp
+	src/leshper/complete.h
 	src/leshper/builtin_reactors.cpp
 	src/leshper/decoration.cpp
 	src/leshper/decoration.h
@@ -274,6 +276,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/leshper_vi_tests.cpp
 	tests/unit/leshper_knowledge_tests.cpp
+	tests/unit/leshper_complete_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp

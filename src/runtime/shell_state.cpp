@@ -164,6 +164,15 @@ std::vector<shell_state::alias_row> shell_state::aliases() const {
 	return rows;
 }
 
+std::vector<std::string_view> shell_state::function_names() const {
+	std::vector<std::string_view> names;
+	names.reserve(_functions.size());
+	for (const auto& [name, definition] : _functions)
+		names.push_back(name);
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
 bool shell_state::lookup_alias(std::string_view name, std::string_view& value) const {
 	const auto it = _aliases.find(name);
 	if (it == _aliases.end())
