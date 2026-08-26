@@ -6,12 +6,19 @@
 // `shell_state`; leshper's loop is a spawned thread and owns editor state and
 // the terminal while editing. The shell reaches the loop through one wakeup
 // pipe - the loop's fifth topic - and the loop reaches the shell by filling one
-// of four LATEST-WINS SLOTS, checked in priority order: `execute`, `port_call`
-// (an action's shell code, #92), `enumerate` (the completer's read-only name
-// list, #139), `highlight`. Each slot holds at most one item;
+// of three LATEST-WINS SLOTS, checked in priority order: `execute`, `port_call`
+// (an action's shell code, #92), `highlight`. Each slot holds at most one item;
 // a newer highlight overwrites a pending one, and that overwrite IS the
 // cancellation. The shell thread waits on a condition variable, because while a
 // command line is being edited it has no descriptors to watch.
+//
+// THERE WAS A FOURTH (#139's `enumerate`, the completer's name list) AND #151
+// DELETED IT. A read that changes nothing does not need a slot, a sequence
+// number and a blocked loop: ADR-0009 already says the loop may read shell
+// state directly while nothing executes, and nothing can execute while the loop
+// is the thing that would have to request it. The completer now calls
+// `shell_knowledge::enumerate` on the loop thread; `shell_writing_flag` is the
+// tripwire that keeps "while nothing executes" honest.
 //
 // THIS FILE IS BOTH HALVES OF THE SEAM, and they are one ticket because they
 // are one protocol: `shell_actor` is what runs on the shell thread, and
@@ -34,6 +41,16 @@
 // `shell_state`. leshper does not link `lesh_runtime` and this file includes no
 // runtime header, which is what makes that a compiler-enforced boundary rather
 // than a convention. Tests fake it in twelve lines.
+//
+// WHAT THE SHELL KNOWS IS THE ACTOR'S, NOT THE LOOP'S (#151). The actor is
+// constructed with the session's `shell_knowledge*` and stamps it on EVERY token
+// it services, so the executing shell's tables reach the highlighter by
+// construction. Before this the LOOP put the pointer on each snapshot - the loop
+// telling the shell where the shell's own state is - and the token this file
+// builds from that snapshot copied every field except that one, so `exit`,
+// `bind`, aliases and functions all painted `command.unknown`. A field that has
+// to be copied on the far side is a field that can be dropped there; a member
+// read at the point of use cannot.
 //
 // ALLOCATION. Messages are recycled: `drain` hands the loop a batch of them and
 // `recycle` hands them back with their vectors cleared but their capacity
@@ -80,10 +97,6 @@ struct shell_message {
 		// An accepted line has finished executing. The loop reclaims the
 		// terminal, re-asserts its modes, resumes the helpers and redraws.
 		execute_done,
-		// The enumeration read (#139, spec 6.9): `names` holds the copy the
-		// completer asked for. Matched on `sequence`, exactly as a port call is,
-		// because the loop is blocked waiting for THIS answer.
-		enumerate_done,
 	};
 
 	kind which = kind::highlight_done;
@@ -106,15 +119,6 @@ struct shell_message {
 
 	// `highlight_done` only.
 	reactor_batch batch;
-
-	// `enumerate_done` only: the shell's names, COPIED (#139).
-	//
-	// A vector of strings on a recycled message, and the recycling is why it is
-	// here rather than in a variant: `recycle` clears the vector and keeps its
-	// capacity, so the second Tab of a session re-fills storage the first one
-	// already grew. The strings themselves are rebuilt - a copy-out door copies -
-	// and that is paid once per Tab, which is human frequency.
-	std::vector<std::string> names;
 };
 
 // The loop's `shell` topic: a pipe read end and a queue behind one mutex.
@@ -181,9 +185,13 @@ private:
 // at `shell_state`.
 //
 // TWO METHODS, and their narrowness is the decision. Everything else the shell
-// knows reaches leshper through the request token (#130/#135), read on this
-// same thread by the reactor that wants it. What is here is only what has to be
-// a CALL: running code changes the world, and the world is the shell's.
+// knows reaches leshper through `shell_knowledge` - stamped on the token for a
+// reactor, read directly by the completer - and never through a call. What is
+// here is only what has to BE a call, and the rule that decides it is that both
+// of these RUN CODE: they change the world, and the world is the shell's. #139
+// added a third for the completer's name list and #151 took it away again, once
+// the owner's reading of ADR-0009 made the direct read legal - which is the rule
+// holding rather than being bent.
 //
 // Both run ON THE SHELL THREAD, synchronously, with nothing else of the
 // shell's running. Neither may touch the terminal: the loop has restored the
@@ -209,31 +217,6 @@ public:
 	// refused loudly. What this seam fixes is only that the call is synchronous
 	// from the action's point of view, which is #92's contract unchanged.
 	virtual std::int32_t port_call(std::string_view code) = 0;
-
-	// The enumeration read (#139, spec 6.9), APPENDED to `into`.
-	//
-	// A THIRD METHOD ON A SEAM WHOSE NARROWNESS WAS THE DECISION, so the
-	// argument has to be made. The rule above is "what is here is only what has
-	// to be a CALL: running code changes the world, and the world is the
-	// shell's". This is the other half of that rule, arriving with the first
-	// consumer that needs it: the completer runs on the LOOP thread (spec 6.9,
-	// owner's call) and the tables it reads are the shell thread's, exclusively,
-	// by ADR-0009. It cannot go through the request token the way `classify`
-	// does, because a token is read where the reactor runs and this reader is
-	// not a reactor. So it has to be a call, and it is one - read-only,
-	// copy-out, and running with nothing else of the shell's running.
-	//
-	// The IMPLEMENTATION is one line over `shell_knowledge::enumerate`; the
-	// shape is declared there and this is only its door across the threads.
-	//
-	// DEFAULTED, so the fakes that existed before this ticket still compile and
-	// so a shell with nothing to enumerate answers nothing rather than failing:
-	// the completer then falls back to paths, which is what a completer with no
-	// shell attached should do.
-	virtual void enumerate(name_domain which, std::vector<std::string>& into) {
-		(void)which;
-		(void)into;
-	}
 };
 
 // ---------------------------------------------------------------------------
@@ -247,7 +230,24 @@ public:
 // mutex; nothing here is called while holding it.
 class shell_actor {
 public:
-	explicit shell_actor(shell_side& shell) noexcept : _shell(&shell) {}
+	// `knowledge` is what the shell KNOWS, and it is required rather than
+	// defaulted for one reason (#151): the field it fills used to arrive on each
+	// snapshot from the loop, and the token this file builds forgot to copy it
+	// for a whole wave. A parameter with no default cannot be forgotten. Null is
+	// still legal and still means "no shell attached" - the highlighter degrades
+	// to `environment_knowledge` - but it now has to be WRITTEN, which is a
+	// different act from omitting an assignment on a struct.
+	//
+	// `writing` is ADR-0009's tripwire, raised around `execute` and `port_call`.
+	// Null is "unchecked", which is what a test with no adapter to protect wants.
+	// Neither pointer is owned; both must outlive the actor.
+	shell_actor(shell_side& shell, const shell_knowledge* knowledge,
+	            shell_writing_flag* writing = nullptr) noexcept
+		: _shell(&shell), _knowledge(knowledge), _writing(writing) {}
+
+	// What every token this actor mints reads through. Exposed so the wiring site
+	// can assert the actor and the completer are looking at one object.
+	[[nodiscard]] const shell_knowledge* knowledge() const noexcept { return _knowledge; }
 
 	shell_actor(const shell_actor&) = delete;
 	shell_actor& operator=(const shell_actor&) = delete;
@@ -266,15 +266,6 @@ public:
 	// Fills the `port_call` slot and answers the sequence number the reply will
 	// carry, which is what the blocked action matches on.
 	[[nodiscard]] std::uint64_t post_port_call(std::string_view code,
-	                                           generation computed_against);
-
-	// Fills the `enumerate` slot and answers the sequence number the reply will
-	// carry (#139). The loop blocks on it, exactly as it blocks on a port call.
-	//
-	// NOT A SUPERSEDE, and it is the one place in this file where filling a slot
-	// does not set the flag: the read changes nothing, so a highlight in flight
-	// against the same tables is still the right answer when it lands.
-	[[nodiscard]] std::uint64_t post_enumerate(name_domain which,
 	                                           generation computed_against);
 
 	// Fills the `highlight` slot, OVERWRITING whatever was pending and
@@ -320,13 +311,6 @@ private:
 		bool filled = false;
 	};
 
-	struct enumerate_slot {
-		name_domain which = name_domain::builtin;
-		generation computed_against;
-		std::uint64_t sequence = 0;
-		bool filled = false;
-	};
-
 	struct highlight_slot {
 		std::string reactor;
 		lesh_reactor_fn fn = nullptr;
@@ -337,10 +321,12 @@ private:
 
 	void serve_execute(execute_slot& job);
 	void serve_port_call(port_slot& job);
-	void serve_enumerate(enumerate_slot& job);
 	void serve_highlight(highlight_slot& job);
 
 	shell_side* _shell;
+	// The executing shell's own tables, stamped on every token served below.
+	const shell_knowledge* _knowledge;
+	shell_writing_flag* _writing;
 	shell_channel _replies;
 
 	mutable std::mutex _mutex;
@@ -348,11 +334,6 @@ private:
 
 	execute_slot _execute;
 	port_slot _port;
-	// THIRD OF FOUR, above `highlight` and below `port_call` (#139). Above the
-	// highlight because the loop thread is BLOCKED on this reply and only
-	// waiting for the other one; below the port call because a port call may
-	// rewrite the very tables this read is about to copy.
-	enumerate_slot _enumerate;
 	highlight_slot _highlight;
 
 	// The cooperative cancellation the highlighter polls. Its address is stable

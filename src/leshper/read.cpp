@@ -197,14 +197,6 @@ public:
 	std::int32_t execute(std::string_view line) override;
 	std::int32_t port_call(std::string_view code) override;
 
-	// The enumeration read (#139, spec 6.9). One line over the SAME adapter the
-	// highlighter's tokens read through, which is the point: there is one
-	// statement anywhere in the tree of what leshper may see of `shell_state`,
-	// and this is its door across the threads rather than a second window.
-	void enumerate(name_domain which, std::vector<std::string>& into) override {
-		_knowledge.enumerate(which, into);
-	}
-
 	// --- the loop thread's side ---------------------------------------------
 
 	[[nodiscard]] const syntax_layer& syntax() const noexcept { return *_providers.syntax; }
@@ -237,6 +229,11 @@ private:
 	runtime::shell_state& _state;
 	const provider_bundle& _providers;
 	runtime::tree_walking_executor _executor;
+	// ADR-0009's tripwire (#151), DECLARED BEFORE THE ADAPTER AND THE ACTOR
+	// because both borrow it: the actor raises it around `execute` and
+	// `port_call` below, and the adapter asserts it is down on every read. One
+	// flag, so the two cannot be talking about different windows.
+	shell_writing_flag _writing;
 	shell_state_knowledge _knowledge;
 	owned_highlighter _highlighter;
 	owned_autosuggester _autosuggester;
@@ -257,29 +254,19 @@ private:
 	std::string _accept_scratch;
 	std::string _prompt_scratch;
 
-	// --- The completer's door to the shell (#139) ----------------------------
+	// --- The completer's door to the shell (#139, direct since #151) ---------
 
-	// `name_source`, answered by the round trip ADR-0009 already has.
+	// THE SAME ADAPTER THE HIGHLIGHTER'S TOKENS READ THROUGH, called on the LOOP
+	// thread. There is one statement anywhere in this tree of what leshper may
+	// see of `shell_state`, and both readers go through it.
 	//
-	// ON THE LOOP THREAD, always: `complete` is called from inside an action,
-	// which is dispatched by the loop, and `read_names` fills the actor's
-	// `enumerate` slot and blocks on the reply. That block is spec 6.9's
-	// "synchronously, on the loop thread" - the loop stops turning for the
-	// duration of one read-only request, which is a few microseconds by #115's
-	// numbers, and no key is dropped because none is read while it waits.
-	class loop_names final : public name_source {
-	public:
-		explicit loop_names(event_loop& loop) noexcept : _loop(&loop) {}
-
-		bool names(name_domain which, std::vector<std::string>& into) const override {
-			return _loop->read_names(which, into);
-		}
-
-	private:
-		event_loop* _loop;
-	};
-
-	loop_names _names;
+	// #139 put a `name_source` and a round trip on the actor between these two
+	// lines; the owner's reading of ADR-0009 removed the need. `complete` is
+	// called from inside an action, dispatched by the loop; the only writers are
+	// `execute` and `port_call`, both of which the loop itself requests and then
+	// blocks on for their whole duration. So while this call runs, nothing is
+	// writing - and `_writing` above is what says so out loud if that ever stops
+	// being true.
 	shell_completer _completer;
 };
 
@@ -307,12 +294,11 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	: _state(state),
 	  _providers(providers),
 	  _executor(pool, state),
-	  _knowledge(state),
+	  _knowledge(state, &_writing),
 	  _autosuggester(providers.history),
-	  _actor(*this),
+	  _actor(*this, &_knowledge, &_writing),
 	  _loop(loop_fds{in, out}, options_for(providers, true)),
-	  _names(_loop),
-	  _completer(&_names) {
+	  _completer(&_knowledge) {
 	// The EXIT trap belongs to the session and not to the first line of it. See
 	// tree_walking_executor::defer_exit_trap; `run` runs it on the way out.
 	_executor.defer_exit_trap(true);
@@ -345,9 +331,11 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	_loop.attach_helpers(_helpers);
 	_loop.attach_shell(_actor);
 	_loop.attach_signals(_signals);
-	// #135's door. Only the shell-thread reactor's snapshot gets it; see
-	// event_loop::attach_shell_knowledge for why no helper may.
-	_loop.attach_shell_knowledge(&_knowledge);
+	// #135's door is NOT attached to the loop (#151). The actor was given it at
+	// construction and stamps it on every token it serves, so the loop never
+	// holds a pointer to state it does not own; see `event_loop`'s note where
+	// `attach_shell_knowledge` used to be.
+	LESH_ASSERT(_actor.knowledge() == &_knowledge);
 }
 
 session::~session() {

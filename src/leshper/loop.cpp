@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <iterator>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
@@ -434,10 +433,6 @@ void event_loop::attach_registry(registry& reg) noexcept {
 
 void event_loop::attach_shell(shell_actor& shell) noexcept { _shell = &shell; }
 
-void event_loop::attach_shell_knowledge(const shell_knowledge* knowledge) noexcept {
-	_knowledge = knowledge;
-}
-
 void event_loop::attach_signals(signal_hub& hub) noexcept {
 	_signals = &hub;
 	_resizes_seen = hub.resize_count();
@@ -836,14 +831,6 @@ void event_loop::handle_shell_message(shell_message& answer) {
 			         "topic=shell execute_done status=%d", static_cast<int>(answer.status));
 			_exit_status = answer.status;
 			break;
-		case shell_message::kind::enumerate_done:
-			// The same "nobody is waiting" case a port call has, and it reaches
-			// here only when `read_names` gave up first - a stop while a Tab was
-			// in flight. The names are dropped with the message.
-			LESH_LOG(log::level::warn, log::category::event,
-			         "topic=shell unmatched enumerate seq=%llu names=%zu",
-			         static_cast<unsigned long long>(answer.sequence), answer.names.size());
-			break;
 	}
 }
 
@@ -945,14 +932,15 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 		// owner. Everything else is state-free - history search, the
 		// autosuggester, path checks - and stays on the stateless helper pool.
 		if (_shell != nullptr && name == _options.shell_thread_reactor) {
-			request_snapshot asking = snapshot_of(_state, served);
-			// #135's door, opened here and nowhere else. Forgetting it does not
-			// break the highlighter - it degrades to `environment_knowledge`,
-			// which is the `getenv` behaviour #124 recorded as wrong about a
-			// `PATH=` the user has just typed - so the assignment is silent and
-			// its absence would be too. See `attach_shell_knowledge`.
-			asking.knowledge = _knowledge;
-			_shell->post_highlight(name, entry.fn, entry.userdata, std::move(asking));
+			// THE SNAPSHOT LEAVES `knowledge` NULL AND THAT IS RIGHT (#151). It
+			// is the SHELL's tables, and the actor - which serves exactly one
+			// shell - stamps them on the token it builds. The loop used to fill
+			// the field in here, which meant the loop telling the shell where the
+			// shell's own state was, and the far side dropped it for a whole
+			// wave. What stays on `request_snapshot` is the helper pool's copy of
+			// the field, where null honestly means "no shell attached".
+			_shell->post_highlight(name, entry.fn, entry.userdata,
+			                       snapshot_of(_state, served));
 			continue;
 		}
 		if (_helpers != nullptr)
@@ -1190,23 +1178,8 @@ port_result event_loop::call_port(std::string_view code) {
 	return answer;
 }
 
-bool event_loop::read_names(name_domain which, std::vector<std::string>& into) {
-	if (_shell == nullptr) {
-		LESH_LOG(log::level::warn, log::category::provider,
-		         "enumeration read with no shell attached");
-		return false;
-	}
-	// NO QUIESCE, unlike `execute`: this runs nothing, forks nothing and touches
-	// no terminal. The helpers keep working and the modes do not move - the loop
-	// simply stops turning until the copy lands, which is the whole of spec
-	// 6.9's "synchronously, on the loop thread".
-	const std::uint64_t sequence = _shell->post_enumerate(which, _state.gen);
-	return wait_on_shell(shell_message::kind::enumerate_done, sequence, &into).has_value();
-}
-
 std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
-                                                      std::uint64_t sequence,
-                                                      std::vector<std::string>* names) {
+                                                      std::uint64_t sequence) {
 	LESH_ASSERT(_shell != nullptr);
 
 	for (;;) {
@@ -1252,21 +1225,12 @@ std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
 			std::optional<std::int32_t> found;
 			for (shell_message& answer : _inbox) {
 				const bool matched_by_sequence =
-					until == shell_message::kind::port_call_done
-					|| until == shell_message::kind::enumerate_done;
+					until == shell_message::kind::port_call_done;
 				if (answer.which == until
 				    && (!matched_by_sequence || answer.sequence == sequence)) {
 					found = answer.status;
 					if (until == shell_message::kind::execute_done)
 						_exit_status = answer.status;
-					// The one reply with a payload. Moved out rather than copied:
-					// the message goes straight back to the channel's spare list
-					// below and the names would die with it.
-					if (names != nullptr && until == shell_message::kind::enumerate_done) {
-						names->insert(names->end(),
-						              std::make_move_iterator(answer.names.begin()),
-						              std::make_move_iterator(answer.names.end()));
-					}
 					continue;
 				}
 				// A highlight computed against the line that is now running, or a

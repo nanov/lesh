@@ -448,16 +448,14 @@ public:
 	void attach_shell(shell_actor& shell) noexcept;
 	void attach_signals(signal_hub& hub) noexcept;
 
-	// What the shell knows (#135), put on the snapshot of every reactor that
-	// runs ON THE SHELL THREAD and on no other.
-	//
-	// THE RESTRICTION IS THE POINT. `shell_knowledge` is a window into
-	// `shell_state`, whose one owner is the shell thread (ADR-0009); a helper
-	// reading through it would be reading tables another thread may be writing.
-	// The shell-thread reactor is the only one for which the pointer is safe, so
-	// it is the only one that gets it, and a state-free reactor keeps the null
-	// that means "no shell attached". Never owned; must outlive this loop.
-	void attach_shell_knowledge(const shell_knowledge* knowledge) noexcept;
+	// THERE IS NO `attach_shell_knowledge` (#151). #135 had one: the loop held
+	// the session's `shell_knowledge*` and put it on the snapshot of the
+	// shell-thread reactor, on no other, and the token built on the far side
+	// then dropped it. The pointer never described anything the LOOP knew - it
+	// is the shell's own tables, handed to the shell so the shell could find
+	// them - so it moved to `shell_actor`, which stamps it on every token it
+	// serves. What a helper's snapshot carries is unchanged: null, meaning "no
+	// shell attached", which is the honest answer for a state-free reactor.
 
 	// --- The read entry (#98, fish #9181) -----------------------------------
 
@@ -544,18 +542,15 @@ public:
 	// #7770 - an action's shell code never gets ECHO back).
 	port_result call_port(std::string_view code);
 
-	// The enumeration read (#139, spec 6.9), from the loop's side: fill the
-	// `enumerate` slot and block on the same two topics until the copy comes
-	// back. Appends to `into`; answers false when there is no shell attached, or
-	// when the wait ended without the reply (a stop while a Tab was in flight).
-	//
-	// THE SAME ROUND TRIP `call_port` MAKES, and reusing it rather than inventing
-	// a mechanism is the point: ADR-0009 already has exactly one way for the loop
-	// to ask the shell a question and wait for the answer, and a Tab is that
-	// question with a different payload. What it does NOT reuse is the port
-	// itself - a port call runs shell CODE, and running code to read a table
-	// would put an arbitrary side effect on the completion path.
-	bool read_names(name_domain which, std::vector<std::string>& into);
+	// THERE IS NO `read_names` (#151). #139 gave the completer a round trip on
+	// the actor's `enumerate` slot; the owner's reading of ADR-0009 removed the
+	// need for one. The loop may read shell state directly while nothing
+	// executes, and while the loop is running an action nothing CAN execute:
+	// `execute` and `port_call` are the only writers and the loop is the thread
+	// that requests them and then blocks in `wait_on_shell` for the whole of
+	// each. So the completer holds a `const shell_knowledge*` and calls
+	// `enumerate` on it, on this thread, and `shell_writing_flag` asserts the
+	// premise on every read rather than leaving it as a paragraph.
 
 	// --- Rendering -----------------------------------------------------------
 
@@ -601,11 +596,8 @@ private:
 	void apply_outcome(const action_result& what, turn_result& result);
 	// Blocks in poll on the `shell` and `signal` topics only, until a message of
 	// `until` (and, for a port call, of `sequence`) arrives.
-	// `names`, when given, receives the `enumerate_done` payload - the one reply
-	// kind that carries more than a status. Defaulted, so the two existing call
-	// sites are untouched.
-	std::optional<std::int32_t> wait_on_shell(shell_message::kind until, std::uint64_t sequence,
-	                                          std::vector<std::string>* names = nullptr);
+	std::optional<std::int32_t> wait_on_shell(shell_message::kind until,
+	                                          std::uint64_t sequence);
 	void handle_shell_message(shell_message& answer);
 	void refresh_size_from_terminal();
 
@@ -632,7 +624,6 @@ private:
 	registry* _registry = nullptr;
 	shell_actor* _shell = nullptr;
 	signal_hub* _signals = nullptr;
-	const shell_knowledge* _knowledge = nullptr;
 	// Minted when a registry is attached: the loop's own dispatch of an action
 	// by name, which is what a timer expiry needs.
 	std::optional<loop_harness> _dispatch;

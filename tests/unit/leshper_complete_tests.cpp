@@ -31,8 +31,11 @@ using namespace lesh::leshper;
 //   `classify_token` - C-6's lexer, asked what is under the cursor. A pure
 //   function of (buffer, cursor), so a case is one line and there are many.
 //
-//   `shell_completer` - the trio, over a FAKE `name_source` (what a shell would
-//   answer) and a FAKE `directory_reader` (what a filesystem would). Faking the
+//   `shell_completer` - the trio, over a FAKE `shell_knowledge` (what a shell
+//   would answer) and a FAKE `directory_reader` (what a filesystem would). Since
+//   #151 the completer holds the knowledge DIRECTLY and calls `enumerate` on the
+//   loop thread, so the fake is the same shape the wiring site's adapter is and
+//   there is no round trip left to stand in for. Faking the
 //   filesystem is what makes the path rules testable without a temporary
 //   directory per case; the real `posix_directory_reader` gets its own test
 //   against a real directory, because that is the only place `d_type` and
@@ -48,37 +51,43 @@ using namespace lesh::leshper;
 //   builtin_actions.cpp directly, because there is no other entry point.
 //
 // WHAT IS NOT HERE: the pager (#138), the keymap binding for Tab (#141), and any
-// concurrency. The enumeration round trip is `shell_actor`'s and is covered by
-// the loop tests; what this file asserts about it is the SHAPE of the door.
+// concurrency. There is no enumeration round trip left to cover (#151 deleted
+// the slot); the rule that makes the direct read legal is asserted where it can
+// fail, in leshper_knowledge_tests.cpp.
 
 namespace {
 
-// A `name_source` that is a map, which is what a test has. It counts its calls,
-// because "one read-only request per Tab per domain" is a claim about how often
-// this gets asked.
-class fake_names final : public name_source {
+// A `shell_knowledge` that is a map, which is what a test has. It counts its
+// calls, because "one read per Tab per domain" is a claim about how often this
+// gets asked.
+//
+// `classify` and `path` are the other half of the interface and no completer
+// asks them; they answer honestly rather than aborting, so that this fake is a
+// whole `shell_knowledge` and not a `name_source` wearing its name.
+class fake_names final : public shell_knowledge {
 public:
 	void define(name_domain which, std::vector<std::string> names) {
 		_tables.insert_or_assign(static_cast<int>(which), std::move(names));
 	}
-	void detach() noexcept { _attached = false; }
 
-	bool names(name_domain which, std::vector<std::string>& into) const override {
+	[[nodiscard]] command_kind classify(std::string_view) const override {
+		return command_kind::unknown;
+	}
+
+	[[nodiscard]] bool path(std::string_view&) const override { return false; }
+
+	void enumerate(name_domain which, std::vector<std::string>& into) const override {
 		asked.push_back(which);
-		if (!_attached)
-			return false;
 		const auto found = _tables.find(static_cast<int>(which));
 		if (found == _tables.end())
-			return true;   // a shell with an empty table is not a shell with none
+			return;   // a shell with an empty table is not a shell with none
 		into.insert(into.end(), found->second.begin(), found->second.end());
-		return true;
 	}
 
 	mutable std::vector<name_domain> asked;
 
 private:
 	std::map<int, std::vector<std::string>> _tables;
-	bool _attached = true;
 };
 
 // A `directory_reader` that is a map from path to entries.
@@ -121,9 +130,12 @@ private:
 struct complete_fixture {
 	fake_names names;
 	fake_directories directories;
+	// "No shell attached" is a NULL KNOWLEDGE since #151, where it used to be a
+	// `name_source` that answered false. Same meaning, one fewer way to say it.
+	bool attached = true;
 
 	[[nodiscard]] completion_result run(std::string_view buffer, std::size_t cursor) {
-		const shell_completer completer{&names, directories};
+		const shell_completer completer{attached ? &names : nullptr, directories};
 		completion_result result;
 		completer.complete(completion_query{buffer, cursor}, result);
 		return result;
@@ -440,7 +452,7 @@ TEST(LeshperCompleteCommands, EachDomainIsAskedExactlyOncePerTab) {
 TEST(LeshperCompleteCommands, WithNoShellAttachedThereAreNoCommandNames) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"cd"});
-	fixture.names.detach();
+	fixture.attached = false;
 	EXPECT_TRUE(fixture.run("c").candidates.empty());
 }
 

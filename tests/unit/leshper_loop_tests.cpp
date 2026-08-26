@@ -697,7 +697,7 @@ TEST(LeshperLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopi
 	fake_tty tty;
 	registry reg;
 	fake_shell shell;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, nullptr),
 	          LESH_OK);
@@ -726,7 +726,7 @@ TEST(LeshperLoopShell, ANewerHighlightOverwritesAPendingOne) {
 	// ADR-0009: "a newer highlight overwrites a pending one, which is the
 	// cancellation." There is no cancel call in the seam, and that is the point.
 	fake_shell shell;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 
 	state target;
 	actor.post_highlight("highlighter", &counting_reactor, nullptr,
@@ -747,7 +747,7 @@ TEST(LeshperLoopShell, ANewerHighlightOverwritesAPendingOne) {
 
 TEST(LeshperLoopShell, ExecuteOutranksAPendingHighlight) {
 	fake_shell shell;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 
 	state target;
 	actor.post_highlight("highlighter", &counting_reactor, nullptr,
@@ -760,7 +760,7 @@ TEST(LeshperLoopShell, ExecuteOutranksAPendingHighlight) {
 
 TEST(LeshperLoopShell, MessagesAreRecycledRatherThanReallocated) {
 	fake_shell shell;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 	state target;
 
 	std::vector<shell_message> inbox;
@@ -782,7 +782,7 @@ TEST(LeshperLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
 	fake_tty tty;
 	fake_shell shell;
 	shell.port_status = 3;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_shell(actor);
@@ -809,7 +809,7 @@ TEST(LeshperLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 	fake_tty tty;
 	fake_shell shell;
 	worker_pool helpers{2};
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_helpers(helpers);
@@ -864,7 +864,7 @@ TEST(LeshperLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 TEST(LeshperLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
 	fake_tty tty;
 	fake_shell shell;
-	shell_actor actor{shell};
+	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_shell(actor);

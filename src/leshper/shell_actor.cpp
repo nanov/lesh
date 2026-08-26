@@ -89,6 +89,13 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	token.selection_active = snapshot.selection_active;
 	token.computed_against = snapshot.computed_against;
 	token.event_kind = snapshot.event_kind;
+	// #151: THE FIELD THAT WAS NOT COPIED. Every other member of the snapshot
+	// was transcribed here and this one was not, so a highlight on the shell
+	// thread ran with a null adapter and `exit`, `bind`, every alias and every
+	// function resolved `unknown` while `cd` passed only because macOS ships
+	// `/usr/bin/cd`. The stamp itself is `shell_actor`'s (it knows whose shell
+	// this is); what belongs here is that the copy is now COMPLETE.
+	token.knowledge = snapshot.knowledge;
 	token.superseded = &superseded;
 	token.spans = &into.spans;
 	token.texts = &into.texts;
@@ -176,10 +183,6 @@ void shell_channel::recycle(std::vector<shell_message>& used) {
 		one.batch.texts.clear();
 		one.batch.proposals.clear();
 		one.batch.reactor.clear();
-		// The enumeration's copy (#139). The VECTOR keeps its capacity across
-		// Tabs; the strings inside it do not survive the clear, which is the
-		// honest cost of a copy-out door and is paid at Tab frequency.
-		one.names.clear();
 		one.sequence = 0;
 		one.status = LESH_OK;
 		_spare.push_back(std::move(one));
@@ -238,22 +241,6 @@ std::uint64_t shell_actor::post_port_call(std::string_view code, generation comp
 	return sequence;
 }
 
-std::uint64_t shell_actor::post_enumerate(name_domain which, generation computed_against) {
-	std::uint64_t sequence = 0;
-	{
-		std::lock_guard lock(_mutex);
-		sequence = ++_sequence;
-		_enumerate.which = which;
-		_enumerate.computed_against = computed_against;
-		_enumerate.sequence = sequence;
-		_enumerate.filled = true;
-		// NO SUPERSEDE. See the declaration: the read writes nothing, so a
-		// highlight in flight against these same tables is still correct.
-	}
-	_work.notify_one();
-	return sequence;
-}
-
 void shell_actor::post_highlight(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
                                  request_snapshot snapshot) {
 	{
@@ -289,26 +276,19 @@ void shell_actor::stop() {
 bool shell_actor::serve_one() {
 	execute_slot execute;
 	port_slot port;
-	enumerate_slot enumerate;
 	highlight_slot highlight;
 
 	{
 		std::lock_guard lock(_mutex);
-		// PRIORITY ORDER, and it is the whole scheduling policy: `execute`,
-		// then `port_call`, then `enumerate`, then `highlight`. A user who
-		// pressed Enter is not waiting behind a repaint of the line they just
-		// left, and a user who pressed Tab is not either - the loop thread is
-		// blocked on the enumeration reply and will not draw that highlight
-		// until it lands.
+		// PRIORITY ORDER, and it is the whole scheduling policy: `execute`, then
+		// `port_call`, then `highlight`. A user who pressed Enter is not waiting
+		// behind a repaint of the line they just left.
 		if (_execute.filled) {
 			execute = std::move(_execute);
 			_execute = execute_slot{};
 		} else if (_port.filled) {
 			port = std::move(_port);
 			_port = port_slot{};
-		} else if (_enumerate.filled) {
-			enumerate = std::move(_enumerate);
-			_enumerate = enumerate_slot{};
 		} else if (_highlight.filled) {
 			highlight = std::move(_highlight);
 			_highlight = highlight_slot{};
@@ -326,8 +306,6 @@ bool shell_actor::serve_one() {
 		serve_execute(execute);
 	else if (port.filled)
 		serve_port_call(port);
-	else if (enumerate.filled)
-		serve_enumerate(enumerate);
 	else
 		serve_highlight(highlight);
 
@@ -344,8 +322,7 @@ void shell_actor::run() {
 		{
 			std::unique_lock lock(_mutex);
 			_work.wait(lock, [this] {
-				return _stopping || _execute.filled || _port.filled || _enumerate.filled
-				       || _highlight.filled;
+				return _stopping || _execute.filled || _port.filled || _highlight.filled;
 			});
 			// Stopping wins over pending work: the loop has already gone, so a
 			// highlight nobody will read is not worth computing, and an
@@ -367,7 +344,16 @@ void shell_actor::serve_execute(execute_slot& job) {
 	shell_message answer = _replies.acquire();
 	answer.which = shell_message::kind::execute_done;
 	answer.computed_against = job.computed_against;
-	answer.status = _shell->execute(job.line);
+	{
+		// ADR-0009's one writer, announced for the length of the write (#151).
+		// `execute` is where a `PATH=` assignment, an `alias`, a function
+		// definition or an `unset` actually happens; any read through the
+		// session's adapter while it runs would be reading a table mid-rewrite,
+		// and the assertion there says so instead of the reader finding out
+		// later.
+		const shell_writing_flag::scope writing{_writing};
+		answer.status = _shell->execute(job.line);
+	}
 	answer.sequence = 0;
 	_replies.post(std::move(answer));
 }
@@ -379,23 +365,12 @@ void shell_actor::serve_port_call(port_slot& job) {
 	answer.which = shell_message::kind::port_call_done;
 	answer.computed_against = job.computed_against;
 	answer.sequence = job.sequence;
-	answer.status = _shell->port_call(job.code);
-	_replies.post(std::move(answer));
-}
-
-void shell_actor::serve_enumerate(enumerate_slot& job) {
-	shell_message answer = _replies.acquire();
-	answer.which = shell_message::kind::enumerate_done;
-	answer.computed_against = job.computed_against;
-	answer.sequence = job.sequence;
-	answer.status = LESH_OK;
-	// `names` came back from `recycle` cleared with its capacity intact; the
-	// interface appends, so the clear is the recycler's and this is the append.
-	_shell->enumerate(job.which, answer.names);
-	LESH_LOG(log::level::debug, log::category::provider,
-	         "shell: enumerate seq=%llu domain=%u names=%zu",
-	         static_cast<unsigned long long>(job.sequence),
-	         static_cast<unsigned>(job.which), answer.names.size());
+	{
+		// The other writer: an action's shell code is arbitrary and may define,
+		// unset or export anything (#92).
+		const shell_writing_flag::scope writing{_writing};
+		answer.status = _shell->port_call(job.code);
+	}
 	_replies.post(std::move(answer));
 }
 
@@ -404,6 +379,10 @@ void shell_actor::serve_highlight(highlight_slot& job) {
 	answer.which = shell_message::kind::highlight_done;
 	answer.computed_against = job.snapshot.computed_against;
 	answer.sequence = 0;
+	// THE STAMP (#151). Not the loop's to put on the snapshot and not this
+	// function's to remember per call site: the actor serves one shell, and this
+	// is that shell's knowledge, on every token it mints.
+	job.snapshot.knowledge = _knowledge;
 	run_reactor_here(job.reactor, job.fn, job.userdata, std::move(job.snapshot), _superseded,
 	                 answer.batch);
 	answer.status = answer.batch.status;
@@ -426,8 +405,7 @@ std::size_t shell_actor::dropped() const noexcept {
 
 bool shell_actor::idle() const noexcept {
 	std::lock_guard lock(_mutex);
-	return !_busy && !_execute.filled && !_port.filled && !_enumerate.filled
-	       && !_highlight.filled;
+	return !_busy && !_execute.filled && !_port.filled && !_highlight.filled;
 }
 
 } // namespace lesh::leshper
