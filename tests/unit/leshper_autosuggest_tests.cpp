@@ -55,6 +55,18 @@ struct suggest_fixture {
 		return s;
 	}
 
+	// Types through the SAME door a keystroke uses - one `self_insert` dispatch
+	// per character - so the undo history is left mid-run, coalescing armed. The
+	// `line()` seed above writes the buffer directly and leaves no run open,
+	// which is why it cannot pin #146's defect.
+	void type(lesh::leshper::state& s, std::string_view text) {
+		for (const char byte : text) {
+			invocation how;
+			how.keys.assign(1, byte);
+			EXPECT_EQ(loop.invoke(s, "self_insert", how).status, LESH_OK);
+		}
+	}
+
 	[[nodiscard]] reactor_batch suggest(const lesh::leshper::state& s,
 	                                    std::uint32_t kinds = LESH_EVENT_BUFFER_CHANGED) {
 		std::vector<reactor_batch> batches = loop.react(s, kinds);
@@ -369,6 +381,96 @@ TEST(LeshperAutosuggest, AcceptingIsOneUndoEntry) {
 	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
 	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+// #146: the same rule #121 gave a paste, for the same reason. An accepted
+// candidate is SHAPED like a plain insertion at the cursor, so the F-4 heuristic
+// would fold it into the typing run that preceded it and re-arm the run behind
+// it. It breaks the run on BOTH sides instead: accept is its own undo step, and
+// the `git` the user typed survives one undo.
+TEST(LeshperAutosuggest, AcceptingBreaksTheTypingRunItFollows) {
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");   // a REAL run, coalescing armed
+	ASSERT_TRUE(s.undo.coalescing());
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "git status --short");
+	// Two steps, not one: the typing run and the acceptance.
+	EXPECT_EQ(s.undo.step_count(), 2u);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "");
+}
+
+TEST(LeshperAutosuggest, TypingAfterAnAcceptStartsItsOwnUndoStep) {
+	// The "after" break, which is the load-bearing half (#121): apply_edit's
+	// record() would otherwise leave the history coalescing again, and the next
+	// typed character would fold into the acceptance.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	fixture.show(s);
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
+	EXPECT_FALSE(s.undo.coalescing());
+	fixture.type(s, " -v");
+
+	ASSERT_EQ(s.buffer.text(), "git status -v");
+	EXPECT_EQ(s.undo.step_count(), 3u);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git status");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, AcceptingASingleCharacterCandidateBreaksTheRunToo) {
+	// The length-1 case, and the reason the discriminator is not "how long was
+	// it". Accepting `gitk` after `git` writes ONE cluster - the same shape a
+	// keystroke writes - and only the fact that it is not the keystroke that
+	// dispatched the action tells the two apart.
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "gitk");
+	EXPECT_EQ(s.undo.step_count(), 2u);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, AcceptingAWordBreaksTheTypingRunItFollows) {
+	// The word-at-a-time twin, which stages TWO writes and still commits one
+	// insertion - so it reaches the coalescing rule looking exactly like the
+	// whole-line accept and has to be told apart the same way.
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_word", invocation{}).status,
+	          LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "git status");
+	EXPECT_EQ(s.undo.step_count(), 2u);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, TypingItselfStillCoalescesThroughTheSameDoor) {
+	// The other side of the discriminator, pinned here because the rule that
+	// tells an acceptance from a keystroke lives in the commit path both use. A
+	// run of self_insert is still ONE undo step.
+	suggest_fixture fixture;
+	lesh::leshper::state s;
+	fixture.type(s, "echo hi");
+	EXPECT_EQ(s.undo.step_count(), 1u);
+	EXPECT_TRUE(s.undo.coalescing());
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "");
 }
 
 TEST(LeshperAutosuggest, AcceptingAWordTakesOneWordAndStops) {
