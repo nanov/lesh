@@ -3,12 +3,12 @@
 // One built-in prompt module (#157, spec §6.10): the class and its one object.
 // See `module.h` for the vocabulary and `modules.h` for the table these sit in.
 
-#include "leshper/prompt/module.h"
+#include "ui/prompt/module.h"
 
 #include <cstdint>
 #include <string_view>
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
 
 // --- env -------------------------------------------------------------------
 
@@ -60,4 +60,4 @@ protected:
 // The one object, for the whole process - see `modules.h`.
 inline constexpr module_env kModuleEnv{};
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt

@@ -23,18 +23,18 @@
 // the wiring site has installed the shipped extension set. A template naming it
 // on an engine without leshnici is refused as an unknown module, like any other.
 
-#include "leshper/prompt/module.h"
-#include "leshper/prompt/module_duration.h"
-#include "leshper/prompt/module_env.h"
-#include "leshper/prompt/module_jobs.h"
-#include "leshper/prompt/module_mode.h"
-#include "leshper/prompt/module_path.h"
-#include "leshper/prompt/module_status.h"
-#include "leshper/prompt/module_time.h"
+#include "ui/prompt/module.h"
+#include "ui/prompt/module_duration.h"
+#include "ui/prompt/module_env.h"
+#include "ui/prompt/module_jobs.h"
+#include "ui/prompt/module_mode.h"
+#include "ui/prompt/module_path.h"
+#include "ui/prompt/module_status.h"
+#include "ui/prompt/module_time.h"
 
 #include <string_view>
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
 
 // --- the singletons and the table ------------------------------------------
 
@@ -72,4 +72,4 @@ inline constexpr builtin_module kBuiltinModules[] = {
 	return nullptr;
 }
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt

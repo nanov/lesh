@@ -9,7 +9,7 @@
 // see `prompt_modules.h` - and by no other route.
 
 #include "leshnici/git_head.h"
-#include "leshper/prompt/module.h"
+#include "ui/prompt/module.h"
 
 #include <string_view>
 
@@ -17,14 +17,14 @@ namespace lesh::leshnici {
 
 // The vocabulary is leshper's; the module is ours. Named rather than pulled in
 // wholesale so the class body below is the same text it was in `prompt.h`.
-using leshper::prompt::code;
-using leshper::prompt::element_status;
-using leshper::prompt::no_params;
-using leshper::prompt::parse_error;
-using leshper::prompt::refuse_any_type;
-using leshper::prompt::sink;
-using leshper::prompt::state;
-using leshper::prompt::typed_module;
+using ui::prompt::code;
+using ui::prompt::element_status;
+using ui::prompt::no_params;
+using ui::prompt::parse_error;
+using ui::prompt::refuse_any_type;
+using ui::prompt::sink;
+using ui::prompt::state;
+using ui::prompt::typed_module;
 
 // --- git -------------------------------------------------------------------
 

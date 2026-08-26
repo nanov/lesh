@@ -53,14 +53,6 @@ namespace lesh::leshper {
 // One reactor's whole answer, carrying both halves; defined below.
 struct reactor_batch;
 
-// The prompt engine (#157, spec §6.10). Declared, not included: this header
-// hands a pointer through and never touches one, so `prompt.h` - which brings
-// `<span>`, the combinator templates and a screenful of static_asserts with it -
-// stays out of every translation unit that only wanted an action registry.
-namespace prompt {
-class engine;
-}
-
 // The memo behind lesh_request_command_kind (#135), one per request.
 //
 // A $PATH walk is a stat per directory, and a line repeats command names -
@@ -205,7 +197,7 @@ struct lesh_registry {
 	// LESH_COMMAND_UNKNOWN.
 	lesh::leshper::host* host = nullptr;
 
-	// The prompt engine the `lesh_prompt_*` verbs configure (#157, §6.10).
+	// The host's prompt engine, OPAQUE TO THE EDITOR (#157 §6.10, #170).
 	//
 	// A BORROWED POINTER ON THE REGISTRY, for `host`'s reason exactly: the
 	// ABI's only long-lived handle is the registry, so a registry of a second
@@ -214,9 +206,17 @@ struct lesh_registry {
 	// LESH_ERR_NOTFOUND rather than pretending the configuration landed
 	// somewhere.
 	//
+	// A `void*` AND NOT A DECLARED TYPE, since #170. The engine renders shell
+	// facts - cwd, exit status, jobs, time, the git branch - so it is the host's
+	// state and lives in `src/ui/prompt/`; leshper carries the slot and does not
+	// name what fills it. `src/ui/prompt/abi.h`'s verbs are the only code that
+	// casts it back, and they are compiled on the host's side of the line, which
+	// is what keeps this field from being a `ui/` include in the editor. The
+	// host sets it (`src/ui/session.cpp`); whoever sets it owns it and must
+	// outlive the registry.
+	//
 	// NOT const: configuring is the point of the door.
-	// Whoever set it owns it and must outlive the registry.
-	lesh::leshper::prompt::engine* prompt_engine = nullptr;
+	void* host_prompt = nullptr;
 };
 
 // The editor, for the duration of one action call.
@@ -514,7 +514,7 @@ public:
 	// THE HOST IS THE REGISTRY'S (#168). `set_shell_knowledge` was here, which
 	// made a setter on the FAKE host the way a real shell told the editor where
 	// its own tables were. It hangs off `registry::host` now - one borrowed
-	// pointer beside `prompt_engine`, answering command kinds and completion
+	// pointer beside `host_prompt`, answering command kinds and completion
 	// alike - and `react` reads it from there.
 
 private:

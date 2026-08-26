@@ -106,9 +106,9 @@ enable_testing()
 #
 #   lesh_options ──► lesh_substrate ──► lesh_syntax ──► lesh_runtime ──┐
 #                            │                                          ▼
-#                            └───────────► lesh_leshper ──────────► lesh_ui ──► lesh
-#                                               │                              ▲
-#                                               └─► lesh_leshnici ─────────────┘
+#                            └───────────► lesh_leshper ──────────► lesh_ui ─────────────────► lesh
+#                                                                      │                       ▲
+#                                                                      └─► lesh_leshnici ──────┘
 #
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
 #
@@ -204,6 +204,14 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # shaped, whose lane-2 half is a spawn_request effect the host carries out;
 # nothing in this target executes, parses or lexes anything.
 #
+# AND NOT THE PROMPT, since #170. `src/leshper/prompt/` was here; it is
+# `src/ui/prompt/` now, because a prompt renders SHELL FACTS - cwd, exit status,
+# jobs, time, the git branch - and that is host knowledge. The editor takes
+# prompt BYTES (`loop_options::prompt` and a pen) and nothing else, and
+# `abi.h` split at the same seam: the `lesh_prompt_*` verbs are
+# `ui/prompt/abi.h`'s, and the registry carries the engine as an opaque `void*`
+# so that no header here names `ui::prompt::engine`.
+#
 # AND NOT lesh_syntax EITHER, since #168 Phase B. It was linked here for one
 # client: the highlighter called `parse()` and `complete.cpp` lexed to find the
 # token under the cursor. Both were KNOWLEDGE - what a line MEANS and what a name
@@ -230,17 +238,6 @@ add_library(lesh_leshper STATIC
 	src/leshper/pager.cpp
 	src/leshper/pager.h
 	src/leshper/pager_actions.cpp
-	src/leshper/prompt/prompt.cpp
-	src/leshper/prompt/prompt.h
-	src/leshper/prompt/module.h
-	src/leshper/prompt/module_duration.h
-	src/leshper/prompt/module_env.h
-	src/leshper/prompt/module_jobs.h
-	src/leshper/prompt/module_mode.h
-	src/leshper/prompt/module_path.h
-	src/leshper/prompt/module_status.h
-	src/leshper/prompt/module_time.h
-	src/leshper/prompt/modules.h
 	src/leshper/proposal.cpp
 	src/leshper/proposal.h
 	src/leshper/sgr.h
@@ -262,28 +259,6 @@ add_library(lesh_leshper STATIC
 	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_substrate)
 
-# leshnici: the shipped extension set (#163).
-#
-# A layer ABOVE leshper, not inside it. What lives here is everything lesh ships
-# on top of the editor's own machinery but does not owe it - prompt modules now,
-# builtins later - and the direction of the arrow is the whole point: leshnici
-# links lesh_leshper, lesh_leshper does not know leshnici exists, so a module
-# that reached back into the engine's internals would fail to link rather than
-# fail review. Nothing in leshper's own targets may name a symbol from here.
-#
-# `src/main.cpp` installs it, since #164: it passes
-# `leshnici::install_prompt_modules` to `run_interactive_shell` as the session's
-# extension hook. `lesh_ui` does not link this target - leshnici is ABOVE ui -
-# so an engine built anywhere else, a unit test or a tool, is the bare
-# seven-module one.
-add_library(lesh_leshnici STATIC
-	src/leshnici/git_head.cpp
-	src/leshnici/git_head.h
-	src/leshnici/module_git.h
-	src/leshnici/prompt_modules.cpp
-	src/leshnici/prompt_modules.h)
-target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
-
 # ui: THE HOST. The session that runs an interactive shell, the loop that drives
 # the editor, the terminal, the workers, the timers, and the adapters that carry
 # shell facts across (#164, #168).
@@ -291,6 +266,11 @@ target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
 # It owns everything with a thread, a descriptor or a clock in it, and drives
 # leshper by sending events and performing the effects that come back - and by
 # nothing else. `src/ui/loop.cpp` is the only caller of `step`.
+#
+# AND IT OWNS THE PROMPT ENGINE (#170). `src/ui/prompt/` is the engine, the
+# seven built-in modules, the template language and the `lesh_prompt_*` ABI
+# (`ui/prompt/abi.h`) - host state, because what a prompt renders is shell
+# facts. `session.cpp` holds the one engine and hands the editor bytes.
 #
 # THE ONE LIBRARY THAT LINKS BOTH HALVES. `lesh_leshper` does not link
 # `lesh_runtime` - spec §4.4 - so the shapes leshper declares have to be filled
@@ -311,6 +291,18 @@ add_library(lesh_ui STATIC
 	src/ui/history_search.h
 	src/ui/loop.cpp
 	src/ui/loop.h
+	src/ui/prompt/abi.h
+	src/ui/prompt/prompt.cpp
+	src/ui/prompt/prompt.h
+	src/ui/prompt/module.h
+	src/ui/prompt/module_duration.h
+	src/ui/prompt/module_env.h
+	src/ui/prompt/module_jobs.h
+	src/ui/prompt/module_mode.h
+	src/ui/prompt/module_path.h
+	src/ui/prompt/module_status.h
+	src/ui/prompt/module_time.h
+	src/ui/prompt/modules.h
 	src/ui/reactors.cpp
 	src/ui/reactors.h
 	src/ui/session.cpp
@@ -325,6 +317,33 @@ add_library(lesh_ui STATIC
 	src/ui/workers.h)
 target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
 
+# leshnici: the shipped extension set (#163).
+#
+# A layer ABOVE THE HOST, not inside it. What lives here is everything lesh ships
+# on top of the machinery below but does not owe it - prompt modules now,
+# builtins later - and the direction of the arrow is the whole point: leshnici
+# links lesh_ui, lesh_ui does not know leshnici exists, so a module that reached
+# back into the engine's internals would fail to link rather than fail review.
+# Nothing in leshper's or ui's own targets may name a symbol from here.
+#
+# IT LINKS `lesh_ui` AND NOT `lesh_leshper`, since #170: the prompt engine a
+# module installs into is `lesh::ui::prompt::engine` and lives in
+# `src/ui/prompt/`. leshper comes along transitively, which is what a module
+# that wants a `leshper::style` needs and no more.
+#
+# `src/main.cpp` installs it, since #164: it passes
+# `leshnici::install_prompt_modules` to `run_interactive_shell` as the session's
+# extension hook. `lesh_ui` does not link this target - leshnici is ABOVE ui -
+# so an engine built anywhere else, a unit test or a tool, is the bare
+# seven-module one.
+add_library(lesh_leshnici STATIC
+	src/leshnici/git_head.cpp
+	src/leshnici/git_head.h
+	src/leshnici/module_git.h
+	src/leshnici/prompt_modules.cpp
+	src/leshnici/prompt_modules.h)
+target_link_libraries(lesh_leshnici PUBLIC lesh_ui)
+
 add_subdirectory("tools")
 
 # The `lesh` binary. The session lives in lesh_ui now (#164); what is left here
@@ -333,7 +352,8 @@ add_subdirectory("tools")
 #
 # THE ONLY PLACE IN THE TREE THAT SAYS `leshnici`. `lesh_ui` links
 # `lesh_leshper` and `lesh_runtime` and not this, because leshnici is the layer
-# ABOVE ui; main.cpp passes `&leshnici::install_prompt_modules` into
+# ABOVE ui - the arrow runs leshnici -> ui, never back; main.cpp passes
+# `&leshnici::install_prompt_modules` into
 # `run_interactive_shell` and the session calls it on the engine it built.
 #
 # Every dependency is named, PRIVATE and explicit - transitivity is not relied
@@ -363,7 +383,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
 	tests/unit/leshnici_git_tests.cpp
-	tests/unit/leshper_prompt_tests.cpp
+	tests/unit/ui_prompt_tests.cpp
 	tests/unit/leshper_style_grammar_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/ui_proposal_tests.cpp

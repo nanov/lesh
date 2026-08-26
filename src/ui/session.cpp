@@ -2,11 +2,11 @@
 
 #include "leshper/abi.h"
 #include "leshper/keymap.h"
-#include "leshper/prompt/prompt.h"
 #include "leshper/registry.h"
 #include "ui/completion.h"
 #include "ui/editor_host.h"
 #include "ui/loop.h"
+#include "ui/prompt/prompt.h"
 #include "ui/reactors.h"
 #include "ui/shell_actor.h"
 #include "ui/shell_state_knowledge.h"
@@ -180,9 +180,14 @@ private:
 // ---------------------------------------------------------------------------
 
 // `binding_console`'s twin, and for the identical reason: the prompt registry,
-// the composer and the tick wheel are leshper's, and a builtin cannot reach
-// them. The runtime declares what a configuration builtin needs to say and this
-// is the implementation, verb for verb over `prompt::engine`.
+// the composer and the tick wheel are the SESSION's - `src/ui/prompt/` since
+// #170 - and a builtin cannot reach them. The runtime declares what a
+// configuration builtin needs to say and this is the implementation, verb for
+// verb over `prompt::engine`.
+//
+// IT NO LONGER BRIDGES TO leshper, which is why it is not called
+// `leshper_prompt_console` any more: both sides of it are the host's, and what
+// it crosses is the runtime/ui line rather than the ui/editor one.
 //
 // IT WAS INSTALLED BEFORE IT HAD A CALLER, and that is why `prompt` cost a
 // builtin and no wiring at all: the seam and the session that owns it were here
@@ -192,9 +197,9 @@ private:
 // and the parse happens on this side of the boundary because only this side has
 // the registry to resolve a module name against.
 
-class leshper_prompt_console final : public runtime::prompt_console {
+class prompt_console_impl final : public runtime::prompt_console {
 public:
-	explicit leshper_prompt_console(leshper::prompt::engine& engine) noexcept : _engine(&engine) {}
+	explicit prompt_console_impl(ui::prompt::engine& engine) noexcept : _engine(&engine) {}
 
 	void module_names(std::vector<std::string>& into) const override {
 		_engine->module_names(into);
@@ -227,16 +232,16 @@ public:
 	}
 
 private:
-	// TWO ENUMS, TRANSLATED HERE. The runtime's `surface` cannot BE leshper's
-	// `surface_id` without the runtime including a leshper header, which is the
+	// TWO ENUMS, TRANSLATED HERE. The runtime's `surface` cannot BE the engine's
+	// `surface_id` without the runtime including a `ui/` header, which is the
 	// link this whole arrangement exists to prevent; so the mapping is three lines
 	// at the one point that legitimately sees both.
-	[[nodiscard]] static leshper::prompt::surface_id surface_of(surface which) noexcept {
-		return which == surface::continuation ? leshper::prompt::surface_id::continuation
-		                                      : leshper::prompt::surface_id::left;
+	[[nodiscard]] static ui::prompt::surface_id surface_of(surface which) noexcept {
+		return which == surface::continuation ? ui::prompt::surface_id::continuation
+		                                      : ui::prompt::surface_id::left;
 	}
 
-	leshper::prompt::engine* _engine;
+	ui::prompt::engine* _engine;
 };
 
 // ---------------------------------------------------------------------------
@@ -266,8 +271,8 @@ struct prompt_facts {
 	bool (*getvar)(const void*, std::string_view, std::string_view&) = nullptr;
 	const void* getvar_ctx = nullptr;
 
-	[[nodiscard]] leshper::prompt::state view() const noexcept {
-		leshper::prompt::state facts;
+	[[nodiscard]] ui::prompt::state view() const noexcept {
+		ui::prompt::state facts;
 		facts.pwd = pwd;
 		facts.home = home;
 		// EMPTY, and deliberately: the vi-mode indicator's context tweak is v2's
@@ -437,7 +442,7 @@ private:
 	// registry the loop owns holds a borrowed pointer to this engine (see the
 	// constructor), and members die in reverse - so the loop, and the registry
 	// with it, has to go first.
-	leshper::prompt::engine _prompt_engine;
+	ui::prompt::engine _prompt_engine;
 	prompt_facts _prompt_facts;
 	// THE ACTOR IS DECLARED BEFORE THE LOOP, and it is not a style choice:
 	// `~event_loop` recycles the messages `drain` handed it back into the
@@ -447,7 +452,7 @@ private:
 	shell_actor _actor;
 	event_loop _loop;
 	std::optional<leshper_binding_console> _console;
-	std::optional<leshper_prompt_console> _prompt_console;
+	std::optional<prompt_console_impl> _prompt_console;
 
 	std::atomic<bool> _cancelled{false};
 	// Loop-thread scratch for the accept action; shell-thread scratch for the
@@ -568,7 +573,10 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// BORROWED, null when there is no session, and the route every
 	// `lesh_prompt_*` verb takes into the composer. A binding that registers a
 	// prompt module reaches this object and no other.
-	context.actions().prompt_engine = &_prompt_engine;
+	// THE OPAQUE SLOT (#170). The registry declares it `void* host_prompt` and
+	// does not name the type; `ui/prompt/abi.h`'s verbs cast it back, and this is
+	// the one place it is filled in.
+	context.actions().host_prompt = &_prompt_engine;
 
 	_console.emplace(context);
 	// `bind` reaches the keymaps through here and by no other route, and only for
@@ -782,8 +790,8 @@ void session::refresh_prompt() {
 	                          && _prompt_continuation_scratch == kPosixContinuation);
 
 	if (_engine_owns_prompt) {
-		_loop.options().prompt = _prompt_engine.output(leshper::prompt::surface_id::left);
-		_loop.options().continuation = _prompt_engine.output(leshper::prompt::surface_id::continuation);
+		_loop.options().prompt = _prompt_engine.output(ui::prompt::surface_id::left);
+		_loop.options().continuation = _prompt_engine.output(ui::prompt::surface_id::continuation);
 	} else {
 		_loop.options().prompt = _prompt_left_scratch;
 		_loop.options().continuation = _prompt_continuation_scratch;
@@ -802,7 +810,7 @@ void session::reconcile_prompt_timer() {
 	leshper::registry& actions = context_of(_loop.editor()).actions();
 
 	const std::uint64_t desired =
-		leshper::prompt::timer_interval_ms(_prompt_engine.next_wake(), _prompt_facts.tick);
+		ui::prompt::timer_interval_ms(_prompt_engine.next_wake(), _prompt_facts.tick);
 
 	// UNCHANGED CADENCE LEAVES THE TIMER ALONE, and this is the load-bearing
 	// branch rather than an optimisation: the loop rearms a timer from the moment
@@ -966,7 +974,7 @@ std::int32_t session::prompt_tick(lesh_editor*, const lesh_invocation*, void* se
 	me._prompt_facts.tick = tick_now();
 	fill_wall_clock(me._prompt_facts);
 
-	leshper::prompt::state facts = me._prompt_facts.view();
+	ui::prompt::state facts = me._prompt_facts.view();
 
 	// AND THE VARIABLE DOOR IS SHUT. A tick may only re-invoke clock-derived
 	// elements (`engine::render_tick`'s contract says so), but the engine cannot
@@ -988,9 +996,9 @@ std::int32_t session::prompt_tick(lesh_editor*, const lesh_invocation*, void* se
 	// `refresh_prompt` decided, and asking it again from this thread is not
 	// available anyway - half the question is about `shell_state`.
 	if (moved && me._engine_owns_prompt) {
-		me._loop.options().prompt = me._prompt_engine.output(leshper::prompt::surface_id::left);
+		me._loop.options().prompt = me._prompt_engine.output(ui::prompt::surface_id::left);
 		me._loop.options().continuation =
-			me._prompt_engine.output(leshper::prompt::surface_id::continuation);
+			me._prompt_engine.output(ui::prompt::surface_id::continuation);
 		// DIRECTLY, and this is the one place an action calls it. The loop is the
 		// calling thread and is mid-turn with nothing staged, and what changed is
 		// an OPTION rather than editor state - so there is no generation to bump

@@ -13,7 +13,7 @@
 // every short spec, which is cheap here and would just be restating the
 // selftest's cases as a loop if it lived there instead.
 
-#include "leshper/prompt/prompt.h"
+#include "ui/prompt/prompt.h"
 #include "leshper/sgr.h"
 #include "leshper/style_grammar.h"
 #include "leshper/surface.h"
@@ -45,7 +45,7 @@ constexpr bool style_round_trips_through_sgr(std::string_view spec) {
 	if (!parsed.ok)
 		return false;
 	std::string bytes;
-	lesh::leshper::prompt::emit_sgr(parsed.value, bytes);
+	lesh::ui::prompt::emit_sgr(parsed.value, bytes);
 	return apply_sgr(std::string_view{bytes}, style{}) == parsed.value;
 }
 

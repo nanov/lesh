@@ -6,7 +6,7 @@
 #include "leshper/host.h"
 #include "leshper/registry.h"
 #include "leshnici/prompt_modules.h"
-#include "leshper/prompt/prompt.h"
+#include "ui/prompt/prompt.h"
 #include "leshper/state.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
@@ -714,7 +714,7 @@ TEST_F(AllocationTest, PaintingDecorationsAddsNothingToWhatALayoutAlreadyCosts) 
 // `set_template` parses, sizes the scratch and the slots, and hands the surface
 // two containers. The warm renders below are what the shell actually does.
 TEST_F(AllocationTest, AWarmPromptRenderNeverReachesTheHeap) {
-	namespace prompt = leshper::prompt;
+	namespace prompt = ui::prompt;
 
 	prompt::engine which;
 	// `git` below is leshnici's since #163, so the engine has to be handed the

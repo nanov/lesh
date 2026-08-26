@@ -18,15 +18,15 @@
 
 #include "leshnici/module_git.h"
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
 class engine;
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt
 
 namespace lesh::leshnici {
 
 // Registers every prompt module leshnici ships, on `which`, under the names a
 // template spells them with. Idempotent, because `register_module` replaces
 // (#101): calling it twice on one engine leaves one registration.
-void install_prompt_modules(leshper::prompt::engine& which);
+void install_prompt_modules(ui::prompt::engine& which);
 
 } // namespace lesh::leshnici

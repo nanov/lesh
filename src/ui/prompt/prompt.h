@@ -74,11 +74,11 @@
 // on an engine by the wiring site, because it reads a filesystem and everything
 // named in the table is a pure function of `state`.
 
-#include "leshper/abi.h"
-#include "leshper/prompt/modules.h"
 #include "leshper/sgr.h"
 #include "leshper/style_grammar.h"
 #include "leshper/surface.h"
+#include "ui/prompt/abi.h"
+#include "ui/prompt/modules.h"
 
 #include <array>
 #include <bit>
@@ -92,7 +92,13 @@
 #include <type_traits>
 #include <vector>
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
+
+// The style GRAMMAR is the editor's too, beside the pen types `module.h` names:
+// `style_grammar.h` stayed in `leshper/` because the highlighter's theme parses
+// the same spellings (#170).
+using leshper::parse_style;
+using leshper::style_parse;
 
 // ---------------------------------------------------------------------------
 // Status, as the engine reads it
@@ -1781,4 +1787,4 @@ static_assert(unescapes("a\\nb\\tc\\\\d", true, "a\nb\tc\\d"));
 
 } // namespace selftest
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt

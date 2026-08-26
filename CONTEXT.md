@@ -169,7 +169,11 @@ highlighter, the autosuggester, the history search and the completion sources ar
 `src/ui/` too (#168 Phase B), so **`lesh_leshper` links `lesh_substrate` and
 nothing else** — not `lesh_syntax` either, because the editor neither parses nor
 lexes. Highlighting and suggesting are runtime, syntax and history KNOWLEDGE; the
-editor only colours regions.
+editor only colours regions. The prompt engine went the same way (#170) — it
+renders shell facts, so it is `src/ui/prompt/` — and the C ABI split at that
+seam: `leshper/abi.h` declares the editor's verbs, `ui/prompt/abi.h` the
+`lesh_prompt_*` ones, and the registry carries the engine as an opaque `void*`
+so that no header under `src/leshper/` names `ui::prompt::engine`.
 _Avoid_: reaching for a symbol across a link the target does not declare; adding
 a dependency by relying on transitivity.
 
@@ -244,9 +248,11 @@ adapters (`ui/history_search.h`, `history_store_source`), the completion sources
 and the token-finding lex behind Tab (`ui/completion.h`), the shell's own tables
 (`ui/shell_knowledge.h`, `shell_state_knowledge` over shell state), and the one
 object that fills leshper's one door (`ui/editor_host.h` — `leshper::host`). The
-prompt and binding consoles run in the other direction. leshper is the editor
-BENEATH it; leshnici the extension set ABOVE it. The shell proper is everything
-else.
+**prompt** engine is its state too (#170): `src/ui/prompt/` is the engine, the
+seven built-in modules, the template language and the `lesh_prompt_*` ABI
+(`ui/prompt/abi.h`), because what a prompt renders is shell facts. The prompt and
+binding consoles run in the other direction. leshper is the editor BENEATH it;
+leshnici the extension set ABOVE it. The shell proper is everything else.
 
 **Front end** _[retired]_:
 A word that carried three meanings at once and now carries none. What it
@@ -306,24 +312,45 @@ mailbox** anywhere in it, driven by a **host**. Integrated: linked into the lesh
 binary, not shipped as a library anyone else builds against, and it never sees
 the shell — `lesh_leshper` links `lesh_substrate` and nothing else, so it declares
 shapes that `src/ui/` fills in. **It knows nothing**: not the shell, not syntax,
-not history, not git (#168 Phase B). What is left is the buffer, the keymap and
-actions, vi, undo and kill, decoding, layout and blit, the pager and selection
-UI, the **decoration**/**proposal** vocabulary, the theme, and the ABI that
-registers actions and reactors. One door out to what it cannot know:
-`leshper::host` (`host.h`).
+not history, not git (#168 Phase B), and not the prompt (#170) — it takes prompt
+BYTES and a pen and never learns what they say. What is left is the buffer, the
+keymap and actions, vi, undo and kill, decoding, layout and blit, the pager and
+selection UI, the **decoration**/**proposal** vocabulary, the style grammar and
+the theme, and the ABI that registers actions and reactors (`leshper/abi.h`; the
+`lesh_prompt_*` verbs are `ui/prompt/abi.h`'s). One door out to what it cannot
+know: `leshper::host` (`host.h`).
 _Avoid_: LLE, the retired earlier name; the reader; readline; calling the
-session, the loop, the reactors or the adapters "leshper" — those are `src/ui/`.
+session, the loop, the reactors, the adapters or the prompt engine "leshper" —
+those are `src/ui/`.
 
 **leshnici** _[lesh]_:
-The shipped extension set: what lesh ships on top of leshper but does not owe
-it — prompt modules now, builtins later. A layer ABOVE leshper (`lesh_leshnici`
-links `lesh_leshper`, never the other way), and it arrives on an engine by being
-installed: `src/main.cpp` hands `install_prompt_modules` to the session as its
+The shipped extension set: what lesh ships on top of the layers below but does
+not owe them — prompt modules now, builtins later. A layer ABOVE the host
+(`lesh_leshnici` links `lesh_ui` since #170, never the other way), because what a
+prompt module installs into is `ui::prompt::engine`, and it arrives on an engine
+by being installed: `src/main.cpp` hands `install_prompt_modules` to the session as its
 extension hook, so an engine built anywhere else is the bare built-in one. `git` is its first resident, and it is
 there rather than among the built-ins because it reads a filesystem where every
 built-in is a pure function of the facts struct.
 _Avoid_: calling a leshnici module a built-in; a template naming one on an
 engine without leshnici is refused as an unknown module, like any other name.
+
+**Prompt** _[lesh]_:
+What the shell draws before the line it is about to read, and the engine that
+draws it (spec §6.10). HOST STATE, in `src/ui/prompt/` (#170): a prompt is a
+function of shell facts — cwd, exit status, job count, elapsed time, the git
+branch — and those are the host's to know, so `ui::prompt::engine` lives beside
+the session that owns them. leshper takes the rendered BYTES and a pen
+(`loop_options::prompt` and `.continuation`) and nothing more. A surface (`left`,
+`continuation`) is a list of placements, each a literal, a style or a **module**;
+modules are singletons with free placement, and the seven built-in ones are pure
+functions of the facts struct while `git` is **leshnici**'s. Configuration is the
+`prompt` builtin's template language, or the `lesh_prompt_*` verbs across
+`ui/prompt/abi.h`, which resolve the engine through an opaque slot on the
+registry. Recalculation is BY CAUSE: a tick re-renders only the item whose
+deadline came up.
+_Avoid_: calling the engine leshper's; calling `git` a built-in; "PS1" for a
+surface.
 
 **Widget** _[lesh]_:
 Reserved for a future UI surface a plugin can draw into — panels, pickers,

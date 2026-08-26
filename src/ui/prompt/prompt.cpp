@@ -20,7 +20,7 @@
 // ordinary `module` object, which is the entire cost of NG-4's promise that the
 // Lua binding reuses these verbs unchanged.
 
-#include "leshper/prompt/prompt.h"
+#include "ui/prompt/prompt.h"
 
 #include "leshper/registry.h"
 #include "substrate/assert.h"
@@ -39,8 +39,8 @@
 // ---------------------------------------------------------------------------
 
 struct lesh_prompt_context {
-	const lesh::leshper::prompt::state* facts = nullptr;
-	lesh::leshper::prompt::sink* out = nullptr;
+	const lesh::ui::prompt::state* facts = nullptr;
+	lesh::ui::prompt::sink* out = nullptr;
 	std::string_view arg;
 
 	// Validity, debug-asserted, exactly as the editor handle's is: zero between
@@ -55,10 +55,10 @@ struct lesh_prompt_context {
 
 namespace {
 
-using lesh::leshper::prompt::element_status;
-using lesh::leshper::prompt::engine;
-using lesh::leshper::prompt::place_result;
-using lesh::leshper::prompt::surface_id;
+using lesh::ui::prompt::element_status;
+using lesh::ui::prompt::engine;
+using lesh::ui::prompt::place_result;
+using lesh::ui::prompt::surface_id;
 
 // The C numbers and the C++ enumerators are one space, and these keep them one.
 // A reordered enum would otherwise make every module's `ready` read as `omitted`,
@@ -131,8 +131,8 @@ bool context_ok(const lesh_prompt_context* context) noexcept {
 // even here. The module's name and the module's own words are both carried on the
 // check; there is no table of which module says what, because a module registered
 // by a binding could never be in it.
-std::string describe_template_error(const lesh::leshper::prompt::template_check& why) {
-	using lesh::leshper::prompt::template_error;
+std::string describe_template_error(const lesh::ui::prompt::template_check& why) {
+	using lesh::ui::prompt::template_error;
 
 	const std::string what{why.what};
 	std::string said;
@@ -182,8 +182,12 @@ std::string describe_template_error(const lesh::leshper::prompt::template_check&
 	return said;
 }
 
+// THE OPAQUE SLOT, CAST BACK (#170). `registry::host_prompt` is a `void*` on the
+// editor's side - leshper carries the pointer and does not name what it points
+// at - and this file, which is the host's, is the only code that knows. The verb
+// signatures are unchanged: a binding still hands the registry it already holds.
 engine* engine_of(lesh_registry* registry) noexcept {
-	return registry == nullptr ? nullptr : registry->prompt_engine;
+	return registry == nullptr ? nullptr : static_cast<engine*>(registry->host_prompt);
 }
 
 bool surface_of(std::uint32_t raw, surface_id& out) noexcept {
@@ -206,7 +210,7 @@ std::string_view text_of(const char* raw) noexcept {
 
 } // namespace
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
 
 // ---------------------------------------------------------------------------
 // A module that came in across the C ABI
@@ -924,7 +928,7 @@ std::uint64_t engine::next_wake() const {
 	return earliest;
 }
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt
 
 // ---------------------------------------------------------------------------
 // The C ABI
@@ -1003,7 +1007,7 @@ std::int32_t lesh_prompt_variable(const lesh_prompt_context* context, const char
 	if (name == nullptr)
 		return LESH_ERR_INVAL;
 
-	const lesh::leshper::prompt::state& facts = *context->facts;
+	const lesh::ui::prompt::state& facts = *context->facts;
 	std::string_view value;
 	if (facts.getvar == nullptr || !facts.getvar(facts.getvar_ctx, std::string_view{name}, value))
 		return LESH_ERR_NOTFOUND;

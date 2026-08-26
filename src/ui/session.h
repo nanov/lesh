@@ -54,7 +54,7 @@ class history_store;
 class shell_state;
 }
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
 class engine;
 }
 
@@ -272,7 +272,7 @@ struct provider_bundle {
 // name a module: `main.cpp` passes `&leshnici::install_prompt_modules`, and null
 // - what every unit test passes - means the bare seven-module engine, on which
 // `{git}` is an unknown module refused at `set`.
-using prompt_extension_installer = void (*)(leshper::prompt::engine&);
+using prompt_extension_installer = void (*)(ui::prompt::engine&);
 
 [[nodiscard]] int run_interactive_shell(runtime::shell_state& state, buffer_pool& pool,
                                         const provider_bundle& providers, int in, int out,
