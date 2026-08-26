@@ -29,9 +29,9 @@
 // that: staging, commit, generation binding, the drop rule.
 
 #include "leshper/abi.h"
-#include "leshper/complete.h"
 #include "leshper/effect.h"
-#include "leshper/shell_knowledge.h"
+#include "leshper/event.h"
+#include "leshper/host.h"
 #include "leshper/state.h"
 
 #include <atomic>
@@ -190,43 +190,31 @@ struct lesh_registry {
 	// Bumped per action call so a stashed handle can be told from a live one.
 	std::uint64_t calls = 0;
 
-	// #94's `Completer` override point, reachable from `lesh_complete` (#139).
+	// THE HOST (#168 Phase B; host.h).
 	//
-	// A BORROWED POINTER ON THE REGISTRY and not a fifth field on a bundle,
-	// because the ABI's only handles are the registry and the editor, and a
-	// provider a binding can pull has to hang off one of them. Null is "no
-	// completer wired up", which `lesh_complete` reports as LESH_ERR_NOTFOUND -
-	// the same answer a leshper embedded with no completer should give.
+	// ONE BORROWED POINTER WHERE THERE WERE TWO. `completion` was #94's
+	// `Completer` override point and `knowledge` was #135's shell tables; both
+	// were leshper-declared interfaces filled in by the ui layer, and Phase B
+	// found they were one door with two names. `host` is that door: it answers
+	// `lesh_request_command_kind` and it carries out `want_completion`.
 	//
 	// Whoever set it owns it and must outlive the registry (ADR-0007: the owner
-	// takes the view away as it takes the object).
-	const lesh::leshper::completer* completion = nullptr;
-
-	// What the shell knows (#135), for the tokens this registry's reactors are
-	// minted against.
-	//
-	// A BORROWED POINTER ON THE REGISTRY, beside `completion` and for the same
-	// reason (#168): it was reached through `editing_context::loop()` and pushed
-	// in with a setter on `loop_harness`, which made the fake host the route by
-	// which a real shell told the editor about itself. The registry is where a
-	// borrowed provider hangs, and the wiring site fills this in the same line it
-	// fills the other two. Null is "no shell attached" and is not an error.
-	//
-	// PHASE B REMOVES IT. `shell_knowledge` has consumers inside leshper only
-	// until the highlighter, the autosuggester and the completion sources move to
-	// `src/ui/` (#168 Phase B); the field goes with the last of them.
-	const lesh::leshper::shell_knowledge* knowledge = nullptr;
+	// takes the view away as it takes the object). Null is "no host attached" and
+	// is not an error - `lesh_complete` reports LESH_ERR_NOTFOUND, the same answer
+	// a leshper embedded with no completer should give, and a name classifies as
+	// LESH_COMMAND_UNKNOWN.
+	lesh::leshper::host* host = nullptr;
 
 	// The prompt engine the `lesh_prompt_*` verbs configure (#157, §6.10).
 	//
-	// A BORROWED POINTER ON THE REGISTRY, for `completion`'s reason exactly: the
+	// A BORROWED POINTER ON THE REGISTRY, for `host`'s reason exactly: the
 	// ABI's only long-lived handle is the registry, so a registry of a second
 	// kind has to hang off it. Null is "no prompt engine wired up" - a
 	// non-interactive shell - and every prompt verb reports it as
 	// LESH_ERR_NOTFOUND rather than pretending the configuration landed
 	// somewhere.
 	//
-	// NOT const, unlike `completion`: configuring is the point of the door.
+	// NOT const: configuring is the point of the door.
 	// Whoever set it owns it and must outlive the registry.
 	lesh::leshper::prompt::engine* prompt_engine = nullptr;
 };
@@ -281,18 +269,24 @@ struct lesh_editor {
 	std::uint32_t dismissed_kind = 0;
 	bool dismiss_requested = false;
 
-	// What `lesh_complete` found, this call (#139).
+	// What `lesh_complete` found, this call (#139, #168 Phase B).
 	//
 	// A MEMBER AND NOT A RETURN VALUE, because three ABI calls read it - the
 	// count, the span, and the candidates one at a time - and because the handle
-	// is reused across dispatches, so the vectors keep their capacity between
-	// Tabs.
+	// is reused across dispatches.
+	//
+	// A BORROWED VIEW AND NOT A LIST. It was a `completion_result` with a
+	// `std::vector<candidate>` in it, which put the shell's candidate strings
+	// inside the editor handle - a second copy of a list the completer already
+	// held. It is the `completion_candidates` EVENT now: a pointer into the
+	// host's own storage, valid until the next `want_completion` that host
+	// carries out, which is exactly as long as the action that asked.
 	//
 	// It does NOT become a proposal and the loop never takes it: the candidates'
 	// destination is the pager (#138), which the action fills through
 	// `lesh_pager_add` before it returns, and a second copy of the list living on
 	// past the call would be a second answer to "what is showing".
-	lesh::leshper::completion_result completion;
+	lesh::leshper::completion_candidates completion;
 	bool completion_ran = false;
 
 	std::uint8_t outcome = 0;  // lesh::leshper::loop_outcome
@@ -328,14 +322,24 @@ struct lesh_request {
 	// Cooperative cancellation. Points at the loop's flag; never owned.
 	const std::atomic<bool>* superseded = nullptr;
 
-	// What the shell knows (#135). Never owned, and read-only by construction:
-	// ADR-0009 makes the shell thread the sole owner of `shell_state`, and a
-	// highlight, a port call and an execution are serialized on it.
+	// THE HOST (#168 Phase B; host.h). Never owned.
 	//
-	// Null is "no shell attached", and it is not an error: the tables read empty
-	// and `$PATH` comes from the process environment, which is exactly what the
-	// highlighter did before this door existed. The wiring site fills it in.
-	const lesh::leshper::shell_knowledge* knowledge = nullptr;
+	// Copied onto the token when it is minted, so a reactor on a worker asks the
+	// same host the registry holds without reaching back through it. Read-only by
+	// construction: ADR-0009 makes the shell thread the sole owner of
+	// `shell_state`, and a highlight, a port call and an execution are serialized
+	// on it.
+	//
+	// Null is "no host attached", and it is not an error: every name classifies as
+	// LESH_COMMAND_UNKNOWN, which is what a leshper embedded in something that is
+	// not this shell would see.
+	//
+	// CONST, where `registry::host` is not, and the difference is the thread. The
+	// only verb a token asks is `classify_command`, which is const and re-entrant;
+	// `carry_out` writes the host's own scratch and is the loop's alone. A token
+	// that cannot name the second cannot be the route by which a worker reaches
+	// it.
+	const lesh::leshper::host* host = nullptr;
 
 	// Mutable because classifying is a QUERY - `lesh_request_command_kind` takes
 	// a `const lesh_request*` beside every other reader on this token - and the
@@ -507,10 +511,11 @@ public:
 	// to be the only evidence that handle validity is enforced.
 	[[nodiscard]] const editor_handle* handle() const noexcept { return &_handle; }
 
-	// THE SHELL'S TABLES ARE THE REGISTRY'S (#168). `set_shell_knowledge` was here,
-	// which made a setter on the fake host the way a real shell told the editor
-	// where its own tables were; the pointer hangs off `registry::knowledge` now,
-	// beside `completion` and `prompt_engine`, and `react` reads it from there.
+	// THE HOST IS THE REGISTRY'S (#168). `set_shell_knowledge` was here, which
+	// made a setter on the FAKE host the way a real shell told the editor where
+	// its own tables were. It hangs off `registry::host` now - one borrowed
+	// pointer beside `prompt_engine`, answering command kinds and completion
+	// alike - and `react` reads it from there.
 
 private:
 	registry* _registry;
@@ -542,86 +547,14 @@ std::size_t register_builtin_actions(registry& reg);
 // reason `register_builtin_actions` is. Answers how many were registered.
 std::size_t register_pager_actions(registry& reg);
 
-// The highlighter's registration-time context: its per-request arena and the
-// style ids it interned (#124). OPAQUE - defined in builtin_reactors.cpp, which
-// like builtin_actions.cpp includes abi.h and nothing else from this module, so
-// a built-in reactor that wanted a shortcut would not compile.
-//
-// It exists as a named thing at all because a reactor, unlike an action, has
-// state: an arena it rewinds per request (#90) and a dozen interned ids. That
-// state needs an owner that frees it before main returns (ADR-0007), and the
-// registry cannot be it - the registry stores a `void*` it never dereferences,
-// which is exactly the language-neutral shape #93 asked for.
-struct highlighter;
-
-[[nodiscard]] highlighter* highlighter_create();
-void highlighter_destroy(highlighter* self) noexcept;
-
-// Registers the built-in reactors (F-20/F-22) through the ABI and by no other
-// route (A-11). `self` must outlive `reg`. Answers how many were registered.
-std::size_t register_builtin_reactors(registry& reg, highlighter& self);
-
-// The owner ADR-0007 asks for, so no caller has to remember the pair above.
-class owned_highlighter {
-public:
-	owned_highlighter() : _self(highlighter_create()) {}
-	~owned_highlighter() { highlighter_destroy(_self); }
-
-	owned_highlighter(const owned_highlighter&) = delete;
-	owned_highlighter& operator=(const owned_highlighter&) = delete;
-
-	[[nodiscard]] highlighter& get() const noexcept { return *_self; }
-
-private:
-	highlighter* _self;
-};
-
-// ---------------------------------------------------------------------------
-// The autosuggester (#133: F-24 to F-26), the second built-in reactor.
-// ---------------------------------------------------------------------------
-
-// Where the entries come from (#125). Declared, not included: this header hands
-// a pointer through and never touches one, so the wiring site chooses between
-// the store's adapter and a `vector_history_source` without registry.h knowing
-// either exists.
-class history_source;
-
-// The autosuggester's registration-time context: its per-request arena, the
-// history it searches, and the one style id it interns. OPAQUE, exactly as
-// `highlighter` is and for the same reason - builtin_reactors.cpp defines it and
-// includes nothing from this module, so a built-in reactor that wanted a
-// shortcut would not compile.
-struct autosuggester;
-
-// `source` is BORROWED and must outlive the returned context. Null is accepted
-// here and refused per request as LESH_ERR_INVAL, on #125's reasoning: a
-// provider wired up wrong should say so rather than look like an empty history.
-[[nodiscard]] autosuggester* autosuggester_create(const history_source* source);
-void autosuggester_destroy(autosuggester* self) noexcept;
-
-// Registers the autosuggester through the ABI and by no other route (A-11).
-// `self` must outlive `reg`. Answers how many were registered.
-//
-// Its own function rather than a second argument to register_builtin_reactors,
-// because that would be a signature change on a call site the loop already
-// makes - the same additive-growth rule the ABI is held to, applied one layer
-// up.
-std::size_t register_autosuggester(registry& reg, autosuggester& self);
-
-// The owner ADR-0007 asks for. `source` is borrowed and must outlive this.
-class owned_autosuggester {
-public:
-	explicit owned_autosuggester(const history_source* source)
-		: _self(autosuggester_create(source)) {}
-	~owned_autosuggester() { autosuggester_destroy(_self); }
-
-	owned_autosuggester(const owned_autosuggester&) = delete;
-	owned_autosuggester& operator=(const owned_autosuggester&) = delete;
-
-	[[nodiscard]] autosuggester& get() const noexcept { return *_self; }
-
-private:
-	autosuggester* _self;
-};
+// THE BUILT-IN REACTORS ARE THE HOST'S (#168 Phase B). The highlighter
+// (F-20/F-21/F-22) and the autosuggester (F-24 to F-26) were declared here and
+// defined in `src/leshper/builtin_reactors.cpp`; they are `src/ui/reactors.h`
+// and `src/ui/reactors.cpp` now, in `lesh::ui`. Nothing about how they reach the
+// editor changed - each is a function pointer and a `void*` in the reactor
+// table, registered through the ABI and reachable by no other route (A-11) -
+// which is why the move cost this header a deletion and the ui layer one
+// include. What they DO is knowledge: a parse, the shell's tables, a `$PATH`
+// sweep, a history walk. The editor only colours regions.
 
 } // namespace lesh::leshper

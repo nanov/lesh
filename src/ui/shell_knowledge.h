@@ -1,16 +1,20 @@
 #pragma once
 
-// WHAT THE SHELL KNOWS, as an interface leshper owns (#130, #135; spec §6.7,
-// narrowed by ADR-0009).
+// WHAT THE SHELL KNOWS, as an interface THE HOST owns (#130, #135; spec §6.7,
+// narrowed by ADR-0009; moved out of `src/leshper/` by #168 Phase B).
 //
 // The highlighter has to say whether `ll` is an alias, `cd` a builtin, `deploy`
 // a function and `ls` a thing on `$PATH` (F-21). All four answers live in
-// `shell_state`, and `lesh_leshper` does not link `lesh_runtime` - that is the
-// CMake rule spec §4.4 made enforceable rather than reviewable. So the shape of
-// the question is declared here and the answer is supplied in the ui layer,
-// which is exactly the A-5 arrangement `history_source` already has: leshper
-// depends on a shape, `src/ui/shell_state_knowledge.h` implements it over the
-// real state, and a test fakes it with a map.
+// `shell_state`. This header used to be leshper's, declaring the SHAPE of the
+// question so the editor could ask it without linking `lesh_runtime` - the CMake
+// rule spec §4.4 made enforceable rather than reviewable. That was the right
+// arrangement while the highlighter was leshper's too. It is not: what a command
+// name IS is shell knowledge, and the editor only colours regions. So the whole
+// question lives on this side now, `src/ui/shell_state_knowledge.h` implements it
+// over the real state, and a test fakes it with a map. What crosses to the editor
+// is `leshper::host::classify_command`, one `std::uint32_t` in abi.h's own
+// LESH_COMMAND_* space, with everything below it - tables, `$PATH`, the sweep -
+// on this side of the door.
 //
 // ONE OWNER, NO VERSION. #130 resolved this over a copy-on-write definitions
 // version held by the request token, because the highlighter then ran on a
@@ -23,13 +27,17 @@
 // token.
 //
 // WHY TWO METHODS AND NOT ONE. #130 wrote "one method: command_kind(name)". The
-// `$PATH` walk is a stat per directory and the token memoizes it per request
-// (F-22 keeps the filesystem off the keystroke path), and the memo lives with
-// the token - so the walk has to run on leshper's side of this boundary, where
-// the token is. The shell's contribution to it is the VALUE of `$PATH` and
-// nothing else. Folding the walk behind `classify` would put a filesystem sweep
-// where the memo cannot see it and re-stat every candidate for every repeat of a
-// name on the line. Both methods below are pure lookups; neither touches disk.
+// `$PATH` walk is a stat per directory and the request MEMOIZES it (F-22 keeps
+// the filesystem off the keystroke path), so the walk has to run where the memo
+// can see it. The shell's contribution to it is the VALUE of `$PATH` and nothing
+// else. Folding the walk behind `classify` would put a filesystem sweep where
+// the memo cannot see it and re-stat every candidate for every repeat of a name
+// on the line. Both methods below are pure lookups; neither touches disk.
+//
+// The two are joined by `ui::classify_command_name` (`editor_host.h`), which is
+// where the walk itself lives; the memo stayed on the request token, in leshper,
+// because a cost cache that can never change an answer belongs with the caller
+// (#168 Phase B).
 
 #include <atomic>
 #include <cstdint>
@@ -38,7 +46,7 @@
 #include <string_view>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // What a command name IS, in the shell's own resolution order.
 //
@@ -241,4 +249,4 @@ public:
 	}
 };
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

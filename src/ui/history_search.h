@@ -3,14 +3,21 @@
 // The history SEARCHER (#94, #125): F-32's line/prefix/token modes and F-33's
 // prefix-constrained navigation, as filters over one newest-first iteration.
 //
-// #94 split the history in two. The store is dumb and lesh-side - append,
-// snapshot-iterate newest-first, entries preserve newlines - behind the
-// `HistoryStore` override point A-13 names. Everything that knows what a
-// SEARCH is lives here, in leshper, and uses C-6's independently callable
-// lexer for token mode. That split is why this file includes no header from
-// `src/runtime/`: it depends on the shape of `for_each_newest_first` and on
-// nothing else about the store, so a user-supplied history provider serves it
-// exactly as the built-in one does (A-13), and the tests feed vectors.
+// #94 split the history in two. The store is dumb - append, snapshot-iterate
+// newest-first, entries preserve newlines - behind the `HistoryStore` override
+// point A-13 names. Everything that knows what a SEARCH is lives here, and uses
+// C-6's independently callable lexer for token mode.
+//
+// BOTH HALVES ARE THE HOST'S (#168 Phase B). This file was `src/leshper/`'s, on
+// the argument that a searcher depends on the shape of `for_each_newest_first`
+// and on nothing else about the store - which is true, and was never the
+// question. What a search IS is HISTORY KNOWLEDGE, and it needs a LEXER to be
+// what it is; the editor is the side that neither knows what a shell command
+// looks like nor links `lesh_syntax`. So the split that matters runs between the
+// store and the editor, not between the store and the searcher, and both halves
+// sit on this side of it. What is unchanged: this file still depends on the shape
+// and not on the file, so a user-supplied history provider serves it exactly as
+// the built-in one does (A-13), and the tests feed vectors.
 //
 // TWO FACES, and only one of them is C.
 //
@@ -48,7 +55,7 @@
 #include <string_view>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // Where the entries come from: the one thing the searcher needs of a history.
 //
@@ -301,4 +308,4 @@ struct history_search_provider {
 // worker and not a correctness mechanism: the loop drops a stale batch anyway.
 std::int32_t history_search_compute(lesh_request* request, void* userdata);
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

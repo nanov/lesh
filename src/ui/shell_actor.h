@@ -66,7 +66,7 @@
 
 #include "leshper/abi.h"
 #include "leshper/registry.h"
-#include "leshper/shell_knowledge.h"
+#include "ui/shell_knowledge.h"
 #include "leshper/state.h"
 #include "ui/workers.h"
 
@@ -237,24 +237,25 @@ public:
 // mutex; nothing here is called while holding it.
 class shell_actor {
 public:
-	// `knowledge` is what the shell KNOWS, and it is required rather than
-	// defaulted for one reason (#151): the field it fills used to arrive on each
-	// snapshot from the loop, and the token this file builds forgot to copy it
-	// for a whole wave. A parameter with no default cannot be forgotten. Null is
-	// still legal and still means "no shell attached" - the highlighter degrades
-	// to `environment_knowledge` - but it now has to be WRITTEN, which is a
-	// different act from omitting an assignment on a struct.
+	// `host` is the door to what the shell KNOWS (`leshper::host`, #168 Phase B;
+	// it was a `shell_knowledge*` here), and it is required rather than defaulted
+	// for one reason (#151): the field it fills used to arrive on each snapshot
+	// from the loop, and the token this file builds forgot to copy it for a whole
+	// wave. A parameter with no default cannot be forgotten. Null is still legal
+	// and still means "no host attached" - every name classifies as
+	// LESH_COMMAND_UNKNOWN - but it now has to be WRITTEN, which is a different
+	// act from omitting an assignment on a struct.
 	//
 	// `writing` is ADR-0009's tripwire, raised around `execute` and `port_call`.
 	// Null is "unchecked", which is what a test with no adapter to protect wants.
 	// Neither pointer is owned; both must outlive the actor.
-	shell_actor(shell_side& shell, const leshper::shell_knowledge* knowledge,
-	            leshper::shell_writing_flag* writing = nullptr) noexcept
-		: _shell(&shell), _knowledge(knowledge), _writing(writing) {}
+	shell_actor(shell_side& shell, const leshper::host* host,
+	            shell_writing_flag* writing = nullptr) noexcept
+		: _shell(&shell), _host(host), _writing(writing) {}
 
 	// What every token this actor mints reads through. Exposed so the wiring site
-	// can assert the actor and the completer are looking at one object.
-	[[nodiscard]] const leshper::shell_knowledge* knowledge() const noexcept { return _knowledge; }
+	// can assert the actor and the registry are looking at one object.
+	[[nodiscard]] const leshper::host* host() const noexcept { return _host; }
 
 	shell_actor(const shell_actor&) = delete;
 	shell_actor& operator=(const shell_actor&) = delete;
@@ -331,9 +332,9 @@ private:
 	void serve_highlight(highlight_slot& job);
 
 	shell_side* _shell;
-	// The executing shell's own tables, stamped on every token served below.
-	const leshper::shell_knowledge* _knowledge;
-	leshper::shell_writing_flag* _writing;
+	// The executing shell's own door, stamped on every token served below.
+	const leshper::host* _host;
+	shell_writing_flag* _writing;
 	shell_channel _replies;
 
 	mutable std::mutex _mutex;

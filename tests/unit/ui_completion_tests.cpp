@@ -1,8 +1,9 @@
 #include "leshper/abi.h"
-#include "leshper/complete.h"
+#include "ui/completion.h"
+#include "ui/editor_host.h"
 #include "leshper/pager.h"
 #include "leshper/registry.h"
-#include "leshper/shell_knowledge.h"
+#include "ui/shell_knowledge.h"
 #include "leshper/state.h"
 #include "runtime/shell_state.h"
 #include "substrate/arena.h"
@@ -54,7 +55,7 @@ using namespace lesh::ui;
 // WHAT IS NOT HERE: the pager (#138), the keymap binding for Tab (#141), and any
 // concurrency. There is no enumeration round trip left to cover (#151 deleted
 // the slot); the rule that makes the direct read legal is asserted where it can
-// fail, in leshper_knowledge_tests.cpp.
+// fail, in ui_command_kind_tests.cpp.
 
 namespace {
 
@@ -163,11 +164,19 @@ struct action_fixture {
 	registry reg;
 	loop_harness loop{reg};
 	shell_completer completer{&names, directories};
+	// THE ONE DOOR (#168 Phase B). `reg.completion` was a `completer*`; the
+	// completer is behind `leshper::host` now, with the shell's tables, and
+	// `lesh_complete` raises a `want_completion` the host carries out where it
+	// stands.
+	editor_host host{&names, &completer};
+	// "No completer wired up", for the tests that need it: a host with a null
+	// completer, which is what a leshper embedded with no completion sources has.
+	editor_host completerless{&names};
 
 	action_fixture() {
 		register_builtin_actions(reg);
 		register_pager_actions(reg);
-		reg.completion = &completer;
+		reg.host = &host;
 	}
 
 	[[nodiscard]] static lesh::leshper::state line(std::string_view text) {
@@ -196,32 +205,32 @@ std::filesystem::path repository_root() {
 // C-6: the token under the cursor
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteToken, AnEmptyLineIsCommandPosition) {
+TEST(UiCompleteToken, AnEmptyLineIsCommandPosition) {
 	const token_under_cursor found = classify_token("", 0);
 	EXPECT_EQ(found.source, completion_source::command);
 	EXPECT_EQ(found.from, 0u);
 }
 
-TEST(LeshperCompleteToken, TheFirstWordIsACommandName) {
+TEST(UiCompleteToken, TheFirstWordIsACommandName) {
 	const token_under_cursor found = classify_token("gre", 3);
 	EXPECT_EQ(found.source, completion_source::command);
 	EXPECT_EQ(found.from, 0u);
 }
 
-TEST(LeshperCompleteToken, TheSecondWordIsAPath) {
+TEST(UiCompleteToken, TheSecondWordIsAPath) {
 	const token_under_cursor found = classify_token("grep fo", 7);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.from, 5u);
 	EXPECT_EQ(found.directory, "");
 }
 
-TEST(LeshperCompleteToken, AFreshWordAfterABlankIsStillAnArgument) {
+TEST(UiCompleteToken, AFreshWordAfterABlankIsStillAnArgument) {
 	const token_under_cursor found = classify_token("grep ", 5);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.from, 5u);
 }
 
-TEST(LeshperCompleteToken, EveryCommandOpenerRestoresCommandPosition) {
+TEST(UiCompleteToken, EveryCommandOpenerRestoresCommandPosition) {
 	for (const std::string_view line : {"ls |", "ls ||", "ls &&", "ls;", "ls &", "ls\n",
 	                                    "(ls;", "ls;;"}) {
 		const token_under_cursor found = classify_token(line, line.size());
@@ -230,26 +239,26 @@ TEST(LeshperCompleteToken, EveryCommandOpenerRestoresCommandPosition) {
 	}
 }
 
-TEST(LeshperCompleteToken, AWordRightAfterAPipeIsACommandName) {
+TEST(UiCompleteToken, AWordRightAfterAPipeIsACommandName) {
 	const token_under_cursor found = classify_token("ls | gre", 8);
 	EXPECT_EQ(found.source, completion_source::command);
 	EXPECT_EQ(found.from, 5u);
 }
 
 // POSIX 2.10.2: an assignment PRECEDES command position, it does not end it.
-TEST(LeshperCompleteToken, AnAssignmentDoesNotEndCommandPosition) {
+TEST(UiCompleteToken, AnAssignmentDoesNotEndCommandPosition) {
 	const token_under_cursor found = classify_token("FOO=bar gre", 11);
 	EXPECT_EQ(found.source, completion_source::command);
 	EXPECT_EQ(found.from, 8u);
 }
 
-TEST(LeshperCompleteToken, AWordThatIsAnAssignmentIsNotItselfACommandName) {
+TEST(UiCompleteToken, AWordThatIsAnAssignmentIsNotItselfACommandName) {
 	// The cursor is inside `FOO=ba`, which is not a name to look up in a table.
 	const token_under_cursor found = classify_token("FOO=ba", 6);
 	EXPECT_EQ(found.source, completion_source::path);
 }
 
-TEST(LeshperCompleteToken, ARedirectionTargetIsAPathAndDoesNotEndCommandPosition) {
+TEST(UiCompleteToken, ARedirectionTargetIsAPathAndDoesNotEndCommandPosition) {
 	const token_under_cursor target = classify_token("> ou", 4);
 	EXPECT_EQ(target.source, completion_source::path);
 	// The command name after the redirection is still a command name.
@@ -258,46 +267,46 @@ TEST(LeshperCompleteToken, ARedirectionTargetIsAPathAndDoesNotEndCommandPosition
 }
 
 // POSIX 2.9.1.1: a command name containing a slash is a pathname.
-TEST(LeshperCompleteToken, ACommandNameWithASlashIsAPath) {
+TEST(UiCompleteToken, ACommandNameWithASlashIsAPath) {
 	const token_under_cursor found = classify_token("./bi", 4);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.directory, "./");
 	EXPECT_EQ(found.from, 2u);
 }
 
-TEST(LeshperCompleteToken, TheDirectoryPartStopsAtTheLastSlash) {
+TEST(UiCompleteToken, TheDirectoryPartStopsAtTheLastSlash) {
 	const token_under_cursor found = classify_token("cat /usr/loc", 12);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.directory, "/usr/");
 	EXPECT_EQ(found.from, 9u);
 }
 
-TEST(LeshperCompleteToken, ATildeIsKeptOutOfTheReplacedRange) {
+TEST(UiCompleteToken, ATildeIsKeptOutOfTheReplacedRange) {
 	const token_under_cursor found = classify_token("cat ~/Doc", 9);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.directory, "~/");
 	EXPECT_EQ(found.from, 6u);
 }
 
-TEST(LeshperCompleteToken, ADollarTailIsAVariable) {
+TEST(UiCompleteToken, ADollarTailIsAVariable) {
 	const token_under_cursor found = classify_token("echo $HO", 8);
 	EXPECT_EQ(found.source, completion_source::variable);
 	EXPECT_EQ(found.from, 6u);   // past the `$`, so the `$` stays in the buffer
 }
 
-TEST(LeshperCompleteToken, ABracedDollarTailIsAVariable) {
+TEST(UiCompleteToken, ABracedDollarTailIsAVariable) {
 	const token_under_cursor found = classify_token("echo ${HO", 9);
 	EXPECT_EQ(found.source, completion_source::variable);
 	EXPECT_EQ(found.from, 7u);
 }
 
-TEST(LeshperCompleteToken, ABareDollarOffersEveryVariable) {
+TEST(UiCompleteToken, ABareDollarOffersEveryVariable) {
 	const token_under_cursor found = classify_token("echo $", 6);
 	EXPECT_EQ(found.source, completion_source::variable);
 	EXPECT_EQ(found.from, 6u);
 }
 
-TEST(LeshperCompleteToken, ADollarInsideAWordStillCompletesTheVariable) {
+TEST(UiCompleteToken, ADollarInsideAWordStillCompletesTheVariable) {
 	const token_under_cursor found = classify_token("echo abc$HO", 11);
 	EXPECT_EQ(found.source, completion_source::variable);
 	EXPECT_EQ(found.from, 9u);
@@ -306,31 +315,31 @@ TEST(LeshperCompleteToken, ADollarInsideAWordStillCompletesTheVariable) {
 // The no-expander rule, made visible: a prefix whose `$` is not a plain
 // parameter cannot be completed, because completing it would mean knowing what
 // it expands to.
-TEST(LeshperCompleteToken, APrefixWithAnExpansionThatIsNotANameCompletesNothing) {
+TEST(UiCompleteToken, APrefixWithAnExpansionThatIsNotANameCompletesNothing) {
 	for (const std::string_view line : {"cat $(ec", "cat ${#fo", "cat $?x"}) {
 		const token_under_cursor found = classify_token(line, line.size());
 		EXPECT_EQ(found.source, completion_source::none) << line;
 	}
 }
 
-TEST(LeshperCompleteToken, InsideACommentThereIsNothingToComplete) {
+TEST(UiCompleteToken, InsideACommentThereIsNothingToComplete) {
 	const token_under_cursor found = classify_token("ls # not a com", 14);
 	EXPECT_EQ(found.source, completion_source::none);
 }
 
-TEST(LeshperCompleteToken, AnOperatorUnderTheCursorCompletesNothing) {
+TEST(UiCompleteToken, AnOperatorUnderTheCursorCompletesNothing) {
 	// The cursor is INSIDE the `&&`, between its two bytes.
 	const token_under_cursor found = classify_token("ls && grep", 4);
 	EXPECT_EQ(found.source, completion_source::none);
 }
 
-TEST(LeshperCompleteToken, ACursorInsideAWordCompletesWhatIsBehindIt) {
+TEST(UiCompleteToken, ACursorInsideAWordCompletesWhatIsBehindIt) {
 	const token_under_cursor found = classify_token("grep foobar", 8);
 	EXPECT_EQ(found.source, completion_source::path);
 	EXPECT_EQ(found.from, 5u);
 }
 
-TEST(LeshperCompleteToken, ACursorPastTheEndIsClamped) {
+TEST(UiCompleteToken, ACursorPastTheEndIsClamped) {
 	const token_under_cursor found = classify_token("gre", 99);
 	EXPECT_EQ(found.source, completion_source::command);
 	EXPECT_EQ(found.from, 0u);
@@ -340,7 +349,7 @@ TEST(LeshperCompleteToken, ACursorPastTheEndIsClamped) {
 // Quoting
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteQuoting, OnlyBytesTheShellRereadsDifferentlyNeedIt) {
+TEST(UiCompleteQuoting, OnlyBytesTheShellRereadsDifferentlyNeedIt) {
 	EXPECT_FALSE(needs_quoting("plain.txt"));
 	EXPECT_FALSE(needs_quoting(""));
 	EXPECT_TRUE(needs_quoting("my file"));
@@ -353,7 +362,7 @@ TEST(LeshperCompleteQuoting, OnlyBytesTheShellRereadsDifferentlyNeedIt) {
 	EXPECT_FALSE(needs_quoting("a#b"));
 }
 
-TEST(LeshperCompleteQuoting, QuotingIsABackslashPerSpecialByte) {
+TEST(UiCompleteQuoting, QuotingIsABackslashPerSpecialByte) {
 	std::string into;
 	quote_into("my file.txt", into);
 	EXPECT_EQ(into, "my\\ file.txt");
@@ -362,7 +371,7 @@ TEST(LeshperCompleteQuoting, QuotingIsABackslashPerSpecialByte) {
 	EXPECT_EQ(into, "\\~x");
 }
 
-TEST(LeshperCompleteQuoting, UnquotingUndoesBackslashesAndBothQuoteForms) {
+TEST(UiCompleteQuoting, UnquotingUndoesBackslashesAndBothQuoteForms) {
 	const auto unquoted = [](std::string_view text) {
 		std::string out;
 		unquote_into(text, out);
@@ -379,7 +388,7 @@ TEST(LeshperCompleteQuoting, UnquotingUndoesBackslashesAndBothQuoteForms) {
 // The trio: command names
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteCommands, TheThreeTablesAndThePathWalkAllContribute) {
+TEST(UiCompleteCommands, TheThreeTablesAndThePathWalkAllContribute) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"cd", "command"});
 	fixture.names.define(name_domain::function, {"codebase"});
@@ -392,7 +401,7 @@ TEST(LeshperCompleteCommands, TheThreeTablesAndThePathWalkAllContribute) {
 	          (std::vector<std::string>{"cd", "co", "codebase", "command", "cowsay"}));
 }
 
-TEST(LeshperCompleteCommands, EachSourceKeepsItsMarker) {
+TEST(UiCompleteCommands, EachSourceKeepsItsMarker) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"xb"});
 	fixture.names.define(name_domain::function, {"xf"});
@@ -409,7 +418,7 @@ TEST(LeshperCompleteCommands, EachSourceKeepsItsMarker) {
 	EXPECT_EQ(result.candidates[3].kind, pager_kind::executable);
 }
 
-TEST(LeshperCompleteCommands, ANonExecutableOnPathIsNotACommand) {
+TEST(UiCompleteCommands, ANonExecutableOnPathIsNotACommand) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::path_directory, {"/bin"});
 	fixture.directories.file("/bin", "readme", false);
@@ -418,14 +427,14 @@ TEST(LeshperCompleteCommands, ANonExecutableOnPathIsNotACommand) {
 	          (std::vector<std::string>{"runner"}));
 }
 
-TEST(LeshperCompleteCommands, ADirectoryOnPathIsNotACommand) {
+TEST(UiCompleteCommands, ADirectoryOnPathIsNotACommand) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::path_directory, {"/bin"});
 	fixture.directories.directory("/bin", "subdir");
 	EXPECT_TRUE(fixture.run("s").candidates.empty());
 }
 
-TEST(LeshperCompleteCommands, ARepeatedPathElementIsWalkedOnce) {
+TEST(UiCompleteCommands, ARepeatedPathElementIsWalkedOnce) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::path_directory, {"/bin", "/bin", "/usr/bin"});
 	fixture.directories.file("/bin", "zz", true);
@@ -434,14 +443,14 @@ TEST(LeshperCompleteCommands, ARepeatedPathElementIsWalkedOnce) {
 	          (std::vector<std::string>{"/bin", "/usr/bin"}));
 }
 
-TEST(LeshperCompleteCommands, OneNameFromTwoSourcesIsOneCandidate) {
+TEST(UiCompleteCommands, OneNameFromTwoSourcesIsOneCandidate) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"cd"});
 	fixture.names.define(name_domain::function, {"cd"});
 	EXPECT_EQ(complete_fixture::texts(fixture.run("cd")), (std::vector<std::string>{"cd"}));
 }
 
-TEST(LeshperCompleteCommands, EachDomainIsAskedExactlyOncePerTab) {
+TEST(UiCompleteCommands, EachDomainIsAskedExactlyOncePerTab) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"cd"});
 	(void)fixture.run("c");
@@ -450,7 +459,7 @@ TEST(LeshperCompleteCommands, EachDomainIsAskedExactlyOncePerTab) {
 	                                    name_domain::alias, name_domain::path_directory}));
 }
 
-TEST(LeshperCompleteCommands, WithNoShellAttachedThereAreNoCommandNames) {
+TEST(UiCompleteCommands, WithNoShellAttachedThereAreNoCommandNames) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"cd"});
 	fixture.attached = false;
@@ -461,7 +470,7 @@ TEST(LeshperCompleteCommands, WithNoShellAttachedThereAreNoCommandNames) {
 // The trio: variables
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteVariables, ADollarPrefixCompletesNamesAndKeepsTheDollar) {
+TEST(UiCompleteVariables, ADollarPrefixCompletesNamesAndKeepsTheDollar) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::variable, {"HOME", "HOSTNAME", "PATH"});
 	const completion_result result = fixture.run("echo $HO");
@@ -472,7 +481,7 @@ TEST(LeshperCompleteVariables, ADollarPrefixCompletesNamesAndKeepsTheDollar) {
 	EXPECT_EQ(result.candidates[0].kind, pager_kind::word);
 }
 
-TEST(LeshperCompleteVariables, OnlyTheVariableDomainIsAsked) {
+TEST(UiCompleteVariables, OnlyTheVariableDomainIsAsked) {
 	complete_fixture fixture;
 	fixture.names.define(name_domain::variable, {"HOME"});
 	(void)fixture.run("echo $H");
@@ -483,7 +492,7 @@ TEST(LeshperCompleteVariables, OnlyTheVariableDomainIsAsked) {
 // The trio: paths
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompletePaths, TheCurrentDirectoryIsWalkedForABareLeaf) {
+TEST(UiCompletePaths, TheCurrentDirectoryIsWalkedForABareLeaf) {
 	complete_fixture fixture;
 	fixture.directories.file("", "notes.txt");
 	fixture.directories.directory("", "node_modules");
@@ -491,7 +500,7 @@ TEST(LeshperCompletePaths, TheCurrentDirectoryIsWalkedForABareLeaf) {
 	          (std::vector<std::string>{"node_modules", "notes.txt"}));
 }
 
-TEST(LeshperCompletePaths, ADirectoryGetsASlashAndStaysOpen) {
+TEST(UiCompletePaths, ADirectoryGetsASlashAndStaysOpen) {
 	complete_fixture fixture;
 	fixture.directories.directory("", "build");
 	const completion_result result = fixture.run("cat bu");
@@ -502,7 +511,7 @@ TEST(LeshperCompletePaths, ADirectoryGetsASlashAndStaysOpen) {
 	EXPECT_EQ(pager_trailer(result.candidates[0].kind), "/");
 }
 
-TEST(LeshperCompletePaths, AFileClosesWithASpace) {
+TEST(UiCompletePaths, AFileClosesWithASpace) {
 	complete_fixture fixture;
 	fixture.directories.file("", "README");
 	const completion_result result = fixture.run("cat RE");
@@ -512,7 +521,7 @@ TEST(LeshperCompletePaths, AFileClosesWithASpace) {
 	EXPECT_EQ(pager_trailer(result.candidates[0].kind), " ");
 }
 
-TEST(LeshperCompletePaths, ASymlinkGetsItsOwnMarker) {
+TEST(UiCompletePaths, ASymlinkGetsItsOwnMarker) {
 	complete_fixture fixture;
 	fixture.directories.symlink("", "link");
 	const completion_result result = fixture.run("cat li");
@@ -520,7 +529,7 @@ TEST(LeshperCompletePaths, ASymlinkGetsItsOwnMarker) {
 	EXPECT_EQ(result.candidates[0].kind, pager_kind::symlink);
 }
 
-TEST(LeshperCompletePaths, ADotfileIsOfferedOnlyWhenTheLeafAsksForOne) {
+TEST(UiCompletePaths, ADotfileIsOfferedOnlyWhenTheLeafAsksForOne) {
 	complete_fixture fixture;
 	fixture.directories.file("", ".hidden");
 	fixture.directories.file("", "visible");
@@ -530,7 +539,7 @@ TEST(LeshperCompletePaths, ADotfileIsOfferedOnlyWhenTheLeafAsksForOne) {
 	          (std::vector<std::string>{".hidden"}));
 }
 
-TEST(LeshperCompletePaths, TheDirectoryPrefixIsWalkedAndNotReplaced) {
+TEST(UiCompletePaths, TheDirectoryPrefixIsWalkedAndNotReplaced) {
 	complete_fixture fixture;
 	fixture.directories.file("/usr/", "share");
 	const completion_result result = fixture.run("cat /usr/sh");
@@ -540,14 +549,14 @@ TEST(LeshperCompletePaths, TheDirectoryPrefixIsWalkedAndNotReplaced) {
 	EXPECT_EQ(complete_fixture::texts(result), (std::vector<std::string>{"share"}));
 }
 
-TEST(LeshperCompletePaths, AnUnreadableDirectoryIsNoCandidatesAndNotAnError) {
+TEST(UiCompletePaths, AnUnreadableDirectoryIsNoCandidatesAndNotAnError) {
 	complete_fixture fixture;
 	const completion_result result = fixture.run("cat /nowhere/x");
 	EXPECT_TRUE(result.candidates.empty());
 }
 
 // §6.9: `~` expanded for the LISTING, kept in the BUFFER.
-TEST(LeshperCompletePaths, ATildeIsExpandedForTheWalkAndKeptInTheBuffer) {
+TEST(UiCompletePaths, ATildeIsExpandedForTheWalkAndKeptInTheBuffer) {
 	complete_fixture fixture;
 	const char* home = ::getenv("HOME");
 	ASSERT_NE(home, nullptr);
@@ -559,7 +568,7 @@ TEST(LeshperCompletePaths, ATildeIsExpandedForTheWalkAndKeptInTheBuffer) {
 	EXPECT_EQ(complete_fixture::texts(result), (std::vector<std::string>{"Documents"}));
 }
 
-TEST(LeshperCompletePaths, ATildeUserIsNotExpandedAndOffersNothing) {
+TEST(UiCompletePaths, ATildeUserIsNotExpandedAndOffersNothing) {
 	complete_fixture fixture;
 	fixture.directories.file("", "x");
 	const completion_result result = fixture.run("cat ~someone/x");
@@ -567,7 +576,7 @@ TEST(LeshperCompletePaths, ATildeUserIsNotExpandedAndOffersNothing) {
 	EXPECT_TRUE(fixture.directories.visited.empty());
 }
 
-TEST(LeshperCompletePaths, WhatTheUserEscapedIsMatchedUnescapedAndQuotedBack) {
+TEST(UiCompletePaths, WhatTheUserEscapedIsMatchedUnescapedAndQuotedBack) {
 	complete_fixture fixture;
 	fixture.directories.file("", "my file.txt");
 	const completion_result result = fixture.run("cat my\\ fi");
@@ -589,12 +598,12 @@ TEST(LeshperCompletePaths, WhatTheUserEscapedIsMatchedUnescapedAndQuotedBack) {
 // action, below, where the real `lesh_pager_commit` makes it.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteSet, NothingMatchedIsAnEmptySetAndNotAnError) {
+TEST(UiCompleteSet, NothingMatchedIsAnEmptySetAndNotAnError) {
 	complete_fixture fixture;
 	EXPECT_TRUE(fixture.run("cat zz").candidates.empty());
 }
 
-TEST(LeshperCompleteSet, TheSetIsSortedAndDeduplicated) {
+TEST(UiCompleteSet, TheSetIsSortedAndDeduplicated) {
 	complete_fixture fixture;
 	fixture.directories.file("", "report");
 	fixture.directories.file("", "readme");
@@ -608,7 +617,7 @@ TEST(LeshperCompleteSet, TheSetIsSortedAndDeduplicated) {
 // The wiring-site adapter, over a real shell_state
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteKnowledge, TheThreeTablesEnumerateThroughTheAdapter) {
+TEST(UiCompleteKnowledge, TheThreeTablesEnumerateThroughTheAdapter) {
 	lesh::runtime::shell_state state;
 	state.set_alias("ll", "ls -l");
 	const shell_state_knowledge knowledge{state};
@@ -623,7 +632,7 @@ TEST(LeshperCompleteKnowledge, TheThreeTablesEnumerateThroughTheAdapter) {
 	EXPECT_EQ(aliases, (std::vector<std::string>{"ll"}));
 }
 
-TEST(LeshperCompleteKnowledge, FunctionsEnumerateSortedAndByNameOnly) {
+TEST(UiCompleteKnowledge, FunctionsEnumerateSortedAndByNameOnly) {
 	lesh::buffer_pool pool{1 << 16};
 	lesh::runtime::shell_state state;
 	const lesh::syntax::tree parsed =
@@ -639,7 +648,7 @@ TEST(LeshperCompleteKnowledge, FunctionsEnumerateSortedAndByNameOnly) {
 	EXPECT_EQ(functions, (std::vector<std::string>{"alpha", "zeta"}));
 }
 
-TEST(LeshperCompleteKnowledge, VariablesEnumerateByNameAndIncludeMarkedOnes) {
+TEST(UiCompleteKnowledge, VariablesEnumerateByNameAndIncludeMarkedOnes) {
 	lesh::runtime::shell_state state;
 	EXPECT_TRUE(state.set("ZZ_ASSIGNED", "1"));
 	state.mark_exported("ZZ_MARKED");
@@ -654,7 +663,7 @@ TEST(LeshperCompleteKnowledge, VariablesEnumerateByNameAndIncludeMarkedOnes) {
 		EXPECT_EQ(one.find('='), std::string::npos);
 }
 
-TEST(LeshperCompleteKnowledge, ThePathIsSplitByTheShellAndTheWalkIsNot) {
+TEST(UiCompleteKnowledge, ThePathIsSplitByTheShellAndTheWalkIsNot) {
 	lesh::runtime::shell_state state;
 	EXPECT_TRUE(state.set("PATH", "/bin::/usr/bin"));
 	const shell_state_knowledge knowledge{state};
@@ -665,7 +674,7 @@ TEST(LeshperCompleteKnowledge, ThePathIsSplitByTheShellAndTheWalkIsNot) {
 	EXPECT_EQ(directories, (std::vector<std::string>{"/bin", ".", "/usr/bin"}));
 }
 
-TEST(LeshperCompleteKnowledge, AnUnsetPathIsNoDirectoriesAndAnEmptyOneIsDot) {
+TEST(UiCompleteKnowledge, AnUnsetPathIsNoDirectoriesAndAnEmptyOneIsDot) {
 	lesh::runtime::shell_state state;
 	EXPECT_TRUE(state.unset("PATH"));
 	const shell_state_knowledge unset{state};
@@ -679,7 +688,7 @@ TEST(LeshperCompleteKnowledge, AnUnsetPathIsNoDirectoriesAndAnEmptyOneIsDot) {
 	EXPECT_EQ(empty, (std::vector<std::string>{"."}));
 }
 
-TEST(LeshperCompleteKnowledge, TheDefaultKnowledgeEnumeratesNothing) {
+TEST(UiCompleteKnowledge, TheDefaultKnowledgeEnumeratesNothing) {
 	const environment_knowledge nothing;
 	std::vector<std::string> names;
 	nothing.enumerate(name_domain::builtin, names);
@@ -691,7 +700,7 @@ TEST(LeshperCompleteKnowledge, TheDefaultKnowledgeEnumeratesNothing) {
 // The real directory reader
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteReader, ARealDirectoryIsReadWithItsKinds) {
+TEST(UiCompleteReader, ARealDirectoryIsReadWithItsKinds) {
 	const std::filesystem::path root = repository_root();
 	std::vector<directory_reader::entry> entries;
 	ASSERT_TRUE(posix_directory_reader().read(root.string(), entries));
@@ -713,7 +722,7 @@ TEST(LeshperCompleteReader, ARealDirectoryIsReadWithItsKinds) {
 	EXPECT_EQ(find(".."), nullptr);
 }
 
-TEST(LeshperCompleteReader, ADirectoryThatIsNotThereIsFalseAndNotACrash) {
+TEST(UiCompleteReader, ADirectoryThatIsNotThereIsFalseAndNotACrash) {
 	std::vector<directory_reader::entry> entries;
 	EXPECT_FALSE(posix_directory_reader().read("/no/such/place/at/all", entries));
 	EXPECT_TRUE(entries.empty());
@@ -729,7 +738,7 @@ TEST(LeshperCompleteReader, ADirectoryThatIsNotThereIsFalseAndNotACrash) {
 // after Tab is asserting the two halves agreeing.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteAction, TheActionIsRegisteredUnderItsName) {
+TEST(UiCompleteAction, TheActionIsRegisteredUnderItsName) {
 	registry reg;
 	register_builtin_actions(reg);
 	std::int32_t exists = 0;
@@ -737,7 +746,7 @@ TEST(LeshperCompleteAction, TheActionIsRegisteredUnderItsName) {
 	EXPECT_EQ(exists, 1);
 }
 
-TEST(LeshperCompleteAction, ASingleCandidateIsInsertedWithItsKindsTrailer) {
+TEST(UiCompleteAction, ASingleCandidateIsInsertedWithItsKindsTrailer) {
 	action_fixture fixture;
 	fixture.directories.file("", "README");
 	lesh::leshper::state s = action_fixture::line("cat RE");
@@ -750,7 +759,7 @@ TEST(LeshperCompleteAction, ASingleCandidateIsInsertedWithItsKindsTrailer) {
 // §6.9: "directories complete with `/` and stay open". The `/` is the pager's,
 // from the kind; staying open is the completer's - it re-runs, and what it
 // finds the second time is the directory's contents.
-TEST(LeshperCompleteAction, ADirectoryGetsItsSlashAndTheCompletionStaysOpen) {
+TEST(UiCompleteAction, ADirectoryGetsItsSlashAndTheCompletionStaysOpen) {
 	action_fixture fixture;
 	fixture.directories.directory("", "build");
 	fixture.directories.file("build/", "one");
@@ -764,7 +773,7 @@ TEST(LeshperCompleteAction, ADirectoryGetsItsSlashAndTheCompletionStaysOpen) {
 	EXPECT_EQ(s.pager.candidates[0].text, "one");
 }
 
-TEST(LeshperCompleteAction, ADirectoryWithOneEntryCompletesItAndStops) {
+TEST(UiCompleteAction, ADirectoryWithOneEntryCompletesItAndStops) {
 	action_fixture fixture;
 	fixture.directories.directory("", "build");
 	fixture.directories.file("build/", "only");
@@ -775,7 +784,7 @@ TEST(LeshperCompleteAction, ADirectoryWithOneEntryCompletesItAndStops) {
 }
 
 // F-30, made by `lesh_pager_commit` and not by anything in this ticket.
-TEST(LeshperCompleteAction, TheSharedPrefixIsInsertedWithoutOpeningThePager) {
+TEST(UiCompleteAction, TheSharedPrefixIsInsertedWithoutOpeningThePager) {
 	action_fixture fixture;
 	fixture.directories.file("", "report-a");
 	fixture.directories.file("", "report-b");
@@ -785,7 +794,7 @@ TEST(LeshperCompleteAction, TheSharedPrefixIsInsertedWithoutOpeningThePager) {
 	EXPECT_FALSE(s.pager.open);
 }
 
-TEST(LeshperCompleteAction, AnAmbiguousSetOpensThePagerOverTheTokensSpan) {
+TEST(UiCompleteAction, AnAmbiguousSetOpensThePagerOverTheTokensSpan) {
 	action_fixture fixture;
 	fixture.directories.file("", "report");
 	fixture.directories.file("", "readme");
@@ -802,7 +811,7 @@ TEST(LeshperCompleteAction, AnAmbiguousSetOpensThePagerOverTheTokensSpan) {
 // A-12: the one buffer write is the pager's staged insertion, so a completion is
 // one undo entry and one generation bump - and undoing it puts back exactly what
 // was typed.
-TEST(LeshperCompleteAction, AnInsertionIsOneUndoEntryAndOneGeneration) {
+TEST(UiCompleteAction, AnInsertionIsOneUndoEntryAndOneGeneration) {
 	action_fixture fixture;
 	fixture.directories.file("", "README");
 	lesh::leshper::state s = action_fixture::line("cat RE");
@@ -813,7 +822,7 @@ TEST(LeshperCompleteAction, AnInsertionIsOneUndoEntryAndOneGeneration) {
 	EXPECT_EQ(s.buffer.text(), "cat RE");
 }
 
-TEST(LeshperCompleteAction, AnUnmatchedPrefixChangesNothingAndOpensNothing) {
+TEST(UiCompleteAction, AnUnmatchedPrefixChangesNothingAndOpensNothing) {
 	action_fixture fixture;
 	fixture.directories.file("", "README");
 	lesh::leshper::state s = action_fixture::line("cat zz");
@@ -822,16 +831,16 @@ TEST(LeshperCompleteAction, AnUnmatchedPrefixChangesNothingAndOpensNothing) {
 	EXPECT_FALSE(s.pager.open);
 }
 
-TEST(LeshperCompleteAction, WithNoCompleterWiredUpTabIsAnOrdinaryNothing) {
+TEST(UiCompleteAction, WithNoCompleterWiredUpTabIsAnOrdinaryNothing) {
 	action_fixture fixture;
-	fixture.reg.completion = nullptr;
+	fixture.reg.host = &fixture.completerless;
 	lesh::leshper::state s = action_fixture::line("cat re");
 	EXPECT_EQ(fixture.tab(s).status, LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "cat re");
 	EXPECT_FALSE(s.pager.open);
 }
 
-TEST(LeshperCompleteAction, AQuotedCandidateReachesTheBufferEscaped) {
+TEST(UiCompleteAction, AQuotedCandidateReachesTheBufferEscaped) {
 	action_fixture fixture;
 	fixture.directories.file("", "my file.txt");
 	lesh::leshper::state s = action_fixture::line("cat my");
@@ -839,7 +848,7 @@ TEST(LeshperCompleteAction, AQuotedCandidateReachesTheBufferEscaped) {
 	EXPECT_EQ(s.buffer.text(), "cat my\\ file.txt ");
 }
 
-TEST(LeshperCompleteAction, ACommandNameCompletesInCommandPosition) {
+TEST(UiCompleteAction, ACommandNameCompletesInCommandPosition) {
 	action_fixture fixture;
 	fixture.names.define(name_domain::builtin, {"readonly"});
 	lesh::leshper::state s = action_fixture::line("reado");
@@ -847,7 +856,7 @@ TEST(LeshperCompleteAction, ACommandNameCompletesInCommandPosition) {
 	EXPECT_EQ(s.buffer.text(), "readonly ");
 }
 
-TEST(LeshperCompleteAction, AVariableCompletesAndTheDollarStays) {
+TEST(UiCompleteAction, AVariableCompletesAndTheDollarStays) {
 	action_fixture fixture;
 	fixture.names.define(name_domain::variable, {"HOME"});
 	lesh::leshper::state s = action_fixture::line("echo $HO");
@@ -899,7 +908,7 @@ std::int32_t probe_action(lesh_editor* editor, const lesh_invocation*, void* sel
 
 } // namespace
 
-TEST(LeshperCompleteAbi, TheVerbsAnswerTheCompletersOwnResult) {
+TEST(UiCompleteAbi, TheVerbsAnswerTheCompletersOwnResult) {
 	action_fixture fixture;
 	fixture.directories.directory("", "build");
 	verb_probe probe;
@@ -919,7 +928,7 @@ TEST(LeshperCompleteAbi, TheVerbsAnswerTheCompletersOwnResult) {
 	EXPECT_EQ(probe.past_the_end_status, LESH_ERR_NOTFOUND);
 }
 
-TEST(LeshperCompleteAbi, BeforeCompleteHasRunTheReadersSayNotFound) {
+TEST(UiCompleteAbi, BeforeCompleteHasRunTheReadersSayNotFound) {
 	action_fixture fixture;
 	verb_probe probe;
 	probe.ask_before_completing = true;
@@ -930,9 +939,9 @@ TEST(LeshperCompleteAbi, BeforeCompleteHasRunTheReadersSayNotFound) {
 	EXPECT_EQ(probe.early_candidate_status, LESH_ERR_NOTFOUND);
 }
 
-TEST(LeshperCompleteAbi, WithNoCompleterCompleteSaysNotFound) {
+TEST(UiCompleteAbi, WithNoCompleterCompleteSaysNotFound) {
 	action_fixture fixture;
-	fixture.reg.completion = nullptr;
+	fixture.reg.host = &fixture.completerless;
 	verb_probe probe;
 	ASSERT_EQ(lesh_action_register(&fixture.reg, "probe", probe_action, &probe), LESH_OK);
 	lesh::leshper::state s = action_fixture::line("cat bu");
@@ -941,7 +950,7 @@ TEST(LeshperCompleteAbi, WithNoCompleterCompleteSaysNotFound) {
 	EXPECT_EQ(probe.count, 0u);
 }
 
-TEST(LeshperCompleteAbi, ARerunDiscardsThePreviousSet) {
+TEST(UiCompleteAbi, ARerunDiscardsThePreviousSet) {
 	action_fixture fixture;
 	fixture.directories.directory("", "build");
 	verb_probe probe;
@@ -960,11 +969,19 @@ TEST(LeshperCompleteAbi, ARerunDiscardsThePreviousSet) {
 // The rule the link graph already enforces, said out loud
 // ---------------------------------------------------------------------------
 
-TEST(LeshperCompleteIncludeDiscipline, TheCompleterIncludesNothingFromTheExpander) {
+TEST(UiCompleteIncludeDiscipline, TheCompleterIncludesNothingFromTheExpander) {
+	// THIS TEST IS THE WHOLE GUARD NOW, and #168 Phase B is why it had to be
+	// said out loud. While the completer was `src/leshper/complete.cpp` the rule
+	// enforced itself: `lesh_leshper` does not link `lesh_runtime`, so an
+	// `#include "runtime/expander.h"` would not have LINKED. It is
+	// `src/ui/completion.cpp` now, in the one library that links both halves, and
+	// the link can no longer say no. §6.9's rule did not change - `$VAR` in a
+	// completion prefix is never expanded in v1 - so what changed is that the
+	// only thing keeping it is this loop over the include lines.
 	const std::filesystem::path source =
-		repository_root() / "src" / "leshper" / "complete.cpp";
+		repository_root() / "src" / "ui" / "completion.cpp";
 	ASSERT_TRUE(std::filesystem::exists(source))
-		<< "the guard could not find complete.cpp from __FILE__ (" << __FILE__ << ")";
+		<< "the guard could not find completion.cpp from __FILE__ (" << __FILE__ << ")";
 	std::ifstream in{source};
 	ASSERT_TRUE(in.is_open());
 
@@ -973,13 +990,13 @@ TEST(LeshperCompleteIncludeDiscipline, TheCompleterIncludesNothingFromTheExpande
 	while (std::getline(in, line)) {
 		if (line.rfind("#include", 0) != 0)
 			continue;
-		// `lesh_leshper` does not link `lesh_runtime`, so a `runtime/` include
-		// here would fail to link - this test says WHY before the linker has to.
 		if (line.find("runtime/") != std::string::npos)
 			offences.push_back(line);
 	}
 	EXPECT_TRUE(offences.empty())
-		<< "complete.cpp must include nothing from src/runtime/ - the expander lives "
-		   "there, and §6.9 keeps the completer expander-free structurally. Found: "
+		<< "completion.cpp must include nothing from src/runtime/ - the expander "
+		   "lives there, and §6.9 keeps the completer expander-free. The link graph "
+		   "stopped enforcing it when the file moved into lesh_ui (#168 Phase B), so "
+		   "this assertion is the only thing left that does. Found: "
 		<< (offences.empty() ? std::string{} : offences.front());
 }

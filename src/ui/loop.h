@@ -463,7 +463,9 @@ public:
 	// is the shell's own tables, handed to the shell so the shell could find
 	// them - so it moved to `shell_actor`, which stamps it on every token it
 	// serves. What a helper's snapshot carries is unchanged: null, meaning "no
-	// shell attached", which is the honest answer for a state-free reactor.
+	// host attached", which is the honest answer for a state-free reactor.
+	// (#168 Phase B: what is stamped is a `const leshper::host*` now, the one
+	// door the editor has; the tables are behind it with the `$PATH` sweep.)
 
 	// --- The read entry (#98, fish #9181) -----------------------------------
 
@@ -558,7 +560,10 @@ public:
 	// that requests them and then blocks in `wait_on_shell` for the whole of
 	// each. So the completer holds a `const shell_knowledge*` and calls
 	// `enumerate` on it, on this thread, and `shell_writing_flag` asserts the
-	// premise on every read rather than leaving it as a paragraph.
+	// premise on every read rather than leaving it as a paragraph. (#168 Phase B:
+	// the completer is `ui::shell_completer` and the loop reaches it through
+	// `ui::editor_host`, which is what `lesh_complete` raises `want_completion`
+	// at. Same thread, same premise, one fewer interface.)
 
 	// --- Rendering -----------------------------------------------------------
 

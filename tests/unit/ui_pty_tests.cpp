@@ -372,7 +372,7 @@ constexpr std::string_view kAliasRc =
 
 } // namespace
 
-TEST(LeshperPty, APromptAppearsAndACommandRuns) {
+TEST(UiPty, APromptAppearsAndACommandRuns) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};
 	ASSERT_TRUE(shell.alive());
@@ -391,7 +391,7 @@ TEST(LeshperPty, APromptAppearsAndACommandRuns) {
 	EXPECT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AShellThatSetsNoPS1PaintsTheNativePrompt) {
+TEST(UiPty, AShellThatSetsNoPS1PaintsTheNativePrompt) {
 	// #157'S FLIP, END TO END, AND FROM THE FIRST PAINT. The owner's ruling is
 	// that §6.10's supersession has arrived: a user who never set `$PS1` expressed
 	// no preference - the POSIX `$ ` every `shell_state` is born holding is not a
@@ -427,7 +427,7 @@ TEST(LeshperPty, AShellThatSetsNoPS1PaintsTheNativePrompt) {
 	EXPECT_TRUE(shell.wait_for(expected, 2)) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnRcTemplateSetsThePromptAndBarePromptPrintsItBack) {
+TEST(UiPty, AnRcTemplateSetsThePromptAndBarePromptPrintsItBack) {
 	// THE TEMPLATE LANGUAGE END TO END (#157): an rc line, through the shell's own
 	// quoting, through the `prompt` builtin, through the console, into the parser,
 	// and out as painted bytes. Every layer is the real one - this file execs the
@@ -452,7 +452,7 @@ TEST(LeshperPty, AnRcTemplateSetsThePromptAndBarePromptPrintsItBack) {
 		<< "the template did not come back; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnIncompleteLineGetsTheContinuationPromptRatherThanRunning) {
+TEST(UiPty, AnIncompleteLineGetsTheContinuationPromptRatherThanRunning) {
 	// F-35, end to end: Enter asks the syntax layer, and an unterminated quote is
 	// a continuation and not a syntax error.
 	const scratch_home home{"PS1='lesh-test>'\nPS2='more>'\n"};
@@ -467,7 +467,7 @@ TEST(LeshperPty, AnIncompleteLineGetsTheContinuationPromptRatherThanRunning) {
 	EXPECT_TRUE(shell.wait_for("one\r\ntwo")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnAcceptedLineIsRecordedInTheHistory) {
+TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 	const scratch_home home{kRc};
 	{
 		shell_on_a_pty shell{home};
@@ -489,7 +489,7 @@ TEST(LeshperPty, AnAcceptedLineIsRecordedInTheHistory) {
 	EXPECT_EQ(entries.front(), "echo remembered");
 }
 
-TEST(LeshperPty, ControlCCancelsTheLineAndLeavesTheStatusAt130) {
+TEST(UiPty, ControlCCancelsTheLineAndLeavesTheStatusAt130) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};
 	ASSERT_TRUE(shell.alive());
@@ -507,7 +507,7 @@ TEST(LeshperPty, ControlCCancelsTheLineAndLeavesTheStatusAt130) {
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, TheIntTrapFiresAtThePromptTheZshWay) {
+TEST(UiPty, TheIntTrapFiresAtThePromptTheZshWay) {
 	// #98 decision 3, the owner's override of the recommendation: Ctrl-C while
 	// editing runs `cancel-line` AND fires the user's INT trap. It is also the
 	// end-to-end proof of the signal CHAIN - `g_pending` is set by a handler the
@@ -523,7 +523,7 @@ TEST(LeshperPty, TheIntTrapFiresAtThePromptTheZshWay) {
 	EXPECT_TRUE(shell.wait_for("caught-int")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnIgnoredIntLeavesTheLineAloneAtThePrompt) {
+TEST(UiPty, AnIgnoredIntLeavesTheLineAloneAtThePrompt) {
 	// #142 rule 3, end to end: the newest ignore stands. `trap '' INT` means in
 	// lesh what it means in bash - Ctrl-C inert at the prompt - because the hub's
 	// reassert now asks the kernel first and declines to take a SIG_IGN back.
@@ -549,7 +549,7 @@ TEST(LeshperPty, AnIgnoredIntLeavesTheLineAloneAtThePrompt) {
 	EXPECT_EQ(shell.count_of("^C"), 0u) << "an ignored SIGINT still printed a cancel indicator";
 }
 
-TEST(LeshperPty, ADefaultHangupKillsTheShell) {
+TEST(UiPty, ADefaultHangupKillsTheShell) {
 	// #142 rule 5 - SIGHUP left the hub entirely. The hub used to CATCH a
 	// SIG_DFL SIGHUP, and the editor's signal entrance is deliberately unbound,
 	// so `kill -HUP $$` on a shell with no HUP trap was simply eaten. `trap - HUP`
@@ -571,7 +571,7 @@ TEST(LeshperPty, ADefaultHangupKillsTheShell) {
 		<< "SIGHUP did not kill the shell the way its own disposition says it should";
 }
 
-TEST(LeshperPty, AChildTrapFiresAfterACommand) {
+TEST(UiPty, AChildTrapFiresAfterACommand) {
 	// #142 rule 4a, end to end, and the defect that motivated the whole ticket.
 	// `trap 'cmd' CHLD` installs `record_signal`; the old save-once hub stomped
 	// it at the next reassert and went on chaining to the disposition from before
@@ -590,7 +590,7 @@ TEST(LeshperPty, AChildTrapFiresAfterACommand) {
 	EXPECT_TRUE(shell.wait_for("caught-chld")) << "the CHLD trap never fired; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlCDuringAForegroundCommandStillYields130AndFiresTheTrap) {
+TEST(UiPty, ControlCDuringAForegroundCommandStillYields130AndFiresTheTrap) {
 	// #142's second amendment: delivery is pinned to the shell thread now - the
 	// loop thread and every helper block the caught set at spawn - so a Ctrl-C
 	// during EXECUTION reaches the one thread that owns `g_pending` every time
@@ -619,7 +619,7 @@ TEST(LeshperPty, ControlCDuringAForegroundCommandStillYields130AndFiresTheTrap) 
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlCDuringAForegroundCommandAbandonsTheRestOfTheLine) {
+TEST(UiPty, ControlCDuringAForegroundCommandAbandonsTheRestOfTheLine) {
 	// THE OTHER HALF of the case above, and the half nothing was watching. With no
 	// trap set, #52's interactive default is what answers SIGINT: the shell stops
 	// running the line rather than merely surviving it. `sleep 5; echo after` must
@@ -660,7 +660,7 @@ TEST(LeshperPty, ControlCDuringAForegroundCommandAbandonsTheRestOfTheLine) {
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlZStopsTheForegroundCommandAndReturnsThePrompt) {
+TEST(UiPty, ControlZStopsTheForegroundCommandAndReturnsThePrompt) {
 	// #161, and the whole of it: #159 reset SIGTSTP to default in the child and
 	// gave it the terminal, so the suspend character now genuinely stops a
 	// foreground external - and every foreground `waitpid(pid, &st, 0)` in the
@@ -726,7 +726,7 @@ TEST(LeshperPty, ControlZStopsTheForegroundCommandAndReturnsThePrompt) {
 	::kill(stopped, SIGKILL);
 }
 
-TEST(LeshperPty, AForegroundPipelineHandsTheTerminalToTheWholeJob) {
+TEST(UiPty, AForegroundPipelineHandsTheTerminalToTheWholeJob) {
 	// #160, and the case the acceptance criteria call `ls | less`: a pipeline is ONE
 	// foreground job, so the terminal goes to its process group and every stage is
 	// in that group. Only a pager can show a human that it worked; what a test can
@@ -754,7 +754,7 @@ TEST(LeshperPty, AForegroundPipelineHandsTheTerminalToTheWholeJob) {
 		<< shell.seen();
 }
 
-TEST(LeshperPty, AForegroundSubshellHandsTheTerminalToTheCommandInside) {
+TEST(UiPty, AForegroundSubshellHandsTheTerminalToTheCommandInside) {
 	// #160's other half, and the acceptance criterion `(nvim .)` takes the screen.
 	//
 	// WHAT MAKES THIS DIFFERENT FROM THE PIPELINE is why `enter_subshell` needed a
@@ -775,7 +775,7 @@ TEST(LeshperPty, AForegroundSubshellHandsTheTerminalToTheCommandInside) {
 		<< shell.seen();
 }
 
-TEST(LeshperPty, ABackgroundJobNeverBecomesTheTerminalsForegroundGroup) {
+TEST(UiPty, ABackgroundJobNeverBecomesTheTerminalsForegroundGroup) {
 	// THE NEGATIVE SPACE, ASSERTED RATHER THAN ASSUMED (#158 decision 3, #160).
 	// This is the half a widening change can silently break: `&` reaches the very
 	// same `run_simple_command` a foreground command does, one fork further down,
@@ -800,7 +800,7 @@ TEST(LeshperPty, ABackgroundJobNeverBecomesTheTerminalsForegroundGroup) {
 		<< "a background job took the terminal; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ACommandSubstitutionNeverBecomesTheTerminalsForegroundGroup) {
+TEST(UiPty, ACommandSubstitutionNeverBecomesTheTerminalsForegroundGroup) {
 	// The other negative, and the one with a reader on the other end of it: the
 	// LINE EDITOR is reading that terminal while a substitution runs, so a
 	// `$(read x)` that became the foreground group would take the user's keystrokes
@@ -825,7 +825,7 @@ TEST(LeshperPty, ACommandSubstitutionNeverBecomesTheTerminalsForegroundGroup) {
 		<< "a command substitution took the terminal from the editor; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlZStopsEveryStageOfAForegroundPipeline) {
+TEST(UiPty, ControlZStopsEveryStageOfAForegroundPipeline) {
 	// THE REVIEW DEFECT IN #160's FIRST CUT, as a test. The terminal handoff is one
 	// per process GROUP - the pipeline's leader makes it for the whole job - but
 	// #158 decision 4's signal reset is one per PROCESS THAT EXECS, and while both
@@ -914,7 +914,7 @@ TEST(LeshperPty, ControlZStopsEveryStageOfAForegroundPipeline) {
 		::kill(pid, SIGKILL);
 }
 
-TEST(LeshperPty, ControlCDuringAForegroundPipelineYields130AndAbandonsTheLine) {
+TEST(UiPty, ControlCDuringAForegroundPipelineYields130AndAbandonsTheLine) {
 	// `sleep 5 | cat` STILL DIES TO A SINGLE CTRL-C, which is an acceptance
 	// criterion precisely because #160 is what puts it at risk. Handing the
 	// pipeline's group the terminal excludes the shell from the keyboard interrupt,
@@ -950,7 +950,7 @@ TEST(LeshperPty, ControlCDuringAForegroundPipelineYields130AndAbandonsTheLine) {
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlCDuringAForegroundPipelineFiresTheIntTrap) {
+TEST(UiPty, ControlCDuringAForegroundPipelineFiresTheIntTrap) {
 	// The sibling of the case above and of #159's own trap test, for the job shape
 	// #160 adds. Measured on this machine with `trap 'echo T' INT; sleep 5 | cat`
 	// and Ctrl-C on a pty: dash fires the trap, zsh fires it, bash does not. That
@@ -974,7 +974,7 @@ TEST(LeshperPty, ControlCDuringAForegroundPipelineFiresTheIntTrap) {
 		<< "the INT trap did not fire for a foreground pipeline; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlCDuringAForegroundSubshellYields130AndAbandonsTheLine) {
+TEST(UiPty, ControlCDuringAForegroundSubshellYields130AndAbandonsTheLine) {
 	// The same contract for the same reason one construct over - and the one that
 	// needed more than a call to `note_interrupt_after_handoff` to keep.
 	//
@@ -1010,7 +1010,7 @@ TEST(LeshperPty, ControlCDuringAForegroundSubshellYields130AndAbandonsTheLine) {
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
+TEST(UiPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};
 	ASSERT_TRUE(shell.alive());
@@ -1031,7 +1031,7 @@ TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
 	EXPECT_TRUE(is_cooked(after)) << "a normal exit left the terminal raw";
 }
 
-TEST(LeshperPty, TheExitBuiltinEndsTheSessionWithItsStatus) {
+TEST(UiPty, TheExitBuiltinEndsTheSessionWithItsStatus) {
 	const scratch_home home{kRc};
 	shell_on_a_pty shell{home};
 	ASSERT_TRUE(shell.alive());
@@ -1048,7 +1048,7 @@ TEST(LeshperPty, TheExitBuiltinEndsTheSessionWithItsStatus) {
 	EXPECT_TRUE(is_cooked(after)) << "`exit` left the terminal raw";
 }
 
-TEST(LeshperPty, AnAcceptedExitPaintsNoSecondPromptAndLeavesAFreshLine) {
+TEST(UiPty, AnAcceptedExitPaintsNoSecondPromptAndLeavesAFreshLine) {
 	// #152, both halves at once. `exit` is honoured by the SHELL thread, which
 	// answers the `execute` slot and only then says the session is over - so the
 	// loop used to unpark, repaint a prompt for a line that will never be typed,
@@ -1073,7 +1073,7 @@ TEST(LeshperPty, AnAcceptedExitPaintsNoSecondPromptAndLeavesAFreshLine) {
 		<< "`exit` left the cursor mid-line; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnExitWithAStatusAlsoLeavesAFreshLine) {
+TEST(UiPty, AnExitWithAStatusAlsoLeavesAFreshLine) {
 	// The same path with a status on it: `exit N` is still an accepted line, and
 	// the status is the shell's answer, not a different exit sequence.
 	const scratch_home home{kRc};
@@ -1093,7 +1093,7 @@ TEST(LeshperPty, AnExitWithAStatusAlsoLeavesAFreshLine) {
 		<< "`exit 3` left the cursor mid-line; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, ControlDAtAnEmptyPromptLeavesAFreshLine) {
+TEST(UiPty, ControlDAtAnEmptyPromptLeavesAFreshLine) {
 	// The EOF half. Nothing is accepted here and nothing runs, so no `\r\n` was
 	// ever written: the cursor is sitting just after `lesh-test>` when the loop
 	// tears down, and the teardown is the only side that can move it.
@@ -1113,7 +1113,7 @@ TEST(LeshperPty, ControlDAtAnEmptyPromptLeavesAFreshLine) {
 		<< "Ctrl-D left the cursor mid-line; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, DyingOnTheAssertPathStillRestoresTheTerminal) {
+TEST(UiPty, DyingOnTheAssertPathStillRestoresTheTerminal) {
 	// #98 decision 5, and the one that is easiest to get wrong: `LESH_ASSERT`
 	// dies through `std::abort()`, so SIGABRT is the assert-and-die path. The
 	// registered restore is async-signal-safe - one `tcgetpgrp`, one `tcsetattr`,
@@ -1137,7 +1137,7 @@ TEST(LeshperPty, DyingOnTheAssertPathStillRestoresTheTerminal) {
 	EXPECT_TRUE(is_cooked(after)) << "the fatal-signal path left the terminal raw";
 }
 
-TEST(LeshperPty, ATerminalBelowTheFloorIsRefusedInOneLine) {
+TEST(UiPty, ATerminalBelowTheFloorIsRefusedInOneLine) {
 	// #97 decision 3: below the floor, leshper never starts. Exit 2, one line -
 	// and NOT a degraded renderer, which is the half of the decision that is
 	// invisible in the code and would be easy to add later by accident.
@@ -1154,7 +1154,7 @@ TEST(LeshperPty, ATerminalBelowTheFloorIsRefusedInOneLine) {
 	EXPECT_EQ(shell.count_of(kPrompt), 0u) << "it started anyway";
 }
 
-TEST(LeshperPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
+TEST(UiPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
 	// F-25 ON A REAL TERMINAL (#144): the autosuggester proposes off the session's
 	// own history, the loop applies the batch, and a key the rc BOUND runs an
 	// action that reads the proposal back through `lesh_proposal_read` and stages
@@ -1196,7 +1196,7 @@ TEST(LeshperPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
 	                                     << shell.seen();
 }
 
-TEST(LeshperPty, RawModeClearsIEXTENAndTheExitPutsItBack) {
+TEST(UiPty, RawModeClearsIEXTENAndTheExitPutsItBack) {
 	// #140 decision 1, and #98's raw mode made complete. On macOS and the BSDs
 	// IEXTEN is what makes the driver's extended `c_cc` entries live: Ctrl-Y is
 	// VDSUSP, Ctrl-O is VDISCARD, Ctrl-V is VLNEXT, Ctrl-W is VWERASE and Ctrl-R
@@ -1233,7 +1233,7 @@ TEST(LeshperPty, RawModeClearsIEXTENAndTheExitPutsItBack) {
 	EXPECT_TRUE(is_cooked(after));
 }
 
-TEST(LeshperPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
+TEST(UiPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
 	// The bit above, spent. `<C-v>` is VLNEXT on this platform, so before #147
 	// the driver swallowed the 0x16 and quoted the byte after it - and the `\r`
 	// that follows here would have been inserted as a literal carriage return,
@@ -1263,7 +1263,7 @@ TEST(LeshperPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
 		<< "the Ctrl-V byte never reached the shell; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
+TEST(UiPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
 	// #140's table on a real terminal, with NOTHING bound by the rc: `<Right>`
 	// is `accept_suggestion_or_forward_char` out of the box, the cursor is at
 	// the end of the buffer and a suggestion is showing, so the key accepts and
@@ -1297,7 +1297,7 @@ TEST(LeshperPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
 // What the shell knows, painted (#151, F-21)
 // ===========================================================================
 
-TEST(LeshperPty, ABuiltinWithNoBinaryBehindItPaintsAsRunnable) {
+TEST(UiPty, ABuiltinWithNoBinaryBehindItPaintsAsRunnable) {
 	// THE DEFECT #151 FIXED, and the only shape of test that could see it. The
 	// highlighter runs on the shell thread (ADR-0009) and its token is built by
 	// `shell_actor`; that build copied every field of the snapshot except
@@ -1324,7 +1324,7 @@ TEST(LeshperPty, ABuiltinWithNoBinaryBehindItPaintsAsRunnable) {
 		<< "`bind` did not paint as runnable; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, AnAliasFromTheRcPaintsAsRunnable) {
+TEST(UiPty, AnAliasFromTheRcPaintsAsRunnable) {
 	// The alias table, reached the same way - and the rc is what puts it there,
 	// so this is #101's ordering and #135's door in one line. `zzalias` is not a
 	// builtin, not a function and not on anybody's `$PATH`.
@@ -1338,7 +1338,7 @@ TEST(LeshperPty, AnAliasFromTheRcPaintsAsRunnable) {
 		<< "the rc's alias did not paint as runnable; saw: " << shell.seen();
 }
 
-TEST(LeshperPty, TheShellsOwnPathDecidesWhetherAnExternalIsKnown) {
+TEST(UiPty, TheShellsOwnPathDecidesWhetherAnExternalIsKnown) {
 	// #124's case, end to end: it is the SHELL's `PATH` variable that classifies,
 	// not the process environment `getenv` would answer with. The assignment is
 	// RUN, not merely typed, because a typed prefix assignment has not happened

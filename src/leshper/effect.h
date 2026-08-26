@@ -2,6 +2,7 @@
 
 #include "leshper/state.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <type_traits>
@@ -145,6 +146,41 @@ struct disarm_timer {
 	}
 };
 
+// Ask the HOST for completion candidates (#168 Phase B).
+//
+// WHAT TAB NEEDED TO KNOW WAS NEVER THE EDITOR'S. Finding the token under the
+// cursor is a lex, classifying it needs the shell's alias, function and builtin
+// tables, and turning it into candidates is a `$PATH` sweep and a readdir. All
+// of that is knowledge and filesystem; the editor's half of a completion is the
+// pager and the insertion. So the question leaves as an effect and the answer
+// comes back as `completion_candidates`.
+//
+// THE BUFFER IS BORROWED, NOT COPIED. It points at the STAGED buffer of the
+// action that asked (`lesh_editor::staged`), which is alive for the whole of the
+// call that produced this effect and is the text the user can actually see -
+// completing the target's buffer instead would complete text an earlier edit in
+// the same action had already replaced. Nothing on this channel allocates, so
+// the alternative to a view would be a fixed array and a length cap on the line.
+//
+// SYNCHRONOUS, and that is `lesh_complete`'s contract rather than a shortcut:
+// the ABI verb answers a count that the action reads back in the same call, so
+// the host performs this one where it is raised (`registry::host`) instead of
+// after `step` returns. The generation still travels, because the pair is the
+// same pair a worker would use if #139's deferral to an index stage ever lands,
+// and an answer that cannot be told stale is an answer that cannot be moved off
+// the loop later.
+struct want_completion {
+	generation computed_against;
+	const char* buffer = nullptr;
+	std::size_t length = 0;
+	std::size_t cursor = 0;
+
+	friend bool operator==(const want_completion& a, const want_completion& b) noexcept {
+		return a.computed_against == b.computed_against && a.buffer == b.buffer
+		       && a.length == b.length && a.cursor == b.cursor;
+	}
+};
+
 // NOTHING ON THIS CHANNEL ALLOCATES (N-2), and the compiler is what says so.
 //
 // An effect is emitted per turn and, for a timer, per expiry - once a second on a
@@ -164,6 +200,7 @@ static_assert(std::is_trivially_copyable_v<end_of_file>);
 static_assert(std::is_trivially_copyable_v<recursive_edit_request>);
 static_assert(std::is_trivially_copyable_v<arm_timer>);
 static_assert(std::is_trivially_copyable_v<disarm_timer>);
+static_assert(std::is_trivially_copyable_v<want_completion>);
 
 // What one turn of the state machine emits (A-2).
 //

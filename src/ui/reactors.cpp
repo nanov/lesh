@@ -3,20 +3,31 @@
 // other route (#93, ADR-0008, A-11). Two sections, in that order; the
 // autosuggester's begins at the banner near the bottom.
 //
+// THE HOST'S, SINCE #168 PHASE B. This was `src/leshper/builtin_reactors.cpp`.
+// Nothing about how it reaches the editor changed - see below - but what it DOES
+// is knowledge: a re-parse of the line, the shell's alias/function/builtin
+// tables, a `$PATH` sweep, a walk of the history. The editor's half of both
+// features is colouring a region and drawing virtual text, and it keeps that
+// half; a file that has to ask what `deploy` IS belongs on the side that knows.
+//
 // LOOK AT THE INCLUDES, and at what is NOT among them. This file sees
 // `leshper/abi.h` and nothing else from leshper - not state.h, not registry.h,
 // not text.h. It cannot read the buffer except by copying it out of the request
 // token, cannot emit a decoration except through that token, and cannot learn
 // that its answer was thrown away. It is a plugin written in C++, held to
 // exactly the surface a Lua reactor will get, by the compiler rather than by
-// anyone's care - the #110 discipline, applied to the reactor half.
+// anyone's care - the #110 discipline, applied to the reactor half. That is why
+// the move was a file move and a namespace change: the door was already the only
+// door.
 //
 // The syntax layer IS allowed, and deliberately: ADR-0008 records "syntax
 // queries on the token" as a door v1 does not open, because "the only clients
 // are native and call the syntax layer directly; zle never had parse access,
 // which is why zsh highlighting re-implements the grammar, the C-5 bug class".
 // So the highlighter calls `parse()` itself. C-1 to C-6 froze as leshper's
-// public API when #104 landed, and this is the client that unfreezes nothing.
+// public API when #104 landed, and this is the client that unfreezes nothing -
+// and since Phase B it is the client from OUTSIDE the editor, which is why
+// `lesh_leshper` no longer links `lesh_syntax` at all.
 //
 // WHY THIS RUNS ON A WORKER (F-22): classifying a command name touches the
 // filesystem - a PATH sweep with a stat per candidate - and that cannot sit on
@@ -32,17 +43,19 @@
 // #90 made the whole design rest on. When the pool lands, this member moves to
 // the worker and nothing else here changes.
 
+#include "ui/reactors.h"
+
 #include "leshper/abi.h"
 
-// The SEARCHER, on the same terms the syntax layer is here on, and the one
-// leshper header this file has that is not abi.h. history_search.h is itself
-// held to the abi.h-only discipline - read its own opening comment - so it
-// carries no editor state, no registry and no arena pointer, and including it
-// opens no door this file is meant to be shut out of. What it is, is #125's
-// pure searcher: query in, matches out, a `history_source` it does not own. The
-// alternative was reimplementing prefix search here, which is the C-5 bug class
-// with a different noun.
-#include "leshper/history_search.h"
+// The SEARCHER, on the same terms the syntax layer is here on. It is a sibling
+// in `lesh::ui` now rather than a leshper header, and it is still held to the
+// abi.h-only discipline - read its own opening comment - so it carries no editor
+// state, no registry and no arena pointer, and including it opens no door this
+// file is meant to be shut out of. What it is, is #125's pure searcher: query in,
+// matches out, a `history_source` it does not own. The alternative was
+// reimplementing prefix search here, which is the C-5 bug class with a different
+// noun.
+#include "ui/history_search.h"
 
 #include "substrate/arena.h"
 #include "syntax/ast.h"
@@ -80,7 +93,7 @@ constexpr std::uint32_t kPollEvery = 256;
 
 } // namespace
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // The highlighter's registration-time context: its arena and its interned style
 // ids. Opaque outside this file - registry.h declares the type and the two
@@ -113,11 +126,11 @@ struct highlighter {
 	std::uint32_t error_syntax = LESH_STYLE_NONE;
 };
 
-} // namespace lesh::leshper
+} // namespace lesh::ui
 
 namespace {
 
-using lesh::leshper::highlighter;
+using lesh::ui::highlighter;
 
 // A run of arena bytes that knows whether it came from the arena's MALLOC
 // FALLBACK and is therefore its own to release - arena_array's rule, one layer
@@ -573,9 +586,9 @@ constexpr style_slot kStyles[] = {
 
 } // namespace
 
-// Out of line rather than in registry.h, so that this file needs no leshper
-// header but abi.h. Declared in registry.h; see the note at the top.
-namespace lesh::leshper {
+// Out of line rather than in reactors.h, so that this file needs no leshper
+// header but abi.h. Declared in reactors.h; see the note at the top.
+namespace lesh::ui {
 
 highlighter* highlighter_create() { return new highlighter{}; }
 
@@ -597,7 +610,7 @@ std::size_t register_builtin_reactors(lesh_registry& reg, highlighter& self) {
 	       ? 1u : 0u;
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui
 
 // ===========================================================================
 // The autosuggester (#133: F-24, F-25, F-26)
@@ -642,10 +655,10 @@ std::size_t register_builtin_reactors(lesh_registry& reg, highlighter& self) {
 // a second reactor proposing under the same kind is what the ABI already is.
 // ===========================================================================
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // The autosuggester's registration-time context. Opaque outside this file, like
-// `highlighter` - registry.h declares the type and the functions that make and
+// `highlighter` - reactors.h declares the type and the functions that make and
 // unmake one, and that is all any caller can see.
 struct autosuggester {
 	// Sized for a long command line, not for a parse: the only thing that goes
@@ -669,12 +682,12 @@ struct autosuggester {
 	std::uint32_t suggestion = LESH_STYLE_NONE;
 };
 
-} // namespace lesh::leshper
+} // namespace lesh::ui
 
 namespace {
 
-using lesh::leshper::autosuggester;
-using lesh::leshper::history_search;
+using lesh::ui::autosuggester;
+using lesh::ui::history_search;
 
 // The sink `history_search::run` calls, as a type rather than as a capture.
 //
@@ -808,7 +821,7 @@ std::int32_t autosuggest(lesh_request* request, void* userdata) {
 
 } // namespace
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 autosuggester* autosuggester_create(const history_source* source) {
 	autosuggester* self = new autosuggester{};
@@ -832,4 +845,4 @@ std::size_t register_autosuggester(lesh_registry& reg, autosuggester& self) {
 	       ? 1u : 0u;
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

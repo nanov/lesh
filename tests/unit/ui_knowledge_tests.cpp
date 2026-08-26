@@ -1,6 +1,7 @@
 #include "leshper/abi.h"
 #include "leshper/registry.h"
-#include "leshper/shell_knowledge.h"
+#include "ui/editor_host.h"
+#include "ui/shell_knowledge.h"
 #include "leshper/state.h"
 #include "runtime/shell_state.h"
 #include "substrate/arena.h"
@@ -46,7 +47,7 @@ using namespace lesh::ui;
 //   with a death test that fires it.
 //
 // The layers BELOW these - the ABI verb and the highlighter's classes - are
-// `leshper_knowledge_tests.cpp`, which includes nothing from `ui/`.
+// `ui_command_kind_tests.cpp`, which drives the ABI verb over a fake host.
 
 namespace {
 
@@ -131,12 +132,13 @@ struct verb_fixture {
 	loop_harness loop{reg};
 	probe asked;
 	fake_knowledge shell;
+	editor_host host{&shell};
 
 	verb_fixture() {
 		EXPECT_EQ(lesh_reactor_register(&reg, "probe", LESH_EVENT_BUFFER_CHANGED,
 		                                probe_reactor, &asked),
 		          LESH_OK);
-		reg.knowledge = &shell;
+		reg.host = &host;
 	}
 
 	// One request, asking about every name in order. Returns what came back.
@@ -267,7 +269,8 @@ TEST(UiKnowledge, TheAdapterAnswersTheVerbEndToEnd) {
 	shell.set_alias("ll", "ls -l");
 	ASSERT_TRUE(shell.set("PATH", scratch.dir()));
 	const shell_state_knowledge knowledge{shell};
-	fixture.reg.knowledge = &knowledge;
+	editor_host host{&knowledge};
+	fixture.reg.host = &host;
 	EXPECT_EQ(fixture.kind_of("ll"), LESH_COMMAND_ALIAS);
 	EXPECT_EQ(fixture.kind_of("cd"), LESH_COMMAND_BUILTIN);
 	EXPECT_EQ(fixture.kind_of("mytool"), LESH_COMMAND_EXTERNAL);
@@ -315,7 +318,7 @@ void serve_one_highlight(shell_actor& actor, probe& asked) {
 	request_snapshot asking = snapshot_of(s, LESH_EVENT_BUFFER_CHANGED);
 	// THE LOOP DOES NOT FILL THIS IN, and that is the whole change: what the
 	// shell knows is not something the loop knows about the shell.
-	EXPECT_EQ(asking.knowledge, nullptr);
+	EXPECT_EQ(asking.host, nullptr);
 	actor.post_highlight("probe", &probe_reactor, &asked, std::move(asking));
 	ASSERT_TRUE(actor.serve_one());
 	std::vector<shell_message> inbox;
@@ -335,7 +338,8 @@ TEST(UiKnowledge, TheActorStampsItsShellsTablesOnTheTokenItServes) {
 	idle_shell nothing;
 	fake_knowledge shell;
 	shell.define("exit", command_kind::builtin);
-	shell_actor actor{nothing, &shell};
+	const editor_host host{&shell};
+	shell_actor actor{nothing, &host};
 
 	probe asked;
 	asked.ask = {"exit"};
@@ -355,7 +359,13 @@ TEST(UiKnowledge, AnActorWithNoTablesLeavesTheTokenOnTheEnvironmentFallback) {
 	const scoped_env_path path{scratch.dir().c_str()};
 
 	idle_shell nothing;
-	shell_actor actor{nothing, nullptr};
+	// The environment fallback is a HOST now (#168 Phase B): what used to be
+	// leshper's own `environment_knowledge` behind the ABI verb is one more thing
+	// on the far side of the one door, because the `$PATH` sweep it needs is
+	// filesystem knowledge.
+	const environment_knowledge environment;
+	const editor_host host{&environment};
+	shell_actor actor{nothing, &host};
 
 	probe asked;
 	asked.ask = {"tool", "nosuchtool"};
@@ -403,7 +413,8 @@ TEST(UiKnowledge, TheWritingFlagIsDownExceptInsideTheTwoWriters) {
 	};
 
 	watching_shell shell{writing, up_during_execute, up_during_port_call};
-	shell_actor actor{shell, &knowledge, &writing};
+	const editor_host host{&knowledge};
+	shell_actor actor{shell, &host, &writing};
 
 	lesh::leshper::state s;
 	EXPECT_FALSE(writing.writing());
@@ -438,7 +449,8 @@ TEST(UiKnowledgeDeathTest, AReadWhileTheShellIsWritingTripsTheAssertion) {
 	shell_writing_flag writing;
 	const shell_state_knowledge knowledge{state, &writing};
 	reading_shell wrong{knowledge};
-	shell_actor actor{wrong, &knowledge, &writing};
+	const editor_host host{&knowledge};
+	shell_actor actor{wrong, &host, &writing};
 
 	lesh::leshper::state s;
 	actor.post_execute("anything", s.gen);

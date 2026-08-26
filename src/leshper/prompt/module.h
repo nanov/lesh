@@ -61,7 +61,7 @@ enum class element_status : std::uint8_t {
 // makes a render a pure function of a value, so a test writes the facts down
 // instead of building a shell; and it makes the value a literal type, so the
 // default prompt renders inside a `static_assert`. The wiring site fills it from
-// `shell_knowledge` on the shell thread (§6.10: never by reaching across the
+// `ui::shell_knowledge` on the shell thread (§6.10: never by reaching across the
 // link boundary), and this file has never heard of that.
 //
 // The views are BORROWED for the duration of one render. Nothing here is stored

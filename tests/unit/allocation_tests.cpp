@@ -3,6 +3,7 @@
 #include "ui/loop.h"
 #include "leshper/event.h"
 #include "leshper/keymap.h"
+#include "leshper/host.h"
 #include "leshper/registry.h"
 #include "leshnici/prompt_modules.h"
 #include "leshper/prompt/prompt.h"
@@ -424,6 +425,193 @@ TEST_F(AllocationTest, ATimerExpiryCostsNoHeap) {
 	EXPECT_EQ(counted, 0u) << "a timer expiry reached the heap";
 
 	EXPECT_EQ(lesh_timer_stop(&actions, id), LESH_OK);
+}
+
+// --- The reactor channel and the completion channel (#168 Phase B) ---------
+
+TEST_F(AllocationTest, ApplyingAWarmHighlightBatchCostsNoHeap) {
+	// THE APPLY, ISOLATED FROM THE COMPUTE, AND IT IS ZERO. #168 Phase B moved
+	// the highlighter and the autosuggester out of the editor and into `src/ui/`;
+	// what stayed is the half that takes their answer - `apply_batch`,
+	// `decorations::rebuild`, `state::proposals` - and this is the number that
+	// says the editor's half of a keystroke reaches the heap not at all.
+	//
+	// IT WAS NOT ZERO UNTIL THIS TICKET. `rebuild` declared its three sweep
+	// buffers as locals and `_texts` was cleared and rebuilt, so a warm line cost
+	// three mallocs for the sweep plus one per redrawn suggestion, per reactor,
+	// per character typed. The buffers are members cleared in place now
+	// (`decorations::rebuild_scratch`) and `_texts` is assigned over rather than
+	// cleared, so the steady state grows nothing.
+	//
+	// COMPUTING may allocate and does: a parse, a `$PATH` sweep, a history walk.
+	// All of it is the host's now and none of it is inside the window below.
+	//
+	// TWO LAYERS, BECAUSE THERE ARE TWO REACTORS. The highlighter's batch is
+	// spans; the autosuggester's is a virtual text and a proposal. A keystroke
+	// applies one of each, and the two go into different layers - so measuring
+	// only one of them would miss the flattening `rebuild` does across both.
+	//
+	// PING-PONG RATHER THAN A REPEATED APPLY. `apply_batch` SWAPS: the batch goes
+	// home carrying the storage the layer had. Applying two batches alternately
+	// therefore rotates their storage through the layer, which is exactly the
+	// steady state a keystroke produces. THE PRIMER exists because of that swap:
+	// the layer starts with EMPTY vectors, and without one apply to push those out
+	// of the rotation the empty set would keep coming back round, `_texts` would
+	// shrink to nothing every other turn, and the string it had grown would be
+	// freed and reallocated - measuring the warm-up, not the steady state.
+	using namespace lesh::leshper;
+
+	state s;
+	s.gen.bump();
+
+	const auto painted_batch = [&](const char* reactor) {
+		reactor_batch batch;
+		batch.reactor = reactor;
+		batch.computed_against = s.gen;
+		// NESTED AND OVERLAPPING ON PURPOSE: `rebuild`'s edge sweep is what the
+		// scratch buffers are for, and a set of disjoint spans would never enter
+		// it. This is the shape `paint_segments` emits for a quoted run with an
+		// expansion inside it.
+		for (std::size_t i = 0; i < 8; ++i)
+			batch.spans.push_back(
+				decoration_span{i * 4, i * 4 + 9, static_cast<std::uint32_t>(i + 1)});
+		return batch;
+	};
+	const auto suggested_batch = [&] {
+		reactor_batch batch;
+		batch.reactor = "autosuggester";
+		batch.computed_against = s.gen;
+		// Long enough to miss libc++'s inline buffer, so a `_texts` that cleared
+		// instead of assigning would show up as one malloc per apply.
+		batch.texts.push_back(
+			virtual_text{32, "a suggestion long enough not to fit inline", 7});
+		batch.proposals.push_back(proposal{
+			LESH_PROPOSAL_AUTOSUGGESTION, "a history entry long enough not to fit inline"});
+		return batch;
+	};
+
+	reactor_batch painted_a = painted_batch("highlighter");
+	reactor_batch painted_b = painted_batch("highlighter");
+	reactor_batch suggested_primer = suggested_batch();
+	reactor_batch suggested_a = suggested_batch();
+	reactor_batch suggested_b = suggested_batch();
+
+	// Warm. The primer pushes the layer's initial empty vectors out of the
+	// rotation and is not used again; the four applies after it give every
+	// rotating buffer, and every buffer `rebuild` keeps, the capacity a line of
+	// this size needs.
+	ASSERT_TRUE(apply_batch(s, painted_a));
+	ASSERT_TRUE(apply_batch(s, suggested_primer));
+	for (int i = 0; i < 2; ++i) {
+		ASSERT_TRUE(apply_batch(s, painted_b));
+		ASSERT_TRUE(apply_batch(s, suggested_a));
+		ASSERT_TRUE(apply_batch(s, painted_a));
+		ASSERT_TRUE(apply_batch(s, suggested_b));
+	}
+	ASSERT_EQ(s.marks.texts().size(), 1u) << "the suggestion is not on screen; nothing is measured";
+	ASSERT_FALSE(s.marks.spans().empty()) << "no spans painted; the sweep never ran";
+	ASSERT_FALSE(s.proposals.empty()) << "no proposal applied; half the channel is untested";
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 1000; ++i) {
+			(void)apply_batch(s, painted_b);
+			(void)apply_batch(s, suggested_a);
+			(void)apply_batch(s, painted_a);
+			(void)apply_batch(s, suggested_b);
+		}
+	});
+	EXPECT_EQ(counted, 0u) << "applying a warm reactor batch reached the heap";
+}
+
+namespace {
+
+// A host that has ALREADY DECIDED. `carry_out` hands back a view of a list built
+// once in the constructor and never touched again, which is what makes the
+// window below leshper's own cost and nothing else's - the real completer walks
+// directories and the shell's tables, and none of that is what #168 Phase B
+// changed.
+class settled_host final : public lesh::leshper::host {
+public:
+	settled_host() {
+		for (int i = 0; i < 32; ++i)
+			_candidates.push_back(lesh::leshper::pager_candidate{
+				"a-candidate-name-long-enough-not-to-fit-inline-" + std::to_string(i),
+				lesh::leshper::pager_kind::word});
+	}
+
+	[[nodiscard]] std::uint32_t classify_command(std::string_view) const override {
+		return LESH_COMMAND_UNKNOWN;
+	}
+
+	[[nodiscard]] bool carry_out(const lesh::leshper::want_completion& what,
+	                             lesh::leshper::completion_candidates& answer) override {
+		answer.computed_against = what.computed_against;
+		answer.items = _candidates.data();
+		answer.count = _candidates.size();
+		answer.replace_from = what.cursor;
+		answer.replace_to = what.cursor;
+		return true;
+	}
+
+private:
+	std::vector<lesh::leshper::pager_candidate> _candidates;
+};
+
+// One action that asks and reads back, the way `complete_word` does.
+std::int32_t ask_and_read(lesh_editor* editor, const lesh_invocation*, void*) {
+	std::size_t count = 0;
+	if (lesh_complete(editor, &count) != LESH_OK)
+		return LESH_ERR_INVAL;
+	std::size_t from = 0;
+	std::size_t to = 0;
+	(void)lesh_completion_range(editor, &from, &to);
+	char text[256];
+	for (std::size_t i = 0; i < count; ++i) {
+		std::size_t length = 0;
+		std::uint32_t kind = 0;
+		(void)lesh_completion_candidate(editor, i, text, sizeof(text), &length, &kind);
+	}
+	return LESH_OK;
+}
+
+} // namespace
+
+TEST_F(AllocationTest, ACompletionRoundTripCostsLeshperNoHeap) {
+	// THE OTHER HALF OF PHASE B'S CHANNEL RULE, and the number that says the move
+	// was worth making. `lesh_complete` used to fill a `completion_result` LIVING
+	// INSIDE `lesh_editor` - a `std::vector<pager_candidate>`, every candidate's
+	// text copied into the editor handle on every Tab. The candidates are the
+	// host's storage now and what crosses is `want_completion` out and
+	// `completion_candidates` back: a generation, a pointer, three sizes, and the
+	// compiler's `is_trivially_copyable_v` on both.
+	//
+	// THE HOST IS PRE-DECIDED ON PURPOSE. What a real completer costs is a readdir
+	// and a `$PATH` sweep, which #168 Phase B did not change and which the ticket
+	// explicitly leaves to the host. What is measured here is the crossing.
+	using namespace lesh::leshper;
+
+	registry actions;
+	settled_host host;
+	actions.host = &host;
+	ASSERT_EQ(lesh_action_register(&actions, "ask_and_read", ask_and_read, nullptr), LESH_OK);
+
+	loop_harness harness{actions};
+	state s;
+	s.buffer.replace(s.buffer.begin_position(), s.buffer.begin_position(),
+	                 std::string("a line with something being completed at the end"));
+	s.cursor = s.buffer.end_position();
+	s.gen.bump();
+
+	// Warm: the handle's staging string takes the buffer's capacity, the keymap
+	// and the dispatch path touch what they lazily build.
+	for (int i = 0; i < 4; ++i)
+		ASSERT_EQ(harness.invoke(s, "ask_and_read", invocation{}).status, LESH_OK);
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 200; ++i)
+			(void)harness.invoke(s, "ask_and_read", invocation{});
+	});
+	EXPECT_EQ(counted, 0u) << "a completion round trip reached the heap on leshper's side";
 }
 
 TEST_F(AllocationTest, ALoopRepaintCostsAConstantThatDoesNotGrow) {

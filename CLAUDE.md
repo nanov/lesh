@@ -61,11 +61,21 @@ a script on a pipe, and nothing in it ever enters the line editor. Iterate with
 adding `:Grapheme*` when positions or width are involved. The full sanitized gate
 still runs once at merge; the exemption is from the sweeps, not the gate.
 **`src/ui/` is NOT exempt** - the host is the interactive path itself, and
-`LeshperPty` execs the real `lesh` binary, so a change there can move both. Its
+`UiPty` execs the real `lesh` binary, so a change there can move both. Its
 suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiWorkers`, `UiKnowledge*`,
-`UiLoopProposals`), and the filter above deliberately leaves them out: `Leshper*`
-is the editor, `Ui*` is the host that drives it (#168). A `src/ui/` change runs
-`--gtest_filter='Ui*:Leshper*'` and then the sweeps.
+`UiLoopProposals`, and since #168 Phase B `UiHighlight`, `UiAutosuggest`,
+`UiHistorySearch`, `UiComplete*`, `UiCommandKind`, `UiReactorTheme`, `UiPty` -
+which was `LeshperPty` and is renamed for the same rule: a suite that execs the
+real binary over a pty is the host's, not the editor's), and the
+filter above deliberately leaves them out: `Leshper*` is the editor, `Ui*` is the
+host that drives it (#168). A `src/ui/` change runs
+`--gtest_filter='Ui*:Leshper*'` and then the sweeps. **`src/ui/` is where the
+KNOWLEDGE lives now** - the highlighter, the autosuggester, the history searcher,
+the completion sources and the shell's tables all moved there in Phase B - so a
+change that looks like "just the editor" is a `src/leshper/` change and a change
+to any of those is not. The one exception the exemption still leans on:
+`lesh_leshper` links `lesh_substrate` and nothing else, so a `src/leshper/` change
+provably cannot reach syntax, the runtime or a file descriptor.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered

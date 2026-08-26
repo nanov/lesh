@@ -157,14 +157,19 @@ One directory, one namespace, one target: `src/X/Y.cpp` holds `lesh::X::Y` and i
 compiled into `lesh_X`. `src/substrate/` is the one flat exception — it is
 `lesh::` with no second component, because it is what everything else is built
 out of. The order is
-`substrate ← syntax ← {runtime, leshper} ← ui ← leshnici ← lesh`, and each target
+`substrate ← {syntax ← runtime, leshper} ← ui ← leshnici ← lesh`, and each target
 names every dependency it uses rather than inheriting one: a layer violation is a
 link failure, not a review comment. Two rules are load-bearing and worth saying
 out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
 shapes; the host fills them in over shell state), and `lesh_ui` is the ONE
 library that links both halves. The editor/host line runs between the last two:
-`loop`, `tty`, `workers` and `shell_actor` are `src/ui/` (#168), so nothing under
-`src/leshper/` holds a thread, a descriptor or a clock.
+`loop`, `tty`, `workers` and `shell_actor` are `src/ui/` (#168 Phase A), so
+nothing under `src/leshper/` holds a thread, a descriptor or a clock; the
+highlighter, the autosuggester, the history search and the completion sources are
+`src/ui/` too (#168 Phase B), so **`lesh_leshper` links `lesh_substrate` and
+nothing else** — not `lesh_syntax` either, because the editor neither parses nor
+lexes. Highlighting and suggesting are runtime, syntax and history KNOWLEDGE; the
+editor only colours regions.
 _Avoid_: reaching for a symbol across a link the target does not declare; adding
 a dependency by relying on transitivity.
 
@@ -232,11 +237,16 @@ interactive shell has that `lesh -c` does not — leshper, prompts, rendering.
 `src/ui/` is the narrower thing: the **host**. It owns the poll loop, the
 terminal, the timers, the workers, the shell handoff, and the session that runs
 an interactive shell to its end; it drives leshper by sending **events** and
-performing **effects**, and by nothing else. It also holds the shell-side
-adapters that answer the shapes leshper declares — `shell_state_knowledge` over
-shell state, `history_store_source` over the history file, the prompt and binding
-consoles in the other direction. leshper is the editor BENEATH it; leshnici the
-extension set ABOVE it. The shell proper is everything else.
+performing **effects**, and by nothing else. It also holds every piece of
+KNOWLEDGE the editing experience needs (#168 Phase B): the highlighter and the
+autosuggester reactors (`ui/reactors.h`), the history searcher and its store
+adapters (`ui/history_search.h`, `history_store_source`), the completion sources
+and the token-finding lex behind Tab (`ui/completion.h`), the shell's own tables
+(`ui/shell_knowledge.h`, `shell_state_knowledge` over shell state), and the one
+object that fills leshper's one door (`ui/editor_host.h` — `leshper::host`). The
+prompt and binding consoles run in the other direction. leshper is the editor
+BENEATH it; leshnici the extension set ABOVE it. The shell proper is everything
+else.
 
 **Front end** _[retired]_:
 A word that carried three meanings at once and now carries none. What it
@@ -294,10 +304,15 @@ of the interactive layer and the one BENEATH `src/ui/`. A pure editor:
 `step(state, event, now) -> effects`, with **no thread, fd, poll, timer or
 mailbox** anywhere in it, driven by a **host**. Integrated: linked into the lesh
 binary, not shipped as a library anyone else builds against, and it never sees
-the shell — `lesh_leshper` does not link `lesh_runtime`, so it declares shapes
-that `src/ui/` fills in.
+the shell — `lesh_leshper` links `lesh_substrate` and nothing else, so it declares
+shapes that `src/ui/` fills in. **It knows nothing**: not the shell, not syntax,
+not history, not git (#168 Phase B). What is left is the buffer, the keymap and
+actions, vi, undo and kill, decoding, layout and blit, the pager and selection
+UI, the **decoration**/**proposal** vocabulary, the theme, and the ABI that
+registers actions and reactors. One door out to what it cannot know:
+`leshper::host` (`host.h`).
 _Avoid_: LLE, the retired earlier name; the reader; readline; calling the
-session, the loop or the adapters "leshper" — those are `src/ui/`.
+session, the loop, the reactors or the adapters "leshper" — those are `src/ui/`.
 
 **leshnici** _[lesh]_:
 The shipped extension set: what lesh ships on top of leshper but does not owe
@@ -331,7 +346,11 @@ adding a mode is registering keymaps and actions.
 **Reactor** _[lesh]_:
 A subscriber to editor state-change events that computes derived state —
 decorations and proposals — asynchronously on a worker. Never mutates buffer,
-cursor or selection. The highlighter and the autosuggester are reactors.
+cursor or selection. The highlighter and the autosuggester are reactors, and both
+are the **host**'s (`src/ui/reactors.cpp`, #168 Phase B) because what they compute
+is knowledge; they reach the editor through the ABI, the way a Lua reactor would.
+What leshper owns is the mechanism — the reactor table, `apply_batch`, the
+generation drop rule — and the vocabulary the answers arrive in.
 _Avoid_: calling a reactor's work an effect; an **effect** is synchronous and
 the loop's own.
 
@@ -347,16 +366,24 @@ through it or not at all, which is what makes applying a stale result
 impossible rather than checked.
 
 **Provider** _[lesh]_:
-A named lesh subsystem leshper pulls from on demand — the syntax layer,
-completer, history store, prompt. The syntax layer is sealed; the other three
-are **override points**: replaceable by user code behind the same contract.
+A named lesh subsystem the interactive layer pulls from on demand — the syntax
+layer, completer, history store, prompt. The syntax layer is sealed; the other
+three are **override points**. All four are the **host**'s (#168 Phase B): they
+are named in `ui::provider_bundle` and assembled by the session, and the editor
+does not know any of them by name. What the editor knows is one door,
+`leshper::host`, which the session fills with an object holding the completer and
+the shell's tables; the history store and the prompt never cross that door at all
+— the reactors and the prompt engine reach them on the host's own side.
 _Avoid_: calling a provider a reactor; reactors are pushed events, providers
-are asked.
+are asked. Saying leshper "pulls" a provider — it asks its host, or nothing.
 
 **Override point** _[lesh]_:
-A provider whose default implementation user code may replace or wrap.
-Native implementations run as trusted threads; user-supplied ones run as
-killable spawned processes, so a broken override cannot wedge the editor.
+A provider whose default implementation user code may replace or wrap, by
+supplying it in the bundle the session is built with. Native implementations run
+as trusted threads; user-supplied ones run as killable spawned processes, so a
+broken override cannot wedge the editor. The replacement happens entirely on the
+host's side of the boundary — the editor sees the same one door whichever
+implementation is behind it.
 
 **Selection** _[lesh]_:
 An anchor position plus an active flag; **the cursor is the head**. The
@@ -373,26 +400,50 @@ becomes a buffer edit only through an accepting action; it never auto-applies.
 **Decoration** _[lesh]_:
 A namespaced annotation anchored to buffer positions: a highlight span or
 virtual text. Survives edits. The one system highlighting and autosuggestions
-both render through.
+both render through. Normalized at APPLICATION time, not at render time — nested
+spans are resolved into one sorted, disjoint list so the layout walk carries no
+scratch — and the normalization itself allocates nothing in the steady state
+(#168 Phase B): its sweep buffers are held, not built, and a copy of them starts
+empty so a copied **state** compares and costs the same as the original.
 
 **Host** _[lesh]_:
 Whatever drives the editor — `src/ui/` in the shell, a fake in a test. It owns
-the loop, the terminal, the timers, the workers and the shell handoff, sends
-**events** in and performs the **effects** that come back. The editor never calls
-it and never reaches into it.
-_Avoid_: calling the host "leshper", or a driver "the editor".
+the loop, the terminal, the timers, the workers and the shell handoff; it owns
+**everything the editor is not allowed to know** — the shell's tables, the
+history, the syntax, the completion sources, the reactors that use them; and it
+sends **events** in and performs the **effects** that come back. The editor never
+calls it except through the one interface it declares for exactly that,
+`leshper::host` (`host.h`): a borrowed pointer on the registry, answering
+`lesh_request_command_kind` and carrying out `want_completion`. A question raised
+there is an **effect** value and its answer is an **event** value, the same
+vocabulary the deferred half uses, so a question that moves to a worker later is
+a change on the host's side and nowhere else.
+_Avoid_: calling the host "leshper", or a driver "the editor"; a second interface
+between the two — there is one door and it is `leshper::host`.
 
 **Event** _[lesh]_:
 The only way into the editor: a closed variant the host constructs and hands to
 `step`. A key, a resize, a worker result, a job notice, injected input, a signal,
 a paste, a timer expiry. There is no side channel — an eighth kind of input has
-to be argued for by adding an alternative to the variant.
+to be argued for by adding an alternative to the variant. `completion_candidates`
+is an event type without being a variant alternative, because it answers a
+`want_completion` inside the turn that asked rather than arriving at `step`; it
+obeys the channel's rules regardless — trivially copyable, and the candidate list
+is a pointer into storage the **host** owns and keeps alive until the next
+`want_completion` it carries out. Anything an event carries that is not a scalar
+is borrowed on the same terms.
 
 **Effect** _[lesh]_:
 The only way out of the editor: what one turn of its state machine emits
 alongside the new state. A repaint, a worker request, a spawn, an armed or
-disarmed timer, and the three that end a line — accepted, cancelled, end of
-file. Synchronous, returned as a value, and carried out by the **host**.
+disarmed timer, a request for completion candidates, and the three that end a
+line — accepted, cancelled, end of file. Synchronous, returned as a value, and
+carried out by the **host**. Trivially copyable, every one: a `static_assert` per
+type in `effect.h` says so, because an effect is emitted per turn and, for a
+timer, per expiry, and text on the channel travels as a borrowed view into
+storage the host owns. `want_completion` is carried out where it is raised rather
+than after the turn, because `lesh_complete` answers a count the same ABI call
+reads back; it is the same value type either way.
 _Avoid_: using it for a reactor's output, which is a decoration or proposal
 arriving later as an event; a host reaching into the editor for something an
 effect should have carried.

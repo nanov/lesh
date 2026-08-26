@@ -223,11 +223,11 @@ constexpr std::array<builtin_descriptor, 31> kBuiltinRegistry = {{
 //
 // THE SHAPE, and it is the one A-5 already uses in the other direction: an
 // interface declared on the side that needs it, implemented at the wiring site
-// that links both. `history_source` is leshper's version - leshper declares the
-// shape and the runtime's history store is adapted onto it where the two meet.
-// This is the mirror image: the runtime declares what `bind` needs to say, and
-// the loop hands it a leshper-backed implementation when it starts an
-// interactive session.
+// that links both. `leshper::host` is the editor's version - the editor declares
+// the one shape it needs of whatever drives it, and `ui::editor_host` fills it in
+// over shell state. This is the mirror image: the runtime declares what `bind`
+// needs to say, and the session hands it a leshper-backed implementation when it
+// starts an interactive one.
 //
 // Until that wiring exists there is no console installed, and `bind` says so
 // rather than pretending: a non-interactive shell has no line editor, exactly as
