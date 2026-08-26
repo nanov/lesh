@@ -848,30 +848,33 @@ void print_declaration(std::string_view keyword, const shell_state::variable_row
 // `export` and `readonly` differ in one flag and one predicate, so they share a
 // body: writing them twice is how the two would come to disagree about `--`, about
 // a bad name, or about what a refused assignment costs.
+// The one option `export` and `readonly` have between them (#148). POSIX gives
+// both utilities the same `-p` and nothing else, so they share a table for the
+// same reason they share a body: two of them would be two chances to disagree.
+//
+// CLUSTERING COMES WITH THE TABLE, and it is a fix rather than a side effect.
+// The loop this replaces compared the WHOLE WORD with `-p`, so `export -pp` was
+// `Illegal option -pp` here while dash, bash and zsh all read it as `-p` given
+// twice. Harmless today because there is one letter; a live bug the day there
+// are two.
+struct declaration_opts {
+	bool print_only = false;  // -p
+};
+
+constexpr auto kDeclaration = args::spec<declaration_opts>(
+	args::option{'p', args::field<&declaration_opts::print_only>}
+		.help("write the declarations in a form that can be re-input"));
+
 builtin_result run_declaration(shell_state& state, char** argv, bool make_readonly) {
 	const std::string_view keyword{argv[0]};
-	size_t i = 1;
-	bool print_only = false;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		// `--` ends the options: readonly-p.tst's 'separator preceding operand' is
-		// `readonly -- a=foo`, which without this assigned to a name of `--`.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg == "-p") {
-			print_only = true;
-			continue;
-		}
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("%.*s: Illegal option %.*s",
-			       static_cast<int>(keyword.size()), keyword.data(),
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
-	}
+	// `--` ends the options: readonly-p.tst's 'separator preceding operand' is
+	// `readonly -- a=foo`, which without it assigned to a name of `--`. The table
+	// answers that once, for every utility, rather than once per loop.
+	const auto parsed = args::parse(kDeclaration, argv);
+	if (parsed.err)
+		return {report_option_error(keyword, parsed.err)};
+	const bool print_only = parsed.opts.print_only;
+	size_t i = static_cast<size_t>(parsed.rest - argv);
 
 	// `-p` PRINTS and ignores any operands, which is dash's behaviour: `readonly -p
 	// x` there neither lists x nor makes it readonly.
