@@ -378,7 +378,7 @@ void session::bind_line_keys() {
 	};
 
 	// ENTER IS BOTH `<C-m>` AND `<C-j>`, and both are required. The key sends
-	// U+000D (Ctrl-M), but `enter_raw` forces only the four bits the editor needs
+	// U+000D (Ctrl-M), but `enter_raw` forces only the handful of bits the editor needs
 	// and leaves the rest of the line discipline as the last command left it -
 	// so ICRNL is usually still on and what the reader actually gets is U+000A
 	// (Ctrl-J). readline and zle bind both for exactly this reason. keymap.cpp

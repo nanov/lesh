@@ -230,10 +230,24 @@ bool terminal::enter_raw() noexcept {
 	}
 
 	struct termios shell = current;
-	// The four bits the editor needs, and no more. ISIG STAYS ON: Ctrl-C must
+	// The bits the editor needs, and no more. ISIG STAYS ON: Ctrl-C must
 	// arrive as SIGINT so #98's `cancel-line` runs off a signal event, and
 	// turning it off would mean re-implementing the driver's job.
-	shell.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+	//
+	// IEXTEN GOES OFF (#140 decision 1, fish's and zle's answer). It is what
+	// makes the BSD driver's extended `c_cc` entries live, and on macOS those
+	// are Ctrl-Y (VDSUSP), Ctrl-O (VDISCARD), Ctrl-V (VLNEXT), Ctrl-W (VWERASE)
+	// and Ctrl-R (VREPRINT) - five bytes the driver eats before any of them
+	// reaches the decoder, several of them the natural accept and word keys.
+	// Whether a key is bindable must be a fact about the keymap, not about
+	// which platform's tty driver claimed the byte first. Ctrl-W stops working
+	// only by accident of WERASE, and `delete_backward_word` is bound to it.
+	//
+	// NOTHING RESTORES THIS SEPARATELY. `_original` is the whole termios as it
+	// was before the first entry, and `leave_raw` and the exit path write it
+	// back wholesale, so the bit rides the save/restore every other bit rides;
+	// a parallel path for one flag would be a second place to get it wrong.
+	shell.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO | IEXTEN));
 	shell.c_cc[VMIN] = 1;
 	shell.c_cc[VTIME] = 0;
 

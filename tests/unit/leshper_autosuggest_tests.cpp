@@ -1,8 +1,11 @@
 #include "leshper/abi.h"
 #include "leshper/history_search.h"
+#include "leshper/layout.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
+#include "leshper/surface.h"
 #include "substrate/arena.h"
+#include "substrate/measure.h"
 
 #include <gtest/gtest.h>
 
@@ -116,6 +119,28 @@ private:
 	loop_harness* _loop;
 	std::vector<std::string> _entries;
 };
+
+// The glyphs of one laid-out row, concatenated - the layout suite's helper, kept
+// small here because the one multi-line test below is about a PICTURE and a
+// proposal read back as bytes would not have shown the continuation lines.
+std::string glyphs_of(const cluster_pool& pool, const surface& painted, std::uint16_t row) {
+	std::string out;
+	for (std::uint16_t column = 0; column < painted.columns(); ++column) {
+		const cell& one = painted.at(row, column);
+		if (!one.glyph.is_continuation())
+			out.append(pool.cluster_of(one.glyph));
+	}
+	return out;
+}
+
+// `head`, then blanks out to the width - computed rather than written out, so an
+// expectation is never a run of spaces nobody can count by eye.
+std::string padded(std::string_view head, int columns) {
+	std::string out{head};
+	for (int filled = lesh::grapheme::display_width(head); filled < columns; ++filled)
+		out.push_back(' ');
+	return out;
+}
 
 // What an accepting action sees, read back through the ABI accessor it uses.
 struct probe {
@@ -603,4 +628,286 @@ TEST(LeshperAutosuggest, AStaleBatchIsNeverAcceptable) {
 
 	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion", invocation{}).status, LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "gitx");
+}
+
+// ---------------------------------------------------------------------------
+// Accepting by FALLTHROUGH (#140 decision 2, #147)
+//
+// One implementation, five thin names, and the fallback in the userdata beside
+// each. What is asserted here is the ACTION's half of the rule; the keymap
+// suite asserts the table, and the vi suite asserts that an operator cannot
+// reach any of it.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperAutosuggest, TheFiveWrappersAreRegisteredAndSoIsTheMotionOneOfThemNeeded) {
+	suggest_fixture fixture;
+	for (const char* name : {"accept_suggestion_or_forward_char",
+	                         "accept_suggestion_or_end_of_line",
+	                         "accept_suggestion_or_forward_word",
+	                         "accept_suggestion_or_word_start_next",
+	                         "accept_suggestion_or_word_end_next",
+	                         // `<A-f>` had no binding before #140, so emacs's
+	                         // forward-word arrives with the table that needs it.
+	                         "forward_word"}) {
+		int32_t exists = 0;
+		EXPECT_EQ(lesh_action_exists(&fixture.reg, name, &exists), LESH_OK);
+		EXPECT_EQ(exists, 1) << name << " is not registered";
+	}
+}
+
+TEST(LeshperAutosuggest, AtTheEndWithASuggestionShowingTheWrapperAccepts) {
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	const action_result result =
+		fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{});
+	EXPECT_EQ(result.status, LESH_OK);
+	EXPECT_TRUE(result.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "git status --short");
+	EXPECT_EQ(s.cursor.byte_offset(), 18u);
+}
+
+TEST(LeshperAutosuggest, EveryWholeLineWrapperAcceptsTheSameWayAtTheEnd) {
+	// `<Right>`, `<C-f>`, `<End>` and `<C-e>` are two names, and both accept the
+	// WHOLE candidate: #140's table gives command mode the partial accepts and
+	// the inserting keymaps both halves.
+	for (const char* name : {"accept_suggestion_or_forward_char",
+	                         "accept_suggestion_or_end_of_line"}) {
+		suggest_fixture fixture{{"git status --short"}};
+		lesh::leshper::state s = suggest_fixture::line("git");
+		fixture.show(s);
+		EXPECT_EQ(fixture.loop.invoke(s, name, invocation{}).status, LESH_OK) << name;
+		EXPECT_EQ(s.buffer.text(), "git status --short") << name;
+	}
+}
+
+TEST(LeshperAutosuggest, TheWordWrapperTakesOneWordTheWayTheActionItComposesDoes) {
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_word", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git status");
+	EXPECT_EQ(s.cursor.byte_offset(), 10u);
+}
+
+TEST(LeshperAutosuggest, WithNothingSuggestedTheWrapperIsTheMotionAndNothingElse) {
+	// The half that matters most: these are the keys `<Right>` and `<End>` have
+	// always been, and a user with no history must not be able to tell that
+	// anything was wrapped around them.
+	suggest_fixture fixture{{"ls"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	const action_result moved =
+		fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{});
+	EXPECT_EQ(moved.status, LESH_OK);
+	EXPECT_FALSE(moved.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(s.cursor.byte_offset(), 2u);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_end_of_line", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.cursor.byte_offset(), 3u);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, MidLineTheWrapperMovesEvenWithASuggestionShowing) {
+	// The cursor is not at the end, so `<Right>` moves one cluster - and it does
+	// so with the batch still applied, which is the case a rule written as "is
+	// anything showing" alone would have got wrong.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(s.cursor.byte_offset(), 2u);
+}
+
+TEST(LeshperAutosuggest, EndMidLineFallsThroughAndTheNextPressAccepts) {
+	// FISH'S BEHAVIOUR, pinned because it looks like a bug and is not. `<End>`
+	// with the cursor mid-line is not at the end, so it falls through to
+	// `end_of_line` - which lands it at the end, where the suggestion is now
+	// acceptable and the SECOND press takes it. Two presses, two meanings, and
+	// the alternative - accepting from anywhere on the line - would make `<End>`
+	// a key you could not use to go to the end.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	s.cursor = lesh::leshper::position::from_byte_offset(0);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_end_of_line", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(s.cursor.byte_offset(), 3u);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_end_of_line", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git status");
+}
+
+TEST(LeshperAutosuggest, ASuggestionNoLongerThanTheBufferFallsThroughRatherThanSwallowingTheKey) {
+	// A proposal that has nothing left past what is typed is not something to
+	// accept, and a key that vanished into an accept-that-did-nothing would be a
+	// dead `<Right>`. The autosuggester never proposes one, so this is built by
+	// hand out of the same batch shape it emits.
+	suggest_fixture fixture;
+	lesh::leshper::state s = suggest_fixture::line("git");
+
+	reactor_batch batch;
+	batch.reactor = "autosuggester";
+	batch.computed_against = s.gen;
+	batch.event_kind = LESH_EVENT_BUFFER_CHANGED;
+	batch.proposals.push_back(proposal{LESH_PROPOSAL_AUTOSUGGESTION, "git"});
+	ASSERT_TRUE(apply_batch(s, batch));
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(s.cursor.byte_offset(), 2u) << "the key was swallowed by an empty accept";
+}
+
+TEST(LeshperAutosuggest, TheWrapperIsOneUndoEntryOnBothPaths) {
+	// #110's wrapper rule, which is what `lesh_action_invoke` buys: the delegate
+	// stages into the caller's staging area and its undo group, so neither half
+	// of this key can be two steps.
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	const std::size_t before = s.undo.step_count();
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "git status --short");
+	EXPECT_EQ(s.undo.step_count(), before + 1);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+// #146, from both sides of the same key. The rule that landed there is about
+// what a BLOCK WRITE does to the typing run; the fallthrough stages nothing at
+// all, so it must leave the history exactly where the bare motion leaves it.
+TEST(LeshperAutosuggest, TheFallthroughLeavesTheUndoHistoryWhereTheBareMotionLeavesIt) {
+	// EQUIVALENCE IS THE ASSERTION, and it is deliberately not "the run
+	// survives". F-4 ends a typing run on any cursor move - undo.h: "an edit
+	// somewhere else in the buffer - ends the run, which is why the editor calls
+	// break_coalescing() on every non-inserting action" - so `forward_char` has
+	// always broken it, wrapped or not. What #146 asks of this path is that the
+	// wrapper add NO undo step of its own and behave byte for byte like the key
+	// it wraps, which is what two runs off one starting point can show.
+	const auto motion_from_mid_line = [](const char* action, lesh::leshper::state& s) {
+		suggest_fixture fixture{{"ls"}};
+		fixture.type(s, "git");
+		ASSERT_TRUE(s.undo.coalescing());
+		fixture.show(s);
+		s.cursor = lesh::leshper::position::from_byte_offset(1);
+		ASSERT_EQ(fixture.loop.invoke(s, action, invocation{}).status, LESH_OK);
+	};
+
+	lesh::leshper::state bare;
+	motion_from_mid_line("forward_char", bare);
+	lesh::leshper::state wrapped;
+	motion_from_mid_line("accept_suggestion_or_forward_char", wrapped);
+
+	EXPECT_EQ(wrapped.buffer.text(), bare.buffer.text());
+	EXPECT_EQ(wrapped.cursor.byte_offset(), bare.cursor.byte_offset());
+	EXPECT_EQ(wrapped.undo.step_count(), bare.undo.step_count());
+	EXPECT_EQ(wrapped.undo.coalescing(), bare.undo.coalescing());
+
+	// And concretely: the typed `git` is still ONE step, because the motion
+	// wrote nothing for the history to record.
+	EXPECT_EQ(wrapped.buffer.text(), "git");
+	EXPECT_EQ(wrapped.cursor.byte_offset(), 2u);
+	EXPECT_EQ(wrapped.undo.step_count(), 1u);
+}
+
+TEST(LeshperAutosuggest, TheWrappersAcceptBreaksTheTypingRunTheWayTheBareAcceptDoes) {
+	// The other side: the accept half reaches the buffer as a block write, and
+	// #146's rule does not care which name dispatched it.
+	suggest_fixture fixture{{"git status --short"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	ASSERT_TRUE(s.undo.coalescing());
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "git status --short");
+	EXPECT_FALSE(s.undo.coalescing());
+	EXPECT_EQ(s.undo.step_count(), 2u);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "");
+}
+
+TEST(LeshperAutosuggest, TheFallthroughPathTakesNothingFromTheHeap) {
+	// A keystroke path, held to #90's instrument: the wrapper asks for the
+	// proposal's LENGTH with capacity zero rather than copying it, so the key
+	// that only moved the cursor copies nothing at all.
+	suggest_fixture fixture{{"git status --short --branch"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	// Warm once: the first dispatch is where a lazily-grown scratch would grow.
+	ASSERT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	auto& counters = lesh::metrics::allocations();
+	const std::size_t heap_before = counters.heap_allocations;
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(counters.heap_allocations, heap_before);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-line candidates (#140 decision 3): suggested whole, no filter.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperAutosuggest, AMultiLineCandidateIsSuggestedWholeAndItsContinuationLinesRender) {
+	// NO CODE CHANGED FOR THIS, which is the assertion. #141 made virtual bytes
+	// buffer bytes and #123 treats a line break as a cluster, so a remembered
+	// `for` loop suggests all three of its lines and the layout draws the two
+	// below the edit line - ghost-styled, reflowing, and acceptable whole. The
+	// entries most worth recalling are the long ones; a filter is one predicate
+	// later if daily use proves it noisy.
+	suggest_fixture fixture{{"for f in *\ndo echo $f\ndone"}};
+	lesh::leshper::state s = suggest_fixture::line("for");
+	fixture.show(s);
+
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	const proposal* whole = s.proposals.find(LESH_PROPOSAL_AUTOSUGGESTION, 0);
+	ASSERT_NE(whole, nullptr);
+	EXPECT_EQ(whole->bytes, "for f in *\ndo echo $f\ndone") << "the candidate was filtered";
+
+	// And it is DRAWN: the virtual text carries the newlines, so the picture has
+	// three content rows and the two continuations are on them.
+	ASSERT_EQ(s.marks.texts().size(), 1u);
+	EXPECT_EQ(s.marks.texts()[0].bytes, " f in *\ndo echo $f\ndone");
+
+	s.columns = 40;
+	s.rows = 10;
+	cluster_pool pool;
+	const layout picture = lay_out(pool, input_for(s, "$ "));
+	EXPECT_EQ(picture.content_rows, 3);
+	ASSERT_GE(picture.screen.rows(), 3);
+	EXPECT_EQ(glyphs_of(pool, picture.screen, 0), padded("$ for f in *", 40));
+	EXPECT_EQ(glyphs_of(pool, picture.screen, 1), padded("do echo $f", 40));
+	EXPECT_EQ(glyphs_of(pool, picture.screen, 2), padded("done", 40));
+
+	// Accepting takes all three lines, because the proposal IS the line.
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "for f in *\ndo echo $f\ndone");
 }
