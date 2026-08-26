@@ -303,8 +303,8 @@ protected:
 // there: the builtin found a console rather than a reason to re-open the
 // argument, and adding `set` and `text` below was the whole of the change.
 //
-// The C ABI verbs (`lesh_prompt_add_module` and friends) are the other caller,
-// and the language-neutral one NG-4 says the Lua binding reuses unchanged. They
+// The C ABI verbs (`lesh_prompt_set_placements` and friends) are the other
+// caller, and the language-neutral one NG-4 says the Lua binding reuses unchanged. They
 // reach the engine through the registry, not through here: this is the in-tree
 // C++ door, and the two are deliberately not layered on one another.
 class prompt_console {
@@ -324,14 +324,24 @@ public:
 		continuation,
 	};
 
-	// How an operation ended, one space for all eight verbs - `binding_console`'s
+	// How an operation ended, one space for every verb - `binding_console`'s
 	// reasoning, and it applies unchanged: the caller's job is to turn each into
-	// a message and a status, and a per-verb enum would make that eight switches
-	// that drift.
+	// a message and a status, and a per-verb enum would make that several
+	// switches that drift.
+	//
+	// TWO ROWS ARE GONE, and it is worth saying which and why. `no_such_module`
+	// and `unbalanced_group` belonged to four ASSEMBLY verbs - `add_module`,
+	// `add_literal`, `open_group`, `close_group`, one call per element - that
+	// this console carried before the template language existed. The owner's
+	// #157 ruling made the whole-surface forms the only configuration doors
+	// (`set` here, `lesh_prompt_set_placements` on the ABI), both atomic and both
+	// resolving a module through the identical rule, so the per-element verbs
+	// had no caller left and were a second, weaker spelling of the first. They
+	// were also the one place a refusal lost its reason: "unknown module" and
+	// "the module refused its argument" collapsed into `no_such_module`, where
+	// `set`'s sentence names the byte.
 	enum class outcome {
 		ok,
-		no_such_module,
-		unbalanced_group,
 		bad_template,
 	};
 
@@ -346,28 +356,11 @@ public:
 	// configuration without restarting the shell.
 	virtual outcome use_default(surface which) = 0;
 
-	// Places a registered module, with its bound argument (`env` takes a variable
-	// name, `path` a style). `no_such_module` when nothing is registered under
-	// that name - a placement is not a registration (§6.10: modules are singletons
-	// with free placement, so the same name may be placed more than once).
-	virtual outcome add_module(surface which, std::string_view name,
-	                           std::string_view arg) = 0;
-
-	// Places literal bytes - the grammar between the modules.
-	virtual outcome add_literal(surface which, std::string_view bytes) = 0;
-
-	// Opens and closes a group: the thing that shows iff a module inside it is
-	// ready, taking its literals and styles with it when it does not. Groups do
-	// not nest in v1, so a second open answers `unbalanced_group`, as does a close
-	// with nothing open.
-	virtual outcome open_group(surface which) = 0;
-	virtual outcome close_group(surface which) = 0;
-
-	// THE PAIR THE `prompt` BUILTIN IS WRITTEN AGAINST (#157), and the reason the
-	// six verbs above are not enough on their own: the six are an ASSEMBLY
-	// interface, one call per element, and a builtin holding a single operand has
-	// a STRING. Somebody has to turn one into the other, and that somebody is on
-	// the far side of this line.
+	// THE PAIR THE `prompt` BUILTIN IS WRITTEN AGAINST (#157). A builtin holding a
+	// single operand has a STRING, and the string is the template language;
+	// somebody has to turn it into elements, and that somebody is on the far side
+	// of this line, because only that side has the registry to resolve a module
+	// name against.
 	//
 	// `set` PARSES ONCE, AT SET TIME, AND SWAPS ATOMICALLY. A template that will
 	// not parse leaves the previous prompt standing - there is no half-applied

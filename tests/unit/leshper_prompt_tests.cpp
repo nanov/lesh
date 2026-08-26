@@ -1873,24 +1873,6 @@ public:
 		return outcome::ok;
 	}
 
-	outcome add_module(surface which, std::string_view name, std::string_view arg) override {
-		return _engine->add_module(surface_of(which), name, arg) ? outcome::ok
-		                                                         : outcome::no_such_module;
-	}
-
-	outcome add_literal(surface which, std::string_view bytes) override {
-		_engine->add_literal(surface_of(which), bytes);
-		return outcome::ok;
-	}
-
-	outcome open_group(surface which) override {
-		return _engine->open_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
-	}
-
-	outcome close_group(surface which) override {
-		return _engine->close_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
-	}
-
 	// The same two bodies read.cpp's adapter has, now that there is a language to
 	// read a template in: one parse-and-swap, and the source string it remembered.
 	outcome set(surface which, std::string_view template_text, std::string& error_out) override {
@@ -1944,24 +1926,26 @@ TEST(LeshperPromptWiring, TheConsoleVerbsReachTheEngineAndBothSurfaces) {
 	// The two surfaces are configured apart, and what this asserts is the
 	// translation between the runtime's `surface` and leshper's `surface_id`:
 	// bytes put on one must not appear on the other.
+	std::string error;
 	EXPECT_EQ(seam.clear(console_surface::left), console_outcome::ok);
 	EXPECT_EQ(seam.clear(console_surface::continuation), console_outcome::ok);
-	EXPECT_EQ(seam.add_literal(console_surface::left, "L"), console_outcome::ok);
-	EXPECT_EQ(seam.add_literal(console_surface::continuation, "C"), console_outcome::ok);
+	EXPECT_EQ(seam.set(console_surface::left, "L", error), console_outcome::ok) << error;
+	EXPECT_EQ(seam.set(console_surface::continuation, "C", error), console_outcome::ok) << error;
 	which.render_full(quiet());
 	EXPECT_EQ(which.output(surface_id::left), "L");
 	EXPECT_EQ(which.output(surface_id::continuation), "C");
 
-	// The one miss a placement has, and it is a miss rather than a fault.
-	EXPECT_EQ(seam.add_module(console_surface::left, "path", ""), console_outcome::ok);
-	EXPECT_EQ(seam.add_module(console_surface::left, "no_such_thing", ""),
-	          console_outcome::no_such_module);
-
-	// Groups do not nest in v1, and neither half of the imbalance is silent.
-	EXPECT_EQ(seam.open_group(console_surface::left), console_outcome::ok);
-	EXPECT_EQ(seam.open_group(console_surface::left), console_outcome::unbalanced_group);
-	EXPECT_EQ(seam.close_group(console_surface::left), console_outcome::ok);
-	EXPECT_EQ(seam.close_group(console_surface::left), console_outcome::unbalanced_group);
+	// The one failure the console has, and it arrives as a SENTENCE: the
+	// per-element verbs that once answered a bare `no_such_module` are gone (see
+	// the enum in builtins.h), so the refusal names the module and the byte.
+	EXPECT_EQ(seam.set(console_surface::left, "{path}", error), console_outcome::ok) << error;
+	EXPECT_EQ(seam.set(console_surface::left, "{no_such_thing}", error),
+	          console_outcome::bad_template);
+	EXPECT_NE(error.find("no_such_thing"), std::string::npos) << error;
+	// And the refusal left the previous prompt standing.
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "~/src");
+	EXPECT_EQ(seam.set(console_surface::left, "L", error), console_outcome::ok) << error;
 
 	// And the shipped table comes back, which is how a user undoes all of it.
 	EXPECT_EQ(seam.use_default(console_surface::left), console_outcome::ok);

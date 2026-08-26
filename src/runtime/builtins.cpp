@@ -2288,14 +2288,12 @@ builtin_result prompt_without_an_editor() {
 // One switch for the console's whole outcome space, `report_bind_outcome`'s
 // opposite number.
 //
-// TWO OF THE FOUR ROWS ARE UNREACHABLE FROM HERE TODAY, and they are written
-// anyway. `no_such_module` and `unbalanced_group` belong to the assembly verbs -
-// `add_module`, `open_group` - and this builtin calls none of them; it hands
-// over a template string and lets the far side assemble. But the switch is
-// total, so the day a verb is added to the console the compiler names this
-// function rather than letting a new outcome fall through to a status with no
-// diagnostic. That is the drift rule the builtin registry's static_assert exists
-// for, applied to an enum instead of a table.
+// The switch is TOTAL over an enum of two, and it stays a switch rather than a
+// bool for the same reason the builtin registry has a static_assert: the day a
+// verb is added to the console with an outcome of its own, the compiler names
+// this function rather than letting the new row fall through to a status with
+// no diagnostic. (It once had four rows; the two for the per-element assembly
+// verbs went with the verbs - see the enum's own note.)
 //
 // `detail` is the console's own sentence for `bad_template` and is printed
 // verbatim: the parser lives across the boundary, so only it can say what was
@@ -2304,12 +2302,6 @@ int report_prompt_outcome(prompt_console::outcome what, std::string_view detail)
 	switch (what) {
 	case prompt_console::outcome::ok:
 		return 0;
-	case prompt_console::outcome::no_such_module:
-		report("prompt: unknown module");
-		return 1;
-	case prompt_console::outcome::unbalanced_group:
-		report("prompt: unbalanced group");
-		return 1;
 	case prompt_console::outcome::bad_template:
 		report("prompt: %.*s", static_cast<int>(detail.size()), detail.data());
 		return 1;

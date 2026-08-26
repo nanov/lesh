@@ -83,28 +83,6 @@ public:
 		return outcome::ok;
 	}
 
-	outcome add_module(surface which, std::string_view name, std::string_view) override {
-		_note(std::string{"module("}.append(name_of(which)).append(",")
-		          .append(name).append(")"));
-		return outcome::ok;
-	}
-
-	outcome add_literal(surface which, std::string_view bytes) override {
-		_note(std::string{"literal("}.append(name_of(which)).append(",")
-		          .append(bytes).append(")"));
-		return outcome::ok;
-	}
-
-	outcome open_group(surface which) override {
-		_note(std::string{"open("}.append(name_of(which)).append(")"));
-		return outcome::ok;
-	}
-
-	outcome close_group(surface which) override {
-		_note(std::string{"close("}.append(name_of(which)).append(")"));
-		return outcome::ok;
-	}
-
 	outcome set(surface which, std::string_view template_text,
 	            std::string& error_out) override {
 		_note(std::string{"set("}.append(name_of(which)).append(",")
