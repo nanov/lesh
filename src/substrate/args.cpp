@@ -1,7 +1,8 @@
 #include "substrate/args.h"
 
+#include "substrate/numeric.h"
+
 #include <cstring>
-#include <limits>
 
 namespace lesh::args {
 
@@ -56,65 +57,52 @@ void increment_field(std::byte* at, std::uint8_t width, bool is_signed) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// The integral converter
+// The integral option-argument
 // ---------------------------------------------------------------------------
 //
-// clip.hpp's, taken as the note recommends (Appendix A) and widened to the
-// erased field: it reads into the widest integer and the caller range-checks
-// against the row's own width. No `strtol`, so no errno, no locale, and no
-// nul-terminated-string requirement beyond what argv already gives.
+// THROUGH THE TREE'S ONE NUMERIC PARSER, not through a converter of its own.
+// The obvious thing here is clip.hpp's constexpr reader, which the research
+// note recommends taking - but substrate/numeric.h already IS that reader, for
+// every site in the shell, and tests/unit/builtin_registry_tests.cpp greps the
+// tree for anything that reads digits without it. #63 consolidated fifteen
+// sites and six idioms after two of them shipped wrong answers a script could
+// branch on; adding a sixteenth reader here would be the state that header
+// exists to end. So `option_argument` is a numeric_site with a policy row, and
+// what is left in this file is the half numeric.h deliberately does not know:
+// how wide the FIELD is.
 //
-// The overflow test is `acc > (limit - digit) / 10` BEFORE the multiply, which
-// is the only formulation that never overflows on the way to detecting an
-// overflow - the version this replaced in three builtins multiplied first.
+// The policy row's range is the widest field a row can bind. The narrower bound
+// belongs here because only the row knows it - `-b 256` does not fit the
+// uint8_t it binds, and `-b -1` is a well-formed number that an unsigned field
+// still has no room for.
 
-struct converted {
-	std::uint64_t magnitude = 0;
-	bool negative = false;
-	bool ok = false;
-};
-
-converted to_integer(std::string_view text) noexcept {
-	if (text.empty())
-		return {};
-	converted out;
-	std::size_t i = 0;
-	if (text[0] == '+' || text[0] == '-') {
-		out.negative = text[0] == '-';
-		if (text.size() == 1)
-			return {};
-		i = 1;
-	}
-	for (; i < text.size(); ++i) {
-		const char c = text[i];
-		if (c < '0' || c > '9')
-			return {};
-		const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
-		if (out.magnitude > (std::numeric_limits<std::uint64_t>::max() - digit) / 10)
-			return {};
-		out.magnitude = out.magnitude * 10 + digit;
-	}
-	out.ok = true;
-	return out;
-}
-
-// Does the converted number fit the field it is about to be written into? The
-// row knows the width and the signedness; nothing else about the type matters.
-bool fits(const converted& n, std::uint8_t width, bool is_signed) noexcept {
-	const unsigned bits = static_cast<unsigned>(width) * 8u;
+bool convert(std::string_view text, std::uint8_t width, bool is_signed,
+             std::uint64_t& bits) noexcept {
+	const numeric_result read = parse_integer(text, numeric_site::option_argument);
+	if (read.status != numeric_parse::ok)
+		return false;
+	const std::int64_t value = read.value;
+	const unsigned field_bits = static_cast<unsigned>(width) * 8u;
 	if (is_signed) {
-		const std::uint64_t limit = std::uint64_t{1} << (bits - 1);
-		return n.negative ? n.magnitude <= limit : n.magnitude < limit;
+		if (field_bits < 64) {
+			const std::int64_t high = (std::int64_t{1} << (field_bits - 1)) - 1;
+			if (value < -high - 1 || value > high)
+				return false;
+		}
+	} else {
+		if (value < 0)
+			return false;
+		if (field_bits < 64 &&
+		    static_cast<std::uint64_t>(value) > (std::uint64_t{1} << field_bits) - 1)
+			return false;
 	}
-	if (n.negative)
-		return n.magnitude == 0; // `-0` is the only negative an unsigned field takes
-	return bits == 64 || n.magnitude < (std::uint64_t{1} << bits);
+	// Two's complement, well defined since C++20: the low `width` bytes of this
+	// are the field's whole object representation.
+	bits = static_cast<std::uint64_t>(value);
+	return true;
 }
 
-void store_number(std::byte* at, const converted& n, std::uint8_t width) noexcept {
-	// Two's complement, well defined since C++20, and the low `width` bytes of
-	// the result are the field's whole object representation.
-	const std::uint64_t bits = n.negative ? ~n.magnitude + 1u : n.magnitude;
+void store_number(std::byte* at, std::uint64_t bits, std::uint8_t width) noexcept {
 	switch (width) {
 	case 1: store<std::uint8_t>(at, static_cast<std::uint8_t>(bits)); break;
 	case 2: store<std::uint16_t>(at, static_cast<std::uint16_t>(bits)); break;
@@ -153,10 +141,10 @@ error apply(const option& row, void* into, bool plus, const char* argument) noex
 		store<std::string_view>(at, std::string_view{argument});
 		break;
 	case setter::store_integral: {
-		const converted n = to_integer(std::string_view{argument});
-		if (!n.ok || !fits(n, row.width, row.is_signed))
+		std::uint64_t bits = 0;
+		if (!convert(std::string_view{argument}, row.width, row.is_signed, bits))
 			return error{error_kind::invalid_argument, row.letter};
-		store_number(at, n, row.width);
+		store_number(at, bits, row.width);
 		break;
 	}
 	}
