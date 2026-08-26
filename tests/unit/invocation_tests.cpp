@@ -11,7 +11,11 @@ namespace {
 invocation parse(std::initializer_list<const char*> words) {
 	static std::vector<const char*> storage;
 	storage.assign(words.begin(), words.end());
-	return parse_invocation(static_cast<int>(storage.size()),
+	// argv[argc] IS A NULL POINTER in a real main - ISO C 5.1.2.2.1 and POSIX XBD 8
+	// both require it - and the parser reads the array through that terminator, the
+	// way every other option scan in the tree does. `argc` stays the word count.
+	storage.push_back(nullptr);
+	return parse_invocation(static_cast<int>(words.size()),
 	                        const_cast<char**>(storage.data()));
 }
 

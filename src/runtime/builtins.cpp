@@ -1,6 +1,7 @@
 #include "runtime/builtins.h"
 
 #include "runtime/diagnostic.h"
+#include "runtime/option_word.h"
 #include "substrate/args.h"
 #include "substrate/numeric.h"
 
@@ -38,80 +39,6 @@ size_t argc_of(char** argv) noexcept {
 // `getopts`. `export` and `readonly` need both, and they come first in the file.
 void print_single_quoted(std::string_view text);
 bool is_name(std::string_view text);
-
-// ONE OPTION WORD AT A TIME, through the shared parser (#148).
-//
-// `args::parse` reads every option word in one call, which is what a utility
-// wants when its options are independent switches. Three here are not:
-//
-//   - `set` and the shell's own command line apply `-o NAME` AS IT ARRIVES. A
-//     string_view field holds one name, and `set -o allexport -o noglob` gives it
-//     two - dash applies both, and so must this. The sigil is per occurrence too:
-//     `set -o errexit +o xtrace` turns one on and the other off.
-//   - `kill` re-reads a word the table REFUSES as a signal name, because `-TERM`
-//     and `-9` are signals standing in option position. It needs to know which
-//     word was refused, which a whole-argv parse cannot say - it reports the
-//     letter and stops.
-//
-// THE GRAMMAR IS STILL THE PARSER'S, and that is the whole point of showing it a
-// window rather than writing a second loop: clustering, `-dX` and `-d X`, `--`,
-// the lone `-`, the `+` sigil, and every diagnostic come from the same table and
-// the same code as `cd`'s. This decides only HOW MUCH of argv the parser is shown
-// at a time, never what any of it means.
-//
-// THE WINDOW IS ONE WORD, WIDENED TO TWO only when the first word ends in an
-// option that needs an argument - which the parser itself says, by answering
-// `missing_argument`. A two-word window offered up front would be wrong: in
-// `set -x -o errexit` the parser would take `-o` for the second word's own
-// business and find nothing after it, and in `kill -l -s TERM` the same. Widening
-// only on demand means the second word can ONLY be an option-argument, never a
-// second option word - so no word is ever read as the wrong thing.
-//
-// Re-parsing the first word inside the widened window applies its rows a second
-// time. Every setter these tables use is idempotent (`set_bool`, `toggle`,
-// `set_enum_value`, `store_view` all write a value rather than accumulate); a
-// `count` row would not be, and no table here has one.
-struct option_word {
-	args::error err{};
-	// Words the group consumed: 0 when `cur[1]` is an operand, 1 for a plain
-	// option word or `--`, 2 when the option-argument was the following word.
-	size_t consumed = 0;
-	// The options are over. Either `cur[1]` was an operand (consumed 0) or it was
-	// `--` (consumed 1, `separator` set).
-	bool done = false;
-	bool separator = false;
-};
-
-// `cur[1]` is the next unread word; `cur[2]` is offered only as an argument. On
-// return, advance by `consumed` and the operands begin at `cur[1]` once `done`.
-template <class T, size_t N>
-[[nodiscard]] option_word next_option_word(const args::spec_table<T, N>& spec, char** cur,
-                                           T& into) {
-	char* const word = cur[1];
-	if (word == nullptr)
-		return option_word{{}, 0, true, false};
-	// `--` IS THE UTILITY'S BUSINESS as well as the parser's: `set --` clears the
-	// positional parameters where a bare `set` leaves them, so the caller has to
-	// know the separator was there and not merely that the options ended. The
-	// parser would consume it silently and report the same `done` either way.
-	if (std::string_view{word} == "--")
-		return option_word{{}, 1, true, true};
-
-	char* one[3] = {cur[0], word, nullptr};
-	const args::scan_result first = args::parse_into(spec, one, into);
-	if (!first.err)
-		return option_word{{}, first.rest == one + 1 ? 0u : 1u, first.rest == one + 1, false};
-	// The parser asked for an argument the window did not hold. If argv has a next
-	// word, it is that argument; if it does not, the error is real.
-	if (first.err.kind != args::error_kind::missing_argument || cur[2] == nullptr)
-		return option_word{first.err, 0, false, false};
-
-	char* two[4] = {cur[0], word, cur[2], nullptr};
-	const args::scan_result second = args::parse_into(spec, two, into);
-	if (second.err)
-		return option_word{second.err, 0, false, false};
-	return option_word{{}, 2, false, false};
-}
 
 // --- regular builtins --------------------------------------------------------
 
