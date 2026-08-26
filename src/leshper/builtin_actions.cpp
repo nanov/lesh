@@ -24,9 +24,10 @@
 // tests asserts the two paths agree on buffer, cursor, generation and undo
 // history, so the duplication is caught by a test rather than by a reader.
 //
-// The three accepting actions (#133) have no twin on the enum path and never
-// will: there is nothing for a switch to dispatch to, because what they act on
-// is a reactor's proposal and the enum path has no reactors.
+// The accepting actions (#133, and #149's per-character one) have no twin on the
+// enum path and never will: there is nothing for a switch to dispatch to,
+// because what they act on is a reactor's proposal and the enum path has no
+// reactors.
 
 #include "leshper/abi.h"
 
@@ -242,6 +243,70 @@ int32_t accept_autosuggestion_word(lesh_editor* editor, const lesh_invocation*, 
 	return lesh_cursor_set(editor, boundary);
 }
 
+// fish's `forward-single-char` (fish 3.5), and DELIBERATELY BOUND TO NO KEY -
+// #149, which is fish's own answer too: fish registers the function and ships no
+// binding for it, because the key it would want is `<Right>`, and `<Right>` is
+// already the accept-whole. Registered and one
+// `bind '<A-Right>' accept_suggestion_char_or_forward_char` away, which is what
+// a name with no key is for. The wrapper row below carries the same note.
+//
+// ONE GRAPHEME CLUSTER PER PRESS, never one byte. The trick is the word twin's:
+// stage the whole candidate first, so the suggested text is somewhere the
+// editor's own segmentation can be pointed at, then ask `LESH_MOTION_NEXT_CLUSTER`
+// where the cluster after the typed prefix ends and truncate there. Two staged
+// writes, one undo entry (A-12), and no second boundary rule in the tree - a
+// combining sequence, a flag and a ZWJ emoji are each one press because F-3's
+// unit says so and this action never learns what a cluster is.
+//
+// COALESCING: this breaks the typing run, like every other block write, and that
+// is #146's RULE READ OFF AS WRITTEN rather than a new decision here. The
+// discriminator asks whether the commit wears all three marks of a keystroke -
+// plain insertion at a point, exactly one cluster, and the inserted bytes ARE
+// the key that dispatched the action. A one-cluster accept wears the first two.
+// It fails the third: the cluster comes off the candidate, and the key that
+// dispatched it (`<A-Right>`, or whatever a user binds) contributes different
+// bytes - usually none at all. So it is a block write, one undo step of its own,
+// and the run breaks on both sides. The tempting exception - "this one is
+// byte-identical to typing that cluster, let it join" - is exactly the reasoning
+// #146 rejected when it made the third mark load-bearing, and it is not reopened
+// here.
+int32_t accept_autosuggestion_char(lesh_editor* editor, const lesh_invocation*, void*) {
+	char candidate[kCandidateBytes];
+	size_t length = 0;
+	int32_t status = read_suggestion(editor, candidate, sizeof(candidate), &length);
+	if (status == LESH_ERR_NOTFOUND)
+		return LESH_OK;
+	if (status != LESH_OK)
+		return status;
+
+	size_t typed = 0;
+	status = lesh_buffer_length(editor, &typed);
+	if (status != LESH_OK)
+		return status;
+	if (length <= typed)
+		return LESH_OK;  // nothing past what is typed: nothing to accept
+
+	status = lesh_buffer_set(editor, candidate, length);
+	if (status != LESH_OK)
+		return status;
+	size_t boundary = 0;
+	status = lesh_position_move(editor, typed, LESH_MOTION_NEXT_CLUSTER, &boundary);
+	if (status != LESH_OK)
+		return status;
+	// A motion that did not move means there is no cluster boundary further on -
+	// take the rest, the same answer the word twin gives for the same reason.
+	// Unreachable while `length > typed`, and cheaper than a wrong truncation if
+	// it ever is not.
+	if (boundary <= typed)
+		boundary = length;
+	if (boundary < length) {
+		status = lesh_buffer_replace(editor, boundary, length, nullptr, 0);
+		if (status != LESH_OK)
+			return status;
+	}
+	return lesh_cursor_set(editor, boundary);
+}
+
 // DELIBERATELY BOUND TO NO KEY, in any keymap, and it is a decision rather than
 // an omission (#140 decision 4, fish's answer). A suggestion changes as you
 // type, so it dismisses itself; Ctrl-C clears the whole line when it does not.
@@ -265,7 +330,7 @@ int32_t dismiss_autosuggestion(lesh_editor* editor, const lesh_invocation*, void
 // binds the pure motion table (#119), and safety is a fact about the tables
 // rather than about a condition somebody has to remember to check.
 //
-// ONE IMPLEMENTATION, five registrations. What differs between `<Right>` and
+// ONE IMPLEMENTATION, six registrations. What differs between `<Right>` and
 // `e` is two action NAMES, and a name is data - so it rides in as registration
 // userdata (the ABI's third argument, the same door the vi repertoire's context
 // comes through) and the wrapper is a lookup and a delegation.
@@ -330,12 +395,20 @@ int32_t accept_suggestion_or(lesh_editor* editor, const lesh_invocation* invocat
 		editor, suggestion_is_acceptable(editor) ? which->accept : which->motion, how);
 }
 
-// The five rows of #140's table, as registration userdata. File scope and
+// The five rows of #140's table plus #149's unbound sixth, as registration
+// userdata. File scope and
 // non-const because the ABI's context argument is a `void*`; constant-
 // initialized and never written, so nothing here is a mutable global in any
 // sense that matters.
 fallthrough to_forward_char{"accept_autosuggestion", "forward_char"};
 fallthrough to_end_of_line{"accept_autosuggestion", "end_of_line"};
+// #149's row, and the one row of this table BOUND TO NOTHING. Same shape as the
+// others - accept when a suggestion is acceptable, otherwise the motion the key
+// always meant - and the same reason it has no key as the action it composes:
+// fish ships `forward-single-char` unbound, because `<Right>` is spent on the
+// whole accept. It is here so that `bind '<A-Right>'
+// accept_suggestion_char_or_forward_char` is the whole of what a user has to do.
+fallthrough to_forward_char_by_one{"accept_autosuggestion_char", "forward_char"};
 fallthrough to_forward_word{"accept_autosuggestion_word", "forward_word"};
 // vi command mode gets the WORD accepts only, and falls through to its own
 // class-aware motions. `b` is not here: a suggestion exists only forward of the
@@ -476,23 +549,29 @@ constexpr builtin builtins[] = {
 	{"forward_word", forward_word},
 	{"undo", undo_action},
 	{"redo", redo_action},
-	// F-25's three. THE ACCEPTS ARE STILL BOUND TO NO KEY THEMSELVES, and that
-	// is unchanged by #140: what the default table binds is the five wrappers
-	// below, which compose these. A user who wants a key that accepts and does
-	// nothing else binds one of these two names, and a user who wants no
-	// dismissal key gets that for free - see the note above the action.
+	// F-25's three, plus #149's. THE ACCEPTS ARE STILL BOUND TO NO KEY
+	// THEMSELVES, and that is unchanged by #140: what the default table binds is
+	// the five wrappers below, which compose these. A user who wants a key that
+	// accepts and does nothing else binds one of these names, and a user who
+	// wants no dismissal key gets that for free - see the note above the action.
 	{"accept_autosuggestion", accept_autosuggestion},
 	{"accept_autosuggestion_word", accept_autosuggestion_word},
+	// #149's per-character accept, fish's `forward-single-char`. Bound to no key
+	// here and to none through a wrapper either - see the note above the action.
+	{"accept_autosuggestion_char", accept_autosuggestion_char},
 	{"dismiss_autosuggestion", dismiss_autosuggestion},
-	// #140's table, five thin names over one implementation. Which accept each
-	// composes is in the userdata beside it, not in the name - the fallback is
-	// what tells them apart to a reader, and `bind -m emacs` shows the name a
-	// key really runs, which was the argument for wrappers over overloading.
+	// #140's table, five thin names over one implementation, and #149's sixth
+	// beside them with no key. Which accept each composes is in the userdata
+	// beside it, not in the name - the fallback is what tells them apart to a
+	// reader, and `bind -m emacs` shows the name a key really runs, which was the
+	// argument for wrappers over overloading.
 	{"accept_suggestion_or_forward_char", accept_suggestion_or, &to_forward_char},
 	{"accept_suggestion_or_end_of_line", accept_suggestion_or, &to_end_of_line},
 	{"accept_suggestion_or_forward_word", accept_suggestion_or, &to_forward_word},
 	{"accept_suggestion_or_word_start_next", accept_suggestion_or, &to_vi_word_next},
 	{"accept_suggestion_or_word_end_next", accept_suggestion_or, &to_vi_word_end},
+	// #149's sixth row. Registered like the other five, bound like none of them.
+	{"accept_suggestion_char_or_forward_char", accept_suggestion_or, &to_forward_char_by_one},
 	// #139's. Bound to Tab at the wiring site (read.cpp) rather than in
 	// keymap.cpp's default tables, because it is only in a session that a
 	// completer exists to complete WITH - the same reason `accept_line` is bound

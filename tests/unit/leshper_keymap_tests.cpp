@@ -384,11 +384,16 @@ TEST(LeshperKeymapRegistry, TheOperatorPendingMapBindsPureMotionsAndNothingThatA
 	EXPECT_EQ(*pending->action_for(keys("$")), "end_of_line");
 }
 
-TEST(LeshperKeymapRegistry, DismissIsBoundInNoDefaultKeymapAtAll) {
+TEST(LeshperKeymapRegistry, DismissAndThePerCharacterAcceptAreBoundInNoDefaultKeymapAtAll) {
 	// #140 decision 4, and it is a decision rather than an omission: a
 	// suggestion changes as you type and Ctrl-C clears the line, so the key is
 	// not spent. The action is registered and one `bind` away, which is what the
 	// note beside it in builtin_actions.cpp says.
+	//
+	// #149 adds two more names on the same footing - the per-character accept and
+	// its fallthrough wrapper, fish's `forward-single-char`, which fish itself
+	// ships unbound because `<Right>` is spent on the whole accept. Registered,
+	// reachable by `bind`, in no default table.
 	keymap_registry maps;
 	maps.install_defaults();
 	std::vector<std::string> names;
@@ -396,9 +401,12 @@ TEST(LeshperKeymapRegistry, DismissIsBoundInNoDefaultKeymapAtAll) {
 	for (const std::string& name : names) {
 		const keymap* map = maps.find(name);
 		ASSERT_NE(map, nullptr);
-		for (const keymap::entry& one : map->entries())
-			EXPECT_NE(one.action, "dismiss_autosuggestion")
-				<< name << " bound " << render_key_notation(one.keys) << " to the dismissal";
+		for (const keymap::entry& one : map->entries()) {
+			for (const char* unbound : {"dismiss_autosuggestion", "accept_autosuggestion_char",
+			                            "accept_suggestion_char_or_forward_char"})
+				EXPECT_NE(one.action, unbound)
+					<< name << " bound " << render_key_notation(one.keys) << " to " << unbound;
+		}
 	}
 }
 
