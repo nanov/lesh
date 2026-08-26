@@ -1120,57 +1120,133 @@ void print_options_reinputtable(const shell_state::options& o) {
 	}
 }
 
+// `set`'s table, and the hardest one in the tree (#148).
+//
+// THE ROWS BIND THE OPTION STATE ITSELF. Every POSIX shell option is already a
+// `bool` field of `shell_state::options`, which is exactly what a `toggle` row
+// binds - so `set -x` and `set +x` are one row writing one field, and the deviant
+// the research note kept setting aside (`+x` is not an option word anywhere else)
+// becomes the most ordinary thing in the table.
+//
+// A scan struct DERIVES from the option state rather than copying it field by
+// field: `-o NAME` needs somewhere to put the name, a spec requires every row to
+// bind one struct, and eleven hand-written copies in and eleven out would be
+// eleven chances to forget the twelfth. Seeding is then one assignment and
+// writing back is one assignment.
+//
+// `set -h` HAS NO `-o` SPELLING and `pipefail`, `vi`, `nolog` and `ignoreeof`
+// have no letter; shell_state::option_table() is where that asymmetry lives, and
+// `apply_option_name` is still what reads it. The letters are the rows.
+struct set_scan : shell_state::options {
+	// `-o NAME` / `+o NAME`. A default-constructed view has a NULL data pointer and
+	// `set -o ''` gives an empty one that is not null, so the two stay apart - and
+	// `set -o ''` keeps reaching `apply_option_name`, which refuses it.
+	std::string_view name{};
+};
+
+// `shell_option<&shell_state::options::trace>` - one row's binding.
+//
+// `&shell_state::options::trace` has type `bool options::*` however it is spelled,
+// including through the derived struct ([expr.unary.op]/4), and a spec requires
+// every row to bind ONE struct. The base-to-derived conversion is the language's
+// own way of saying "the same field, seen from here", and it is a constant
+// expression, so the row is still built at compile time.
+template <bool shell_state::options::*Member>
+inline constexpr auto shell_option = args::field<static_cast<bool set_scan::*>(Member)>;
+
+constexpr auto kSet = args::spec<set_scan>(
+	args::option{'a', shell_option<&shell_state::options::all_export>, args::toggle}
+		.help("export every name that is assigned"),
+	args::option{'b', shell_option<&shell_state::options::notify>, args::toggle}
+		.help("report terminated background jobs at once (recorded, inert)"),
+	args::option{'C', shell_option<&shell_state::options::no_clobber>, args::toggle}
+		.help("refuse to truncate an existing file with >"),
+	args::option{'e', shell_option<&shell_state::options::exit_on_error>, args::toggle}
+		.help("exit when a command fails"),
+	args::option{'f', shell_option<&shell_state::options::no_glob>, args::toggle}
+		.help("disable pathname expansion"),
+	args::option{'h', shell_option<&shell_state::options::hash_all>, args::toggle}
+		.help("hash commands as functions are defined (recorded, inert)"),
+	args::option{'m', shell_option<&shell_state::options::monitor>, args::toggle}
+		.help("job control (recorded, inert)"),
+	args::option{'n', shell_option<&shell_state::options::no_exec>, args::toggle}
+		.help("read commands without executing them"),
+	args::option{'u', shell_option<&shell_state::options::error_on_unset>, args::toggle}
+		.help("treat an unset parameter as an error"),
+	args::option{'v', shell_option<&shell_state::options::verbose>, args::toggle}
+		.help("echo input lines as they are read"),
+	args::option{'x', shell_option<&shell_state::options::trace>, args::toggle}
+		.help("trace commands as they are executed"),
+	args::option{'o', args::field<&set_scan::name>, args::value("NAME")}
+		.plus_sigil()
+		.help("set the option NAME names; with no NAME, list the options"));
+
 builtin_result builtin_set(shell_state& state, char** argv) {
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
+	// The scan IS the option state, seeded from it. A word that is refused half way
+	// therefore leaves the letters it had already applied applied - `set -x -Z`
+	// turns on xtrace and then reports - which is what the loop this replaces did,
+	// and what dash does.
+	set_scan scan;
+	static_cast<shell_state::options&>(scan) = state.opts();
 
-		// `--` ends the options and replaces the positional parameters with
-		// whatever follows - including nothing, which clears them.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg.size() < 2 || (arg[0] != '-' && arg[0] != '+'))
-			break;  // a plain operand also ends the options and sets $1..
-
-		const bool enable = arg[0] == '-';
-		// One option table, shared with command-line parsing (runtime/invocation.h),
-		// so `set -m` and `sh -m` cannot disagree about which letters exist.
-		for (const char c : arg.substr(1)) {
-			if (c == 'o') {
-				// A bare `set -o` LISTS; `set -o name` sets. dash prints the verbose
-				// form for `-o` and the re-inputtable form for `+o`.
-				if (argv[i + 1] == nullptr) {
-					if (enable)
-						print_options_verbose(state.opts());
-					else
-						print_options_reinputtable(state.opts());
-					break;
-				}
-				if (!shell_state::apply_option_name(state.opts(), argv[++i], enable)) {
-					// An unknown option is an ERROR, not something to shrug at. This
-					// return value was discarded with a `(void)`, so `set -o bogus`
-					// succeeded silently - and `set` is a special builtin, so dash both
-					// reports and exits a non-interactive shell. Status 2 and the
-					// wording are dash's.
-					report("set: Illegal option %co %s",
-					       arg[0], argv[i]);
-					return {2};
-				}
+	// ONE OPTION WORD AT A TIME, because `-o NAME` is applied AS IT ARRIVES. A
+	// string_view field holds one name and `set -o allexport -o noglob` gives it
+	// two - dash applies both, and so does this. The sigil is per occurrence for
+	// the same reason: `set -o errexit +o xtrace` turns one on and the other off,
+	// and a stored view cannot remember which sigil it arrived under.
+	char** cur = argv;
+	bool separator = false;
+	for (;;) {
+		scan.name = {};
+		const option_word step = next_option_word(kSet, cur, scan);
+		state.opts() = scan;
+		if (step.err) {
+			if (step.err.kind == args::error_kind::missing_argument &&
+			    step.err.letter == 'o') {
+				// A BARE `set -o` LISTS. `next_option_word` widens its window only
+				// when argv really does hold a next word, so a missing argument to
+				// `-o` can only mean there is none - which is exactly the condition
+				// the loop tested as `argv[i + 1] == nullptr`. dash prints the verbose
+				// form for `-o` and the re-inputtable form for `+o`, and set-p.tst's
+				// round trip depends on the second.
+				if (cur[1][0] == '-')
+					print_options_verbose(state.opts());
+				else
+					print_options_reinputtable(state.opts());
+				cur += 1;
 				break;
 			}
-			if (!shell_state::apply_option_letter(state.opts(), c, enable)) {
-				report("set: Illegal option %c%c", arg[0], c);
+			return {report_option_error("set", step.err)};
+		}
+		if (scan.name.data() != nullptr) {
+			// One option table, shared with command-line parsing
+			// (runtime/invocation.h), so `set -o monitor` and `sh -o monitor` cannot
+			// disagree about which names exist.
+			//
+			// An unknown name is an ERROR, not something to shrug at. The return
+			// value was once discarded with a `(void)`, so `set -o bogus` succeeded
+			// silently - and `set` is a special builtin, so dash both reports and
+			// exits a non-interactive shell. Status 2 and the wording are dash's.
+			if (!shell_state::apply_option_name(scan, scan.name, cur[1][0] == '-')) {
+				report("set: Illegal option %co %.*s", cur[1][0],
+				       static_cast<int>(scan.name.size()), scan.name.data());
 				return {2};
 			}
+			state.opts() = scan;
+		}
+		cur += step.consumed;
+		if (step.done) {
+			separator = step.separator;
+			break;
 		}
 	}
 
 	// Only replace the positional parameters when operands were actually given -
 	// bare `set -e` must not clear them, which is why this is conditional rather
-	// than unconditional.
-	if (argv[i] != nullptr || (i > 1 && std::string_view{argv[i - 1]} == "--")) {
+	// than unconditional. A bare `set --` DOES clear them, which is why the
+	// separator is a fact the driver hands back rather than one re-read from argv.
+	size_t i = static_cast<size_t>(cur + 1 - argv);
+	if (argv[i] != nullptr || separator) {
 		std::vector<std::string> positional;
 		for (; argv[i] != nullptr; ++i)
 			positional.emplace_back(argv[i]);
