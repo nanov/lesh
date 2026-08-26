@@ -285,7 +285,7 @@ protected:
 //
 // THE SAME PROBLEM AND THEREFORE THE SAME SHAPE - §6.10 says so in as many
 // words: "`prompt_console` beside `binding_console`". The prompt registry, the
-// composer and the tick wheel live in leshper (`src/leshper/prompt.h`), and
+// composer and the tick wheel live in leshper (`src/leshper/prompt/prompt.h`), and
 // `lesh_runtime` does not link `lesh_leshper`; a builtin in this file cannot
 // call `engine::add_module` any more than it can call a keymap function. So the
 // runtime declares what a configuration builtin needs to SAY, and the wiring

@@ -52,11 +52,13 @@ process group and kills by group, and it clears the stale `.trs` files that woul
 otherwise be counted as this run's. Six times on this map a runner defect has
 masqueraded as a shell bug, and this is the cheapest one to fall into.
 
-**leshper-only changes need no sweep.** The `lesh` binary does not link
-`lesh_leshper`, so a change confined to `src/leshper/` provably cannot move the
-corpus or the conformance score - iterate with
-`./build/debug/lesh_tests --gtest_filter='Leshper*'` (milliseconds), adding
-`:Grapheme*` when positions or width are involved. The full sanitized gate
+**Editor-only changes need no sweep.** A change confined to `src/leshper/` or
+`src/leshnici/` cannot move the corpus or the conformance score - not because
+the binary leaves that code out (`lesh` links `lesh_leshper`, and `lesh_leshnici`
+above it), but because the conformance corpus is non-interactive: every case runs
+a script on a pipe, and nothing in it ever enters the line editor. Iterate with
+`./build/debug/lesh_tests --gtest_filter='Leshper*:Leshnici*'` (milliseconds),
+adding `:Grapheme*` when positions or width are involved. The full sanitized gate
 still runs once at merge; the exemption is from the sweeps, not the gate.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure

@@ -1,10 +1,11 @@
 #include "leshper/read.h"
 
+#include "leshnici/prompt_modules.h"
 #include "leshper/abi.h"
 #include "leshper/complete.h"
 #include "leshper/keymap.h"
 #include "leshper/loop.h"
-#include "leshper/prompt.h"
+#include "leshper/prompt/prompt.h"
 #include "leshper/registry.h"
 #include "leshper/shell_actor.h"
 #include "leshper/shell_state_knowledge.h"
@@ -498,6 +499,19 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _actor(*this, &_knowledge, &_writing),
 	  _loop(loop_fds{in, out}, options_for(providers, true)),
 	  _completer(&_knowledge) {
+	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163).
+	//
+	// FIRST THING, and the reason is precedence rather than taste: everything
+	// below this - `use_default`, `source_rc`, the first paint - may name a
+	// prompt module, and a module registered afterwards would be one a template
+	// set before it could not resolve. The engine's constructor seeds the seven
+	// built-ins; this is where the ones lesh ships on top of them arrive, and
+	// leshper itself never learns their names.
+	//
+	// THE WIRING SITE IS THE ONLY CALLER, which is what makes an engine built by
+	// a test a bare one: `{git}` on it is an unknown module, refused at `set`.
+	leshnici::install_prompt_modules(_prompt_engine);
+
 	// The EXIT trap belongs to the session and not to the first line of it. See
 	// tree_walking_executor::defer_exit_trap; `run` runs it on the way out.
 	_executor.defer_exit_trap(true);

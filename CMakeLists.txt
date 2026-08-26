@@ -207,15 +207,22 @@ add_library(lesh_leshper STATIC
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
-	src/leshper/git_head.cpp
-	src/leshper/git_head.h
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/pager.cpp
 	src/leshper/pager.h
 	src/leshper/pager_actions.cpp
-	src/leshper/prompt.cpp
-	src/leshper/prompt.h
+	src/leshper/prompt/prompt.cpp
+	src/leshper/prompt/prompt.h
+	src/leshper/prompt/module.h
+	src/leshper/prompt/module_duration.h
+	src/leshper/prompt/module_env.h
+	src/leshper/prompt/module_jobs.h
+	src/leshper/prompt/module_mode.h
+	src/leshper/prompt/module_path.h
+	src/leshper/prompt/module_status.h
+	src/leshper/prompt/module_time.h
+	src/leshper/prompt/modules.h
 	src/leshper/proposal.cpp
 	src/leshper/proposal.h
 	src/leshper/sgr.h
@@ -248,6 +255,26 @@ add_library(lesh_leshper STATIC
 	src/leshper/workers.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
 
+# leshnici: the shipped extension set (#163).
+#
+# A layer ABOVE leshper, not inside it. What lives here is everything lesh ships
+# on top of the editor's own machinery but does not owe it - prompt modules now,
+# builtins later - and the direction of the arrow is the whole point: leshnici
+# links lesh_leshper, lesh_leshper does not know leshnici exists, so a module
+# that reached back into the engine's internals would fail to link rather than
+# fail review. Nothing in leshper's own targets may name a symbol from here.
+#
+# The wiring site installs it. `src/leshper/read.cpp` calls
+# `leshnici::install_prompt_modules` on the session's engine; an engine built
+# anywhere else - a unit test, a tool - is the bare seven-module one.
+add_library(lesh_leshnici STATIC
+	src/leshnici/git_head.cpp
+	src/leshnici/git_head.h
+	src/leshnici/module_git.h
+	src/leshnici/prompt_modules.cpp
+	src/leshnici/prompt_modules.h)
+target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
+
 add_subdirectory("tools")
 
 # The `lesh` binary, and the ONE place both halves meet.
@@ -257,8 +284,13 @@ add_subdirectory("tools")
 # lesh_leshper does not link lesh_runtime, so a file that drifted into the
 # editor's target would fail to link rather than fail review. The same goes for
 # src/leshper/shell_state_knowledge.h, which is in no library target at all.
+#
+# Since #163 it is also the site that reaches UP into lesh_leshnici, calling
+# `install_prompt_modules` on the session's engine - the second reason the same
+# file cannot live in lesh_leshper, and the only place in the tree where the
+# shipped extension set is named.
 add_executable(lesh src/main.cpp src/leshper/read.cpp src/leshper/read.h)
-target_link_libraries(lesh PRIVATE lesh_leshper lesh_runtime lesh_syntax lesh_ui)
+target_link_libraries(lesh PRIVATE lesh_leshnici lesh_leshper lesh_runtime lesh_syntax lesh_ui)
 
 add_executable(lesh_tests
 	src/leshper/read.cpp
@@ -281,6 +313,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_decoration_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
+	tests/unit/leshnici_git_tests.cpp
 	tests/unit/leshper_prompt_tests.cpp
 	tests/unit/leshper_style_grammar_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
@@ -308,7 +341,7 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_leshper lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
+target_link_libraries(lesh_tests PRIVATE lesh_leshnici lesh_leshper lesh_runtime lesh_syntax lesh_ui gtest gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale
 # expectation (#108).
@@ -340,6 +373,7 @@ file(GLOB_RECURSE LESH_PUBLIC_HEADERS
 	${PROJECT_SOURCE_DIR}/src/substrate/*.h
 	${PROJECT_SOURCE_DIR}/src/syntax/*.h
 	${PROJECT_SOURCE_DIR}/src/leshper/*.h
+	${PROJECT_SOURCE_DIR}/src/leshnici/*.h
 	${PROJECT_SOURCE_DIR}/src/runtime/*.h)
 set(SELF_CONTAINMENT_DIR ${CMAKE_CURRENT_BINARY_DIR}/self_containment)
 file(MAKE_DIRECTORY ${SELF_CONTAINMENT_DIR})
@@ -352,7 +386,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshper lesh_runtime lesh_substrate lesh_syntax)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici lesh_leshper lesh_runtime lesh_substrate lesh_syntax)
 
 # The committed src/substrate/unicode_tables.h must be exactly what the
 # generator emits from the vendored UCD (#108). The 766 conformance cases prove
