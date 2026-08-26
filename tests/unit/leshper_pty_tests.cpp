@@ -210,6 +210,20 @@ private:
 	return (modes.c_lflag & IEXTEN) != 0;
 }
 
+// #152: what the parent shell inherits when lesh is gone. The question is
+// whether a newline followed the last thing the prompt painted - NOT whether
+// the wire's last byte is one, because the armed exit restore writes
+// `\x1b[?2004l` after everything else and a terminal draws nothing for it and
+// moves no cursor for it. fish and zsh both leave column 0 here; a shell that
+// does not is what zsh's inverse `%` marker is reporting.
+[[nodiscard]] bool a_newline_follows_the_last_prompt(std::string_view wire,
+                                                     std::string_view prompt) {
+	const std::size_t last = wire.rfind(prompt);
+	if (last == std::string_view::npos)
+		return false;
+	return wire.find('\n', last) != std::string_view::npos;
+}
+
 // Every test starts the same way, and the rc file proves #101's ordering as a
 // side effect: the prompt only says `lesh-test>` because `~/.leshrc` ran before
 // the first read.
@@ -439,6 +453,71 @@ TEST(LeshperPty, TheExitBuiltinEndsTheSessionWithItsStatus) {
 	struct termios after{};
 	ASSERT_TRUE(shell.modes(after));
 	EXPECT_TRUE(is_cooked(after)) << "`exit` left the terminal raw";
+}
+
+TEST(LeshperPty, AnAcceptedExitPaintsNoSecondPromptAndLeavesAFreshLine) {
+	// #152, both halves at once. `exit` is honoured by the SHELL thread, which
+	// answers the `execute` slot and only then says the session is over - so the
+	// loop used to unpark, repaint a prompt for a line that will never be typed,
+	// and exit out from under it, leaving the parent's cursor parked after
+	// `lesh-test>`. ONE prompt for the whole session is the assertion: the
+	// blitter diffs, so typing `exit` re-emits no prompt, and a second
+	// occurrence can only be a repaint that should not have happened.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("exit\r");
+	const std::optional<int> status = shell.reap();
+	ASSERT_TRUE(status.has_value()) << "`exit` did not end the session; saw: " << shell.seen();
+	ASSERT_TRUE(WIFEXITED(*status));
+	EXPECT_EQ(WEXITSTATUS(*status), 0);
+
+	EXPECT_EQ(shell.count_of(kPrompt), 1u)
+		<< "a prompt was painted after the accepted `exit`; saw: " << shell.seen();
+	EXPECT_TRUE(a_newline_follows_the_last_prompt(shell.seen(), kPrompt))
+		<< "`exit` left the cursor mid-line; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, AnExitWithAStatusAlsoLeavesAFreshLine) {
+	// The same path with a status on it: `exit N` is still an accepted line, and
+	// the status is the shell's answer, not a different exit sequence.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("exit 3\r");
+	const std::optional<int> status = shell.reap();
+	ASSERT_TRUE(status.has_value()) << "`exit 3` did not end the session; saw: " << shell.seen();
+	ASSERT_TRUE(WIFEXITED(*status));
+	EXPECT_EQ(WEXITSTATUS(*status), 3);
+
+	EXPECT_EQ(shell.count_of(kPrompt), 1u)
+		<< "a prompt was painted after the accepted `exit 3`; saw: " << shell.seen();
+	EXPECT_TRUE(a_newline_follows_the_last_prompt(shell.seen(), kPrompt))
+		<< "`exit 3` left the cursor mid-line; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlDAtAnEmptyPromptLeavesAFreshLine) {
+	// The EOF half. Nothing is accepted here and nothing runs, so no `\r\n` was
+	// ever written: the cursor is sitting just after `lesh-test>` when the loop
+	// tears down, and the teardown is the only side that can move it.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("\x04");
+	const std::optional<int> status = shell.reap();
+	ASSERT_TRUE(status.has_value()) << "Ctrl-D did not end the session; saw: " << shell.seen();
+	ASSERT_TRUE(WIFEXITED(*status));
+
+	EXPECT_EQ(shell.count_of(kPrompt), 1u)
+		<< "a prompt was painted after the EOF; saw: " << shell.seen();
+	EXPECT_TRUE(a_newline_follows_the_last_prompt(shell.seen(), kPrompt))
+		<< "Ctrl-D left the cursor mid-line; saw: " << shell.seen();
 }
 
 TEST(LeshperPty, DyingOnTheAssertPathStillRestoresTheTerminal) {

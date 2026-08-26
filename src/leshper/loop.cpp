@@ -488,6 +488,23 @@ void event_loop::enter_read() {
 }
 
 void event_loop::leave_read() {
+	// #152: THE PARENT'S PROMPT STARTS AT COLUMN 0. fish and zsh both move to a
+	// fresh line on their way out; zsh's inverse `%` marker is what a shell that
+	// does not looks like from the outside, and it is what the owner saw.
+	//
+	// A CHECK, NOT A GUESS. The last layout knows which cell the terminal's
+	// cursor is parked on - `screen.cursor()` is the placement the blitter
+	// honoured - so the newline is written exactly when the cursor is not at the
+	// left edge. When there is no live layout there is nothing to move and
+	// nothing is written: an accepted `exit` took that path, where
+	// `accept_current_line` wrote the newline before the command ran and dropped
+	// `_have_previous` on the way, and painted nothing after it.
+	//
+	// Before `leave_raw`, because until it returns the terminal is still the
+	// loop's - the byte goes out the way every other byte the terminal receives
+	// does (#98).
+	if (_have_previous && _previous.screen.cursor().column != 0 && _fds.output >= 0)
+		write_all(_fds.output, "\r\n");
 	if (_options.manage_terminal)
 		_terminal.leave_raw();
 	// The bytes still held belong to whoever has the terminal next (#111's
@@ -1125,7 +1142,23 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 		status = wait_on_shell(shell_message::kind::execute_done, 0);
 	}
 
+	// THE LINE THAT JUST RAN MAY HAVE BEEN AN `exit` (#152). Only the shell
+	// thread can know that, and it says so by `request_stop()` BEFORE it posts
+	// the reply this wait returned - so the flag is settled by the time it is
+	// read here, and reading it here is the whole point: one line further down
+	// the loop lays out a fresh prompt for a line nobody will ever type, paints
+	// it, and the process exits out from under it, leaving the user's parent
+	// shell to start its own prompt after `$ `. The unpark still happens - the
+	// park depth is a balance and `leave_read` is owed a terminal to hand back -
+	// but the repaint does not.
+	const bool ending = _stopping.load(std::memory_order_relaxed);
+
 	resume_after_execution();
+
+	if (ending) {
+		_exiting = true;
+		return status;
+	}
 
 	// The decorations go with the line they were computed for. Not because they
 	// are stale - the drop rule would sort that out - but because they are
