@@ -294,6 +294,7 @@ add_executable(lesh_tests
 	tests/unit/expander_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
+	tests/unit/prompt_builtin_tests.cpp
 	tests/unit/read_tests.cpp
 	tests/unit/readonly_tests.cpp
 	tests/unit/test_builtin_tests.cpp

@@ -154,7 +154,7 @@ struct builtin_descriptor {
 // `getopts` is regular and not special: POSIX 2.14 lists it nowhere in the
 // special set, so its failure must not exit a non-interactive shell - `getopts`
 // with too few operands has to report and carry on, the way dash does.
-constexpr std::array<builtin_descriptor, 30> kBuiltinRegistry = {{
+constexpr std::array<builtin_descriptor, 31> kBuiltinRegistry = {{
 	// POSIX XCU 2.14, the special builtins. The list is closed and the membership
 	// matters: a failure in one of these exits a non-interactive shell, and
 	// assignments preceding one persist.
@@ -196,6 +196,12 @@ constexpr std::array<builtin_descriptor, 30> kBuiltinRegistry = {{
 	{"getopts", builtin_kind::regular, builtin_home::table},
 	{"kill", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"pwd", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
+	// `prompt` is `bind` one console over (#157): the rc surface for the prompt
+	// engine, where `bind` is the rc surface for the keymap registry. Reported by
+	// name on the same argument, and it is the same argument: there is no
+	// `/usr/bin/prompt` it could stand in for, and its whole purpose is to change
+	// the shell it runs in - a prompt set in a subprocess would die with it.
+	{"prompt", builtin_kind::regular, builtin_home::table},
 	{"read", builtin_kind::regular, builtin_home::table},
 	{"test", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
 	{"[", builtin_kind::regular, builtin_home::table, builtin_report::pathname},
@@ -286,15 +292,16 @@ protected:
 // site - `src/leshper/read.cpp`, the one translation unit that links both
 // halves - hands it a leshper-backed implementation for the life of a session.
 //
-// NOTHING IN THIS FILE CALLS IT IN v1, and that is deliberate rather than
-// unfinished. §6.10 scopes v1 to "the registry, the composer, the tick wheel, a
-// `constexpr` default prompt table, and configuration through the ABI"; the
-// `bind`-shaped builtin and the `{module:style:type}` template language are the
-// recorded follow-up, because the builtin's operand grammar is the template
-// language's grammar and inventing half of it now would be inventing the half
-// that has to be kept. What v1 needs from this class is that the seam exist and
-// be installed the day the session starts, so the builtin, when it is written,
-// finds a console rather than a reason to re-open this argument.
+// `builtin_prompt` IS THE CALLER, and it arrived after the seam rather than with
+// it. §6.10 scoped v1 to "the registry, the composer, the tick wheel, a
+// `constexpr` default prompt table, and configuration through the ABI" and left
+// the `bind`-shaped builtin and the `{module:style:type}` template language as
+// the recorded follow-up, because the builtin's operand grammar IS the template
+// language's grammar and inventing half of it early would have been inventing
+// the half that has to be kept. What v1 needed from this class was that the seam
+// exist and be installed the day the session starts - and it paid off exactly
+// there: the builtin found a console rather than a reason to re-open the
+// argument, and adding `set` and `text` below was the whole of the change.
 //
 // The C ABI verbs (`lesh_prompt_add_module` and friends) are the other caller,
 // and the language-neutral one NG-4 says the Lua binding reuses unchanged. They
@@ -317,14 +324,15 @@ public:
 		continuation,
 	};
 
-	// How an operation ended, one space for all six verbs - `binding_console`'s
+	// How an operation ended, one space for all eight verbs - `binding_console`'s
 	// reasoning, and it applies unchanged: the caller's job is to turn each into
-	// a message and a status, and a per-verb enum would make that six switches
+	// a message and a status, and a per-verb enum would make that eight switches
 	// that drift.
 	enum class outcome {
 		ok,
 		no_such_module,
 		unbalanced_group,
+		bad_template,
 	};
 
 	// Every registered module's name, sorted. The listing verb, `bind -l`'s
@@ -354,6 +362,41 @@ public:
 	// with nothing open.
 	virtual outcome open_group(surface which) = 0;
 	virtual outcome close_group(surface which) = 0;
+
+	// THE PAIR THE `prompt` BUILTIN IS WRITTEN AGAINST (#157), and the reason the
+	// six verbs above are not enough on their own: the six are an ASSEMBLY
+	// interface, one call per element, and a builtin holding a single operand has
+	// a STRING. Somebody has to turn one into the other, and that somebody is on
+	// the far side of this line.
+	//
+	// `set` PARSES ONCE, AT SET TIME, AND SWAPS ATOMICALLY. A template that will
+	// not parse leaves the previous prompt standing - there is no half-applied
+	// state to see, and no shell left with a prompt it cannot draw, which is the
+	// failure mode a per-element interface makes reachable by construction. That
+	// promise is the console side's to keep; the builtin only reports what it is
+	// told.
+	//
+	// `error_out` IS A HUMAN SENTENCE, printed verbatim after "prompt: ". The
+	// wording belongs to the console because the PARSER does: the template
+	// language lives across the link boundary, in leshper, and only that side can
+	// say which byte of `{git:*:branch` was the mistake. A runtime-side wording
+	// would be a second, worse description of a failure it cannot see.
+	virtual outcome set(surface which, std::string_view template_text,
+	                    std::string& error_out) = 0;
+
+	// The SOURCE STRING the surface was last set from - the template text itself,
+	// not a rendering of it and not a walk of the elements it produced.
+	//
+	// This is what makes bare `prompt` printable at all. The alternative was an
+	// introspection door - list the elements, ask each one its kind and argument,
+	// spell the template back out - and §6.10 recorded that door closed: it would
+	// put the element vocabulary on this side of the boundary, where every new
+	// module kind becomes a new enumerator in a runtime header. Remembering the
+	// bytes that were handed in costs one `std::string` per surface and keeps the
+	// vocabulary where it belongs. Empty for a surface never set from a template
+	// (the shipped default is a table, not a string), which prints as an empty
+	// line rather than as an error.
+	virtual void text(surface which, std::string& out) const = 0;
 
 protected:
 	prompt_console() = default;

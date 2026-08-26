@@ -228,6 +228,19 @@ public:
 		                                              : outcome::unbalanced_group;
 	}
 
+	// INTERIM: the sibling ticket that lands the `{module:style:type}` parser
+	// replaces this body with the real parse-and-swap.
+	outcome set(surface, std::string_view, std::string& error_out) override {
+		error_out = "the template language lands with the parser (#157)";
+		return outcome::bad_template;
+	}
+
+	// INTERIM: the same sibling ticket replaces this with the remembered source
+	// string, which cannot exist before something can set one.
+	void text(surface, std::string& out) const override {
+		out.clear();
+	}
+
 private:
 	// TWO ENUMS, TRANSLATED HERE. The runtime's `surface` cannot BE leshper's
 	// `surface_id` without the runtime including a leshper header, which is the

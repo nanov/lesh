@@ -131,9 +131,12 @@ TEST_F(BuiltinRegistryTest, SpecialBuiltinsAreExactlyThePosixList) {
 	                         "export", "readonly", "return", "set", "shift", "times",
 	                         "trap", "unset"})
 		EXPECT_EQ(classify_builtin(name), builtin_kind::special) << name;
+	// `bind` and `prompt` are lesh's own rather than POSIX's, and REGULAR for the
+	// reason the closed list above gives: a prompt that would not parse must not
+	// end an rc file, and 2.14's fatality belongs to the fifteen names only.
 	for (const auto& name : {"cd", "echo", "false", "pwd", "true", "test", "[",
 	                         "alias", "unalias", "read", "command", "kill",
-	                         "getopts", "wait"})
+	                         "getopts", "wait", "bind", "prompt"})
 		EXPECT_EQ(classify_builtin(name), builtin_kind::regular) << name;
 	EXPECT_EQ(classify_builtin("grep"), builtin_kind::none);
 	EXPECT_EQ(classify_builtin(""), builtin_kind::none);
@@ -305,6 +308,14 @@ TEST_F(BuiltinRegistryTest, CommandDescribesAUtilityByPathnameAndTheRestByName) 
 	EXPECT_EQ(capture("command -V echo"), "echo is a shell builtin (/bin/echo)\n");
 	EXPECT_EQ(capture("command -v cat"), "/bin/cat\n");
 	EXPECT_EQ(capture("command -V cat"), "cat is /bin/cat\n");
+	// `bind` and `prompt` are the must-be-built-in end of that split, and the
+	// clearest case of it: there is no `/usr/bin/prompt` for the search to find,
+	// and a prompt configured in a subprocess would die with the subprocess.
+	// Nothing but the registry row decides this, so a row that drifted to
+	// `pathname` would show up as a pathname search that finds nothing.
+	EXPECT_EQ(capture("command -v bind"), "bind\n");
+	EXPECT_EQ(capture("command -v prompt"), "prompt\n");
+	EXPECT_EQ(capture("command -V prompt"), "prompt is a shell builtin\n");
 }
 
 TEST_F(BuiltinRegistryTest, CommandReportsANameItCannotFindAsNotFound) {

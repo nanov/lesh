@@ -1384,8 +1384,10 @@ TEST_F(LeshperPromptGit, ATickSplicesGitsSlotAndOnlyANewPromptRereadsIt) {
 //
 // WHERE `leshper_prompt_console`'S IS NOT: it stays anonymous in read.cpp,
 // unreachable from here, and that is `binding_console`'s precedent exactly -
-// that adapter is tested through `bind`, and v1 has no prompt builtin to test
-// this one through. Contorting the design to make an untestable-by-necessity
+// that adapter is tested through `bind`, and this one through `prompt`, whose
+// own tests drive a fake console rather than reaching into read.cpp
+// (tests/unit/prompt_builtin_tests.cpp). Contorting the design to make an
+// untestable-by-necessity
 // class reachable would be paying for the follow-up ticket's test in this
 // ticket's code. What IS asserted here is the seam's own contract: the interface
 // is implementable over the real engine, the six verbs reach it, the two
@@ -1430,6 +1432,17 @@ public:
 	outcome close_group(surface which) override {
 		return _engine->close_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
 	}
+
+	// The same interim answers read.cpp's adapter gives, and for the same reason:
+	// the `{module:style:type}` parser is the sibling ticket, and until it lands
+	// the honest answer to a template is that there is no language to read it in.
+	// Both bodies go away together.
+	outcome set(surface, std::string_view, std::string& error_out) override {
+		error_out = "the template language lands with the parser (#157)";
+		return outcome::bad_template;
+	}
+
+	void text(surface, std::string& out) const override { out.clear(); }
 
 private:
 	[[nodiscard]] static surface_id surface_of(surface which) noexcept {
