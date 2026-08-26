@@ -847,6 +847,12 @@ struct bind_run {
 	std::string output;
 };
 
+// The console the next `run_bind` hands its shell. A file-scope pointer HERE
+// rather than in the shell (#134 moved the real seam onto `shell_state`) only
+// because `run_bind` builds its own shell per call: the guard below installs
+// one for the duration of a test and the shell picks it up.
+lesh::runtime::binding_console* g_test_console = nullptr;
+
 bind_run run_bind(const std::vector<std::string>& words) {
 	std::vector<char*> argv;
 	std::vector<std::string> owned = words;
@@ -867,6 +873,7 @@ bind_run run_bind(const std::vector<std::string>& words) {
 	::close(into);
 
 	lesh::runtime::shell_state shell;
+	shell.set_binding_console(g_test_console);
 	lesh::runtime::builtin_result result;
 	const bool ran = lesh::runtime::try_run_builtin(shell, argv.data(), result, false);
 
@@ -889,9 +896,9 @@ bind_run run_bind(const std::vector<std::string>& words) {
 class console_guard {
 public:
 	explicit console_guard(editing_context& context) : _console(context) {
-		lesh::runtime::install_binding_console(&_console);
+		g_test_console = &_console;
 	}
-	~console_guard() { lesh::runtime::install_binding_console(nullptr); }
+	~console_guard() { g_test_console = nullptr; }
 
 	console_guard(const console_guard&) = delete;
 	console_guard& operator=(const console_guard&) = delete;
@@ -906,7 +913,7 @@ TEST(LeshperKeymapBind, WithNoLineEditorItSaysSoRatherThanPretending) {
 	// A non-interactive shell has no keymaps to mutate, and `bind` in an rc file
 	// guarded for both kinds of shell must not end the script - so this is an
 	// OPERATIONAL failure and not a usage error.
-	lesh::runtime::install_binding_console(nullptr);
+	g_test_console = nullptr;
 	const bind_run ran = run_bind({"bind", "-l"});
 	EXPECT_EQ(ran.status, 1);
 	EXPECT_NE(ran.output.find("no line editor"), std::string::npos);

@@ -1508,6 +1508,12 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	result.outcome = static_cast<loop_outcome>(_handle.outcome);
 	result.exit_status = _handle.exit_status;
+	// Latched for the loop, which is the only caller that can carry an outcome
+	// out. See `take_outcome`: the keystroke path runs through `step`, which
+	// returns effects and not results, so without this a bound `accept_line`
+	// asked for nothing.
+	if (result.outcome != loop_outcome::none)
+		_requested = requested_outcome{result.outcome, result.exit_status};
 	result.cursor_moved = target.cursor != cursor_before;
 	_handle.target = nullptr;
 	_handle.applied = nullptr;

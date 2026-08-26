@@ -227,10 +227,18 @@ target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
 
 add_subdirectory("tools")
 
-add_executable(lesh src/main.cpp)
-target_link_libraries(lesh PRIVATE lesh_runtime lesh_syntax lesh_ui)
+# The `lesh` binary, and the ONE place both halves meet.
+#
+# src/leshper/read.cpp is compiled HERE rather than into lesh_leshper, and that
+# is the rule enforcing itself (spec §4.4): it includes runtime headers, and
+# lesh_leshper does not link lesh_runtime, so a file that drifted into the
+# editor's target would fail to link rather than fail review. The same goes for
+# src/leshper/shell_state_knowledge.h, which is in no library target at all.
+add_executable(lesh src/main.cpp src/leshper/read.cpp src/leshper/read.h)
+target_link_libraries(lesh PRIVATE lesh_leshper lesh_runtime lesh_syntax lesh_ui)
 
 add_executable(lesh_tests
+	src/leshper/read.cpp
 	tests/base_tests.cpp
 	tests/unit/allocation_tests.cpp
 	tests/unit/arithmetic_tests.cpp
@@ -243,6 +251,8 @@ add_executable(lesh_tests
 	tests/unit/leshper_autosuggest_tests.cpp
 	tests/unit/leshper_tests.cpp
 	tests/unit/leshper_paste_tests.cpp
+	tests/unit/leshper_pty_tests.cpp
+	tests/unit/leshper_read_tests.cpp
 	tests/unit/leshper_replay_tests.cpp
 	tests/unit/log_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
@@ -273,6 +283,14 @@ target_link_libraries(lesh_tests PRIVATE lesh_leshper lesh_runtime lesh_syntax l
 # expectation (#108).
 target_compile_definitions(lesh_tests PRIVATE
 	LESH_UCD_DIR="${PROJECT_SOURCE_DIR}/third_party/ucd")
+# The pty test drives the REAL binary rather than a session forked out of the
+# test process (#134). It has to: `loop.cpp` captures the process's pid at static
+# initialization to tell a forked child from the shell, so a session forked out
+# of an already-running gtest binary sees every signal as "delivered to a child"
+# and re-raises it. Exec'ing the shell is also the honest test - main.cpp's floor
+# check, its rc lookup and its logging setup are all on the path.
+target_compile_definitions(lesh_tests PRIVATE LESH_BINARY="$<TARGET_FILE:lesh>")
+add_dependencies(lesh_tests lesh)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 

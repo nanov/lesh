@@ -28,14 +28,18 @@ x .d88"               z`    ^%    .uef^"
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unistd.h>
 #include <vector>
 
+#include "leshper/read.h"
 #include "runtime/executor.h"
+#include "runtime/history_store.h"
 #include "runtime/invocation.h"
 #include "runtime/shell_state.h"
+#include "substrate/log.h"
 #include "syntax/parser.h"
 
 namespace {
@@ -96,6 +100,89 @@ std::string read_all(std::istream& in) {
 	return out;
 }
 
+// Everything an INTERACTIVE shell has and a non-interactive one does not.
+//
+// #101's ordering, and it is the whole shape of this function: the state exists
+// (main built it), the rc runs, the first read begins. An rc file may bind keys
+// and set modes because the editing context is built before it - which is why
+// the session is constructed first and started second.
+//
+// NON-INTERACTIVE SHELLS REACH NONE OF THIS. Not the rc, not the history file,
+// not the editor, not a second thread. That is #101's decision and it is also
+// what keeps `-c` fast and the conformance score honest: the two paths share
+// `shell_state`, the parser and the executor, and nothing else.
+int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
+                    const char* term) {
+	// #97 decision 3: below the floor, leshper never starts. One line, exit 2,
+	// the shape this file already had. The owner explicitly held open the
+	// courtesy of exec'ing /bin/sh instead; that is not taken here, because a
+	// shell that silently becomes a different shell is worse to debug than one
+	// that says why it stopped.
+	if (!lesh::leshper::terminal_meets_floor(term)) {
+		std::fprintf(stderr,
+		             "lesh: %s is below the terminal floor (ANSI, 256 colours, "
+		             "bracketed paste)\n",
+		             term == nullptr || term[0] == '\0' ? "an unset $TERM" : term);
+		return 2;
+	}
+
+	// #120 left this awaiting a caller, and this is it. `interactive = true`
+	// FORBIDS the stderr sink outright (#98): a diagnostic written over the edit
+	// line corrupts the one surface the user is looking at, and there is no
+	// override because the message that corrupted it is the message they cannot
+	// read. A log file that will not open costs diagnostics, not the session, so
+	// the answer is deliberately not checked.
+	lesh::log::options logging;
+	logging.interactive = true;
+	logging.tty = ttyname(STDIN_FILENO);
+	logging.floor = "ansi+256+paste";
+	(void)lesh::log::configure_from_environment(logging);
+
+	// The four providers (#94). Owned HERE, so they outlive the session that
+	// borrows them and are freed before main returns (ADR-0007).
+	const lesh::leshper::shell_syntax_layer syntax;
+	const lesh::leshper::shell_prompt_source prompt{state};
+
+	// #101: a non-interactive shell touches no history file, and `history_store`
+	// has no way to know which kind of shell built it - so the decision is made
+	// here, once, by not building one. No `$HOME` means no path and no store,
+	// which reads back as an empty history rather than as an error.
+	std::optional<lesh::runtime::history_store> history;
+	if (const std::optional<std::string> path = lesh::runtime::history_store::default_path())
+		history.emplace(*path);
+	const lesh::leshper::vector_history_source empty_history;
+	std::optional<lesh::leshper::history_store_source> recorded;
+	if (history.has_value())
+		recorded.emplace(*history);
+
+	lesh::leshper::provider_bundle providers;
+	providers.syntax = &syntax;
+	providers.prompt = &prompt;
+	providers.history = recorded.has_value()
+		? static_cast<const lesh::leshper::history_source*>(&*recorded)
+		: static_cast<const lesh::leshper::history_source*>(&empty_history);
+	providers.store = history.has_value() ? &*history : nullptr;
+	// The completer is #94's fourth provider and v1 has none. Null, and the
+	// bundle says so.
+	providers.completion = nullptr;
+
+	// WHICH rc, decided here; WHEN it runs is the session's (#101 decision 3).
+	// `$ENV` wins when it is set, per POSIX for an interactive shell; otherwise
+	// `~/.leshrc`, one file, no search - the neovim-shaped lookup arrives with
+	// the Lua runtime.
+	std::string rc;
+	if (const char* env = std::getenv("ENV"); env != nullptr && env[0] != '\0') {
+		rc = env;
+	} else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+		rc = std::string{home} + "/.leshrc";
+	}
+	const int status = lesh::leshper::run_interactive_shell(state, pool, providers,
+	                                                        STDIN_FILENO, STDOUT_FILENO, rc);
+	// ADR-0007: the logger owns two descriptors, and this is where they go back.
+	lesh::log::shutdown();
+	return status;
+}
+
 // There is ONE front end (#28). The strangler seam ADR-0002 opened - two front
 // ends compiled in and chosen by LESH_FRONTEND - closed when src/legacy/ was
 // deleted, so the variable is no longer read and setting it does nothing.
@@ -118,6 +205,11 @@ int main(int argc, char **argv) {
 	const bool interactive = inv.interactive.value_or(
 		!command_string && !script_path && isatty(STDIN_FILENO) && isatty(STDERR_FILENO));
 
+	// THE USER'S `$TERM`, read BEFORE the line below overwrites it. #97's floor
+	// check is about the terminal the user is actually on, and the `setenv` is a
+	// conformance-corpus convenience that would otherwise answer the question for
+	// every terminal in the world with the same string.
+	const char* const term_on_entry = std::getenv("TERM");
 	setenv("TERM", "xterm-256color", 1);
 
 	// Flush after every std::cout / std::cerr
@@ -158,7 +250,7 @@ int main(int argc, char **argv) {
 	// `-i` with input that is not a terminal is an ordinary POSIX invocation:
 	// interactive is about SEMANTICS - which signals are fatal, whether an error
 	// exits - not about line editing. There is nothing to edit when the input is
-	// a file, so only a terminal needs the editor lesh does not have yet.
+	// a file, so only a terminal gets the editor.
 	//
 	// Refusing it outright cost 1,800 conformance assertions: ten of the signal
 	// files run the shell under test as `sh -i` with the case piped in.
@@ -170,10 +262,5 @@ int main(int argc, char **argv) {
 		const std::string source = read_all(std::cin);
 		return run_shell(source, pool, state, true, &input);
 	}
-	// A terminal, and nothing to drive it with. Deleting legacy took replxx and
-	// its prompt with it, and NOTHING replaces them in the interim: leshper is
-	// built without a TTY and binds at the end (decision #86). So this stays the
-	// answer at a terminal until the line editor lands, deliberately.
-	std::fprintf(stderr, "lesh: no interactive mode yet\n");
-	return 2;
+	return run_interactive(state, pool, term_on_entry);
 }

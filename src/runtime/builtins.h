@@ -266,16 +266,11 @@ protected:
 	binding_console() = default;
 };
 
-// Installs the console `bind` reaches, or clears it with a null pointer.
-//
-// NON-OWNING, and the installer outlives the shell's use of it - the loop owns
-// the editing context (ADR-0007) and simply lends this view of it. A pointer
-// here rather than a member of `shell_state` only because `shell_state` is not
-// this ticket's to change; the seam moves there when the loop is wired up, and
-// nothing but these two functions has to change when it does.
-void install_binding_console(binding_console* console) noexcept;
-
-[[nodiscard]] binding_console* installed_binding_console() noexcept;
+// The console lives on `shell_state` (#134): `state.set_binding_console(&c)`
+// installs it for that shell and `state.console()` is what `bind` asks. It moved
+// off file scope the moment there was a loop to own it, exactly as the note that
+// stood here said it would - so two shells in one process (a test's, and the
+// one under it) can no longer be handed each other's keymaps.
 
 // Where a utility's OPERANDS begin, having discarded a leading `--`.
 //

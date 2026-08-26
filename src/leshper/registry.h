@@ -378,6 +378,32 @@ public:
 	// on; called by a test from inside a reactor to watch the poll notice.
 	void supersede() noexcept { _superseded.store(true, std::memory_order_relaxed); }
 
+	// The loop outcome the last dispatched action REQUESTED, latched here and
+	// taken by the loop (#134).
+	//
+	// WHY A LATCH AND NOT THE RETURN VALUE. `invoke` answers with the whole
+	// `action_result`, and the loop's own dispatch - a timer expiry - reads the
+	// outcome straight off it. The KEYSTROKE path does not: a key goes through
+	// editor.cpp's `step`, which is a pure function of state and events and has
+	// no loop to hand an outcome to, so before this existed `accept_line`,
+	// `cancel_line` and `exit` requested from a bound key went nowhere at all.
+	// The harness is the one object both paths already share, so it holds the
+	// request until the loop takes it after `step` returns.
+	//
+	// LAST WINS within one turn. A turn that dispatched two actions asking for
+	// two different outcomes is a keymap that bound two verbs to one key, and
+	// the second is the one that ran.
+	struct requested_outcome {
+		loop_outcome what = loop_outcome::none;
+		std::int32_t exit_status = 0;
+	};
+
+	[[nodiscard]] requested_outcome take_outcome() noexcept {
+		const requested_outcome taken = _requested;
+		_requested = requested_outcome{};
+		return taken;
+	}
+
 	// The handle the last invoke used. Exposed so a test can hold what an action
 	// would have stashed and see that it went dead, without a death test having
 	// to be the only evidence that handle validity is enforced.
@@ -396,6 +422,7 @@ private:
 	std::atomic<bool> _superseded{false};
 	std::vector<reactor_batch> _applied;
 	const shell_knowledge* _knowledge = nullptr;
+	requested_outcome _requested;
 };
 
 // True when the handle is one a call is currently allowed to use. The predicate

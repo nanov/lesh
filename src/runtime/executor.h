@@ -123,6 +123,40 @@ public:
 	// shell surveyed in #14 has.
 	[[nodiscard]] command_runner& as_command_runner() noexcept { return _runner; }
 
+	// --- The interactive caller (#134) ---------------------------------------
+	//
+	// An INTERACTIVE shell reads many inputs through ONE executor - one per line
+	// the user accepts - where `-c` and a script read exactly one. The three
+	// members below are the whole of what that difference costs; everything else
+	// about running a command is identical, which is the point.
+
+	// Whether `exit` has been asked for. The interactive session ends when it
+	// answers true; a script's `run_input` has already stopped by then.
+	[[nodiscard]] bool exit_requested() const noexcept { return _exit_requested; }
+
+	// The EXIT trap belongs to the SESSION, not to any one line.
+	//
+	// `run_input` and `run` both run it on the way out of the input they were
+	// given, which is right for a script and wrong for a prompt: it would fire
+	// after the first line and, being once-only, never again. The interactive
+	// caller defers it and runs it itself when the session ends. Off by default,
+	// so nothing about `-c` or a script changes.
+	void defer_exit_trap(bool v) noexcept { _defer_exit_trap = v; }
+
+	// Runs the deferred EXIT trap, once. Answers the status the shell should
+	// leave with when the trap BODY exited, and `status` unchanged otherwise.
+	[[nodiscard]] int finish(int status);
+
+	// Ctrl-C at the prompt (#98 decisions 2 and 3, the zsh way).
+	//
+	// `$?` becomes 130 and any INT trap fires - at a command boundary, which is
+	// where a trap body belongs (#33) and is exactly what the prompt is. The
+	// unwind an UNCAUGHT interrupt raises is consumed here rather than left
+	// standing: `run_input`'s loop normally consumes it after the command it
+	// abandoned, and there is no command here to abandon, only a prompt to
+	// return to.
+	void interrupt_at_prompt();
+
 private:
 	// Where a spawned process sends its output and takes its input, and which
 	// process group it joins.
@@ -484,6 +518,8 @@ private:
 	uint64_t _substitutions = 0;
 	// Set by `exit`, so the program loop stops rather than running the next command.
 	bool _exit_requested = false;
+	// See defer_exit_trap. False everywhere but an interactive session.
+	bool _defer_exit_trap = false;
 	// Set by a `return` that reached the top level - outside any function and any
 	// dot script. POSIX leaves that unspecified; dash and zsh both END THE INPUT,
 	// so `return; echo x` prints nothing. Only run_input reads it, and it is
