@@ -637,23 +637,24 @@ void event_loop::take_batch(reactor_batch& answer) {
 		return;
 	}
 
-	// The emitting reactor IS the decoration namespace (ADR-0008): a new batch
-	// replaces that reactor's previous one and touches nobody else's.
+	// AND THIS IS WHERE IT LANDS (#141). The batch's spans and virtual text go
+	// into the editor's own `marks`, which is what `lay_out` reads - so the trail
+	// from a reactor's emit to a coloured cell ends here rather than in a vector
+	// beside the loop. #129 wrote that this is where the application would go
+	// when `state::decorations` gained a type, and this is that.
 	//
-	// SWAPPED, not moved: the batch we are handed is pooled storage (#126's
-	// message pool, or the shell channel's recycler), and moving out of it would
-	// hand the pool back an empty vector with no capacity, defeating the pooling
-	// on the very path it was built for.
-	for (reactor_batch& held : _decorations) {
-		if (held.reactor == answer.reactor) {
-			std::swap(held, answer);
-			++_applied;
-			_needs_render = true;
-			return;
-		}
-	}
-	_decorations.emplace_back();
-	std::swap(_decorations.back(), answer);
+	// The emitting reactor IS the decoration namespace (ADR-0008): a new batch
+	// replaces that reactor's previous one and touches nobody else's. `apply`
+	// SWAPS rather than copying, because the batch we are handed is pooled
+	// storage (#126's message pool, or the shell channel's recycler) and moving
+	// out of it would hand the pool back an empty vector with no capacity,
+	// defeating the pooling on the very path it was built for.
+	//
+	// THE PROPOSALS DO NOT COME WITH IT, and that is not an oversight. A
+	// proposal is what an action would ACCEPT (#133), not something anchored to
+	// a buffer position, and `lesh_proposal_read` reads it from the applied
+	// batches the dispatching harness holds. This is the decoration store.
+	_state.marks.apply(answer.reactor, answer.spans, answer.texts);
 	++_applied;
 	_needs_render = true;
 }
@@ -856,6 +857,7 @@ void event_loop::apply_outcome(const action_result& what, turn_result& result) {
 				write_all(_fds.output, "^C\r\n");
 			apply_edit(_state, position{}, _state.buffer.end_position(), "");
 			_state.undo.break_coalescing();
+			_state.marks.clear();   // the same rule accept follows
 			_have_previous = false;
 			_needs_render = true;
 			finish_cancelled_line();
@@ -891,6 +893,16 @@ void event_loop::render() {
 	in.width = _options.width;
 	in.prompt_pen = _options.prompt_pen;
 	in.text_pen = _options.text_pen;
+
+	// The theme, caught up with whatever the registry has interned since the
+	// last repaint. Here rather than at `attach_registry` because a binding may
+	// intern a name at any time, and incremental so that it is a size comparison
+	// on every repaint after the first - which is what keeps the repaint pin in
+	// allocation_tests.cpp a constant with highlighting in it.
+	if (_registry != nullptr) {
+		_theme.sync(_registry->styles);
+		in.theme = &_theme;
+	}
 
 	layout desired = lay_out(_pool, in);
 
@@ -993,6 +1005,13 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	}
 
 	resume_after_execution();
+
+	// The decorations go with the line they were computed for. Not because they
+	// are stale - the drop rule would sort that out - but because they are
+	// anchored to BYTE OFFSETS in a buffer that is about to be emptied, and a
+	// suggestion left standing over an empty prompt is a suggestion for a line
+	// that has already run.
+	_state.marks.clear();
 
 	// A fresh line: the accepted text is gone, and it is gone as ONE edit so
 	// that undo does not walk back into a command that has already run.

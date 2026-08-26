@@ -460,8 +460,10 @@ TEST(LeshperLoopWorkers, AReadableFdIsAnsweredWithDrain) {
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
 	EXPECT_TRUE(helpers.completions().empty());
 	EXPECT_FALSE(helpers.completions().armed()) << "drain disarms; a read would not have";
-	ASSERT_EQ(loop.decorations().size(), 1u);
-	EXPECT_EQ(loop.decorations().front().reactor, "counter");
+	// #141: a taken batch lands in the editor's own decorations, namespaced by
+	// the reactor that emitted it. There is no loop-side store any more.
+	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "counter");
 }
 
 TEST(LeshperLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
@@ -487,7 +489,7 @@ TEST(LeshperLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.dropped_batches() > 0; }));
 	EXPECT_EQ(loop.applied_batches(), 0u);
-	EXPECT_TRUE(loop.decorations().empty());
+	EXPECT_TRUE(loop.editor().marks.layers().empty());
 }
 
 // ===========================================================================
@@ -518,8 +520,8 @@ TEST(LeshperLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopi
 	EXPECT_TRUE(actor.replies().armed());
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
-	ASSERT_EQ(loop.decorations().size(), 1u);
-	EXPECT_EQ(loop.decorations().front().reactor, "highlighter");
+	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "highlighter");
 	EXPECT_FALSE(actor.replies().armed()) << "drain disarms the shell topic too";
 }
 

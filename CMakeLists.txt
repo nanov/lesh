@@ -192,6 +192,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/abi.h
 	src/leshper/builtin_actions.cpp
 	src/leshper/builtin_reactors.cpp
+	src/leshper/decoration.cpp
+	src/leshper/decoration.h
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
@@ -201,6 +203,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/pager.h
 	src/leshper/pager_actions.cpp
 	src/leshper/sgr.h
+	src/leshper/theme.h
 	src/leshper/loop.cpp
 	src/leshper/loop.h
 	src/leshper/shell_actor.cpp
@@ -258,6 +261,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_read_tests.cpp
 	tests/unit/leshper_replay_tests.cpp
 	tests/unit/log_tests.cpp
+	tests/unit/leshper_decoration_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
 	tests/unit/leshper_loop_tests.cpp

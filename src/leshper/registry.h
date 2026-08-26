@@ -42,10 +42,10 @@
 
 namespace lesh::leshper {
 
-// What a reactor emits, declared here because the token below points at
-// vectors of them and defined below, where the loop-side vocabulary lives.
-struct decoration_span;
-struct virtual_text;
+// What a reactor emits. `decoration_span` and `virtual_text` are NOT declared
+// here any more: they are `decoration.h`'s, which `state.h` includes, because
+// `state::decorations` holds them (#141). The proposal stays - it is the loop's
+// vocabulary and no state field carries one.
 struct proposal;
 // One reactor's whole answer. The editor handle points at the applied ones so
 // an accepting action can read a proposal back (#133); defined below.
@@ -294,26 +294,17 @@ struct action_result {
 	effects produced;
 };
 
-// A reactor's output, copied at the emit call site: nothing here points into
-// the worker's arena, which is what lets #90 reset it under us.
-struct decoration_span {
-	std::size_t start = 0;
-	std::size_t end = 0;
-	std::uint32_t style_id = LESH_STYLE_NONE;
-
-	friend bool operator==(const decoration_span&, const decoration_span&) noexcept = default;
-};
-
-struct virtual_text {
-	std::size_t at = 0;
-	std::string bytes;
-	// The interned semantic id lesh_emit_virtual_text_styled carried, or
-	// LESH_STYLE_NONE from the unstyled emit (#133). Additive, and defaulted, so
-	// the two emit functions differ in exactly this field.
-	std::uint32_t style_id = LESH_STYLE_NONE;
-
-	friend bool operator==(const virtual_text&, const virtual_text&) noexcept = default;
-};
+// A reactor's output is copied at the emit call site: nothing in a batch points
+// into the worker's arena, which is what lets #90 reset it under us.
+// `decoration_span` and `virtual_text` are in `decoration.h`; the proposal is
+// here, with the batch that carries it.
+//
+// The one thing the two files must agree on, made a build failure rather than a
+// comment: `decoration.h` spells "no style" as a literal 0 so that it need not
+// include abi.h, and this is where the two spellings are checked against each
+// other.
+static_assert(LESH_STYLE_NONE == 0u,
+              "decoration.h defaults style_id to 0 and means LESH_STYLE_NONE");
 
 struct proposal {
 	std::uint32_t kind = LESH_PROPOSAL_AUTOSUGGESTION;

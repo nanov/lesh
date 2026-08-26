@@ -1,5 +1,6 @@
 #pragma once
 
+#include "leshper/decoration.h"
 #include "leshper/kill_store.h"
 #include "leshper/text.h"
 #include "leshper/undo.h"
@@ -96,13 +97,12 @@ struct region {
 // ---------------------------------------------------------------------------
 // The keymap stack, and what is still a placeholder beside it.
 //
-// ONE below is still a placeholder: a NAMED type with no behaviour, so that
-// A-1's state struct already has the field the spec says it has and its ticket
-// fills a type in rather than threading a new member through every signature.
-// It says which ticket fills it. Nothing reads it, and the editor does not get
-// to grow a use for it before its ticket lands. The keymap stack was one of
-// three and stopped being a placeholder with #118; the pager was the second and
-// stopped being one with #138.
+// NOTHING BELOW IS A PLACEHOLDER ANY MORE. Each of the three began as a NAMED
+// type with no behaviour, so that A-1's state struct already had the field the
+// spec says it has and its ticket could fill a type in rather than thread a new
+// member through every signature. The keymap stack was the first and stopped
+// being one with #118; the pager was the second and stopped being one with
+// #138; the decorations were the third and stopped being one with #141.
 // ---------------------------------------------------------------------------
 
 // The stack of keymaps dispatch runs against (A-8, F-8 to F-12, spec §6.4).
@@ -304,15 +304,13 @@ struct change_replay {
 	friend bool operator==(const change_replay&, const change_replay&) noexcept = default;
 };
 
-// Namespaced annotations anchored to buffer positions (A-7). Fills with #93,
-// which defines the reactor subscription interface that produces them; the
-// highlighter (F-20) and the autosuggester (F-24) are its first two clients and
-// neither exists yet.
-struct decorations {
-	friend constexpr bool operator==(const decorations&, const decorations&) noexcept {
-		return true;
-	}
-};
+// Namespaced annotations anchored to buffer positions (A-7) - NOT a placeholder
+// any more (#141). The type is `decoration.h`'s, which this file includes: the
+// spans #93's reactors emit with interned semantic style ids, and the virtual
+// text #133's autosuggester draws beyond the end of what was typed. It lives in
+// its own header because the normalization that turns nested spans into the
+// sorted, disjoint list the renderer walks wants a translation unit, and this
+// header is included by nearly everything in leshper.
 
 // ---------------------------------------------------------------------------
 // The pager (#138, F-28 to F-30, spec §6.9). NOT a placeholder any more.
@@ -456,7 +454,13 @@ struct state {
 	text_buffer buffer;
 	position cursor;
 	keymap_stack keymaps;
-	decorations marks; // #93
+	// What the reactors have said about the buffer, applied (#93, #141). The
+	// loop writes it in `take_batch` under the generation drop rule, and
+	// `lay_out` reads it: this is the whole of the highlighter's and the
+	// autosuggester's visible output.
+	//
+	// DERIVED, AND DELIBERATELY OUT OF `operator==` - see the argument there.
+	decorations marks;
 	pending_input pending;
 	pager_state pager; // #138
 	generation gen;
@@ -582,9 +586,36 @@ struct state {
 		return true;
 	}
 
+	// N-3's equality: one operator over every field a replay must reproduce,
+	// rather than a comparison of whichever fields a test remembered to check.
+	//
+	// `marks` IS NOT IN IT, and that is a decision rather than an omission.
+	//
+	// N-3 replays a RECORDED EVENT SEQUENCE against a fresh state and demands an
+	// equal state at the end. Decorations are not in that sequence: they are what
+	// a reactor computed, off this thread, against a snapshot - a worker's, or
+	// the shell thread's (ADR-0009) - and whether the answer had come back by the
+	// time the last recorded event was consumed is a matter of scheduling. Two
+	// runs of the same recording can differ in `marks` while agreeing on every
+	// byte the user typed and every byte the buffer holds, so comparing them
+	// would make N-3's guarantee a race. Worse, the answers themselves are a
+	// function of things the recording does not carry: `$PATH`, the filesystem,
+	// and which functions the shell has defined (#135). A replay on another
+	// machine paints a different picture of the same line, correctly.
+	//
+	// #118 kept the registries out for the neighbouring reason - they are
+	// ENVIRONMENT, reached through `editing_context` rather than owned - and this
+	// is the same boundary approached from the other side: `marks` is owned here,
+	// because a turn of the loop writes it and it must travel with a copied
+	// state, but it is DERIVED from environment and not from input. What
+	// `operator==` compares is what the typed input determines.
+	//
+	// `decorations::operator==` still exists, so a test that wants to assert on
+	// the applied spans compares them directly and says so - which is what the
+	// decoration tests do.
 	friend bool operator==(const state& a, const state& b) noexcept {
 		return a.buffer == b.buffer && a.cursor == b.cursor && a._selected == b._selected
-		    && a.keymaps == b.keymaps && a.marks == b.marks && a.pending == b.pending
+		    && a.keymaps == b.keymaps && a.pending == b.pending
 		    && a.pager == b.pager && a.gen == b.gen && a.undo == b.undo
 		    && a.kills == b.kills && a.repeat == b.repeat
 		    && a.columns == b.columns && a.rows == b.rows;
