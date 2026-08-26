@@ -9,9 +9,17 @@
 // then classified into one of three sources: a word in command position
 // completes to command names, a token whose tail is `$name` completes to
 // variable names, and everything else completes to paths. The two name lists
-// come from the shell thread through `name_source` below - one read-only
-// request per Tab, answered with a COPY (ADR-0009: the shell owns its tables and
-// leshper only reads them). The directory walk runs HERE, on the loop.
+// come from `shell_knowledge::enumerate`, called RIGHT HERE on the loop thread -
+// one copy per Tab per domain. The directory walk runs here too.
+//
+// READING THE SHELL'S TABLES FROM THE LOOP THREAD IS ADR-0009's OWN RULE (#151),
+// not an exception to it: the loop reads shell state while nothing executes, and
+// nothing can execute while the loop is inside an action, because `execute` and
+// `port_call` are the only writers and the loop is the thread that requests each
+// and then blocks until it is done. #139 shipped this as a round trip through a
+// fourth slot on `shell_actor` and a `name_source` interface in front of it;
+// #151 deleted both, because the copy is the same copy either way and the
+// protocol was the part that could be got wrong.
 //
 // SYNCHRONOUS, AND THAT IS THE OWNER-APPROVED DEVIATION FROM F-31. F-31 wants
 // candidates streamed from a worker so a cold directory cannot block. §6.9 defers
@@ -108,28 +116,14 @@ struct completion_query {
 // The two doors the completer reaches through (A-5, both)
 // ---------------------------------------------------------------------------
 
-// The shell's names, FROM THE LOOP THREAD.
-//
-// A second interface beside `shell_knowledge` and not a widening of it, because
-// they are asked from different threads and that difference is the design.
-// `shell_knowledge` is read where the shell state lives; this is asked where the
-// completer lives, and every implementation of it is a round trip. The wiring
-// site's implementation posts to `shell_actor`'s `enumerate` slot and blocks;
-// a test's implementation answers from a vector.
-class name_source {
-public:
-	name_source() = default;
-	virtual ~name_source() = default;
-
-	name_source(const name_source&) = delete;
-	name_source& operator=(const name_source&) = delete;
-
-	// Appends every name of `which` to `into`. False when there is no shell to
-	// ask, which is not an error: the completer then offers what it can find on
-	// its own, which for a command is the `$PATH` walk and for a variable is
-	// nothing.
-	virtual bool names(name_domain which, std::vector<std::string>& into) const = 0;
-};
+// THE FIRST DOOR IS `shell_knowledge` (shell_knowledge.h), unchanged and not
+// wrapped. #139 put a second interface in front of it - `name_source`, one
+// method, every implementation a cross-thread round trip - because the completer
+// was on the loop and the tables were the shell thread's. #151 removed the round
+// trip, and with it the only difference between the two shapes; a second
+// interface whose implementation is now `return _knowledge->enumerate(...)` is
+// one spelling too many for one idea. A null `shell_knowledge*` says what
+// `name_source::names` returning false used to say: no shell attached.
 
 // The filesystem, injectable - which is what makes every path rule below
 // testable without a temporary directory per case.
@@ -182,20 +176,23 @@ public:
 
 // The v1 trio.
 //
-// Both doors are BORROWED and must outlive it. A null `names` is legal and means
-// "no shell attached" - path completion still works, which is what a leshper
-// embedded in something that is not this shell would want.
+// Both doors are BORROWED and must outlive it. A null `knowledge` is legal and
+// means "no shell attached" - path completion still works, which is what a
+// leshper embedded in something that is not this shell would want.
+//
+// ON THE LOOP THREAD, and the pointer is only safe there because the loop is not
+// turning while the shell writes; see the file header and ADR-0009.
 class shell_completer final : public completer {
 public:
-	explicit shell_completer(const name_source* names,
+	explicit shell_completer(const shell_knowledge* knowledge,
 	                         const directory_reader& directories
 	                         = posix_directory_reader()) noexcept
-		: _names(names), _directories(&directories) {}
+		: _knowledge(knowledge), _directories(&directories) {}
 
 	void complete(const completion_query& query, completion_result& into) const override;
 
 private:
-	// One domain, one round trip to the shell thread, filtered by prefix.
+	// One domain, one call into the shell's tables, filtered by prefix.
 	// `scratch` is the caller's, reused across the domains of one Tab.
 	void gather_names(name_domain which, pager_kind kind, std::string_view typed,
 	                  std::vector<candidate>& out, std::vector<std::string>& scratch) const;
@@ -205,7 +202,7 @@ private:
 	void gather_paths(std::string_view directory, std::string_view typed,
 	                  std::vector<candidate>& out) const;
 
-	const name_source* _names;
+	const shell_knowledge* _knowledge;
 	const directory_reader* _directories;
 };
 

@@ -469,11 +469,12 @@ void shell_completer::complete(const completion_query& query, completion_result&
 void shell_completer::gather_names(name_domain which, pager_kind kind,
                                    std::string_view typed, std::vector<candidate>& out,
                                    std::vector<std::string>& scratch) const {
-	if (_names == nullptr)
+	if (_knowledge == nullptr)
 		return;
 	scratch.clear();
-	if (!_names->names(which, scratch))
-		return;
+	// DIRECTLY, ON THIS THREAD (#151). See complete.h: the loop reads shell state
+	// while nothing executes, and inside an action nothing can.
+	_knowledge->enumerate(which, scratch);
 	for (const std::string& name : scratch) {
 		if (name.size() >= typed.size() && std::string_view{name}.substr(0, typed.size()) == typed)
 			add_candidate(name, kind, out);
@@ -493,10 +494,10 @@ void shell_completer::gather_commands(std::string_view typed, std::vector<candid
 	gather_names(name_domain::function, pager_kind::word, typed, out, scratch);
 	gather_names(name_domain::alias, pager_kind::word, typed, out, scratch);
 
-	// THE `$PATH` WALK, HERE AND NOT ON THE SHELL THREAD. See shell_knowledge.h:
-	// the shell hands over the split value and this side does the readdir, which
-	// is the same readdir path completion is already doing and the same place a
-	// memo would go.
+	// THE `$PATH` WALK, AND THE SHELL DOES NOT DO IT. See shell_knowledge.h: the
+	// shell hands over the split value and this side does the readdir, which is
+	// the same readdir path completion is already doing and the same place a memo
+	// would go.
 	//
 	// MEMOIZED PER TAB AND NOT ACROSS TABS: the directories are visited once per
 	// call, and a `$PATH` element that appears twice is walked once. A cache that
@@ -504,11 +505,10 @@ void shell_completer::gather_commands(std::string_view typed, std::vector<candid
 	// of the command list - it changes rarely"), and it is deliberately not built
 	// here, because a stale one answers a question about a shell that no longer
 	// exists.
-	if (_names == nullptr)
+	if (_knowledge == nullptr)
 		return;
 	scratch.clear();
-	if (!_names->names(name_domain::path_directory, scratch))
-		return;
+	_knowledge->enumerate(name_domain::path_directory, scratch);
 	std::vector<directory_reader::entry> entries;
 	std::vector<std::string> walked;
 	for (const std::string& where : scratch) {

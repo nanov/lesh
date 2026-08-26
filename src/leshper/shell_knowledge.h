@@ -31,6 +31,7 @@
 // where the memo cannot see it and re-stat every candidate for every repeat of a
 // name on the line. Both methods below are pure lookups; neither touches disk.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -82,6 +83,60 @@ enum class name_domain : std::uint8_t {
 	path_directory = 4,
 };
 
+// ADR-0009's rule, made checkable (#151).
+//
+// THE RULE IS "THE SHELL WRITES ITS OWN STATE, AND NOBODY READS IT WHILE IT
+// DOES". Everything above depends on it - the bare pointers on the request
+// token, the borrowed `string_view` out of `path`, the deleted copy-on-write
+// version of #130 - and until this type existed it was a paragraph in an ADR
+// that a future reader could only obey by remembering. What makes the rule
+// checkable is that there are exactly TWO writers, `shell_side::execute` and
+// `shell_side::port_call`, and both are entered from one place: `shell_actor`
+// serving a slot. So the actor raises this flag around them and every read
+// through an adapter that holds one asserts it is down.
+//
+// WHY AN ATOMIC WHEN THE CLAIM IS THAT THERE IS NO CONCURRENCY. Because the
+// claim is exactly what is being checked: the flag is written on the shell
+// thread and read wherever a reader happens to be - the shell thread for the
+// highlighter, the LOOP thread for the completer (see `enumerate` below) - and
+// a plain `bool` read across those would be the data race the assertion exists
+// to catch, which is a poor way to catch it. Relaxed on both sides: this is a
+// tripwire, not a handshake, and it orders nothing.
+//
+// DEBUG-ONLY COST. The load lives inside `LESH_ASSERT` and compiles out in
+// release; what remains is two relaxed stores per execution or port call, which
+// is per COMMAND and not per keystroke.
+class shell_writing_flag {
+public:
+	[[nodiscard]] bool writing() const noexcept {
+		return _writing.load(std::memory_order_relaxed);
+	}
+
+	// Raised for the length of one write, ON THE SHELL THREAD. RAII rather than
+	// a pair of calls, because the write it brackets is a `virtual` the shell
+	// implements and may leave by throwing.
+	class scope {
+	public:
+		explicit scope(shell_writing_flag* flag) noexcept : _flag(flag) {
+			if (_flag != nullptr)
+				_flag->_writing.store(true, std::memory_order_relaxed);
+		}
+		~scope() {
+			if (_flag != nullptr)
+				_flag->_writing.store(false, std::memory_order_relaxed);
+		}
+
+		scope(const scope&) = delete;
+		scope& operator=(const scope&) = delete;
+
+	private:
+		shell_writing_flag* _flag;
+	};
+
+private:
+	std::atomic<bool> _writing{false};
+};
+
 // The shell's tables, asked one name at a time.
 //
 // Const throughout: leshper never mutates shell state, which is the whole of
@@ -121,13 +176,24 @@ public:
 	//
 	// COPY-OUT, WHERE THE OTHER TWO BORROW, and that is the whole point of the
 	// method existing rather than an iterator or a view. `classify` and `path`
-	// are asked BY THE HIGHLIGHTER, which ADR-0009 put on the shell thread, so a
-	// view into the state's own storage cannot be invalidated under it. This one
-	// is asked BY THE COMPLETER, which spec 6.9 put on the LOOP thread: the
-	// answer crosses a thread boundary and has to be a copy, or it is a pointer
-	// into a table the shell owns and may rewrite the moment the reply is
-	// posted. The copy is per Tab, which is human frequency; #137 records a
-	// per-thread cached command list as the v2 that makes it free.
+	// answer ONE question and are asked at keystroke frequency, so borrowing is
+	// what keeps them free. This one hands over a WHOLE TABLE to a caller that
+	// then sorts, filters and de-duplicates it, and it is asked once per Tab per
+	// domain - human frequency. A view would be a view over storage that the
+	// next `unset`, `alias` or function definition invalidates, held by a
+	// completer that has already gone back to the loop's poll; the copy is what
+	// makes the lifetime the caller's. #137 records a cached command list as the
+	// v2 that makes it free.
+	//
+	// ASKED FROM THE LOOP THREAD (#151), and that is legal by ADR-0009 rather
+	// than in spite of it. The loop reads shell state while nothing EXECUTES,
+	// and nothing can: `execute` and `port_call` are the only writers, the loop
+	// itself is what requests them, and it is blocked in `wait_on_shell` for the
+	// whole of each. #139 routed this through a round trip on the actor's
+	// `enumerate` slot; #151 deleted the slot, because a copy the loop makes for
+	// itself and a copy the shell thread makes for it are the same copy with one
+	// less protocol. `shell_writing_flag` above is the tripwire that keeps the
+	// argument true.
 	//
 	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
 	// out of `classify`: the walk is a readdir per directory and it belongs on

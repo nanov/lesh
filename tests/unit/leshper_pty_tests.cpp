@@ -43,6 +43,13 @@
 // `~/.lesh_history`, and a test that read the developer's own rc would pass
 // differently on every machine and append to a history they use.
 //
+// WHAT #151 ADDED: the highlighter, through the real seam. A unit test can only
+// assert that a token WITH an adapter answers correctly; the defect #151 fixed
+// was that the real session's token never got one, so the only test that could
+// have caught it is one that reads colours off a real pty. The words chosen are
+// the discriminating ones - `exit` and `bind` have no binary anywhere on the
+// machine, so nothing but the shell's own builtin table can make them green.
+//
 // F-41 IS WHAT THIS IS FOR: every exit path restores the terminal. Three are
 // exercised - Ctrl-D at an empty prompt, `exit`, and death by SIGABRT, which is
 // LESH_ASSERT's route and #98 decision 5's "assert-and-die path". A fourth,
@@ -91,6 +98,13 @@ public:
 				::_exit(120);
 			::setenv("HOME", home_path.c_str(), 1);
 			::setenv("TERM", term, 1);
+			// SET, NOT INHERITED. The theme's colours are RGB and the blitter
+			// quantizes them to the 256-colour cube unless the terminal says it
+			// can take them literally - so without this, whether an assertion
+			// about `38;2;95;175;95` passes would depend on the developer's own
+			// `$COLORTERM`. Nothing here asserts on the quantized form; that is
+			// blit's own test.
+			::setenv("COLORTERM", "truecolor", 1);
 			::unsetenv("ENV");
 			::unsetenv("LESH_LOG");
 			::unsetenv("LESH_LOG_FILE");
@@ -228,6 +242,22 @@ private:
 // side effect: the prompt only says `lesh-test>` because `~/.leshrc` ran before
 // the first read.
 constexpr std::string_view kRc = "PS1='lesh-test>'\n";
+
+// The theme's two verdicts about a command name, as the wire sees them (#124's
+// vocabulary, theme.h's colours, `COLORTERM=truecolor` above).
+//
+// ALL FOUR RUNNABLE KINDS SHARE ONE GREEN - external, builtin, function, alias -
+// and #141's pty smoke test could not tell them apart because it used
+// `echo`, which is all four's colour AND has a binary. So the discrimination
+// here is not in the colour: it is in the WORD. `exit` and `bind` are green only
+// if the shell's builtin table was consulted, because there is nothing else on
+// the machine they could be.
+constexpr std::string_view kRunnable = "38;2;95;175;95";
+constexpr std::string_view kUnknown = "38;2;215;95;95";
+
+// The rc that gives a session an alias with nothing behind it.
+constexpr std::string_view kAliasRc =
+	"PS1='lesh-test>'\nalias zzalias='echo aliased'\n";
 
 } // namespace
 
@@ -698,4 +728,78 @@ TEST(LeshperPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
 
 	EXPECT_TRUE(shell.wait_for("42", 2))
 		<< "the default Right did not accept; saw: " << shell.seen();
+}
+
+// ===========================================================================
+// What the shell knows, painted (#151, F-21)
+// ===========================================================================
+
+TEST(LeshperPty, ABuiltinWithNoBinaryBehindItPaintsAsRunnable) {
+	// THE DEFECT #151 FIXED, and the only shape of test that could see it. The
+	// highlighter runs on the shell thread (ADR-0009) and its token is built by
+	// `shell_actor`; that build copied every field of the snapshot except
+	// `knowledge`, so the verb fell back to `environment_knowledge` - empty
+	// tables, `getenv("PATH")` - and every name that is ONLY a builtin resolved
+	// unknown. `cd` hid it on macOS, which ships `/usr/bin/cd`. `exit` and `bind`
+	// have no binary anywhere, so green here means the builtin table was read.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("exit");
+	ASSERT_TRUE(shell.wait_for(kRunnable))
+		<< "`exit` did not paint as runnable; saw: " << shell.seen();
+
+	// A second word, on a fresh line, so that one lucky repaint is not the whole
+	// evidence. Ctrl-C rather than Enter, because Enter would run `exit`.
+	shell.type("\x03");
+	ASSERT_TRUE(shell.wait_for("^C"));
+	const std::size_t runnable = shell.count_of(kRunnable);
+	shell.type("bind");
+	EXPECT_TRUE(shell.wait_for(kRunnable, runnable + 1))
+		<< "`bind` did not paint as runnable; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, AnAliasFromTheRcPaintsAsRunnable) {
+	// The alias table, reached the same way - and the rc is what puts it there,
+	// so this is #101's ordering and #135's door in one line. `zzalias` is not a
+	// builtin, not a function and not on anybody's `$PATH`.
+	const scratch_home home{kAliasRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("zzalias");
+	EXPECT_TRUE(shell.wait_for(kRunnable))
+		<< "the rc's alias did not paint as runnable; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, TheShellsOwnPathDecidesWhetherAnExternalIsKnown) {
+	// #124's case, end to end: it is the SHELL's `PATH` variable that classifies,
+	// not the process environment `getenv` would answer with. The assignment is
+	// RUN, not merely typed, because a typed prefix assignment has not happened
+	// yet - which is the distinction the highlighter is required to respect.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("ls");
+	ASSERT_TRUE(shell.wait_for(kRunnable))
+		<< "`ls` was not found on the inherited PATH; saw: " << shell.seen();
+
+	shell.type("\x03");
+	ASSERT_TRUE(shell.wait_for("^C"));
+	const std::size_t runnable = shell.count_of(kRunnable);
+	const std::size_t unknown = shell.count_of(kUnknown);
+
+	shell.type("PATH=/nonexistent\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 3));
+
+	shell.type("ls");
+	EXPECT_TRUE(shell.wait_for(kUnknown, unknown + 1))
+		<< "`ls` did not go unknown under an empty PATH; saw: " << shell.seen();
+	EXPECT_EQ(shell.count_of(kRunnable), runnable)
+		<< "nothing on this line can be runnable any more; saw: " << shell.seen();
 }

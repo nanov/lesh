@@ -22,6 +22,7 @@
 #include "leshper/shell_knowledge.h"
 #include "runtime/builtins.h"
 #include "runtime/shell_state.h"
+#include "substrate/assert.h"
 
 #include <cstddef>
 #include <string>
@@ -41,10 +42,23 @@ namespace lesh::leshper {
 //
 // The state must outlive this adapter, which must outlive every request token
 // that points at it.
+//
+// AND IT IS WHERE ADR-0009 IS CHECKED (#151). Every method below opens with
+// `assert_readable`, which fails if the shell thread is inside `execute` or
+// `port_call` - the two verbs that can WRITE the state this reads. The check
+// belongs here rather than in the base class because this is the adapter over
+// the REAL state: a fake over a map has nothing a running command could change,
+// and a check it could never fail is a check nobody would trust. Debug-only:
+// `LESH_ASSERT` compiles out in release.
 class shell_state_knowledge final : public shell_knowledge {
 public:
-	explicit shell_state_knowledge(const runtime::shell_state& state) noexcept
-		: _state(&state) {}
+	// `writing` is the flag `shell_actor` raises around the two writers. Null -
+	// the default - means "unchecked", which is what every adapter built over a
+	// state that no actor is serving gets, and what the tests that own their own
+	// `shell_state` want.
+	explicit shell_state_knowledge(const runtime::shell_state& state,
+	                               const shell_writing_flag* writing = nullptr) noexcept
+		: _state(&state), _writing(writing) {}
 
 	// Alias, function, builtin - the executor's own order, and the reason it is
 	// worth reading beside `executor.cpp`'s command search rather than inventing
@@ -55,6 +69,7 @@ public:
 	// that memoizes those. `unknown` from here means "not in the three tables",
 	// and the token walks `$PATH` next.
 	[[nodiscard]] command_kind classify(std::string_view name) const override {
+		assert_readable();
 		std::string_view ignored;
 		if (_state->lookup_alias(name, ignored))
 			return command_kind::alias;
@@ -69,6 +84,7 @@ public:
 	// the moment the line being typed is `PATH=/opt/bin` and the assignment has
 	// run, which is exactly the case #124 recorded `getenv` as getting wrong.
 	[[nodiscard]] bool path(std::string_view& out) const override {
+		assert_readable();
 		return _state->lookup(std::string_view{"PATH"}, out);
 	}
 
@@ -80,6 +96,7 @@ public:
 	// `classify_builtin` reads, so the completer cannot offer a builtin the
 	// classifier would then call unknown. Nothing here touches the filesystem.
 	void enumerate(name_domain which, std::vector<std::string>& into) const override {
+		assert_readable();
 		switch (which) {
 			case name_domain::builtin:
 				for (const runtime::builtin_descriptor& one : runtime::kBuiltinRegistry)
@@ -110,6 +127,22 @@ public:
 	}
 
 private:
+	// ADR-0009 in one line, and the reason the rest of this file may borrow.
+	//
+	// NOT A GUARD ON THE CALLER'S THREAD - it says nothing about WHO is reading,
+	// only that the one writer is not writing. That is the whole invariant: the
+	// highlighter reads on the shell thread between slots, the completer reads on
+	// the loop thread while the loop is not blocked on an execution, and either
+	// is safe exactly when this is false.
+	void assert_readable() const noexcept {
+		// The discard is for RELEASE, where `LESH_ASSERT` expands to nothing and
+		// the flag is a member nobody reads. Keeping the member in both builds
+		// rather than compiling it out keeps this class one layout, which is what
+		// lets the same header be compiled into `lesh` and into `lesh_tests`.
+		(void)_writing;
+		LESH_ASSERT(_writing == nullptr || !_writing->writing());
+	}
+
 	// `$PATH`, cut on `:`, with POSIX 2.6's rule applied HERE and nowhere else:
 	// an empty element means the current directory. An UNSET `PATH` yields no
 	// directories at all, which is not the same as an empty one - an empty
@@ -132,6 +165,7 @@ private:
 	}
 
 	const runtime::shell_state* _state;
+	const shell_writing_flag* _writing;
 };
 
 } // namespace lesh::leshper
