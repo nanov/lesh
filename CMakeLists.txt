@@ -213,6 +213,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/proposal.cpp
 	src/leshper/proposal.h
 	src/leshper/sgr.h
+	src/leshper/style_grammar.h
 	src/leshper/theme.h
 	src/leshper/loop.cpp
 	src/leshper/loop.h
@@ -275,6 +276,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
 	tests/unit/leshper_prompt_tests.cpp
+	tests/unit/leshper_style_grammar_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/leshper_loop_tests.cpp
 	tests/unit/leshper_workers_tests.cpp
