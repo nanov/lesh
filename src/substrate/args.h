@@ -409,6 +409,19 @@ struct step {
 	error err{};
 };
 
+// Whether the spec admits the `+` sigil AT ALL. It decides whether `+x` is an
+// option word or an operand, and the distinction is not cosmetic: `set +x`
+// clears an option, while `cd +1` is a chdir into a directory called `+1`, which
+// is what dash does and what this tree did before the table replaced its loop.
+// So a spec with no toggle row never reads `+` as a sigil, and a spec with one
+// reads every `+` word as options - `set +z` is an illegal option, not a file.
+[[nodiscard]] constexpr bool admits_plus(std::span<const option> rows) noexcept {
+	for (const option& row : rows)
+		if (row.plus)
+			return true;
+	return false;
+}
+
 [[nodiscard]] constexpr std::size_t index_of(std::span<const option> rows, char letter) noexcept {
 	// A linear scan, which is what zsh and dash do (`strchr` over an optstring).
 	// Tables here run to two or three rows and `set`'s to twelve; at that size a
@@ -487,7 +500,8 @@ struct step {
 			// A lone `-` is an operand - cd's OLDPWD, trap's reset action - and a
 			// word starting with neither sigil ends the options. POSIX does not
 			// permute: everything from here on is an operand.
-			if (word.size() < 2 || (word[0] != '-' && word[0] != '+'))
+			const bool sigil = word[0] == '-' || (word[0] == '+' && admits_plus(rows));
+			if (word.size() < 2 || !sigil)
 				return step{};
 			if (word[0] == '-' && word[1] == '-')
 				return long_option(c, rows, word);
@@ -710,10 +724,22 @@ constexpr bool operands_follow_the_options() {
 	return !r.err && r.rest == argv + 2;
 }
 
-constexpr bool a_plus_word_is_accepted_only_where_a_row_admits_it() {
+constexpr bool a_plus_word_is_an_option_only_where_a_row_admits_the_sigil() {
+	// kProbe has a toggle row, so `+` is a sigil for it and an unknown letter
+	// after one is an error.
 	char a0[] = "set", a1[] = "+x", *argv[] = {a0, a1, nullptr};
-	char b0[] = "cd", b1[] = "+L", *bad[] = {b0, b1, nullptr};
+	char b0[] = "set", b1[] = "+L", *bad[] = {b0, b1, nullptr};
 	return !run(argv).err && run(bad).err == error{error_kind::unknown_option, 'L'};
+}
+
+constexpr bool a_spec_without_a_toggle_reads_a_plus_word_as_an_operand() {
+	// `cd +1` is a chdir into a directory named `+1`, not an illegal option.
+	static constexpr auto kNoPlus =
+		spec<opts>(option{'L', field<&opts::m>, mode::logical},
+	               option{'P', field<&opts::m>, mode::physical});
+	char a0[] = "cd", a1[] = "+1", *argv[] = {a0, a1, nullptr};
+	const auto r = scan(kNoPlus.view(), argv);
+	return !r.err && r.rest == argv + 1;
 }
 
 constexpr bool no_options_at_all_leaves_the_first_word() {
@@ -757,7 +783,8 @@ static_assert(an_unknown_option_names_its_letter(), "the reporter needs the lett
 static_assert(an_unknown_letter_inside_a_cluster_is_the_one_reported(), "not the first letter");
 static_assert(a_missing_option_argument_is_an_error(), "Guideline 7 with nothing after it");
 static_assert(operands_follow_the_options(), "Guideline 9: no permutation");
-static_assert(a_plus_word_is_accepted_only_where_a_row_admits_it(), "set's +x, and only set's");
+static_assert(a_plus_word_is_an_option_only_where_a_row_admits_the_sigil(), "set's +x");
+static_assert(a_spec_without_a_toggle_reads_a_plus_word_as_an_operand(), "and cd's +1 is a path");
 static_assert(no_options_at_all_leaves_the_first_word(), "");
 static_assert(an_empty_argv_tail_is_an_empty_operand_list(), "");
 static_assert(an_empty_word_ends_the_options(), "");

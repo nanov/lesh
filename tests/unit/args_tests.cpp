@@ -213,11 +213,27 @@ TEST(Args, AToggleWritesTrueForMinusAndFalseForPlus) {
 	EXPECT_FALSE(args::parse(kWide, clustered.argv()).opts.xtrace);
 }
 
-TEST(Args, APlusWordIsRejectedWhereTheRowDoesNotAdmitIt) {
-	words w{{"cd", "+L"}};
-	const auto r = args::parse(kCd, w.argv());
-	EXPECT_EQ(r.err, (args::error{args::error_kind::unknown_option, 'L'}));
-	EXPECT_EQ(r.rest, nullptr);
+TEST(Args, ThePlusSigilExistsOnlyForASpecThatHasAToggle) {
+	// `set +z` is an illegal option because `set` reads `+` as a sigil, but
+	// `cd +1` is a chdir into a directory named `+1` - which is dash's behaviour
+	// and this tree's before the table replaced cd's loop. The distinction is per
+	// SPEC, not per letter: a table with no toggle row never reads `+` at all.
+	words unknown_toggle{{"set", "+z"}};
+	EXPECT_EQ(args::parse(kWide, unknown_toggle.argv()).err,
+	          (args::error{args::error_kind::unknown_option, 'z'}));
+
+	words a_path{{"cd", "+1"}};
+	const auto r = args::parse(kCd, a_path.argv());
+	EXPECT_FALSE(r.err);
+	EXPECT_EQ(a_path.index_of(r.rest), 1);
+	EXPECT_STREQ(*r.rest, "+1");
+
+	// And a letter cd DOES know is still an operand behind a `+`.
+	words looks_like_an_option{{"cd", "+L"}};
+	const auto p = args::parse(kCd, looks_like_an_option.argv());
+	EXPECT_FALSE(p.err);
+	EXPECT_STREQ(*p.rest, "+L");
+	EXPECT_EQ(p.opts.mode, cd_mode::logical);
 }
 
 TEST(Args, ACounterCountsEveryAppearance) {
