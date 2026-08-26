@@ -18,6 +18,22 @@ human at a real terminal to watch (`nvim ./` taking the screen, `less` paging):
 stop, gives the terminal back, sets `$?` to 128+SIGTSTP and returns to a prompt,
 leaving the process alive and stopped for `kill -CONT`.
 
+#160 completes the FOREGROUND-JOB SET and asserts the negative space:
+
+  e. a foreground PIPELINE is one job - the terminal goes to its process group,
+     and the LAST stage, which only joined that group, reports owning it;
+  f. a foreground `( )` gives the terminal to the command inside it;
+  g. `&` and `$( )` never take it, which is the half a widening change can break
+     silently and so is checked rather than assumed;
+  h. EVERY stage execs with SIGTTOU/SIGTTIN/SIGTSTP at their defaults, not just
+     the one that made the handoff - the handoff is per process GROUP and the
+     reset is per PROCESS, so Ctrl-Z of `sleep 30 | sleep 30` must stop BOTH;
+  i. Ctrl-C of either new shape still returns 130 AND abandons the rest of the
+     line, which the handoff itself is what puts at risk.
+
+Note that (e) INVERTS an assertion this file used to make: before #160 a pipeline
+was on the "never takes the terminal" list.
+
 Usage: tools/tty_handoff_probe.py [path-to-lesh]   (default ./build/release/lesh)
 """
 
@@ -100,13 +116,17 @@ class Shell:
 	def send(self, text):
 		os.write(self.master, text.encode())
 
-	def wait_for(self, pattern, timeout=TIMEOUT):
+	def wait_for(self, pattern, timeout=TIMEOUT, times=1):
+		# A COUNT, not just a search, for the same reason the C++ pty harness counts:
+		# `self.log` holds everything the session ever wrote, so a second stop report
+		# or a second prompt has to be told from the first or the wait answers
+		# instantly with the old one.
 		deadline = time.time() + timeout
 		while time.time() < deadline:
-			if re.search(pattern, self.log):
+			if len(re.findall(pattern, self.log)) >= times:
 				return True
 			self.pump(0.05)
-		return bool(re.search(pattern, self.log))
+		return len(re.findall(pattern, self.log)) >= times
 
 	def close(self):
 		try:
@@ -140,6 +160,9 @@ def main():
 	py = sys.executable
 
 	sh = Shell(path)
+	# Every pid the session ever reported stopped. A set, because the wire is
+	# cumulative and each case has to count only the stops it caused.
+	stopped_pids_seen = set()
 	try:
 		sh.wait_for(r"\$|>|%", timeout=5)
 		shell_pgrp = sh.fg_pgrp()
@@ -198,13 +221,54 @@ def main():
 		got = sh.wait_for(r"GOT=typed-after-the-job", timeout=6)
 		check("`read` after a tty-taking command on the same line gets input",
 		      got, "" if got else "read never produced GOT=... (tail: %r)" % sh.log[-200:])
-		# SCOPE (#158 decision 3). The three constructs that must NOT take the
-		# terminal, watched the same way. Each reaches the very same
-		# `run_simple_command` a foreground command does, one fork further down, so
-		# "it did not happen" is the assertion worth making.
+		# SCOPE (#158 decision 3), COMPLETED BY #160 - and this is the half of the
+		# probe #160 changed rather than added to. The foreground-job set is now
+		# three shapes wide, and a pipeline moved from the "must not" list to the
+		# "must" list: it is ONE job, so its group gets the terminal and every stage
+		# is in that group. A probe still asserting `sleep 1 | cat` never takes the
+		# terminal would now be contradicting the shell it is here to check.
+		#
+		# `tcgetpgrp(2)` AND NOT `(0)` for the inner reports below. A pipeline
+		# stage's fd 0 is a PIPE by the time it runs, so asking fd 0 answers ENOTTY
+		# and says nothing about the terminal; stderr is still the terminal in every
+		# one of these shapes. The `SELF` check further up can use fd 0 because a
+		# plain foreground command's stdin was never replaced.
+		inner = ("import os,sys;"
+		         "print(sys.argv[1], os.tcgetpgrp(2) == os.getpgid(0), os.getpgid(0))")
+
+		# (e) THE POSITIVES: the two job shapes #160 adds, each reporting from
+		# INSIDE itself. The pipeline's report comes from its LAST stage, which is
+		# the discriminating one - it never called `tcsetpgrp`, it only joined the
+		# leader's group, so it owning the terminal is what proves one handoff
+		# covers the job. The subshell's comes from the command INSIDE the `( )`,
+		# which is one fork further down than the subshell itself and only reachable
+		# because the saved tty fd survives `enter_subshell` for a foreground `( )`.
+		for label, line, tag in (
+			("a foreground pipeline's last stage",
+			 "sleep 1 | %s -c \"%s\" PIPE" % (py, inner), "PIPE"),
+			("the command inside a foreground ( )",
+			 "(%s -c \"%s\" SUBSH)" % (py, inner), "SUBSH"),
+		):
+			sh.send(line + "\n")
+			sh.wait_for(r"%s (True|False) \d+" % tag)
+			m = re.search(r"%s (True|False) (\d+)" % tag, sh.log)
+			check("%s is the terminal's foreground group" % label,
+			      bool(m) and m.group(1) == "True",
+			      m.group(0) if m else "no report from inside the job")
+			check("and %s is in a group of its own, not the shell's" % label,
+			      bool(m) and int(m.group(2)) != shell_pgrp,
+			      "job pgrp=%s shell pgrp=%d" % (m.group(2) if m else "?", shell_pgrp))
+			sh.pump(0.4)
+
+		# (f) THE NEGATIVES, which #160 asserts rather than assumes. Each reaches
+		# the very same `run_simple_command` a foreground command does, one fork
+		# further down, and the only thing between it and the terminal is
+		# `enter_subshell` clearing the saved fd - which #160 turned into a decision
+		# with two answers, so "the default is still clear" needs checking. A
+		# `$(read x)` that became the foreground group would take the user's
+		# keystrokes away from the prompt they were typed at.
 		for label, line in (("a background job", "sleep 1 &"),
-		                    ("a command substitution", "x=$(sleep 1)"),
-		                    ("a pipeline (#160, not yet)", "sleep 1 | cat")):
+		                    ("a command substitution", "x=$(sleep 1)")):
 			sh.send(line + "\n")
 			seen = set()
 			deadline = time.time() + 1.4
@@ -215,6 +279,74 @@ def main():
 			check("%s never takes the terminal" % label,
 			      not stolen, "foreground groups seen: %s" % sorted(seen))
 			sh.pump(0.4)
+
+		# (g) `sleep 5 | cat` STILL DIES TO A SINGLE CTRL-C, the acceptance
+		# criterion #160's own handoff puts at risk: the pipeline's group is the
+		# foreground group now, so the shell is excluded from the keyboard interrupt
+		# and the reap has to synthesize the delivery. Both halves, because the
+		# first version of #159's synthesis had the status right and the unwind
+		# wrong: 130, AND the rest of the line abandoned.
+		sh.send("sleep 5 | cat; echo PIPEAFTER=$((1 + 1))\n")
+		sh.pump(0.4)
+		sh.send("\x03")
+		sh.pump(1.0)
+		sh.send("echo PIPEINT=$?\n")
+		ok = sh.wait_for(r"PIPEINT=130", timeout=8)
+		check("Ctrl-C of a foreground pipeline returns 130 to a usable prompt",
+		      ok, "" if ok else "no PIPEINT=130 (tail: %r)" % sh.log[-200:])
+		check("and it abandons the rest of the line",
+		      "PIPEAFTER=2" not in sh.log,
+		      "`echo` after the pipeline ran anyway" if "PIPEAFTER=2" in sh.log else "")
+
+		# (g2) EVERY STAGE EXECS WITH THE STOP SIGNALS AT THEIR DEFAULT, which the
+		# handoff alone does not give them. The handoff is one per process GROUP -
+		# the leader makes it for the job - but #158 decision 4's reset is one per
+		# PROCESS THAT EXECS, and while the two were one function only the leader got
+		# either: `less` at the end of a pipeline had an ignored SIGTSTP. Ctrl-Z of a
+		# two-stage pipeline is the cheapest way to see it, because a stage that
+		# ignored the stop keeps running and the shell blocks on it.
+		sh.send("sleep 30 | sleep 30\n")
+		sh.pump(0.4)
+		sh.send("\x1a")
+		sh.wait_for(r"stopped: pid \d+", timeout=6, times=2)
+		stage_pids = re.findall(r"stopped: pid (\d+)", sh.log)
+		# The Ctrl-Z check further down reports one stop of its own, so count the
+		# ones this case added rather than the ones on the wire.
+		before = len(stopped_pids_seen)
+		for p in stage_pids:
+			stopped_pids_seen.add(p)
+		check("every stage of a foreground pipeline stops on Ctrl-Z",
+		      len(stopped_pids_seen) - before >= 2,
+		      "stopped pids reported: %s" % stage_pids)
+		sh.send("echo PIPETSTP=$?\n")
+		want = 128 + int(signal.SIGTSTP)
+		ok = sh.wait_for(r"PIPETSTP=%d" % want, timeout=6)
+		check("and the pipeline's $? is 128+SIGTSTP from a usable prompt",
+		      ok, "" if ok else "no PIPETSTP=%d (tail: %r)" % (want, sh.log[-200:]))
+		# Continued and then killed: nothing else will, and a stopped `sleep 30`
+		# outliving this probe would be the probe's own leak.
+		for p in stage_pids:
+			for sig in (signal.SIGCONT, signal.SIGKILL):
+				try:
+					os.kill(int(p), sig)
+				except (ProcessLookupError, PermissionError):
+					pass
+
+		# (h) The same pair for a foreground `( )`, which needs more than the note
+		# to keep: the subshell is excluded too and has no interactive default left,
+		# so it takes SIGINT's real default action and dies of it rather than
+		# exiting 130 - the only thing the waiting parent can tell from `exit 130`.
+		sh.send("(sleep 5); echo SUBAFTER=$((1 + 1))\n")
+		sh.pump(0.4)
+		sh.send("\x03")
+		sh.pump(1.0)
+		sh.send("echo SUBINT=$?\n")
+		ok = sh.wait_for(r"SUBINT=130", timeout=8)
+		check("Ctrl-C of a foreground ( ) returns 130 to a usable prompt",
+		      ok, "" if ok else "no SUBINT=130 (tail: %r)" % sh.log[-200:])
+		check("and it abandons the rest of the line",
+		      "SUBAFTER=2" not in sh.log,
+		      "`echo` after the subshell ran anyway" if "SUBAFTER=2" in sh.log else "")
 
 		# NO REGRESSION on the one thing the SIG_IGN leak was propping up: Ctrl-C
 		# of a foreground job. The child is the foreground group now, so the kernel
@@ -236,8 +368,16 @@ def main():
 		sh.send("sleep 30\n")
 		sh.pump(0.4)
 		sh.send("\x1a")
-		reported = sh.wait_for(r"stopped: pid \d+", timeout=5)
-		m = re.search(r"stopped: pid (\d+)", sh.log)
+		# THE LAST REPORT ON THE WIRE, not the first. `sh.log` is cumulative and the
+		# pipeline case above already reported two stops of its own, so a `re.search`
+		# here would answer about one of THOSE - a pid this probe has already killed,
+		# which then passes the liveness check below on a zombie that still accepts
+		# signals. Found by adding that case: the check went green about the wrong
+		# process.
+		reported = sh.wait_for(r"stopped: pid \d+", timeout=5,
+		                       times=len(stopped_pids_seen) + 1)
+		all_reported = re.findall(r"stopped: pid (\d+)", sh.log)
+		m = all_reported[-1] if all_reported else None
 		check("Ctrl-Z of a foreground command reports the stop and returns",
 		      reported, "" if reported else "no stopped report (tail: %r)" % sh.log[-200:])
 		check("the terminal is the shell's again after the stop",
@@ -251,7 +391,7 @@ def main():
 		# pid and walked away, and `kill -CONT` of it has to be a real way out. Then
 		# killed, because nothing else is going to - the shell keeps no job table,
 		# and a stopped process outliving this probe would be the probe's own leak.
-		stopped_pid = int(m.group(1)) if m else -1
+		stopped_pid = int(m) if m else -1
 		alive = False
 		if stopped_pid > 0:
 			try:

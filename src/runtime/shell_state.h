@@ -44,6 +44,27 @@ enum class builtin_kind {
 // the `bind` seam (#134) without this header depending on the builtin table.
 class binding_console;
 
+// What a forked child is to the shell that forked it, and the ONE thing that
+// answer decides: whether the child keeps the saved terminal fd (#158 decision 3,
+// scoped by #160). See shell_state::enter_subshell, which is the only reader.
+//
+// Two values rather than a bool because the question at each fork site is "what
+// is this child", not "should the fd be cleared" - the sites know the first and
+// would have to re-derive the second. `detached` is the DEFAULT: every fork that
+// does not claim to be a foreground job gets no terminal.
+enum class subshell_role {
+	// `&`, `$( )`, and every helper fork. No terminal: an asynchronous job or a
+	// command substitution taking the terminal from the line editor would be its
+	// own bug, which is #158 decision 3's whole point.
+	detached,
+	// A `( )` the shell is WAITING ON, or a stage of a foreground pipeline. Keeps
+	// the fd, which two things then read: the handoff at the inner fork, so
+	// `(nvim .)` becomes the terminal's foreground group, and the per-process
+	// signal reset on the exec path, so every stage of `ls | less` execs with
+	// SIGTSTP at its default rather than only the one that made the handoff.
+	foreground_job,
+};
+
 class shell_state final : public parameter_source,
                           public arithmetic_variables,
                           public parameter_assigner,
@@ -487,18 +508,54 @@ public:
 	// echo $?' INT` prints 2 - and it regressed the moment the entry status was
 	// added without this, because the child inherited a value that stopped applying
 	// to it. Two facts about one event, so they live in one call.
-	void enter_subshell() {
+	void enter_subshell(subshell_role role = subshell_role::detached) {
 		_signals.reset_for_subshell();
 		_trap_entry_status.reset();
-		// A THIRD fact about the same event (#159): a subshell does not manage the
-		// terminal. The fd is what gates the handoff in `spawn`, so dropping it here
-		// is what keeps `nvim &`, `$(nvim)` and a pipeline stage from taking the
-		// terminal away from the editor - #158 decision 3 scopes the handoff to
-		// FOREGROUND jobs, and every one of those constructs reaches the same
-		// `run_simple_command` a foreground command does, one fork further down.
-		// Gating on `interactive()` instead would not do: an async child is still an
-		// interactive shell's child, and it stays one all the way to its own exec.
-		_tty_fd = -1;
+		// A THIRD fact about the same event (#159, scoped by #160): whether this
+		// subshell manages the terminal.
+		//
+		// DETACHED CLEARS, and that is the default because it is the safe answer.
+		// The fd is what gates the handoff in `spawn`, so dropping it here is what
+		// keeps `nvim &` and `$(nvim)` from taking the terminal away from the editor
+		// - #158 decision 3 scopes the handoff to FOREGROUND jobs, and every one of
+		// those constructs reaches the same `run_simple_command` a foreground
+		// command does, one fork further down. Gating on `interactive()` instead
+		// would not do: an async child is still an interactive shell's child, and it
+		// stays one all the way to its own exec. A fork site that says nothing about
+		// its role therefore gets no terminal, and a NEW one cannot steal it from
+		// the line editor by omission.
+		//
+		// A FOREGROUND `( )` IS THE ONE EXCEPTION, and what it needs is the FD
+		// rather than the handoff. A subshell does not exec: the command inside it
+		// forks AGAIN, into a group of its own, and only a live fd at that inner
+		// fork can make `(nvim .)` the terminal's foreground group. So the subshell
+		// keeps the fd and its own foreground children take the terminal the way any
+		// foreground command does, giving it back to the subshell's group after each
+		// - the subshell is a shell, and it manages the terminal for the jobs it
+		// runs exactly as its parent does.
+		//
+		// A FOREGROUND PIPELINE STAGE IS THE OTHER, for a different reason. The
+		// TERMINAL it does not need: `run_pipeline` hands it to the group leader
+		// before this call, and one handoff covers every stage because the later ones
+		// join that group. The FD it does need, because the fd is also what gates the
+		// per-process signal reset in `become_command` - and that reset is owed by
+		// every stage that execs, not just the leader. Clearing it here was the
+		// review defect in #160's first cut: stages 2..N exec'd with SIGTTOU, SIGTTIN
+		// and SIGTSTP still ignored, so `less` at the end of a pipeline could not be
+		// suspended and `sleep 30 | sleep 30` under Ctrl-Z stopped only its first
+		// stage while the shell blocked on the second.
+		//
+		// A COMPOUND stage keeps the fd too and that is now safe, where before the
+		// split it would not have been: the reset lives on the exec path, a compound
+		// stage never execs, so it keeps the SIGTTOU ignore that makes handing the
+		// terminal to a nested command and taking it back legal - exactly the
+		// property a foreground `( )` relies on.
+		//
+		// KEEPING IS NOT OBTAINING, which is what makes the exception compose: a
+		// `( )` inside `&` or inside `$( )` asks to keep an fd that is already -1,
+		// and -1 it stays.
+		if (role == subshell_role::detached)
+			_tty_fd = -1;
 	}
 
 	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
@@ -527,8 +584,9 @@ public:
 	// -1 IS THE GATE, and it is the only one the runtime asks. A non-interactive
 	// shell never sets it, so every tty syscall added by #159 is skipped by
 	// construction rather than by an `interactive()` test repeated at each site;
-	// and `enter_subshell` clears it, which is what scopes the handoff to
-	// foreground jobs. See the note there.
+	// and `enter_subshell` clears it for every child but a foreground `( )`, which
+	// is what scopes the handoff to foreground jobs. See the note there for why
+	// that one child is the exception and why a pipeline stage is not.
 	void set_tty_fd(int fd) noexcept { _tty_fd = fd; }
 	[[nodiscard]] int tty_fd() const noexcept { return _tty_fd; }
 
@@ -598,7 +656,7 @@ private:
 	options _options;
 	bool _interactive = false;
 	// Non-owning; see set_tty_fd. -1 in every non-interactive shell and in every
-	// subshell, which is what makes the terminal handoff opt-in.
+	// detached subshell, which is what makes the terminal handoff opt-in.
 	int _tty_fd = -1;
 	// Non-owning; see set_binding_console. Null in every non-interactive shell,
 	// which is what makes `bind` say "no line editor" rather than pretend.

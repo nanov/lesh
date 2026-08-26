@@ -250,6 +250,26 @@ private:
 	return i == first_digit ? -1 : pid;
 }
 
+// EVERY pid the wire reported stopped, in order (#160). A pipeline is one job and
+// Ctrl-Z stops its whole process group, so the report is one line PER MEMBER -
+// `pid_in_stopped_report` above answers about the first and would be satisfied by
+// a shell that only ever stopped one.
+[[nodiscard]] std::vector<pid_t> pids_in_stopped_reports(std::string_view wire) {
+	constexpr std::string_view marker = "stopped: pid ";
+	std::vector<pid_t> pids;
+	for (std::size_t at = wire.find(marker); at != std::string_view::npos;
+	     at = wire.find(marker, at + marker.size())) {
+		std::size_t i = at + marker.size();
+		const std::size_t first_digit = i;
+		pid_t pid = 0;
+		for (; i < wire.size() && wire[i] >= '0' && wire[i] <= '9'; ++i)
+			pid = pid * 10 + (wire[i] - '0');
+		if (i != first_digit)
+			pids.push_back(pid);
+	}
+	return pids;
+}
+
 [[nodiscard]] bool a_newline_follows_the_last_prompt(std::string_view wire,
                                                      std::string_view prompt) {
 	const std::size_t last = wire.rfind(prompt);
@@ -278,6 +298,36 @@ constexpr std::string_view kUnknown = "38;2;215;95;95";
 // The rc that gives a session an alias with nothing behind it.
 constexpr std::string_view kAliasRc =
 	"PS1='lesh-test>'\nalias zzalias='echo aliased'\n";
+
+// A command that answers ONE question from inside whatever job it is part of: is
+// my own process group the terminal's foreground group? That is the whole of
+// #158 decision 1 as a job can observe it, and #160's scope decision is four
+// answers to it - yes for a foreground pipeline and a foreground `( )`, no for
+// `&` and for `$( )`.
+//
+// `ps` AND `$$` RATHER THAN A PYTHON ONE-LINER. `tools/tty_handoff_probe.py`
+// asks `os.tcgetpgrp(0) == os.getpgid(0)` because it is already Python; a test
+// in the sanitized gate should not acquire an interpreter dependency for two
+// integers. `TPGID` is the foreground group of the process's CONTROLLING
+// terminal, so it is still readable in a `&` job whose fd 0 is /dev/null, and
+// `$$` inside `sh -c` is the pid of the `sh` that IS the job - a pipeline stage
+// execs in place, so no fork stands between this and the group being asserted.
+//
+// `-n "$1"` FIRST, and it is not defensive noise: without it a `ps` that printed
+// nothing would leave both words empty, `[ "" = "" ]` would be TRUE, and every
+// positive assertion below would pass on a machine where the probe did not run.
+// The guard makes a broken probe report `lost`, which fails the positive tests
+// and passes the negative ones - the direction that cannot fake a green.
+//
+// THE MARKER IS COMPUTED, the same discipline as `$((1 + 1))-ran-anyway` above:
+// the editor paints the line as it is keyed, so `pipe$((1 + 1))=owns` is on the
+// terminal before anything runs and only execution can turn it into `pipe2=owns`.
+[[nodiscard]] std::string owns_terminal_probe(std::string_view tag) {
+	return std::string{R"(sh -c 'set -- $(ps -o tpgid=,pgid= -p $$); )"
+	                   R"([ -n "$1" ] && [ "$1" = "$2" ] && echo )"} +
+	       std::string{tag} + R"($((1 + 1))=owns || echo )" + std::string{tag} +
+	       R"($((1 + 1))=lost')";
+}
 
 } // namespace
 
@@ -572,6 +622,290 @@ TEST(LeshperPty, ControlZStopsTheForegroundCommandAndReturnsThePrompt) {
 	shell.type("kill -KILL " + std::to_string(stopped) + "\r");
 	EXPECT_TRUE(shell.wait_for(kPrompt, 5)) << "saw: " << shell.seen();
 	::kill(stopped, SIGKILL);
+}
+
+TEST(LeshperPty, AForegroundPipelineHandsTheTerminalToTheWholeJob) {
+	// #160, and the case the acceptance criteria call `ls | less`: a pipeline is ONE
+	// foreground job, so the terminal goes to its process group and every stage is
+	// in that group. Only a pager can show a human that it worked; what a test can
+	// assert is the mechanism underneath it, which is that the LAST stage - the one
+	// that never made a handoff call and only joined the leader's group - finds
+	// itself the terminal's foreground group.
+	//
+	// THE LAST STAGE ON PURPOSE. The leader owning the terminal proves only that
+	// `tcsetpgrp` was called; the last stage owning it proves the thing #160
+	// actually decided, that one handoff to the group leader covers the job. A
+	// per-stage handoff and a single one are indistinguishable from the leader.
+	//
+	// `sleep 1` FIRST so the leader is still alive while the probe runs. With
+	// `echo x |` the leader would usually be a zombie by then and the test would be
+	// asserting against a group whose leader had already gone - true here, but for
+	// a reason that has nothing to do with what is being tested.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("sleep 1 | " + owns_terminal_probe("pipe") + "\r");
+	EXPECT_TRUE(shell.wait_for("pipe2=owns"))
+		<< "the last stage of a foreground pipeline is not the terminal's foreground group; saw: "
+		<< shell.seen();
+}
+
+TEST(LeshperPty, AForegroundSubshellHandsTheTerminalToTheCommandInside) {
+	// #160's other half, and the acceptance criterion `(nvim .)` takes the screen.
+	//
+	// WHAT MAKES THIS DIFFERENT FROM THE PIPELINE is why `enter_subshell` needed a
+	// role at all. A subshell does not exec: the command inside it forks AGAIN,
+	// into a process group of its own, so no handoff the subshell could make would
+	// reach it. Only the saved tty fd SURVIVING into the subshell lets that inner
+	// fork hand the terminal over, and this assertion is what says it survived -
+	// against a shell that cleared it, the probe reports `lost` and nvim would be
+	// running blind in a background group, which is the whole #158 defect.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("(" + owns_terminal_probe("sub") + ")\r");
+	EXPECT_TRUE(shell.wait_for("sub2=owns"))
+		<< "the command inside a foreground ( ) is not the terminal's foreground group; saw: "
+		<< shell.seen();
+}
+
+TEST(LeshperPty, ABackgroundJobNeverBecomesTheTerminalsForegroundGroup) {
+	// THE NEGATIVE SPACE, ASSERTED RATHER THAN ASSUMED (#158 decision 3, #160).
+	// This is the half a widening change can silently break: `&` reaches the very
+	// same `run_simple_command` a foreground command does, one fork further down,
+	// and the only thing standing between it and the terminal is `enter_subshell`
+	// clearing the saved fd. #160 turned that clearing into a decision with two
+	// answers, so "the default is still clear" needs a test rather than a comment.
+	//
+	// A background job's fd 0 is /dev/null by POSIX, which is why the probe reads
+	// TPGID from the CONTROLLING terminal instead of from a descriptor - the
+	// question is whether the group was made foreground, not what it can read.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type(owns_terminal_probe("bg") + " &\r");
+	ASSERT_TRUE(shell.wait_for("bg2="))
+		<< "the background probe never reported at all; saw: " << shell.seen();
+	EXPECT_TRUE(shell.wait_for("bg2=lost"))
+		<< "a background job took the terminal; saw: " << shell.seen();
+	EXPECT_EQ(shell.count_of("bg2=owns"), 0u)
+		<< "a background job took the terminal; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ACommandSubstitutionNeverBecomesTheTerminalsForegroundGroup) {
+	// The other negative, and the one with a reader on the other end of it: the
+	// LINE EDITOR is reading that terminal while a substitution runs, so a
+	// `$(read x)` that became the foreground group would take the user's keystrokes
+	// away from the prompt they were typed at. #158 decision 3 names it as its own
+	// bug, and it stays one.
+	//
+	// The probe's output is CAPTURED by the substitution rather than written to the
+	// terminal, so it is echoed back out - which also proves the substitution ran
+	// at all, making the absence of `owns` an assertion about the handoff rather
+	// than about a command that never happened.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("echo captured-$(" + owns_terminal_probe("cs") + ")\r");
+	ASSERT_TRUE(shell.wait_for("captured-cs2="))
+		<< "the substitution never ran; saw: " << shell.seen();
+	EXPECT_TRUE(shell.wait_for("captured-cs2=lost"))
+		<< "a command substitution took the terminal from the editor; saw: " << shell.seen();
+	EXPECT_EQ(shell.count_of("cs2=owns"), 0u)
+		<< "a command substitution took the terminal from the editor; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlZStopsEveryStageOfAForegroundPipeline) {
+	// THE REVIEW DEFECT IN #160's FIRST CUT, as a test. The terminal handoff is one
+	// per process GROUP - the pipeline's leader makes it for the whole job - but
+	// #158 decision 4's signal reset is one per PROCESS THAT EXECS, and while both
+	// lived in one function only the leader got either. So stages 2..N exec'd with
+	// SIGTTOU, SIGTTIN and SIGTSTP still SIG_IGN, inherited from the editing loop:
+	// `ls | less` handed `less` a SIGTSTP it could not act on, and this case stopped
+	// the first `sleep` while the second ignored the stop and the shell blocked in
+	// its wait for the remaining thirty seconds.
+	//
+	// WITHOUT THE FIX THIS TEST FAILS BY BLOCKING into the harness budget rather
+	// than by asserting something false, which is why every step is a budgeted
+	// `wait_for`: the second stage never stops, so the second report never comes and
+	// no prompt does either.
+	//
+	// TWO REPORTS IS THE ASSERTION, not one. A shell that stopped only the leader
+	// would satisfy `pid_in_stopped_report` and the #161 test next door, which is
+	// exactly how this survived review of the first cut.
+	//
+	// `sleep 30` twice, for #161's reason: the assertions below run against
+	// processes that must still be there, and a short command could exit on its own
+	// under load and pass this for the wrong reason.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("sleep 30 | sleep 30\r");
+	// Long enough that both stages are certainly running and the editor parked - the
+	// same wait every during-a-command test in this file takes.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x1a");
+
+	// `times = 2`: the harness counts occurrences rather than searching, so this
+	// waits for a SECOND report instead of being satisfied by the first.
+	ASSERT_TRUE(shell.wait_for("stopped: pid ", 2))
+		<< "only one stage of the pipeline stopped - the others exec'd with the shell's "
+		   "ignored SIGTSTP and the shell is still waiting on them; saw: " << shell.seen();
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+		<< "no prompt after the stop; saw: " << shell.seen();
+
+	// 128 + WSTOPSIG for the suspend character, composed from the members the same
+	// way any pipeline status is - here every member stopped, so the last one decides
+	// and it decides the same as the rest.
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=" + std::to_string(128 + SIGTSTP)))
+		<< "$? is not 128+SIGTSTP after the pipeline stopped; saw: " << shell.seen();
+
+	// BOTH PIDS ARE REAL AND BOTH ARE STOPPED. The pids are the only handles the
+	// user is given - no job table, which is what the report's parenthesis says - so
+	// reading them back off the wire is the test standing where the user stands.
+	const std::vector<pid_t> stopped = pids_in_stopped_reports(shell.seen());
+	ASSERT_GE(stopped.size(), 2u)
+		<< "fewer than two pids in the stopped reports; saw: " << shell.seen();
+	EXPECT_NE(stopped[0], stopped[1]) << "the same pid was reported twice";
+	for (const pid_t pid : stopped) {
+		EXPECT_GT(pid, 0);
+		EXPECT_EQ(::kill(pid, 0), 0)
+			<< "reported pid " << pid << " is gone, so it was never stopped; saw: "
+			<< shell.seen();
+	}
+
+	// Cleanup, and the reason the commands are `sleep 30`: continued, they would
+	// outlive this test by half a minute. `kill -CONT` first, so the prompt is
+	// asserted usable afterwards and the documented way out is exercised on a
+	// pipeline as well as on a simple command; then SIGKILL, because the shell keeps
+	// no job table and nothing else is going to.
+	//
+	// ONE LINE, one `wait_for`, exactly as the simple-command case next door does
+	// it - `kill` takes every pid at once. Typing a second line before the prompt
+	// for the first has come back is what this file's budgeted waits exist to
+	// avoid, and here it is not merely untidy: continuing two stopped processes
+	// while another line is queued lands a SIGCHLD job notice in the event queue
+	// mid-`accept_current_line`, and that path has a live heap-use-after-free in
+	// `src/leshper/loop.cpp` (the queue reallocates under the `const event&`
+	// `event_loop::handle` is still holding). It is not this ticket's bug and not
+	// this ticket's file to fix; staying prompt-synchronized is the convention
+	// anyway.
+	std::string cleanup = "kill -CONT";
+	for (const pid_t pid : stopped)
+		cleanup += " " + std::to_string(pid);
+	shell.type(cleanup + "; echo cont=$?-$((1 + 1))\r");
+	EXPECT_TRUE(shell.wait_for("cont=0-2"))
+		<< "`kill -CONT` of the stopped pids did not succeed from a usable prompt; saw: "
+		<< shell.seen();
+	for (const pid_t pid : stopped)
+		::kill(pid, SIGKILL);
+}
+
+TEST(LeshperPty, ControlCDuringAForegroundPipelineYields130AndAbandonsTheLine) {
+	// `sleep 5 | cat` STILL DIES TO A SINGLE CTRL-C, which is an acceptance
+	// criterion precisely because #160 is what puts it at risk. Handing the
+	// pipeline's group the terminal excludes the shell from the keyboard interrupt,
+	// so the reap has to synthesize the delivery the way #159's does for a simple
+	// command - and if it does not, the shell reports 130 and then calmly runs the
+	// rest of the line, which dash, zsh and bash all refuse to do (measured on this
+	// machine) and which lesh refused to do before the pipeline had a handoff.
+	//
+	// THE STATUS AND THE ABANDON ARE ONE CONTRACT, not two assertions that happen
+	// to sit together: the member whose status became the pipeline's is the member
+	// the interrupt note asks about, so `$?` being 130 from a kill is exactly what
+	// abandons the line. Asserting only one of them would let the pair drift.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("sleep 5 | cat; echo $((1 + 1))-pipe-ran-anyway\r");
+	// Long enough that the pipeline is certainly the foreground job and the editor
+	// parked - the same wait the simple-command Ctrl-C tests above take.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x03");
+
+	// A second prompt is the line being over, however it ended, and waiting on it
+	// rather than on a timeout is what keeps the absence assertion honest.
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+		<< "no prompt after the interrupt - the shell is still waiting on the pipeline; saw: "
+		<< shell.seen();
+	EXPECT_EQ(shell.count_of("2-pipe-ran-anyway"), 0u)
+		<< "the interrupt did not abandon the rest of the line; saw: " << shell.seen();
+
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlCDuringAForegroundPipelineFiresTheIntTrap) {
+	// The sibling of the case above and of #159's own trap test, for the job shape
+	// #160 adds. Measured on this machine with `trap 'echo T' INT; sleep 5 | cat`
+	// and Ctrl-C on a pty: dash fires the trap, zsh fires it, bash does not. That
+	// is the same three-shell split #159 resolved for the simple command, so it
+	// gets the same answer - ADR-0001 makes dash the POSIX floor and #98 decision 3
+	// is the owner's override adopting zsh's INT-trap visibility, and bash's
+	// silence is the divergence that decision declined by name.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("trap 'echo caught-int' INT\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+
+	shell.type("sleep 5 | cat\r");
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x03");
+
+	EXPECT_TRUE(shell.wait_for("caught-int"))
+		<< "the INT trap did not fire for a foreground pipeline; saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlCDuringAForegroundSubshellYields130AndAbandonsTheLine) {
+	// The same contract for the same reason one construct over - and the one that
+	// needed more than a call to `note_interrupt_after_handoff` to keep.
+	//
+	// A `( )` puts TWO processes between the keyboard and the shell. The interrupt
+	// reaches the command inside the subshell, which dies of it; the SUBSHELL is
+	// excluded too, and it has no interactive default left - `enter_subshell` drops
+	// #52's, because a subshell is not the process that reads commands - so the
+	// pending flag it records for itself would be dropped on the floor, the
+	// subshell would exit 130 of its own accord, and the parent's note keys on
+	// WIFSIGNALED and would see an ordinary exit. `echo after` would run.
+	//
+	// So the subshell takes SIGINT's REAL DEFAULT ACTION and dies of it, which is
+	// what the kernel would have done had the terminal not moved, and the only
+	// thing the waiting parent can tell apart from `exit 130`. dash, zsh and bash
+	// all abandon the line here (measured on this machine), and so did lesh before
+	// the subshell had a handoff to be excluded by.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("(sleep 5); echo $((1 + 1))-sub-ran-anyway\r");
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x03");
+
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+		<< "no prompt after the interrupt - the shell is still waiting on the subshell; saw: "
+		<< shell.seen();
+	EXPECT_EQ(shell.count_of("2-sub-ran-anyway"), 0u)
+		<< "the interrupt did not abandon the rest of the line; saw: " << shell.seen();
+
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
 }
 
 TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
