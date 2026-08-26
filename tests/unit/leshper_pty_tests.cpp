@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <string>
@@ -83,7 +84,17 @@ private:
 class shell_on_a_pty {
 public:
 	explicit shell_on_a_pty(const scratch_home& home, const char* term = "xterm-256color") {
-		if (::openpty(&_master, &_slave, nullptr, nullptr, nullptr) != 0)
+		// A SIZE, EXPLICITLY. `openpty` with no winsize leaves the pty at 0x0 and
+		// the shell falls back to tty.h's 80x24 - which was fine while every
+		// expectation here was a ten-byte `lesh-test>`, and is not fine now that
+		// one of them is a full filesystem path (#157's native prompt). A prompt
+		// that wrapped would reach the wire with a line break through the middle of
+		// it and no exact match could find it. 24 rows, which is what the fallback
+		// gave, so nothing else in this file sees a different screen.
+		struct winsize size{};
+		size.ws_col = 120;
+		size.ws_row = 24;
+		if (::openpty(&_master, &_slave, nullptr, nullptr, &size) != 0)
 			return;
 		const std::string home_path = home.path();
 		_child = ::fork();
@@ -108,6 +119,13 @@ public:
 			::unsetenv("ENV");
 			::unsetenv("LESH_LOG");
 			::unsetenv("LESH_LOG_FILE");
+			// AND `$PWD`, so the shell's LOGICAL working directory is its physical
+			// one. `shell_state::logical_working_directory` prefers an inherited
+			// `$PWD` whenever it still names the current directory, and whatever
+			// ctest put there may name it by a different spelling than `getcwd`
+			// does. #157's prompt test computes its expectation with `getcwd`; this
+			// is what makes the shell answer the same question the same way.
+			::unsetenv("PWD");
 			::execl(LESH_BINARY, "lesh", static_cast<char*>(nullptr));
 			::_exit(121);
 		}
@@ -295,6 +313,29 @@ constexpr std::string_view kRc = "PS1='lesh-test>'\n";
 constexpr std::string_view kRunnable = "38;2;95;175;95";
 constexpr std::string_view kUnknown = "38;2;215;95;95";
 
+// What the shipped prompt (#157) looks like ON THE WIRE in a given directory:
+// `path_t`'s `$HOME` contraction, then the arrow - and NOT the space after it,
+// for `kPrompt`'s reason one screen up. The default table's literal is `"> "`,
+// but the blitter erases to end of line rather than emitting a trailing space,
+// so the space never reaches the terminal.
+//
+// RESTATED HERE RATHER THAN REACHED FOR, on purpose. This file execs the real
+// binary and shares no code with it; an expectation computed by calling the
+// engine would be the shell agreeing with itself, and the whole point of a pty
+// test is that it does not get to do that.
+[[nodiscard]] std::string contracted_path(std::string_view pwd, std::string_view home) {
+	// BY COMPONENT: a sibling whose name merely starts with `$HOME`'s is not
+	// inside it, which is the rule `path_t` follows and prompt.h asserts.
+	if (!home.empty() && pwd.size() >= home.size() && pwd.substr(0, home.size()) == home
+	    && (pwd.size() == home.size() || pwd[home.size()] == '/'))
+		return "~" + std::string{pwd.substr(home.size())};
+	return std::string{pwd};
+}
+
+[[nodiscard]] std::string native_prompt_in(std::string_view pwd, std::string_view home) {
+	return contracted_path(pwd, home) + ">";
+}
+
 // The rc that gives a session an alias with nothing behind it.
 constexpr std::string_view kAliasRc =
 	"PS1='lesh-test>'\nalias zzalias='echo aliased'\n";
@@ -348,6 +389,67 @@ TEST(LeshperPty, APromptAppearsAndACommandRuns) {
 	// And the prompt comes back, which is what makes it a session and not a
 	// one-shot.
 	EXPECT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
+}
+
+TEST(LeshperPty, AShellThatSetsNoPS1PaintsTheNativePrompt) {
+	// #157'S FLIP, END TO END, AND FROM THE FIRST PAINT. The owner's ruling is
+	// that §6.10's supersession has arrived: a user who never set `$PS1` expressed
+	// no preference - the POSIX `$ ` every `shell_state` is born holding is not a
+	// choice - so what the session shows is the engine's own default table. The rc
+	// file here is EMPTY, which is the case `source_rc` returns early on and the
+	// reason the session constructor has to do the first refresh itself.
+	//
+	// The other half of this rule is every other test in this file: their rc sets
+	// `PS1='lesh-test>'`, and that they still see it is what says the opt-out
+	// survived.
+	const scratch_home home{""};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+
+	// The child inherited THIS process's working directory, and its `$HOME` is the
+	// scratch directory - which the build tree is not inside - so the contraction
+	// finds nothing to contract and the expectation is the whole path.
+	const std::string expected =
+		native_prompt_in(std::filesystem::current_path().string(), home.path());
+	ASSERT_TRUE(shell.wait_for(expected))
+		<< "no native prompt; expected " << expected << "; saw: " << shell.seen();
+	// AND NOT THE STUB, not even once. `$ ` is what `$PS1` holds and what
+	// `options_for` seeded the loop with, so a single `$` anywhere on this wire
+	// would mean the stub got painted first and the native prompt only arrived
+	// later - which is exactly what happens if the session constructor does not
+	// refresh before `run`. The `$` alone, without its space, because the blitter
+	// would erase to end of line rather than emit the space.
+	EXPECT_EQ(shell.count_of("$"), 0u) << "the POSIX stub was painted; saw: " << shell.seen();
+
+	// A prompt and not a banner: a command runs and it comes back.
+	shell.type("echo native-on\r");
+	EXPECT_TRUE(shell.wait_for("native-on")) << "saw: " << shell.seen();
+	EXPECT_TRUE(shell.wait_for(expected, 2)) << "saw: " << shell.seen();
+}
+
+TEST(LeshperPty, AnRcTemplateSetsThePromptAndBarePromptPrintsItBack) {
+	// THE TEMPLATE LANGUAGE END TO END (#157): an rc line, through the shell's own
+	// quoting, through the `prompt` builtin, through the console, into the parser,
+	// and out as painted bytes. Every layer is the real one - this file execs the
+	// binary - so nothing here can pass by the shell agreeing with itself.
+	const scratch_home home{"prompt '[{path}]> '\n"};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+
+	// The literal runs on either side of the placement, with `path`'s contraction
+	// between them - and no trailing space, for the reason `kPrompt` gives: the
+	// blitter erases to end of line rather than emitting one.
+	const std::string expected =
+		"[" + contracted_path(std::filesystem::current_path().string(), home.path()) + "]>";
+	ASSERT_TRUE(shell.wait_for(expected))
+		<< "no templated prompt; expected " << expected << "; saw: " << shell.seen();
+
+	// And bare `prompt` prints the SOURCE back - the round trip that makes
+	// `prompt > f` and re-reading `f` a configuration. It arrives through
+	// `printf`, not the blitter, so the trailing space is on the wire this time.
+	shell.type("prompt\r");
+	EXPECT_TRUE(shell.wait_for("[{path}]> "))
+		<< "the template did not come back; saw: " << shell.seen();
 }
 
 TEST(LeshperPty, AnIncompleteLineGetsTheContinuationPromptRatherThanRunning) {

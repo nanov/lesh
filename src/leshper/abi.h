@@ -906,6 +906,238 @@ int32_t lesh_pager_filter_push(lesh_editor* editor, const char* bytes, size_t le
  * close the pager on the backspace that would have emptied it. */
 int32_t lesh_pager_filter_pop(lesh_editor* editor);
 
+/* ------------------------------------------------------------------------- */
+/* The prompt (#157, spec 6.10)                                               */
+/*                                                                            */
+/* `bind`'s SHAPE, A DIFFERENT REGISTRY. The prompt is leshper state, and the  */
+/* runtime configures it the way it configures keymaps: across this surface.   */
+/* Nothing below is C++-shaped - no element type, no status enum, no template  */
+/* - because NG-4 says the Lua binding reuses these verbs unchanged, and a     */
+/* verb that took a C++ value would be the one place it could not.            */
+/*                                                                            */
+/* TWO HALVES, AND THEY ARE ADDRESSED DIFFERENTLY. Registering a module and    */
+/* placing elements are REGISTRY operations, long-lived, on `lesh_registry*`.  */
+/* Everything a module does while it runs is on `lesh_prompt_context*`, valid  */
+/* only for the receiving call - the same handle discipline the editor has,    */
+/* and for the same reason.                                                    */
+/*                                                                            */
+/* EVERY VERB HERE ANSWERS LESH_ERR_NOTFOUND WHEN NO ENGINE IS WIRED UP. A     */
+/* non-interactive shell has no prompt engine at all, and a binding that       */
+/* configures one should learn that the way it learns there is no completer -  */
+/* by being told, not by crashing and not by silently succeeding.              */
+/* ------------------------------------------------------------------------- */
+
+/* What a module's return value MEANS - spec 6.10's element status. A module    */
+/* answers one of these; a literal and a style answer NEUTRAL, and only a       */
+/* module may answer the first three.                                           */
+/*                                                                             */
+/* A NEGATIVE RETURN - any of the LESH_ERR_* above - reads as OMITTED. A module */
+/* that failed contributes nothing and the prompt still draws; there is no      */
+/* error channel out of a render, because there is nowhere for an error to go   */
+/* that is not the prompt itself. */
+#define LESH_PROMPT_OMITTED 0
+#define LESH_PROMPT_READY 1
+/* Reserved: v1's loop-integration surface is timers only, so nothing resolves
+ * a pending element yet and a group does not count one as ready. The
+ * completion path arrives with #156. */
+#define LESH_PROMPT_PENDING 2
+#define LESH_PROMPT_NEUTRAL 3
+
+/* The surfaces v1 has. The right prompt and the transient prompt are #156's and
+ * arrive as new constants. */
+#define LESH_PROMPT_LEFT 0u
+#define LESH_PROMPT_CONTINUATION 1u
+
+/* One module call. Valid only for the duration of that call; stashing it is
+ * undefined behaviour, asserted in debug builds. */
+typedef struct lesh_prompt_context lesh_prompt_context;
+
+/* A module: reads shell facts through the context, writes its bytes, and
+ * answers a LESH_PROMPT_* status.
+ *
+ * `userdata` is the registration-time context, exactly as an action's is. The
+ * PLACEMENT's type slot is not a parameter - `lesh_prompt_arg` reads it - because
+ * a module is a singleton with free placement (6.10) and the argument belongs to
+ * the placement rather than to the registration. */
+typedef int32_t (*lesh_prompt_module_fn)(lesh_prompt_context* context, void* userdata);
+
+/* A module's TYPE-SLOT GRAMMAR, checked once at set time (6.10).
+ *
+ * Every built-in owns one - `path` knows its five variants, `env` knows that a
+ * variable name is required - and this is the same door for a module that came
+ * from a binding. Zero accepts. A POSITIVE value refuses, and `error_out` may
+ * carry one short human phrase saying why; `*length_out` is its length whether or
+ * not it fit, `lesh_buffer_get`'s convention as everywhere else here.
+ *
+ * WHY IT IS WORTH A VERB. Without one, a mistyped type slot is not an error at
+ * all: the module gets bytes it does not understand at RENDER time, once a
+ * prompt, with nowhere to report them - so the user sees a segment silently doing
+ * the wrong thing rather than a message naming the byte they got wrong. A
+ * validator moves that discovery to the moment the template was written. */
+typedef int32_t (*lesh_prompt_validate_fn)(const char* type, size_t length, void* userdata,
+                                           char* error_out, size_t capacity, size_t* length_out);
+
+/* Registers a module under `name`, replacing any existing registration - #101's
+ * rule again, so re-sourcing an rc file is idempotent. Names are snake_case;
+ * anything else, or a null function, is LESH_ERR_INVAL.
+ *
+ * A module registered this way ACCEPTS ANY TYPE SLOT: it has no grammar this side
+ * can check, so nothing is refused at set time and the bytes arrive at
+ * `lesh_prompt_arg` as written. Use the checked form below to own a grammar.
+ *
+ * Registering does not place anything. `lesh_prompt_place` does that, and may do
+ * it more than once. */
+int32_t lesh_prompt_module_register(lesh_registry* registry,
+                                    const char* name,
+                                    lesh_prompt_module_fn fn,
+                                    void* userdata);
+
+/* The same registration, with a type-slot validator. ADDITIVE: the verb above is
+ * unchanged and still means "accepts any type", so nothing written against it has
+ * to move.
+ *
+ * `validate` may be NULL, which makes this exactly the unchecked form. Both
+ * functions receive the same `userdata`. */
+int32_t lesh_prompt_module_register_checked(lesh_registry* registry,
+                                            const char* name,
+                                            lesh_prompt_module_fn fn,
+                                            lesh_prompt_validate_fn validate,
+                                            void* userdata);
+
+/* True (1) when a module of that name is registered, built-in ones included. */
+int32_t lesh_prompt_module_exists(lesh_registry* registry, const char* name, int32_t* out);
+
+/* ---- Inside a module call ---- */
+
+/* Appends bytes to the prompt. They are BYTES, not a string: no NUL is looked
+ * for and none is written. */
+int32_t lesh_prompt_write(lesh_prompt_context* context, const char* bytes, size_t length);
+
+/* The placement's argument, copied out - `lesh_buffer_get`'s convention exactly.
+ * `*length_out` is the full length whether or not it fit, LESH_ERR_TOOSMALL when
+ * it did not, and `out` may be NULL with `capacity` zero to ask the length
+ * first. An unargued placement answers zero bytes, which is not an error. */
+int32_t lesh_prompt_arg(const lesh_prompt_context* context, char* out, size_t capacity,
+                        size_t* length_out);
+
+/* The virtual clock, in 10 ms ticks (6.10). A module derives its animation frame
+ * from this - `frame = tick / cadence % n` - and stores nothing, which is what
+ * makes two spinners spin in phase and #109's replay reproduce a frame
+ * sequence. */
+int32_t lesh_prompt_tick(const lesh_prompt_context* context, uint64_t* out);
+
+/* Asks to be re-invoked in `ticks` ticks. Zero means the next tick, not "never".
+ *
+ * The composer keeps ONE deadline list and arms the loop's single prompt timer
+ * for the earliest, so nothing runs every 10 ms and a static prompt causes zero
+ * idle wakeups. Asking twice in one call keeps the SMALLEST request. */
+int32_t lesh_prompt_wake_in(lesh_prompt_context* context, uint64_t ticks);
+
+/* A shell variable's value, copied out like every other reader.
+ * LESH_ERR_NOTFOUND when it is unset or when no variable lookup is wired up -
+ * which a module should treat the way the built-in `env` does, by omitting. */
+int32_t lesh_prompt_variable(const lesh_prompt_context* context, const char* name,
+                             char* out, size_t capacity, size_t* length_out);
+
+/* `$?` - the status of the command before this prompt. */
+int32_t lesh_prompt_last_status(const lesh_prompt_context* context, int32_t* out);
+
+/* ---- Placing elements ---- */
+
+/* Empties a surface. A cleared surface renders nothing at all, which is a
+ * legitimate configuration (an empty continuation prompt) and not a mistake to
+ * be corrected into the default. */
+int32_t lesh_prompt_clear(lesh_registry* registry, uint32_t surface);
+
+/* Puts a surface back on the built-in default table. */
+int32_t lesh_prompt_use_default(lesh_registry* registry, uint32_t surface);
+
+/* Appends ONE PLACEMENT - the template's five parts, as five arguments. Every
+ * argument is a NUL-terminated string and NULL means empty.
+ *
+ * ONE VERB, BECAUSE THERE IS ONE ELEMENT (6.10). This replaces the three that
+ * were here - a module verb, a literal verb and a style verb - and the reason is
+ * not tidiness: three verbs let a caller say things the template language cannot
+ * (a style with no span to close it) while not letting it say things the language
+ * can (a module with a prefix that vanishes with it). One `place` call is exactly
+ * `{name:style:type:prefix:postfix}` and exactly nothing else, so the ABI and the
+ * string are the same configuration language with two spellings.
+ *
+ *   `name`    the module. NULL or "" places a LITERAL: no module, the affix bytes
+ *             painted unconditionally, taking no part in a group's vote.
+ *   `style`   the string grammar - `"cyan.bold"`, `"#89dceb"`, `"red+#222"`.
+ *   `type`    the module's own slot, handed to it as written and parsed by IT.
+ *   `prefix`  bytes before the module's, painted only if it said something.
+ *   `postfix` bytes after, on the same condition.
+ *
+ * The placement lands INSIDE the open group when there is one, and at top level
+ * otherwise. Every byte is copied.
+ *
+ * FOUR ANSWERS:
+ *   LESH_OK            - placed.
+ *   LESH_ERR_NOTFOUND  - no module of that name (and no engine on the registry).
+ *   1                  - the STYLE spec would not parse.
+ *   2                  - the module REFUSED the type slot.
+ * The two positive ones are domain statuses, not LESH_ERR_INVAL: the arguments
+ * were well formed and their CONTENT was wrong, which is the caller's own text.
+ * There is no message channel here because there is nothing to say that the
+ * caller, holding the string, could not say better; `lesh_prompt_set`, whose text
+ * a human typed, has one. */
+int32_t lesh_prompt_place(lesh_registry* registry, uint32_t surface,
+                          const char* name, const char* style,
+                          const char* type, const char* prefix, const char* postfix);
+
+/* Sets a surface from a TEMPLATE - `{module:style:type:prefix:postfix}`, `(…)`
+ * groups, `\:`-family escapes - replacing everything on it.
+ *
+ * PARSED ONCE, HERE, AND SWAPPED WHOLE. A template that will not parse changes
+ * nothing at all: the prompt that was standing is still standing, and there is no
+ * half-applied configuration to undo. That is the one thing this verb has that
+ * the element verbs above cannot give a caller holding a single string.
+ *
+ * THREE ANSWERS, AND THE MIDDLE ONE IS THE POINT:
+ *   LESH_OK             - set. `*error_length_out` is zero.
+ *   1                   - REFUSED. `error_out` holds one human sentence naming
+ *                         the byte that was wrong ("unknown module 'gti' at byte
+ *                         7"), and `*error_length_out` its length.
+ *   LESH_ERR_TOOSMALL   - refused, and the sentence did not fit.
+ *                         `*error_length_out` is its full length; ask again with
+ *                         room. `error_out` may be NULL with a zero capacity to
+ *                         ask the length first, exactly as every other reader
+ *                         here works.
+ * Anything negative other than TOOSMALL is a malformed call or no engine.
+ * `error_length_out` may not be NULL - a caller that does not want the message
+ * still has to be told there was one. */
+int32_t lesh_prompt_set(lesh_registry* registry, uint32_t surface,
+                        const char* text, size_t length,
+                        char* error_out, size_t error_capacity, size_t* error_length_out);
+
+/* The SOURCE the surface was last set from, copied out - the template text
+ * itself, never a rendering of it and never a walk of the elements back into a
+ * spelling.
+ *
+ * A surface on the shipped default answers the default's own template; one built
+ * out of `lesh_prompt_place` calls answers zero bytes, because a prompt assembled
+ * placement by placement has no template string and inventing one would put the
+ * element vocabulary on the caller's side of this boundary. */
+int32_t lesh_prompt_text(lesh_registry* registry, uint32_t surface,
+                         char* out, size_t capacity, size_t* length_out);
+
+/* Opens a group - the ONLY combinator (6.10). Everything placed until the
+ * matching close is its child, and the group is shown only when a child inside it
+ * is ready; a literal child never votes.
+ *
+ * LESH_ERR_REFUSED when one is already open. Groups do not nest across THIS
+ * surface, and refusing is the honest answer - a caller that lost track of its
+ * own nesting should hear so rather than have the verbs guess. Nesting is the
+ * template language's (`lesh_prompt_set`, and the engine's node tree holds it):
+ * a verb stream is linear and has no way to say which group a close belongs to,
+ * which is exactly what a bracketed grammar does say. */
+int32_t lesh_prompt_group_open(lesh_registry* registry, uint32_t surface);
+
+/* Closes it. LESH_ERR_REFUSED when none is open. */
+int32_t lesh_prompt_group_close(lesh_registry* registry, uint32_t surface);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

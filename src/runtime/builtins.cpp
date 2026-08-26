@@ -2245,6 +2245,183 @@ builtin_result builtin_bind(shell_state& state, char** argv) {
 	return {report_bind_outcome(what, keys)};
 }
 
+// --- `prompt` --------------------------------------------------------------
+//
+// `bind`'s shape, one console over (#157, spec §6.10). Where `bind` is the rc
+// surface for the keymap registry, this is the rc surface for the prompt engine,
+// and it reaches that engine through `prompt_console` and by no other route -
+// same link boundary, same reason, and the header's note on `binding_console`
+// covers both. This file includes no leshper header, and the link graph is what
+// enforces that rather than a reviewer: `lesh_runtime` does not link
+// `lesh_leshper`, so a direct call would not build.
+//
+// THE WHOLE COMMAND LINE, since it is small enough to write down:
+//
+//     prompt                 write the left prompt's template
+//     prompt -c              write the continuation prompt's template
+//     prompt TEMPLATE        set the left prompt
+//     prompt -c TEMPLATE     set the continuation prompt
+//     prompt -l              write the registered module names, sorted
+//     prompt -r              put the shipped default back on BOTH prompts
+//
+// A GETTER AND A SETTER ON THE SAME WORD, which is `bind`'s arrangement too and
+// deliberately not a `-p` for the reading form: a prompt has exactly one
+// configuration per surface, so the operand's presence already says which of the
+// two was meant, and an option to say it again could only ever disagree.
+//
+// `-r` TAKES NO SURFACE ON PURPOSE. It is the undo, and the thing being undone
+// is a session's worth of rc-file configuration across both prompts; a `-r -c`
+// that reset only half would leave a shell in a state no rc file ever put it in,
+// which is a worse thing to be able to reach than a slightly blunter reset. So
+// `-c` with `-r` is a usage error rather than a narrowing, and the same for
+// `-l`, which reads a registry that has no surface at all.
+
+builtin_result prompt_without_an_editor() {
+	// `bind`'s answer, word for word and status for status. A non-interactive
+	// shell has no prompt engine for the same reason it has no keymaps, and an rc
+	// file guarded for both kinds of shell must not die here - so this is an
+	// OPERATIONAL failure and not a usage error.
+	report("prompt: no line editor in this shell");
+	return {1, control_flow::normal, 1, failure_kind::operational};
+}
+
+// One switch for the console's whole outcome space, `report_bind_outcome`'s
+// opposite number.
+//
+// TWO OF THE FOUR ROWS ARE UNREACHABLE FROM HERE TODAY, and they are written
+// anyway. `no_such_module` and `unbalanced_group` belong to the assembly verbs -
+// `add_module`, `open_group` - and this builtin calls none of them; it hands
+// over a template string and lets the far side assemble. But the switch is
+// total, so the day a verb is added to the console the compiler names this
+// function rather than letting a new outcome fall through to a status with no
+// diagnostic. That is the drift rule the builtin registry's static_assert exists
+// for, applied to an enum instead of a table.
+//
+// `detail` is the console's own sentence for `bad_template` and is printed
+// verbatim: the parser lives across the boundary, so only it can say what was
+// wrong with the bytes.
+int report_prompt_outcome(prompt_console::outcome what, std::string_view detail) {
+	switch (what) {
+	case prompt_console::outcome::ok:
+		return 0;
+	case prompt_console::outcome::no_such_module:
+		report("prompt: unknown module");
+		return 1;
+	case prompt_console::outcome::unbalanced_group:
+		report("prompt: unbalanced group");
+		return 1;
+	case prompt_console::outcome::bad_template:
+		report("prompt: %.*s", static_cast<int>(detail.size()), detail.data());
+		return 1;
+	}
+	return 1;
+}
+
+struct prompt_opts {
+	bool continuation = false;   // -c
+	bool list_modules = false;   // -l
+	bool reset = false;          // -r
+};
+
+constexpr auto kPrompt = args::spec<prompt_opts>(
+	args::option{'c', args::field<&prompt_opts::continuation>}
+		.help("act on the continuation prompt rather than the left one"),
+	args::option{'l', args::field<&prompt_opts::list_modules>}
+		.help("write the names of the modules a template may place"),
+	args::option{'r', args::field<&prompt_opts::reset>}
+		.help("put the shipped default back on both prompts"));
+
+builtin_result builtin_prompt(shell_state& state, char** argv) {
+	// Options first and `--` ends them, so `prompt -- -c` sets a prompt whose
+	// template begins with a hyphen. Parsed through lesh::args like every other
+	// builtin here (#155), which is also what makes `prompt -cr` mean what a
+	// reader of any other utility expects.
+	const auto parsed = args::parse(kPrompt, argv);
+	if (parsed.err)
+		return {report_option_error("prompt", parsed.err)};
+	const prompt_opts opts = parsed.opts;
+	const size_t at = static_cast<size_t>(parsed.rest - argv);
+	const bool has_operand = argv[at] != nullptr;
+
+	// THE COMMAND LINE IS CHECKED BEFORE THE CONSOLE IS ASKED FOR, `bind`'s order
+	// and for `bind`'s reason: a malformed command line has to be malformed in
+	// every shell, or an rc file would be validated only by the interactive one
+	// that runs it and a typo would sit unnoticed in the non-interactive path.
+	if (opts.list_modules && opts.reset) {
+		report("prompt: -l and -r are separate commands");
+		return {2};
+	}
+	if (opts.list_modules || opts.reset) {
+		const char* const verb = opts.list_modules ? "-l" : "-r";
+		if (has_operand) {
+			report("prompt: %s takes no operands", verb);
+			return {2};
+		}
+		if (opts.continuation) {
+			report("prompt: -c has no meaning with %s", verb);
+			return {2};
+		}
+	}
+	if (has_operand && argv[at + 1] != nullptr) {
+		// ONE operand, and a second is a mistake rather than something ignored: a
+		// template is a single word, so `prompt {path} {git}` is an unquoted one and
+		// silently setting it to the first half is the worst of the answers.
+		report("prompt: too many operands");
+		return {2};
+	}
+
+	prompt_console* console = state.prompts();
+	if (console == nullptr)
+		return prompt_without_an_editor();
+
+	if (opts.list_modules) {
+		// The console sorts; this only writes. Sorting here as well would be a
+		// second ordering to disagree with the ABI's.
+		std::vector<std::string> names;
+		console->module_names(names);
+		for (const std::string& one : names)
+			std::printf("%s\n", one.c_str());
+		return {0};
+	}
+
+	if (opts.reset) {
+		// Both surfaces, and the second is attempted even though the first cannot
+		// fail today - `use_default` puts back a table that is `constexpr`, so
+		// there is nothing for it to refuse. Written as two checked calls because
+		// the alternative is a silent half-reset the day that stops being true.
+		const prompt_console::outcome left =
+			console->use_default(prompt_console::surface::left);
+		if (left != prompt_console::outcome::ok)
+			return {report_prompt_outcome(left, {})};
+		const prompt_console::outcome carried_on =
+			console->use_default(prompt_console::surface::continuation);
+		return {report_prompt_outcome(carried_on, {})};
+	}
+
+	const prompt_console::surface which = opts.continuation
+		? prompt_console::surface::continuation
+		: prompt_console::surface::left;
+
+	if (!has_operand) {
+		// The SOURCE STRING, not a rendering: `prompt > f` and reading `f` back
+		// re-inputs the configuration, which is the round trip `bind -m emacs > f`
+		// already promises one seam over. An unconfigured surface answers empty and
+		// prints an empty line rather than nothing at all, so the output has one
+		// line per invocation whatever the state.
+		std::string text;
+		console->text(which, text);
+		std::printf("%.*s\n", static_cast<int>(text.size()), text.data());
+		return {0};
+	}
+
+	// The template is parsed ONCE, here, and the swap is the console's to make
+	// atomic: a refusal leaves the prompt that was already standing. So there is
+	// nothing to undo on this side of the failure - only something to report.
+	std::string error;
+	const prompt_console::outcome what = console->set(which, argv[at], error);
+	return {report_prompt_outcome(what, error)};
+}
+
 // `unalias -a`, and the one letter POSIX gives it.
 //
 // `unalias -Z` USED TO BE AN OPERAND - an alias named `-Z`, reported as not found
@@ -2450,7 +2627,7 @@ constexpr entry kBuiltins[] = {
 	{"set", builtin_set},     {"break", builtin_break}, {"continue", builtin_continue},
 	{"return", builtin_return}, {"shift", builtin_shift},
 	{"alias", builtin_alias}, {"unalias", builtin_unalias},
-	{"bind", builtin_bind},
+	{"bind", builtin_bind}, {"prompt", builtin_prompt},
 	{"read", builtin_read}, {"times", builtin_times},
 	{"trap", builtin_trap}, {"kill", builtin_kill}, {"getopts", builtin_getopts},
 	{"readonly", builtin_readonly},
@@ -2511,6 +2688,14 @@ static_assert(registry_agrees_with_handlers(),
 // owner that frees it" is answered on the other side of the boundary. The
 // registry itself is reached from `state` and is owned there (spec §6.4).
 binding_console::~binding_console() = default;
+
+// And the prompt's, on the same terms (#157, §6.10). It stood alone here while
+// the seam had no caller; `builtin_prompt` above is that caller now, and the
+// arrangement did not have to move to get one - which was the argument for
+// installing the console the day the session started rather than the day
+// something asked it a question. The ABI verbs still reach the engine through
+// the registry rather than through here, and the two doors stay unlayered.
+prompt_console::~prompt_console() = default;
 
 int report_bad_number(std::string_view builtin, std::string_view operand,
                       numeric_parse why) {
