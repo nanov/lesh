@@ -1037,13 +1037,63 @@ int32_t lesh_prompt_add_module(lesh_registry* registry, uint32_t surface,
 int32_t lesh_prompt_add_literal(lesh_registry* registry, uint32_t surface,
                                 const char* bytes, size_t length);
 
+/* Appends a style decoration, spelled in the string grammar - `"cyan.bold"`,
+ * `"#89dceb"`, `"red+#222"`. Bytes, copied; an empty spec is the pen's default.
+ *
+ * A style inside a group is what makes the group put the pen back at its end; a
+ * style at top level paints from there on.
+ *
+ * A SPEC THAT WILL NOT PARSE ANSWERS 1, a positive domain status, and places
+ * nothing. It is not LESH_ERR_INVAL: the arguments were well formed and the
+ * CONTENT was wrong, which is the caller's own text. */
+int32_t lesh_prompt_add_style(lesh_registry* registry, uint32_t surface,
+                              const char* spec, size_t length);
+
+/* Sets a surface from a TEMPLATE - `{module:style:type:prefix:postfix}`, `(…)`
+ * groups, `\:`-family escapes - replacing everything on it.
+ *
+ * PARSED ONCE, HERE, AND SWAPPED WHOLE. A template that will not parse changes
+ * nothing at all: the prompt that was standing is still standing, and there is no
+ * half-applied configuration to undo. That is the one thing this verb has that
+ * the element verbs above cannot give a caller holding a single string.
+ *
+ * THREE ANSWERS, AND THE MIDDLE ONE IS THE POINT:
+ *   LESH_OK             - set. `*error_length_out` is zero.
+ *   1                   - REFUSED. `error_out` holds one human sentence naming
+ *                         the byte that was wrong ("unknown module 'gti' at byte
+ *                         7"), and `*error_length_out` its length.
+ *   LESH_ERR_TOOSMALL   - refused, and the sentence did not fit.
+ *                         `*error_length_out` is its full length; ask again with
+ *                         room. `error_out` may be NULL with a zero capacity to
+ *                         ask the length first, exactly as every other reader
+ *                         here works.
+ * Anything negative other than TOOSMALL is a malformed call or no engine.
+ * `error_length_out` may not be NULL - a caller that does not want the message
+ * still has to be told there was one. */
+int32_t lesh_prompt_set(lesh_registry* registry, uint32_t surface,
+                        const char* text, size_t length,
+                        char* error_out, size_t error_capacity, size_t* error_length_out);
+
+/* The SOURCE the surface was last set from, copied out - the template text
+ * itself, never a rendering of it and never a walk of the elements back into a
+ * spelling.
+ *
+ * A surface on the shipped default answers the default's own template; one built
+ * out of `lesh_prompt_add_module` and friends answers zero bytes, because a
+ * prompt assembled element by element has no template string and inventing one
+ * would put the element vocabulary on the caller's side of this boundary. */
+int32_t lesh_prompt_text(lesh_registry* registry, uint32_t surface,
+                         char* out, size_t capacity, size_t* length_out);
+
 /* Opens a group: everything added until the matching close is its child, and the
  * group is shown only when a module inside it is ready.
  *
- * LESH_ERR_REFUSED when one is already open. Groups do not nest in v1 across
- * this surface, and refusing is the honest answer - a caller that lost track of
- * its own nesting should hear so rather than have the verbs guess. Nesting
- * arrives with the template language, which has the structure to express it. */
+ * LESH_ERR_REFUSED when one is already open. Groups do not nest across THIS
+ * surface, and refusing is the honest answer - a caller that lost track of its
+ * own nesting should hear so rather than have the verbs guess. Nesting is the
+ * template language's (`lesh_prompt_set`, and the engine's node tree holds it):
+ * a verb stream is linear and has no way to say which group a close belongs to,
+ * which is exactly what a bracketed grammar does say. */
 int32_t lesh_prompt_group_open(lesh_registry* registry, uint32_t surface);
 
 /* Closes it. LESH_ERR_REFUSED when none is open. */

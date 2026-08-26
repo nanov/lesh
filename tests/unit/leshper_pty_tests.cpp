@@ -283,14 +283,17 @@ constexpr std::string_view kUnknown = "38;2;215;95;95";
 // binary and shares no code with it; an expectation computed by calling the
 // engine would be the shell agreeing with itself, and the whole point of a pty
 // test is that it does not get to do that.
-[[nodiscard]] std::string native_prompt_in(std::string_view pwd, std::string_view home) {
-	std::string shown{pwd};
+[[nodiscard]] std::string contracted_path(std::string_view pwd, std::string_view home) {
 	// BY COMPONENT: a sibling whose name merely starts with `$HOME`'s is not
 	// inside it, which is the rule `path_t` follows and prompt.h asserts.
 	if (!home.empty() && pwd.size() >= home.size() && pwd.substr(0, home.size()) == home
 	    && (pwd.size() == home.size() || pwd[home.size()] == '/'))
-		shown = "~" + std::string{pwd.substr(home.size())};
-	return shown + ">";
+		return "~" + std::string{pwd.substr(home.size())};
+	return std::string{pwd};
+}
+
+[[nodiscard]] std::string native_prompt_in(std::string_view pwd, std::string_view home) {
+	return contracted_path(pwd, home) + ">";
 }
 
 // The rc that gives a session an alias with nothing behind it.
@@ -352,6 +355,31 @@ TEST(LeshperPty, AShellThatSetsNoPS1PaintsTheNativePrompt) {
 	shell.type("echo native-on\r");
 	EXPECT_TRUE(shell.wait_for("native-on")) << "saw: " << shell.seen();
 	EXPECT_TRUE(shell.wait_for(expected, 2)) << "saw: " << shell.seen();
+}
+
+TEST(LeshperPty, AnRcTemplateSetsThePromptAndBarePromptPrintsItBack) {
+	// THE TEMPLATE LANGUAGE END TO END (#157): an rc line, through the shell's own
+	// quoting, through the `prompt` builtin, through the console, into the parser,
+	// and out as painted bytes. Every layer is the real one - this file execs the
+	// binary - so nothing here can pass by the shell agreeing with itself.
+	const scratch_home home{"prompt '[{path}]> '\n"};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+
+	// The literal runs on either side of the placement, with `path`'s contraction
+	// between them - and no trailing space, for the reason `kPrompt` gives: the
+	// blitter erases to end of line rather than emitting one.
+	const std::string expected =
+		"[" + contracted_path(std::filesystem::current_path().string(), home.path()) + "]>";
+	ASSERT_TRUE(shell.wait_for(expected))
+		<< "no templated prompt; expected " << expected << "; saw: " << shell.seen();
+
+	// And bare `prompt` prints the SOURCE back - the round trip that makes
+	// `prompt > f` and re-reading `f` a configuration. It arrives through
+	// `printf`, not the blitter, so the trailing space is on the wire this time.
+	shell.type("prompt\r");
+	EXPECT_TRUE(shell.wait_for("[{path}]> "))
+		<< "the template did not come back; saw: " << shell.seen();
 }
 
 TEST(LeshperPty, AnIncompleteLineGetsTheContinuationPromptRatherThanRunning) {

@@ -65,6 +65,12 @@ bool fake_getvar(const void*, std::string_view name, std::string_view& out) {
 		out = "dana";
 		return true;
 	}
+	// A variable whose NAME contains a colon, which is a name only `\:` can
+	// spell in a template - the escape's whole point, and unreachable without it.
+	if (name == "A:B") {
+		out = "escaped";
+		return true;
+	}
 	if (name == "EMPTY") {
 		out = std::string_view{};
 		return true;
@@ -1433,16 +1439,17 @@ public:
 		return _engine->close_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
 	}
 
-	// The same interim answers read.cpp's adapter gives, and for the same reason:
-	// the `{module:style:type}` parser is the sibling ticket, and until it lands
-	// the honest answer to a template is that there is no language to read it in.
-	// Both bodies go away together.
-	outcome set(surface, std::string_view, std::string& error_out) override {
-		error_out = "the template language lands with the parser (#157)";
-		return outcome::bad_template;
+	// The same two bodies read.cpp's adapter has, now that there is a language to
+	// read a template in: one parse-and-swap, and the source string it remembered.
+	outcome set(surface which, std::string_view template_text, std::string& error_out) override {
+		return _engine->set_template(surface_of(which), template_text, error_out)
+			? outcome::ok
+			: outcome::bad_template;
 	}
 
-	void text(surface, std::string& out) const override { out.clear(); }
+	void text(surface which, std::string& out) const override {
+		out.assign(_engine->template_text(surface_of(which)));
+	}
 
 private:
 	[[nodiscard]] static surface_id surface_of(surface which) noexcept {
@@ -1577,6 +1584,481 @@ TEST(LeshperPromptEngine, ConfiguredIsFalseUntilAVerbRunsAndIsNeverRegained) {
 		one.clear(surface_id::continuation);
 		EXPECT_TRUE(one.configured());
 	}
+	{
+		// A REFUSED TEMPLATE IS NOT A CONFIGURATION EITHER, and it is the one verb
+		// where the distinction is visible to a user: a typo in an rc file must not
+		// take `$PS1` away and leave nothing in its place.
+		engine one;
+		std::string error;
+		EXPECT_FALSE(one.set_template(surface_id::left, "{gti}", error));
+		EXPECT_FALSE(one.configured());
+		EXPECT_TRUE(one.set_template(surface_id::left, "{git}", error));
+		EXPECT_TRUE(one.configured());
+	}
+}
+
+// ---------------------------------------------------------------------------
+// --- the template language (#157, §6.10) ---
+// ---------------------------------------------------------------------------
+//
+// WHAT IS NOT HERE, AND WHY: the grammar. Every structural rule, every refusal
+// and every byte offset is asserted by the COMPILER, in prompt.h's selftests,
+// through the same `scan_template` these tests drive - one walk at two
+// evaluation times, and the cheaper one is checked at build time. What is left
+// for a running test is what a constant expression cannot see: the NODES the
+// walk builds and the bytes they render, the wording of the sentences, the
+// atomicity of the swap, and everything that crosses the ABI.
+
+// A template set on the left surface and rendered. The whole omission table is
+// checked through this.
+std::string set_and_render(engine& which, std::string_view text, const prompt::state& facts) {
+	std::string error;
+	EXPECT_TRUE(which.set_template(surface_id::left, text, error)) << text << ": " << error;
+	which.render_full(facts);
+	return std::string{which.output(surface_id::left)};
+}
+
+// The facts a template test wants: a variable table, and a failed last command
+// so `status` has something to say.
+prompt::state loud() {
+	prompt::state facts = quiet();
+	facts.getvar = &fake_getvar;
+	facts.status = 2;
+	return facts;
+}
+
+TEST(LeshperPromptTemplate, EveryRowOfTheOmissionTableRenders) {
+	engine which;
+	const prompt::state facts = loud();
+
+	// prmt's table, row for row: an empty slot is the default, and a trailing
+	// colon is legal.
+	EXPECT_EQ(set_and_render(which, "{path}", facts), "~/src");
+	EXPECT_EQ(set_and_render(which, "{path:}", facts), "~/src");
+	EXPECT_EQ(set_and_render(which, "{path:cyan}", facts), "\x1b[36m~/src\x1b[0m");
+	EXPECT_EQ(set_and_render(which, "{env::USER}", facts), "dana");
+	EXPECT_EQ(set_and_render(which, "{status:red::[:]}", facts), "\x1b[31m[2]\x1b[0m");
+	EXPECT_EQ(set_and_render(which, "{status::::!}", facts), "2!");
+	EXPECT_EQ(set_and_render(which, "{status:magenta::on :}", facts), "\x1b[35mon 2\x1b[0m");
+	EXPECT_EQ(set_and_render(which, "{path}> ", facts), "~/src> ");
+
+	// AND THE AFFIXES VANISH WITH THE MODULE, which is the whole reason they are
+	// slots rather than adjacent literal runs: the same template, one fact
+	// different, and the brackets are gone with the number.
+	EXPECT_EQ(set_and_render(which, "{status:red::[:]}", quiet()), "");
+	EXPECT_EQ(set_and_render(which, "{status::::!}", quiet()), "");
+
+	// A free literal run is unconditional and vanishes with nothing - binding is
+	// explicit grouping, never adjacency (§6.10).
+	EXPECT_EQ(set_and_render(which, "[{status}]", quiet()), "[]");
+}
+
+TEST(LeshperPromptTemplate, TheStandaloneLiteralCarriesItsTextInTheAffixSlots) {
+	engine which;
+
+	EXPECT_EQ(set_and_render(which, "{literal:blue::your mother}", quiet()),
+	          "\x1b[34myour mother\x1b[0m");
+	// Both affixes, in order, with nothing invented between them.
+	EXPECT_EQ(set_and_render(which, "{literal:blue::hi :there}", quiet()),
+	          "\x1b[34mhi there\x1b[0m");
+	// Unstyled, and then the same bytes written bare: one literal node either way.
+	EXPECT_EQ(set_and_render(which, "{literal:::plain}", quiet()), "plain");
+	EXPECT_EQ(set_and_render(which, "plain", quiet()), "plain");
+
+	std::string error;
+	// THE TYPE SLOT IS NOT WHERE THE TEXT GOES. Slot 3 is always the type and
+	// `literal` has none, so the spelling that looks like it ought to work is the
+	// refusal that matters most.
+	EXPECT_FALSE(which.set_template(surface_id::left, "{literal::x}", error));
+	EXPECT_EQ(error, "literal takes no type at byte 10");
+	EXPECT_FALSE(which.set_template(surface_id::left, "{literal:blue:x:hi}", error));
+	EXPECT_EQ(error, "literal takes no type at byte 14");
+
+	// And a literal with no text at all is not an empty literal, it is a mistake.
+	EXPECT_FALSE(which.set_template(surface_id::left, "{literal}", error));
+	EXPECT_EQ(error, "literal needs text at byte 1");
+	EXPECT_FALSE(which.set_template(surface_id::left, "{literal:blue}", error));
+	EXPECT_EQ(error, "literal needs text at byte 1");
+}
+
+TEST(LeshperPromptTemplate, AStyledLiteralIsGrammarAndDoesNotVote) {
+	engine which;
+
+	// `git` says nothing here (`fs_allowed` is false) and the group has no other
+	// module, so the whole group goes and the styled literal with it. Had the
+	// literal voted, this would paint `on ` in a session that is in no repository
+	// at all.
+	EXPECT_EQ(set_and_render(which, "({literal:dim::on} {git})", quiet()), "");
+
+	// The same span at top level, where nothing votes on anything: it paints, and
+	// it puts the pen back at its own end rather than leaking it into what
+	// follows.
+	EXPECT_EQ(set_and_render(which, "{literal:dim::on} x", quiet()), "\x1b[2mon\x1b[0m x");
+}
+
+TEST(LeshperPromptTemplate, TheEscapesReachTheBytes) {
+	engine which;
+	const prompt::state facts = loud();
+
+	// `\:` inside a type slot is the escape's whole purpose: a variable whose name
+	// contains a colon is unreachable without it.
+	EXPECT_EQ(set_and_render(which, "{env::A\\:B}", facts), "escaped");
+	EXPECT_EQ(set_and_render(which, "\\{path\\}", facts), "{path}");
+	EXPECT_EQ(set_and_render(which, "\\(not a group\\)", facts), "(not a group)");
+	EXPECT_EQ(set_and_render(which, "a\\nb\\tc", facts), "a\nb\tc");
+	EXPECT_EQ(set_and_render(which, "c:\\\\d", facts), "c:\\d");
+	EXPECT_EQ(set_and_render(which, "{literal:::\\(hi\\)}", facts), "(hi)");
+
+	// A bare `}` means nothing outside a placement and needs no escape; a `)` is
+	// structural everywhere and does.
+	EXPECT_EQ(set_and_render(which, "}x", facts), "}x");
+}
+
+TEST(LeshperPromptTemplate, EveryRefusalIsOneSentenceWithTheByteItPointsAt) {
+	engine which;
+	std::string error;
+
+	const auto refuses = [&](std::string_view text, std::string_view said) {
+		error.clear();
+		EXPECT_FALSE(which.set_template(surface_id::left, text, error)) << text;
+		EXPECT_EQ(error, said) << text;
+	};
+
+	refuses("{path}{gti}", "unknown module 'gti' at byte 7");
+	refuses("{path", "unclosed '{' at byte 0");
+	refuses("( x", "unclosed '(' at byte 0");
+	refuses("{path} x)", "unbalanced ')' at byte 8");
+	refuses("{path:blod}", "bad style 'blod' at byte 6");
+	refuses("{path:cyan.blod}", "bad style 'blod' at byte 11");
+	refuses("{a:b:c:d:e:f}", "too many fields at byte 10");
+	refuses("{env}", "env needs a variable name at byte 1");
+	refuses("{path::short}", "path takes no argument at byte 7");
+	refuses("{}", "a placement needs a module name at byte 1");
+	refuses("a\\qb", "unknown escape '\\q' at byte 1");
+}
+
+TEST(LeshperPromptTemplate, ARefusedTemplateLeavesEverythingExactlyAsItWas) {
+	engine which;
+	std::string error;
+
+	ASSERT_TRUE(which.set_template(surface_id::left, "{path:cyan}> ", error));
+	which.render_full(loud());
+	const std::string before{which.output(surface_id::left)};
+	const std::string remembered{which.template_text(surface_id::left)};
+	ASSERT_FALSE(before.empty());
+
+	// A template that gets a long way in before it fails - a placement, a group,
+	// a literal - so that a builder mutating the surface as it walked would leave
+	// visible wreckage rather than none.
+	EXPECT_FALSE(which.set_template(surface_id::left, "{path}( on {gti}) {status}", error));
+	EXPECT_EQ(error, "unknown module 'gti' at byte 12");
+
+	which.render_full(loud());
+	EXPECT_EQ(which.output(surface_id::left), before);
+	EXPECT_EQ(which.template_text(surface_id::left), remembered);
+}
+
+TEST(LeshperPromptTemplate, TheDefaultTableAndItsTemplateAgree) {
+	// THE SHIPPED PROMPT, TWICE OVER: the `constexpr` table an untouched engine
+	// holds, and the string `use_default` remembers for it. That the two render
+	// the same bytes is what makes `prompt` printing `{path}> ` on a fresh shell a
+	// true statement rather than a plausible one.
+	engine table_side;
+	engine template_side;
+
+	std::string error;
+	ASSERT_TRUE(template_side.set_template(surface_id::left, prompt::kDefaultLeftTemplate, error));
+	ASSERT_TRUE(template_side.set_template(surface_id::continuation,
+	                                       prompt::kDefaultContinuationTemplate, error));
+
+	prompt::state elsewhere = quiet();
+	elsewhere.pwd = "/etc";
+	elsewhere.status = 130;
+
+	for (const prompt::state& facts : {quiet(), elsewhere}) {
+		table_side.render_full(facts);
+		template_side.render_full(facts);
+		EXPECT_EQ(table_side.output(surface_id::left), template_side.output(surface_id::left));
+		EXPECT_EQ(table_side.output(surface_id::continuation),
+		          template_side.output(surface_id::continuation));
+	}
+
+	EXPECT_EQ(table_side.template_text(surface_id::left), "{path}> ");
+	EXPECT_EQ(table_side.template_text(surface_id::continuation), "> ");
+}
+
+TEST(LeshperPromptTemplate, TheRememberedTextIsTheSourceOrNothingAtAll) {
+	engine which;
+
+	EXPECT_EQ(which.template_text(surface_id::left), "{path}> ");
+	EXPECT_EQ(which.template_text(surface_id::continuation), "> ");
+
+	which.clear(surface_id::left);
+	EXPECT_EQ(which.template_text(surface_id::left), "");
+
+	std::string error;
+	ASSERT_TRUE(which.set_template(surface_id::left, "{path:cyan}$ ", error));
+	EXPECT_EQ(which.template_text(surface_id::left), "{path:cyan}$ ");
+
+	// AN ASSEMBLY VERB HAS NO TEMPLATE STRING, so it says so rather than leaving
+	// a stale one behind that no longer describes the prompt.
+	which.add_literal(surface_id::left, "!");
+	EXPECT_EQ(which.template_text(surface_id::left), "");
+
+	ASSERT_TRUE(which.set_template(surface_id::left, "{path}> ", error));
+	EXPECT_TRUE(which.add_module(surface_id::left, "status", ""));
+	EXPECT_EQ(which.template_text(surface_id::left), "");
+
+	which.use_default(surface_id::left);
+	EXPECT_EQ(which.template_text(surface_id::left), "{path}> ");
+}
+
+TEST(LeshperPromptTemplate, TheValidatorsBuiltInTableIsTheRegistrys) {
+	// The `constexpr` validator resolves names against a table in the header; the
+	// engine resolves them against the registry its constructor filled. Two lists
+	// that must not drift, and this is the only place they can be compared.
+	engine which;
+	std::vector<std::string> names;
+	which.module_names(names);
+
+	ASSERT_EQ(names.size(), std::size(prompt::kBuiltinModules));
+	for (std::size_t i = 0; i < names.size(); ++i)
+		EXPECT_EQ(names[i], prompt::kBuiltinModules[i].name) << i;
+}
+
+TEST(LeshperPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
+	abi_probe probe;
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &probe), LESH_OK);
+
+	// The grammar has nothing to say about a type slot it did not define: the
+	// module parses its own argument and the parser's job is to hand it over.
+	EXPECT_EQ(set_and_render(which, "{probe::whatever}", quiet()), "<whatever>");
+	EXPECT_EQ(probe.arg, "whatever");
+
+	// A REPLACED BUILT-IN IS THE SAME CASE. `path` takes no argument only while
+	// `path` is the built-in; a user who registered their own owns its grammar,
+	// which is why the rule is keyed on what the name resolves to.
+	counter mine;
+	mine.label = "p";
+	mine.constant = true;
+	std::string error;
+	EXPECT_FALSE(which.set_template(surface_id::left, "{path::short}", error));
+	ASSERT_EQ(which.register_module("path", &counting_module, &mine), LESH_OK);
+	EXPECT_TRUE(which.set_template(surface_id::left, "{path::short}", error)) << error;
+
+	// And before any registration at all the same template is a refusal.
+	engine fresh;
+	EXPECT_FALSE(fresh.set_template(surface_id::left, "{probe::whatever}", error));
+	EXPECT_EQ(error, "unknown module 'probe' at byte 1");
+}
+
+TEST(LeshperPromptEngine, AddStyleReachesTheGroupsResetFlag) {
+	engine which;
+	which.clear(surface_id::left);
+	which.clear(surface_id::continuation);
+
+	ASSERT_TRUE(which.open_group(surface_id::left));
+	EXPECT_TRUE(which.add_style(surface_id::left, "red.bold"));
+	which.add_literal(surface_id::left, "[");
+	ASSERT_TRUE(which.add_module(surface_id::left, "status", ""));
+	which.add_literal(surface_id::left, "]");
+	ASSERT_TRUE(which.close_group(surface_id::left));
+	which.add_literal(surface_id::left, "$");
+
+	// THE FLAG THIS VERB FINALLY SETS: the group ends with a reset, so the `$`
+	// after it is not red.
+	prompt::state failed = quiet();
+	failed.status = 7;
+	which.render_full(failed);
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[1;31m[7]\x1b[0m$");
+
+	// And the style vanishes with the module, like any other decoration.
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "$");
+
+	// A spec that will not parse places nothing.
+	EXPECT_FALSE(which.add_style(surface_id::left, "blod"));
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "$");
+}
+
+TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConvention) {
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	constexpr std::string_view kTemplate = "{path}> ";
+	std::size_t length = 7;
+	ASSERT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, kTemplate.data(), kTemplate.size(),
+	                          nullptr, 0, &length),
+	          LESH_OK);
+	// Zero, and written even though there was no message: that is how a caller
+	// sizing the message first learns there is none.
+	EXPECT_EQ(length, 0u);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
+
+	char buffer[64];
+	std::size_t out_length = 0;
+	ASSERT_EQ(lesh_prompt_text(&registry, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
+	          LESH_OK);
+	EXPECT_EQ(std::string(buffer, out_length), kTemplate);
+
+	// THE REFUSAL, ASKED FOR TWICE: the length first with no buffer at all, then
+	// the sentence with room for it.
+	constexpr std::string_view kBad = "{gti}";
+	std::size_t needed = 0;
+	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, kBad.data(), kBad.size(), nullptr, 0,
+	                          &needed),
+	          LESH_ERR_TOOSMALL);
+	ASSERT_GT(needed, 0u);
+	std::string message;
+	message.resize(needed);
+	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, kBad.data(), kBad.size(),
+	                          message.data(), message.size(), &needed),
+	          1);
+	EXPECT_EQ(message, "unknown module 'gti' at byte 1");
+
+	// And the prompt that was standing is still standing, twice refused.
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
+	ASSERT_EQ(lesh_prompt_text(&registry, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
+	          LESH_OK);
+	EXPECT_EQ(std::string(buffer, out_length), kTemplate);
+
+	// The style verb, and its own domain status for a spec that will not parse.
+	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	ASSERT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, "cyan", 4), LESH_OK);
+	ASSERT_EQ(lesh_prompt_add_module(&registry, LESH_PROMPT_LEFT, "path", nullptr), LESH_OK);
+	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	EXPECT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, "blod", 4), 1);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m");
+
+	// A surface assembled verb by verb has no template string.
+	ASSERT_EQ(lesh_prompt_text(&registry, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
+	          LESH_OK);
+	EXPECT_EQ(out_length, 0u);
+
+	// The argument errors, and the one that is a missing engine rather than a
+	// malformed call.
+	lesh_registry bare;
+	ASSERT_EQ(bare.prompt_engine, nullptr);
+	EXPECT_EQ(lesh_prompt_set(&bare, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, &needed),
+	          LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_text(&bare, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
+	          LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_add_style(&bare, LESH_PROMPT_LEFT, "cyan", 4), LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_set(nullptr, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, &needed),
+	          LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_set(&registry, 7u, "x", 1, nullptr, 0, &needed), LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, nullptr, 3, nullptr, 0, &needed),
+	          LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, nullptr),
+	          LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_add_style(&registry, 7u, "cyan", 4), LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_add_style(&registry, LESH_PROMPT_LEFT, nullptr, 4), LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_text(&registry, 7u, buffer, sizeof buffer, &out_length), LESH_ERR_INVAL);
+}
+
+// --- groups, against a real repository -------------------------------------
+
+TEST_F(LeshperPromptGit, ATemplatesGroupVanishesWithItsModule) {
+	const std::string repo = make_repo("templated", "ref: refs/heads/topic\n");
+	write_text(repo + "/.git/refs/heads/topic", sha40('a') + "\n");
+	const std::string bare = at("templated_not_a_repo");
+	make_dirs(bare);
+
+	engine which;
+	prompt::state facts = quiet();
+	facts.pwd = repo;
+	facts.home = std::string_view{};
+	facts.fs_allowed = true;
+
+	prompt::state elsewhere = facts;
+	elsewhere.pwd = bare;
+
+	// §6.10's own example, spelled in the language for the first time.
+	EXPECT_EQ(set_and_render(which, "{path}( on {git})> ", facts), repo + " on topic> ");
+	which.render_full(elsewhere);
+	EXPECT_EQ(which.output(surface_id::left), bare + "> ");
+
+	// The same thing said with slots instead of a group, which is what the
+	// desugaring means: one styled span, the affixes inside it, the style
+	// covering both.
+	EXPECT_EQ(set_and_render(which, "{path}{git:magenta:: on :}> ", facts),
+	          repo + "\x1b[35m on topic\x1b[0m> ");
+	which.render_full(elsewhere);
+	EXPECT_EQ(which.output(surface_id::left), bare + "> ");
+}
+
+TEST_F(LeshperPromptGit, GroupsNestAndTheInnerOneRendersOnlyIfTheOuterSurvived) {
+	const std::string repo = make_repo("nested_template", "ref: refs/heads/deep\n");
+	write_text(repo + "/.git/refs/heads/deep", sha40('b') + "\n");
+	const std::string bare = at("nested_not_a_repo");
+	make_dirs(bare);
+
+	engine which;
+	prompt::state facts = quiet();
+	facts.pwd = repo;
+	facts.home = std::string_view{};
+	facts.fs_allowed = true;
+	facts.status = 3;
+
+	// NESTING IS THE TEMPLATE LANGUAGE'S - the ABI's verb stream still refuses it,
+	// having no way to say which group a close belongs to - and the vote is
+	// unchanged by it: only DIRECT module children vote, exactly as a `seg` nested
+	// in a `seg` does not vote at compile time. So this outer group lives or dies
+	// on `git`, and the inner one runs only if it lived.
+	EXPECT_EQ(set_and_render(which, "( on {git} ([{status}]))", facts), " on deep [3]");
+
+	// Outside a repository the whole thing goes, inner group included.
+	prompt::state elsewhere = facts;
+	elsewhere.pwd = bare;
+	which.render_full(elsewhere);
+	EXPECT_EQ(which.output(surface_id::left), "");
+
+	// The inner module alone cannot save the outer group, which is the other half
+	// of the same rule and the half that would surprise someone: a group is not a
+	// module and does not vote for its parent.
+	EXPECT_EQ(set_and_render(which, "( on ({status}))", elsewhere), "");
+}
+
+TEST_F(LeshperPromptGit, PuttingAColourOnAPlacementDoesNotChangeHowItVotes) {
+	// THE TRAP THE MANUAL SMOKE CAUGHT, and the reason a desugared placement is
+	// stamped a module rather than a group: `( on {git})` works, so
+	// `( on {git:magenta})` has to work, or adding one word to a prompt that was
+	// fine would silently empty it - a group with nothing in it that can vote can
+	// never be shown, and nothing about the spelling says so.
+	const std::string repo = make_repo("coloured", "ref: refs/heads/tinted\n");
+	write_text(repo + "/.git/refs/heads/tinted", sha40('c') + "\n");
+	const std::string bare = at("coloured_not_a_repo");
+	make_dirs(bare);
+
+	engine which;
+	prompt::state facts = quiet();
+	facts.pwd = repo;
+	facts.home = std::string_view{};
+	facts.fs_allowed = true;
+
+	EXPECT_EQ(set_and_render(which, "{path}( on {git})> ", facts), repo + " on tinted> ");
+	EXPECT_EQ(set_and_render(which, "{path}( on {git:magenta})> ", facts),
+	          repo + " on \x1b[35mtinted\x1b[0m> ");
+	// With its affixes inside the group as well - a placement carrying a style and
+	// two affixes is still one placement to the group around it.
+	EXPECT_EQ(set_and_render(which, "{path}({git:magenta:: on :!})> ", facts),
+	          repo + "\x1b[35m on tinted!\x1b[0m> ");
+
+	// And all three vanish together outside a repository.
+	prompt::state elsewhere = facts;
+	elsewhere.pwd = bare;
+	EXPECT_EQ(set_and_render(which, "{path}( on {git})> ", elsewhere), bare + "> ");
+	EXPECT_EQ(set_and_render(which, "{path}( on {git:magenta})> ", elsewhere), bare + "> ");
+	EXPECT_EQ(set_and_render(which, "{path}({git:magenta:: on :!})> ", elsewhere), bare + "> ");
 }
 
 } // namespace

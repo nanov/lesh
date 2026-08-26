@@ -111,6 +111,68 @@ bool context_ok(const lesh_prompt_context* context) noexcept {
 			return LESH_ERR_INVAL;                                             \
 	} while (0)
 
+// The scan's error as the sentence the builtin prints after "prompt: ".
+//
+// THE WORDING IS HERE AND NOT IN THE HEADER, and the split is the point: the
+// grammar walk is `constexpr` and carries a code and an offset, which is all a
+// `static_assert` can compare anyway; turning one into English needs a
+// `std::string` and belongs on the side that has a user to talk to. One sentence,
+// one byte offset, no punctuation to strip - `report_prompt_outcome` prints it
+// verbatim.
+std::string describe_template_error(const lesh::leshper::prompt::template_check& why) {
+	using lesh::leshper::prompt::template_error;
+
+	const std::string what{why.what};
+	std::string said;
+	switch (why.error) {
+		case template_error::none:
+			return {};
+		case template_error::unclosed_placement:
+			said = "unclosed '{'";
+			break;
+		case template_error::unbalanced_close:
+			said = "unbalanced ')'";
+			break;
+		case template_error::unclosed_group:
+			said = "unclosed '('";
+			break;
+		case template_error::too_many_fields:
+			said = "too many fields";
+			break;
+		case template_error::empty_name:
+			said = "a placement needs a module name";
+			break;
+		case template_error::unknown_module:
+			said = "unknown module '" + what + "'";
+			break;
+		case template_error::bad_style:
+			said = "bad style '" + what + "'";
+			break;
+		case template_error::bad_escape:
+			said = "unknown escape '" + what + "'";
+			break;
+		case template_error::needs_argument:
+			// v1's only `needs_argument` built-in is `env`, so this can afford to
+			// say what the argument IS rather than that there must be one. A second
+			// module of this rule would arrive with its own noun and this line would
+			// have to grow a table; one module does not need one.
+			said = what + " needs a variable name";
+			break;
+		case template_error::takes_no_argument:
+			said = what + " takes no argument";
+			break;
+		case template_error::literal_needs_text:
+			said = "literal needs text";
+			break;
+		case template_error::literal_takes_no_type:
+			said = "literal takes no type";
+			break;
+	}
+	said += " at byte ";
+	said += std::to_string(why.error_at);
+	return said;
+}
+
 engine* engine_of(lesh_registry* registry) noexcept {
 	return registry == nullptr ? nullptr : registry->prompt_engine;
 }
@@ -274,6 +336,11 @@ void engine::clear(surface_id which) {
 		one.status = element_status::omitted;
 		one.wake_at = 0;
 	}
+
+	// A cleared surface was set from no template, which is the truth and not a
+	// gap: see `template_text`. Every assembly verb below empties it for the same
+	// reason.
+	target.text.clear();
 }
 
 void engine::use_default(surface_id which) {
@@ -295,6 +362,14 @@ void engine::use_default(surface_id which) {
 		made->kind = one.kind;
 		target.nodes.push_back(std::move(made));
 	}
+
+	// AND THE TABLE'S OWN SPELLING, so `prompt` prints the prompt the shell is
+	// showing rather than the empty line an untemplated surface would answer. The
+	// two are the same prompt and the suite says so - see
+	// `TheDefaultTableAndItsTemplateAgree`, which renders both against two states
+	// and compares bytes.
+	target.text.assign(which == surface_id::continuation ? kDefaultContinuationTemplate
+	                                                     : kDefaultLeftTemplate);
 }
 
 engine::node& engine::place(surface& into, std::unique_ptr<node> made) {
@@ -319,7 +394,9 @@ bool engine::add_module(surface_id which, std::string_view name, std::string_vie
 	made->bound.userdata = found->second.userdata;
 	made->data = &made->bound;
 
-	place(at(which), std::move(made));
+	surface& target = at(which);
+	place(target, std::move(made));
+	target.text.clear();
 	_configured = true;
 	return true;
 }
@@ -332,8 +409,29 @@ void engine::add_literal(surface_id which, std::string_view bytes) {
 	made->bound.arg = made->arg;
 	made->data = &made->bound;
 
-	place(at(which), std::move(made));
+	surface& target = at(which);
+	place(target, std::move(made));
+	target.text.clear();
 	_configured = true;
+}
+
+bool engine::add_style(surface_id which, std::string_view spec) {
+	const style_parse parsed = parse_style(spec);
+	if (!parsed.ok)
+		return false;
+
+	auto made = std::make_unique<node>();
+	made->fn = &decoration_style;
+	made->kind = element_kind::decoration;
+	made->styles = true;   // what makes an enclosing group owe a reset
+	made->pen = parsed.value;
+	made->data = &made->pen;
+
+	surface& target = at(which);
+	place(target, std::move(made));
+	target.text.clear();
+	_configured = true;
+	return true;
 }
 
 bool engine::open_group(surface_id which) {
@@ -348,6 +446,7 @@ bool engine::open_group(surface_id which) {
 	// Top level only: `place` would have put it inside the open group, and there
 	// is no open group here by the check above.
 	target.open = &place(target, std::move(made));
+	target.text.clear();
 	_configured = true;
 	return true;
 }
@@ -357,8 +456,215 @@ bool engine::close_group(surface_id which) {
 	if (target.open == nullptr)
 		return false;
 	target.open = nullptr;
+	target.text.clear();
 	_configured = true;
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// The template language, built
+// ---------------------------------------------------------------------------
+
+// `scan_template`'s building policy: the same walk the `constexpr` validator
+// runs, with node construction hung off its hooks.
+//
+// IT BUILDS INTO ITS OWN STORAGE AND HANDS OVER ONLY AT THE END. That is the
+// whole of the atomicity promise - there is no partial application to undo,
+// because nothing was applied. The engine is borrowed only to resolve names.
+struct engine::builder {
+	engine* owner = nullptr;
+	std::vector<std::unique_ptr<node>> nodes;
+	std::vector<node*> open;   // the group stack; the scanner guarantees it balances
+	std::string scratch;       // the unescape target, reused across slots
+
+	node& place_here(std::unique_ptr<node> made) {
+		node& placed = *made;
+		if (open.empty())
+			nodes.push_back(std::move(made));
+		else
+			open.back()->children.push_back(std::move(made));
+		return placed;
+	}
+
+	// KEYED ON THE RESOLVED FUNCTION, NOT ON THE NAME. `{path::short}` is refused
+	// because `path` is still the built-in that takes no argument; a user who
+	// registered their own `path` gets `free_argument` and owns its argument
+	// grammar, which is the only answer that does not make the engine the arbiter
+	// of a vocabulary it did not define.
+	[[nodiscard]] module_rule resolve(std::string_view name) const {
+		const auto found = owner->_modules.find(name);
+		if (found == owner->_modules.end())
+			return module_rule::unknown;
+
+		const element_fn fn = found->second.fn;
+		if (fn == &module_env)
+			return module_rule::needs_argument;
+		if (fn == &module_path || fn == &module_status || fn == &module_jobs
+		    || fn == &module_mode || fn == &module_time || fn == &module_duration
+		    || fn == &module_git)
+			return module_rule::no_argument;
+		return module_rule::free_argument;
+	}
+
+	[[nodiscard]] std::unique_ptr<node> make_literal(const template_slice& bytes) {
+		scratch.clear();
+		unescape_into(bytes, scratch);
+		return make_literal_bytes(scratch);
+	}
+
+	[[nodiscard]] std::unique_ptr<node> make_literal_bytes(std::string_view bytes) {
+		auto made = std::make_unique<node>();
+		made->fn = &decoration_literal;
+		made->kind = element_kind::decoration;
+		made->arg.assign(bytes);
+		made->bound.arg = made->arg;
+		made->data = &made->bound;
+		return made;
+	}
+
+	[[nodiscard]] std::unique_ptr<node> make_style(const style& pen) {
+		auto made = std::make_unique<node>();
+		made->fn = &decoration_style;
+		made->kind = element_kind::decoration;
+		made->styles = true;
+		made->pen = pen;
+		made->data = &made->pen;
+		return made;
+	}
+
+	[[nodiscard]] std::unique_ptr<node> make_module(std::string_view name,
+	                                                const template_slice& arg) {
+		// `resolve` already said this name is there; the second lookup is what
+		// makes `add_module` and this one entry point rather than two.
+		const auto found = owner->_modules.find(name);
+		auto made = std::make_unique<node>();
+		made->fn = found->second.fn;
+		made->kind = element_kind::module;
+		scratch.clear();
+		unescape_into(arg, scratch);
+		made->arg.assign(scratch);
+		made->bound.arg = made->arg;
+		made->bound.userdata = found->second.userdata;
+		made->data = &made->bound;
+		return made;
+	}
+
+	void on_literal(const template_slice& run) { place_here(make_literal(run)); }
+
+	void on_open_group() {
+		auto made = std::make_unique<node>();
+		made->kind = element_kind::group;   // fn null: the engine drives its phases
+		open.push_back(&place_here(std::move(made)));
+	}
+
+	void on_close_group() { open.pop_back(); }
+
+	// THE DESUGARING, AND IT IS ONE NODE SHAPE (§6.10, #156). A placement with no
+	// style and no affixes is a bare module element - the cheapest thing the
+	// engine can hold. A placement with any of them is ONE group over
+	// `[style?, prefix, module, postfix?]`: the style spans the affixes and the
+	// value, the group's own vote makes all three vanish together when the module
+	// says nothing, and the group's styles flag puts the pen back at the end. No
+	// new machinery, and no second rule for how a styled segment behaves.
+	void on_placement(std::string_view name, const style& pen, bool styled,
+	                  const template_slice& type, const template_slice& prefix,
+	                  const template_slice& postfix) {
+		if (!styled && prefix.empty() && postfix.empty()) {
+			place_here(make_module(name, type));
+			return;
+		}
+
+		auto group = std::make_unique<node>();
+		// STAMPED A MODULE, THOUGH IT IS BUILT LIKE A GROUP, and this line is what
+		// makes the desugaring TRANSPARENT. `{git}` votes in an enclosing group;
+		// `{git:magenta}` is the same placement wearing a colour and has to vote
+		// identically, or `( on {git:magenta})` would be a group with no module
+		// child of its own, could never win a vote, and would render nothing for
+		// ever - which is what adding one word to a working prompt would silently
+		// do. The node IS a placement; the group is how a placement carries a style
+		// and two affixes, not what it is. "Groups do not vote" is untouched: an
+		// explicit `(…)` written by a user still does not vote in its parent.
+		group->kind = element_kind::module;
+		node& seg = place_here(std::move(group));
+
+		// Built in order and pushed directly: `place_here` would have put them at
+		// this builder's current level, which is the group's PARENT.
+		if (styled)
+			seg.children.push_back(make_style(pen));
+		if (!prefix.empty())
+			seg.children.push_back(make_literal(prefix));
+		seg.children.push_back(make_module(name, type));
+		if (!postfix.empty())
+			seg.children.push_back(make_literal(postfix));
+	}
+
+	// The same shape with no value in the middle - which is exactly what
+	// `{literal:blue::hi}` is. The two affixes concatenate with nothing between
+	// them, so an unstyled one collapses to a single literal node and is then
+	// indistinguishable from the bare bytes it spells.
+	void on_literal_placement(const style& pen, bool styled, const template_slice& prefix,
+	                          const template_slice& postfix) {
+		if (!styled) {
+			scratch.clear();
+			unescape_into(prefix, scratch);
+			unescape_into(postfix, scratch);
+			place_here(make_literal_bytes(scratch));
+			return;
+		}
+
+		// A SPAN: a group that does not vote. A group with no module child could
+		// never win a vote, so this one is stamped a DECORATION - it always
+		// renders, it answers `neutral`, and inside a parent group it takes no part
+		// in the parent's vote (§6.10: decorations do not vote). The style still
+		// resets at the span's end, which is what makes the styling local to the
+		// bytes it was written for.
+		auto span = std::make_unique<node>();
+		span->kind = element_kind::decoration;   // fn null: the engine drives it
+		node& placed = place_here(std::move(span));
+		placed.children.push_back(make_style(pen));
+		if (!prefix.empty())
+			placed.children.push_back(make_literal(prefix));
+		if (!postfix.empty())
+			placed.children.push_back(make_literal(postfix));
+	}
+};
+
+bool engine::set_template(surface_id which, std::string_view text, std::string& error_out) {
+	builder build;
+	build.owner = this;
+	// A structural count, not an exact one: every top-level node is a placement, a
+	// group or a literal run, so the braces and parens bound it from above with
+	// one to spare for a trailing run.
+	std::size_t structural = 1;
+	for (const char one : text)
+		if (one == '{' || one == '(')
+			++structural;
+	build.nodes.reserve(structural);
+
+	const template_check checked = scan_template(text, build);
+	if (!checked.ok) {
+		error_out = describe_template_error(checked);
+		// AND NOTHING ELSE HAPPENS. Not the swap, not the slots, not
+		// `_configured` - a verb that changed nothing configured nothing, and the
+		// prompt that was standing is still standing.
+		return false;
+	}
+
+	surface& target = at(which);
+	target.nodes = std::move(build.nodes);
+	target.open = nullptr;
+	target.bytes.clear();
+	for (slot& one : target.slots) {
+		one.status = element_status::omitted;
+		one.wake_at = 0;
+	}
+	target.text.assign(text);
+	_configured = true;
+	return true;
+}
+
+std::string_view engine::template_text(surface_id which) const {
+	return at(which).text;
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +728,24 @@ element_status engine::invoke(node& one, const state& facts, sink& out, std::siz
 // be two behaviours.
 element_status engine::render_group(node& group, const state& facts, sink& out,
                                     std::size_t depth) {
+	// A SPAN - the same node shape with the vote skipped, which is what a
+	// `{literal:blue::hi}` desugars to. It has no module child and could therefore
+	// never win a vote; being stamped a decoration says it was never in the
+	// running, so it always renders, it answers `neutral`, and it takes no part in
+	// an enclosing group's vote either. The style reset at the end is the same one
+	// a voting group owes.
+	if (group.kind == element_kind::decoration) {
+		bool painted = false;
+		for (const std::unique_ptr<node>& child : group.children) {
+			if (child->styles)
+				painted = true;
+			invoke(*child, facts, out, depth + 1);
+		}
+		if (painted)
+			out.write_style(style{});
+		return element_status::neutral;
+	}
+
 	bool any_ready = false;
 	for (const std::unique_ptr<node>& child : group.children) {
 		if (child->kind != element_kind::module)
@@ -450,6 +774,13 @@ element_status engine::render_group(node& group, const state& facts, sink& out,
 		}
 		if (child->styles)
 			styled = true;
+		// A CHILD GROUP RECURSES THROUGH HERE, and it is phase two that reaches it
+		// because a group is not a module and does not vote - the same rule the
+		// compile-time `seg` follows for a nested `seg` or `when`. So
+		// `({git} ({path}))` shows or vanishes on `git` alone, and the inner group
+		// renders only if the outer one survived. Nesting is the template
+		// language's (the ABI's verb stream still refuses it - it is a linear
+		// stream with no way to say which group a close belongs to).
 		invoke(*child, facts, out, depth + 1);
 	}
 
@@ -691,6 +1022,76 @@ std::int32_t lesh_prompt_add_literal(lesh_registry* registry, std::uint32_t surf
 
 	which->add_literal(target, length == 0 ? std::string_view{} : std::string_view{bytes, length});
 	return LESH_OK;
+}
+
+std::int32_t lesh_prompt_add_style(lesh_registry* registry, std::uint32_t surface,
+                                   const char* spec, std::size_t length) {
+	if (registry == nullptr)
+		return LESH_ERR_INVAL;
+	engine* which = engine_of(registry);
+	if (which == nullptr)
+		return LESH_ERR_NOTFOUND;
+	surface_id target = surface_id::left;
+	if (!surface_of(surface, target))
+		return LESH_ERR_INVAL;
+	if (spec == nullptr && length != 0)
+		return LESH_ERR_INVAL;
+
+	// A SPEC THAT WILL NOT PARSE IS A POSITIVE DOMAIN STATUS, not LESH_ERR_INVAL.
+	// The argument was well formed - a pointer and a length, both fine - and what
+	// failed was its CONTENT, which is the caller's own text and not a misuse of
+	// the verb. There is no message channel here because there is nothing to say
+	// that `style_grammar.h`'s offset would not say better to a caller holding the
+	// string; `lesh_prompt_set`, whose text a human typed, has one.
+	const std::string_view text = length == 0 ? std::string_view{} : std::string_view{spec, length};
+	return which->add_style(target, text) ? LESH_OK : 1;
+}
+
+std::int32_t lesh_prompt_set(lesh_registry* registry, std::uint32_t surface, const char* text,
+                             std::size_t length, char* error_out, std::size_t error_capacity,
+                             std::size_t* error_length_out) {
+	if (registry == nullptr)
+		return LESH_ERR_INVAL;
+	engine* which = engine_of(registry);
+	if (which == nullptr)
+		return LESH_ERR_NOTFOUND;
+	surface_id target = surface_id::left;
+	if (!surface_of(surface, target))
+		return LESH_ERR_INVAL;
+	if ((text == nullptr && length != 0) || error_length_out == nullptr)
+		return LESH_ERR_INVAL;
+
+	std::string message;
+	const std::string_view source = length == 0 ? std::string_view{} : std::string_view{text, length};
+	if (which->set_template(target, source, message)) {
+		// The length is always written, and on success it is zero - so a caller
+		// that asked with a null buffer to size the message first learns from the
+		// return value that there is none.
+		*error_length_out = 0;
+		return LESH_OK;
+	}
+
+	// REFUSED, and the message travels under `lesh_buffer_get`'s convention: the
+	// length is reported whether or not it fit, a short buffer is TOOSMALL rather
+	// than a truncation, and NULL with zero capacity asks the length. The domain
+	// status 1 is what a caller sees once the message has actually been handed
+	// over - TOOSMALL can only happen on this path, so the two together are
+	// "refused, ask again with room".
+	const std::int32_t copied = copy_out(message, error_out, error_capacity, error_length_out);
+	return copied == LESH_OK ? 1 : copied;
+}
+
+std::int32_t lesh_prompt_text(lesh_registry* registry, std::uint32_t surface, char* out,
+                              std::size_t capacity, std::size_t* length_out) {
+	if (registry == nullptr)
+		return LESH_ERR_INVAL;
+	engine* which = engine_of(registry);
+	if (which == nullptr)
+		return LESH_ERR_NOTFOUND;
+	surface_id target = surface_id::left;
+	if (!surface_of(surface, target))
+		return LESH_ERR_INVAL;
+	return copy_out(which->template_text(target), out, capacity, length_out);
 }
 
 std::int32_t lesh_prompt_group_open(lesh_registry* registry, std::uint32_t surface) {

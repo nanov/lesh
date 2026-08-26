@@ -181,11 +181,13 @@ private:
 // them. The runtime declares what a configuration builtin needs to say and this
 // is the implementation, verb for verb over `prompt::engine`.
 //
-// IT HAS NO CALLER IN v1 AND IS INSTALLED ANYWAY. The `bind`-shaped builtin is
-// #157's recorded follow-up (its operand grammar is the template language's, and
-// half of that grammar is the half that would have to be kept), so what exists
-// today is the seam and the session that owns it. Installing it now is what
-// makes writing that builtin a builtin-shaped job rather than a wiring one.
+// IT WAS INSTALLED BEFORE IT HAD A CALLER, and that is why `prompt` cost a
+// builtin and no wiring at all: the seam and the session that owns it were here
+// first, and the builtin found a console rather than a reason to re-open the
+// argument. `set` and `text` are the two verbs the template language finally
+// gives real bodies - the operand grammar the builtin hands over is the language,
+// and the parse happens on this side of the boundary because only this side has
+// the registry to resolve a module name against.
 class leshper_prompt_console final : public runtime::prompt_console {
 public:
 	explicit leshper_prompt_console(prompt::engine& engine) noexcept : _engine(&engine) {}
@@ -228,17 +230,20 @@ public:
 		                                              : outcome::unbalanced_group;
 	}
 
-	// INTERIM: the sibling ticket that lands the `{module:style:type}` parser
-	// replaces this body with the real parse-and-swap.
-	outcome set(surface, std::string_view, std::string& error_out) override {
-		error_out = "the template language lands with the parser (#157)";
-		return outcome::bad_template;
+	// The parse-and-swap, one call over. The atomicity the runtime's declaration
+	// promises is the engine's to keep and it keeps it: a refusal leaves the
+	// surface exactly as it was, and what comes back here is only the sentence to
+	// print.
+	outcome set(surface which, std::string_view template_text, std::string& error_out) override {
+		return _engine->set_template(surface_of(which), template_text, error_out)
+			? outcome::ok
+			: outcome::bad_template;
 	}
 
-	// INTERIM: the same sibling ticket replaces this with the remembered source
-	// string, which cannot exist before something can set one.
-	void text(surface, std::string& out) const override {
-		out.clear();
+	// The remembered SOURCE, not a walk of the elements: see the declaration in
+	// builtins.h for why that door stays closed.
+	void text(surface which, std::string& out) const override {
+		out.assign(_engine->template_text(surface_of(which)));
 	}
 
 private:
@@ -550,8 +555,8 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	_state.set_binding_console(&*_console);
 
 	_prompt_console.emplace(_prompt_engine);
-	// And the prompt's console, installed the day the session starts even though
-	// v1 has no builtin to call it (#157) - see the class above.
+	// And the prompt's console, which `prompt` reaches through and by no other
+	// route (#157) - see the class above.
 	_state.set_prompt_console(&*_prompt_console);
 
 	_loop.attach_registry(context.actions());

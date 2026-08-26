@@ -29,12 +29,22 @@
 // the running shell, and the static_asserts at the bottom of this file render
 // the real default prompt rather than a paper copy of it.
 //
-// v1 STYLES ARE VALUES. `style_of<kCyan>` takes a `leshper::style` as a
-// non-type template argument; there is no style-string parser here and that is
-// deliberate (§6.10's last paragraph) - the `cyan.bold` grammar arrives with its
-// first string source and is then shared with the highlighter's theme (#141).
-// What v1 has is the SGR emission, `emit_sgr` below, and it is the exact inverse
-// of `sgr.h`'s reader, asserted as such.
+// STYLES AUTHORED IN C++ ARE VALUES. `style_of<kCyan>` takes a `leshper::style`
+// as a non-type template argument, and `emit_sgr` below is the exact inverse of
+// `sgr.h`'s reader, asserted as such. §6.10's string grammar has since arrived
+// with its first string source - `style_grammar.h`, called from the template
+// parser's style slot and from `add_style` - so the two authoring sides now
+// differ only in WHEN the style is a value: at compile time for the table, at
+// set time for a template.
+//
+// THE TEMPLATE LANGUAGE IS A THIRD AUTHORING SIDE AND NOT A THIRD COMPOSER. The
+// parser below (`scan_template`) builds the same `{fn, data, kind}` nodes the
+// ABI verbs build, through the same paths, so `{path:cyan}` and an
+// `add_style`/`add_module` pair are one configuration spelled twice. One grammar
+// serves two evaluation times: `validate_template` walks it at compile time
+// against the built-in module names, and the engine's builder walks it at set
+// time against the live registry - the same walk with a different policy, which
+// is #156's rule that a second walk is a second grammar.
 //
 // WHAT THIS FILE DOES NOT DO. It does not know about the loop, the layout, the
 // blitter or `shell_state`. `state` is a plain struct of facts somebody else
@@ -43,6 +53,7 @@
 #include "leshper/abi.h"
 #include "leshper/git_head.h"
 #include "leshper/sgr.h"
+#include "leshper/style_grammar.h"
 #include "leshper/surface.h"
 
 #include <array>
@@ -550,6 +561,20 @@ constexpr int decoration_literal(const state&, sink& out, const void* data) {
 	return code(element_status::neutral);
 }
 
+// A style placed at runtime - `style_of<V>`'s twin, and the element the `styles`
+// flag has been waiting for since v1.
+//
+// ITS DATA IS THE PEN ITSELF, not a `binding`. A style has no argument and no
+// registration, so borrowing the binding's `arg` for it would be storing a
+// `style` in a `string_view`-shaped hole; the engine's node owns a `style` beside
+// its bytes and points `data` at that. Null data paints nothing rather than
+// reading through a pointer nobody set.
+constexpr int decoration_style(const state&, sink& out, const void* data) {
+	if (data != nullptr)
+		out.write_style(*static_cast<const style*>(data));
+	return code(element_status::neutral);
+}
+
 // ---------------------------------------------------------------------------
 // Authoring at compile time
 // ---------------------------------------------------------------------------
@@ -864,6 +889,436 @@ inline constexpr auto kDefaultLeft = table<path_t, literal<"> ">>();
 
 inline constexpr auto kDefaultContinuation = table<literal<"> ">>();
 
+// THE SAME TWO PROMPTS AS TEMPLATE SOURCE. `use_default` remembers these as the
+// surface's template text, so `prompt` on a fresh shell prints the prompt it is
+// actually showing rather than an empty line - and the equivalence is not a
+// claim, it is a test: `set_template("{path}> ")` renders byte-identically to
+// `kDefaultLeft` (`TheDefaultTableAndItsTemplateAgree`). What a table buys over
+// the string is that it costs no parse and no allocation at startup; what the
+// string buys is that a user can read it, edit one byte of it, and hand it back.
+inline constexpr std::string_view kDefaultLeftTemplate = "{path}> ";
+inline constexpr std::string_view kDefaultContinuationTemplate = "> ";
+
+// ---------------------------------------------------------------------------
+// The template language
+// ---------------------------------------------------------------------------
+
+// prmt's placement grammar, adapted (§6.10, owner's ruling on #157):
+//
+//   template  := ( literal-run | group | placement )*
+//   group     := '(' template ')'                    - nestable
+//   placement := '{' name [':' style [':' type [':' prefix [':' postfix]]]] '}'
+//   escapes   := \{  \}  \(  \)  \:  \n  \t  \\
+//
+// AN EMPTY SLOT IS THE DEFAULT, which is prmt's omission table kept verbatim
+// because it is what makes five slots bearable to type: `{git}`, `{git:magenta}`,
+// `{path:cyan:short}`, `{git:magenta::on :}` (default type, prefix only),
+// `{git::::!}` (postfix only), `{env::USER}` (type only). An empty style is no
+// styling, an empty type is the module's own default, an empty affix is no affix,
+// and a trailing colon is legal - `{git:}` is `{git}`.
+//
+// FIVE SLOTS AND NOT SIX. A sixth unescaped `:` inside a placement is refused at
+// set time, and that refusal is what makes `\:` unambiguous inside a type or an
+// affix: colons in bytes are escaped, colons between slots are not, and there is
+// no counting rule to remember.
+//
+// FREE LITERAL RUNS ARE UNCONDITIONAL; binding a literal to a module is always
+// explicit - an affix slot or a group, never adjacency (§6.10). `{path}( on
+// {git})> ` is the whole of that rule: the arrow always paints, ` on ` paints
+// only in a repository.
+//
+// WHAT WAS TAKEN FROM prmt's `src/parser.rs`, AND WHAT WAS DELIBERATELY INVERTED.
+// Taken: the single byte-level pass with no backtracking, the structural jump
+// (`find_first_of` over `{ ( ) \`) rather than per-byte inspection, and the lazy
+// unescape - a slice with no backslash is copied whole and the transform loop
+// runs only where one appears. Inverted, all three for the same underlying
+// reason, that prmt re-parses per prompt draw and we parse once:
+//
+//   1. prmt DEGRADES a malformed placement to literal text, because an error on
+//      a path that runs every draw would corrupt every prompt. We refuse at set
+//      time with a message and leave the old prompt standing, which is the only
+//      answer that can tell a user their typo at the moment they made it.
+//   2. prmt BORROWS its bytes (`Cow`) because the template outlives the render.
+//      Ours outlive the builtin's argv by the whole session, so every byte is
+//      copied into engine-owned storage as it is parsed.
+//   3. prmt emits a flat token vector for a later pass to interpret. We build the
+//      engine's nodes directly, through the same paths the ABI verbs use, so
+//      there is no intermediate AST to keep in step with the element vocabulary.
+
+// What went wrong, as a value. The runtime path words these into a sentence
+// (`describe_template_error` in prompt.cpp); the compile-time path only needs to
+// know THAT one happened and where, so the wording is not in the header and a
+// `static_assert` compares codes and offsets instead of strings.
+enum class template_error : std::uint8_t {
+	none = 0,
+	unclosed_placement,
+	unbalanced_close,
+	unclosed_group,
+	too_many_fields,
+	empty_name,
+	unknown_module,
+	bad_style,
+	bad_escape,
+	needs_argument,
+	takes_no_argument,
+	literal_needs_text,
+	literal_takes_no_type,
+};
+
+// The scan's answer. `error_at` is a byte offset INTO THE TEMPLATE and points at
+// the byte a user has to look at - the offending brace, colon, backslash, name or
+// style item, never at the start of the line. `what` names the offending token
+// where there is one to name (`gti`, `blod`, `\q`), as a view into the caller's
+// own bytes.
+struct template_check {
+	bool ok = true;
+	std::size_t error_at = 0;
+	template_error error = template_error::none;
+	std::string_view what{};
+};
+
+// One slot or one literal run, as the scanner found it: the RAW bytes, still
+// escaped, plus where they start and whether the transform is needed at all.
+// Carrying the offset rather than deriving it by pointer subtraction keeps the
+// whole walk usable inside a constant expression without arithmetic on pointers
+// into a `string_view` nobody owns.
+struct template_slice {
+	std::string_view raw{};
+	std::size_t at = 0;
+	bool escaped = false;
+
+	[[nodiscard]] constexpr bool empty() const noexcept { return raw.empty(); }
+};
+
+// The eight escapes, and nothing else is one.
+[[nodiscard]] constexpr bool escape_byte(char spelled, char& out) noexcept {
+	switch (spelled) {
+		case '{': case '}': case '(': case ')': case ':': case '\\':
+			out = spelled;
+			return true;
+		case 'n': out = '\n'; return true;
+		case 't': out = '\t'; return true;
+		default: return false;
+	}
+}
+
+// AN UNKNOWN ESCAPE IS AN ERROR, not two literal bytes. The alternative - keep
+// `\q` as a backslash and a `q` - makes a mistyped `\n` a prompt that silently
+// says `\n` forever, and this parser's whole posture is that a mistake is told
+// to its author at the moment it is written.
+constexpr void unescape_into(const template_slice& piece, std::string& out) {
+	if (!piece.escaped) {
+		// The common case, and the reason the flag exists: no inspection, no loop.
+		out.append(piece.raw);
+		return;
+	}
+	for (std::size_t i = 0; i < piece.raw.size(); ++i) {
+		char decoded = 0;
+		if (piece.raw[i] == '\\' && i + 1 < piece.raw.size()
+		    && escape_byte(piece.raw[i + 1], decoded)) {
+			out.push_back(decoded);
+			++i;
+			continue;
+		}
+		out.push_back(piece.raw[i]);
+	}
+}
+
+// What a name resolves to, and the whole of v1's argument validation.
+//
+// KEYED ON WHAT THE NAME RESOLVES TO, NOT ON THE SPELLING. The built-ins' type
+// slots are decided here because v1 gives them none - `path`'s `short`/`full`
+// variants and `git`'s status flags are recorded future work (#156) and the
+// wording deliberately does not promise them - while a module that came in
+// across the ABI parses its own argument, so this grammar has nothing to say
+// about it. The runtime policy therefore asks the REGISTRY, and a user who
+// replaced `path` with a module of their own gets `free_argument`: they own its
+// argument grammar as surely as they own its bytes.
+enum class module_rule : std::uint8_t {
+	unknown,
+	no_argument,
+	needs_argument,
+	free_argument,
+};
+
+struct builtin_module_name {
+	std::string_view name;
+	module_rule rule;
+};
+
+// The eight `engine()` registers, as a compile-time table. It is a SECOND
+// statement of the constructor's list, and deliberately so: the constructor is
+// the live registry, this is what a template validated inside a `static_assert`
+// is allowed to assume, and a `constexpr` walk cannot consult a `std::map`. The
+// two agreeing is asserted at runtime (`TheValidatorKnowsEveryBuiltIn`).
+inline constexpr builtin_module_name kBuiltinModules[] = {
+	{"duration", module_rule::no_argument},
+	{"env", module_rule::needs_argument},
+	{"git", module_rule::no_argument},
+	{"jobs", module_rule::no_argument},
+	{"mode", module_rule::no_argument},
+	{"path", module_rule::no_argument},
+	{"status", module_rule::no_argument},
+	{"time", module_rule::no_argument},
+};
+
+[[nodiscard]] constexpr module_rule builtin_module_rule(std::string_view name) noexcept {
+	for (const builtin_module_name& one : kBuiltinModules)
+		if (one.name == name)
+			return one.rule;
+	return module_rule::unknown;
+}
+
+// THE STANDALONE STYLED LITERAL, spelled like a placement because everything
+// with a style is spelled like a placement.
+//
+// Its text rides the AFFIX slots and never the type slot: the slot order is
+// uniform across the grammar (slot 3 is always the type), so `{literal:blue::hi}`
+// is simply the placement with no value in the middle - `{literal:blue:x:hi}` is
+// refused for the same reason `{path:cyan:x}` is. Both affixes render, in order,
+// with nothing invented between them, which makes `{literal:red::[:]}` a pair of
+// brackets around nothing rather than an error.
+//
+// IT IS STAMPED A DECORATION. `({literal:dim::on} {git})` vanishes outside a
+// repository, because a literal - however it was spelled - is grammar and grammar
+// does not vote (§6.10). The name shadows any module registered under it, which
+// is the one thing the pseudo-module costs and is worth saying out loud.
+inline constexpr std::string_view kLiteralPlacement = "literal";
+
+// The one grammar walk. `build` is a POLICY, not an interface: two of them exist,
+// one that builds nodes and one that does nothing at all, and templating over
+// them is what keeps the compile-time validator and the set-time builder from
+// being two walks that drift (#156's rule).
+//
+// A policy provides:
+//   module_rule resolve(std::string_view name) const;
+//   void on_literal(const template_slice& run);
+//   void on_open_group();
+//   void on_close_group();
+//   void on_placement(std::string_view name, const style& pen, bool styled,
+//                     const template_slice& type, const template_slice& prefix,
+//                     const template_slice& postfix);
+//   void on_literal_placement(const style& pen, bool styled,
+//                             const template_slice& prefix,
+//                             const template_slice& postfix);
+//
+// NOTHING IS EMITTED PAST THE FIRST ERROR: the scan returns at the byte that
+// failed, so a policy that built half a prompt has built only that half - which
+// is why the builder builds into its own storage and the engine swaps at the end
+// rather than mutating a surface as it goes.
+template <class Builder>
+[[nodiscard]] constexpr template_check scan_template(std::string_view text, Builder& build) {
+	template_check answer;
+	const auto fail = [&answer](template_error which, std::size_t at,
+	                            std::string_view what) -> template_check {
+		answer.ok = false;
+		answer.error = which;
+		answer.error_at = at;
+		answer.what = what;
+		return answer;
+	};
+
+	// Two counters instead of a stack of open offsets: the group that was left
+	// unclosed is always the OUTERMOST unmatched one, and that is the last `(`
+	// seen at depth zero. No allocation, and the same code in both worlds.
+	std::size_t depth = 0;
+	std::size_t outermost_open_at = 0;
+	std::size_t i = 0;
+
+	while (i < text.size()) {
+		// --- a literal run, by structural jumps rather than byte by byte ---
+		const std::size_t run_start = i;
+		std::size_t run_end = text.size();
+		bool run_escaped = false;
+		for (;;) {
+			const std::size_t at = text.find_first_of("{()\\", i);
+			if (at == std::string_view::npos) {
+				i = text.size();
+				break;
+			}
+			if (text[at] != '\\') {
+				run_end = at;
+				i = at;
+				break;
+			}
+			char decoded = 0;
+			if (at + 1 >= text.size() || !escape_byte(text[at + 1], decoded))
+				return fail(template_error::bad_escape, at,
+				            text.substr(at, text.size() - at < 2 ? text.size() - at : 2));
+			run_escaped = true;
+			i = at + 2;
+		}
+		if (run_end > run_start)
+			build.on_literal(template_slice{text.substr(run_start, run_end - run_start),
+			                                run_start, run_escaped});
+		if (i >= text.size())
+			break;
+
+		// --- a group ---
+		if (text[i] == '(') {
+			if (depth == 0)
+				outermost_open_at = i;
+			++depth;
+			build.on_open_group();
+			++i;
+			continue;
+		}
+		if (text[i] == ')') {
+			// `)` is structural everywhere, so a literal one is `\)`. `}` is not -
+			// it means nothing outside a placement - which is why a bare `}` needs
+			// no escape even though `\}` is accepted for symmetry.
+			if (depth == 0)
+				return fail(template_error::unbalanced_close, i, text.substr(i, 1));
+			--depth;
+			build.on_close_group();
+			++i;
+			continue;
+		}
+
+		// --- a placement ---
+		const std::size_t open_at = i;
+		template_slice field[5];
+		std::size_t filled = 0;
+		std::size_t colons = 0;
+		std::size_t sixth_at = 0;
+		std::size_t start = open_at + 1;
+		bool escaped = false;
+		bool closed = false;
+		std::size_t k = start;
+		while (k < text.size()) {
+			const char one = text[k];
+			if (one == '\\') {
+				char decoded = 0;
+				if (k + 1 >= text.size() || !escape_byte(text[k + 1], decoded))
+					return fail(template_error::bad_escape, k,
+					            text.substr(k, text.size() - k < 2 ? text.size() - k : 2));
+				escaped = true;
+				k += 2;
+				continue;
+			}
+			if (one != ':' && one != '}') {
+				++k;
+				continue;
+			}
+
+			const template_slice piece{text.substr(start, k - start), start, escaped};
+			if (filled < 5)
+				field[filled++] = piece;
+			else if (!piece.empty())
+				// The trailing colon is legal and an empty sixth field is what it
+				// leaves behind; bytes in that field are a slot this grammar does
+				// not have.
+				return fail(template_error::too_many_fields, sixth_at, piece.raw);
+			escaped = false;
+			start = k + 1;
+
+			if (one == '}') {
+				closed = true;
+				++k;
+				break;
+			}
+			++colons;
+			if (colons > 5)
+				return fail(template_error::too_many_fields, k, text.substr(k, 1));
+			if (colons == 5)
+				sixth_at = k;
+			++k;
+		}
+		if (!closed)
+			return fail(template_error::unclosed_placement, open_at, text.substr(open_at, 1));
+
+		// A module name is snake_case, so nothing in one ever needs an escape and
+		// the raw bytes are the name. An escape there simply makes it a name
+		// nobody registered.
+		const std::string_view name = field[0].raw;
+		if (name.empty())
+			return fail(template_error::empty_name, field[0].at, name);
+
+		const template_slice& style_slot = field[1];
+		const template_slice& type_slot = field[2];
+		const template_slice& prefix = field[3];
+		const template_slice& postfix = field[4];
+
+		style pen{};
+		const bool styled = !style_slot.empty();
+		if (styled) {
+			// NOT UNESCAPED FIRST: a style spec is names, digits, `#`, `+`, `.` and
+			// `-`, and none of the eight escapes can appear in a valid one, so the
+			// raw bytes are the spec and an escaped byte simply fails to parse.
+			const style_parse parsed = parse_style(style_slot.raw);
+			if (!parsed.ok) {
+				// The failing ITEM, not the whole spec: `bad style 'blod'` is what
+				// the author has to fix, and the offset is absolute so they can find
+				// it in a long line.
+				std::string_view item = style_slot.raw.substr(parsed.error_at);
+				const std::size_t dot = item.find('.');
+				if (dot != std::string_view::npos)
+					item = item.substr(0, dot);
+				return fail(template_error::bad_style, style_slot.at + parsed.error_at, item);
+			}
+			pen = parsed.value;
+		}
+
+		if (name == kLiteralPlacement) {
+			if (!type_slot.empty())
+				return fail(template_error::literal_takes_no_type, type_slot.at, name);
+			if (prefix.empty() && postfix.empty())
+				return fail(template_error::literal_needs_text, field[0].at, name);
+			build.on_literal_placement(pen, styled, prefix, postfix);
+			i = k;
+			continue;
+		}
+
+		switch (build.resolve(name)) {
+			case module_rule::unknown:
+				return fail(template_error::unknown_module, field[0].at, name);
+			case module_rule::needs_argument:
+				if (type_slot.empty())
+					return fail(template_error::needs_argument, field[0].at, name);
+				break;
+			case module_rule::no_argument:
+				if (!type_slot.empty())
+					return fail(template_error::takes_no_argument, type_slot.at, name);
+				break;
+			case module_rule::free_argument:
+				break;
+		}
+
+		build.on_placement(name, pen, styled, type_slot, prefix, postfix);
+		i = k;
+	}
+
+	if (depth != 0)
+		return fail(template_error::unclosed_group, outermost_open_at,
+		            text.substr(outermost_open_at, 1));
+	return answer;
+}
+
+// The do-nothing policy: the same walk, resolving against the built-in table and
+// building nothing at all.
+struct template_validator {
+	[[nodiscard]] constexpr module_rule resolve(std::string_view name) const noexcept {
+		return builtin_module_rule(name);
+	}
+	constexpr void on_literal(const template_slice&) const noexcept {}
+	constexpr void on_open_group() const noexcept {}
+	constexpr void on_close_group() const noexcept {}
+	constexpr void on_placement(std::string_view, const style&, bool, const template_slice&,
+	                            const template_slice&, const template_slice&) const noexcept {}
+	constexpr void on_literal_placement(const style&, bool, const template_slice&,
+	                                    const template_slice&) const noexcept {}
+};
+
+// A template's structure, its styles and its built-in argument rules, checked
+// wherever the bytes are known at compile time - a shipped default, a test, a
+// literal in a future C++-authored configuration. It cannot see a module the ABI
+// registered at run time, which is the one thing the set-time walk has that this
+// does not; everything else is the same code and the same errors.
+[[nodiscard]] constexpr template_check validate_template(std::string_view text) noexcept {
+	template_validator only_checking;
+	return scan_template(text, only_checking);
+}
+
 // ---------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------
@@ -944,6 +1399,16 @@ public:
 
 	void add_literal(surface_id which, std::string_view bytes);
 
+	// A style decoration, from the string grammar (`style_grammar.h`). False is a
+	// spec that would not parse, and it places nothing when it answers so.
+	//
+	// THIS IS THE VERB `node::styles` HAS BEEN NAMING. A style inside a group is
+	// what makes the group owe a reset at its end; a style at top level paints
+	// from there on, exactly as an `add_literal` of the same escape sequence would
+	// - the difference being that this one is a value the engine understands and
+	// can re-emit, rather than bytes it forwards.
+	bool add_style(surface_id which, std::string_view spec);
+
 	// GROUPS DO NOT NEST IN v1, ACROSS THE ABI. A second open while one is open
 	// is refused rather than silently flattened or silently nested: the verbs are
 	// a linear stream and a caller that lost track of its own nesting should hear
@@ -953,6 +1418,32 @@ public:
 
 	// False when none is open.
 	bool close_group(surface_id which);
+
+	// The template language, parsed ONCE and swapped ATOMICALLY.
+	//
+	// On success the surface holds the elements the template describes and
+	// remembers its source; on failure `error_out` holds one human sentence with
+	// a byte offset and THE SURFACE IS UNTOUCHED - its elements, its slots and its
+	// remembered text are all exactly what they were, because the parse builds
+	// into its own storage and only a complete parse reaches the surface. That is
+	// the promise `prompt_console::set` documents on the runtime side, and it is
+	// kept here rather than there because only a parser can keep it.
+	//
+	// A FAILED SET CONFIGURED NOTHING, `add_module`'s rule for a name nobody
+	// registered: `configured()` does not move, so a shell whose only prompt verb
+	// was a typo still has `$PS1`.
+	bool set_template(surface_id which, std::string_view text, std::string& error_out);
+
+	// The source string the surface was last set from, or empty.
+	//
+	// EMPTY IS AN HONEST ANSWER, NOT A MISSING ONE. `use_default` remembers the
+	// shipped template (`kDefaultLeftTemplate`), and `set_template` remembers what
+	// it was handed - but the assembly verbs cannot: a prompt built out of
+	// `add_module` and `add_literal` calls has no template string, and inventing
+	// one by walking the elements back into a spelling would put the element
+	// vocabulary on the far side of a boundary §6.10 closed. So every one of those
+	// verbs, and `clear`, empties it.
+	[[nodiscard]] std::string_view template_text(surface_id which) const;
 
 	// Whether anything has configured this engine - false until the first of the
 	// six verbs above has run, from C++ or across the ABI, and true from then on.
@@ -1001,23 +1492,40 @@ private:
 	// `binding::arg` is a view into `arg` on the same node - a vector that
 	// reallocated would dangle it.
 	struct node {
-		// Null IFF this is a runtime group: the engine drives its two phases
-		// itself. Everything else - a built-in module, an ABI module, a runtime
-		// literal, and every element copied out of the default table, `seg`
-		// included - is opaque and answers for itself.
+		// Null IFF the ENGINE drives this node's children rather than the node
+		// answering for itself - a runtime group, and the styled span a
+		// `{literal:blue::hi}` desugars to. Everything else - a built-in module,
+		// an ABI module, a runtime literal or style, and every element copied out
+		// of the default table, `seg` included - is opaque and answers for itself.
+		//
+		// `kind` is what tells the three apart, and it answers "what is this to the
+		// group AROUND it", never "how is it built":
+		//   * a null-`fn` GROUP is a user's `(…)`: it runs the two-phase vote
+		//     inside, and like every group it does not vote in its own parent;
+		//   * a null-`fn` MODULE is a desugared placement, `{git:magenta}`: the
+		//     same vote inside, and it DOES vote in its parent, because it is one
+		//     placement and putting a colour on it must not change that;
+		//   * a null-`fn` DECORATION is a span, `{literal:blue::hi}`: no vote in
+		//     either direction, because it is grammar.
 		element_fn fn = nullptr;
 		const void* data = nullptr;
 		element_kind kind = element_kind::module;
 
 		// Whether this child is a style decoration, and therefore whether the
-		// group owes a reset. NOTHING SETS IT IN v1: the ABI has no style verb,
-		// because v1 has no style-string parser to give it an argument. It is
-		// here because the two-phase group is one implementation and the rule is
-		// part of it; the verb arrives with the string grammar.
+		// group owes a reset at its end. Set by `add_style` and by the template
+		// parser's style slot - the verb this flag waited for through v1, which
+		// had the two-phase rule but no string grammar to give a style an
+		// argument.
 		bool styles = false;
 
 		std::string arg;   // engine-owned bytes; `bound.arg` views these
 		binding bound;
+
+		// A style decoration's value, and `data` points HERE rather than at
+		// `bound` for those nodes. A node is heap-owned and never moves, so the
+		// pointer is stable for the configuration's whole life - the same
+		// reasoning `bound.arg` viewing `arg` rests on.
+		style pen{};
 
 		// Rendering scratch, per node, kept warm. On the node rather than in a
 		// pool because a group's phase one needs one per module child at once,
@@ -1045,7 +1553,17 @@ private:
 		std::vector<slot> slots;
 		std::string bytes;
 		node* open = nullptr;
+
+		// What `template_text` answers: the source `set_template` was handed, or
+		// the shipped default's own spelling, or empty. See `template_text`.
+		std::string text;
 	};
+
+	// The BUILDING policy for `scan_template`, defined in prompt.cpp. A nested
+	// class because it makes `node` - and it is the only thing outside the engine
+	// that does, which is how the "one shape, built through one set of paths"
+	// rule stays checkable by looking at one file.
+	struct builder;
 
 	struct module_entry {
 		element_fn fn = nullptr;
@@ -1356,6 +1874,99 @@ constexpr bool emits(const style& pen, std::string_view expected) {
 	emit_sgr(pen, bytes);
 	return bytes == expected;
 }
+
+// 6. THE TEMPLATE GRAMMAR, AT THE OTHER OF ITS TWO EVALUATION TIMES. The same
+//    `scan_template` the engine builds with, walked with the do-nothing policy:
+//    what these prove is the grammar itself - the omission table, the affix
+//    slots, the escapes and every refusal - and that it is one walk, because
+//    there is only one to fail.
+//
+//    THE SHIPPED DEFAULTS PARSE, and that is the assertion that would catch a
+//    grammar change breaking the string `use_default` hands back.
+static_assert(validate_template(kDefaultLeftTemplate).ok);
+static_assert(validate_template(kDefaultContinuationTemplate).ok);
+static_assert(validate_template("{path}> ").ok);
+static_assert(validate_template("").ok);
+
+// prmt's omission table, row by row: every legal spelling of an empty slot.
+static_assert(validate_template("{git}").ok);
+static_assert(validate_template("{git:magenta}").ok);
+static_assert(validate_template("{git:}").ok);            // trailing colon
+static_assert(validate_template("{git:magenta::on :}").ok);   // default type, prefix only
+static_assert(validate_template("{git::::!}").ok);            // postfix only
+static_assert(validate_template("{status:red::[:]}").ok);     // both affixes
+static_assert(validate_template("{env::USER}").ok);           // type only
+static_assert(validate_template("{env::A\\:B}").ok);          // a colon IN the type
+
+// Groups, nested, and the literal runs between them.
+static_assert(validate_template("{path}( on {git})> ").ok);
+static_assert(validate_template("(({git}))").ok);
+static_assert(validate_template("\\{not a placement\\}").ok);
+static_assert(validate_template("a\\nb\\tc\\\\d").ok);
+
+// The standalone styled literal: its text is in the AFFIX slots, and the type
+// slot it does not have is refused rather than quietly read as text.
+static_assert(validate_template("{literal:blue::hi}").ok);
+static_assert(validate_template("{literal:blue::hi :there}").ok);
+static_assert(validate_template("{literal:::plain}").ok);
+static_assert(validate_template("{literal:blue:x:hi}").error == template_error::literal_takes_no_type);
+static_assert(validate_template("{literal::x}").error == template_error::literal_takes_no_type);
+static_assert(validate_template("{literal}").error == template_error::literal_needs_text);
+static_assert(validate_template("{literal:blue}").error == template_error::literal_needs_text);
+
+// Every refusal, with the byte it points at - the offset is the contract, not a
+// detail, because it is what the message tells the user to look at.
+static_assert(!validate_template("{gti}").ok);
+static_assert(validate_template("{gti}").error == template_error::unknown_module);
+static_assert(validate_template("{gti}").error_at == 1);
+static_assert(validate_template("{gti}").what == "gti");
+static_assert(validate_template("{path}{gti}").error_at == 7);
+
+static_assert(validate_template("{path").error == template_error::unclosed_placement);
+static_assert(validate_template("{path").error_at == 0);
+
+static_assert(validate_template("( x").error == template_error::unclosed_group);
+static_assert(validate_template("( x").error_at == 0);
+static_assert(validate_template("(a)(b").error_at == 3);
+static_assert(validate_template("x)").error == template_error::unbalanced_close);
+static_assert(validate_template("x)").error_at == 1);
+
+static_assert(validate_template("{env}").error == template_error::needs_argument);
+static_assert(validate_template("{env}").error_at == 1);
+static_assert(validate_template("{env:cyan}").error == template_error::needs_argument);
+
+static_assert(validate_template("{path::short}").error == template_error::takes_no_argument);
+static_assert(validate_template("{path::short}").error_at == 7);
+
+static_assert(validate_template("{path:blod}").error == template_error::bad_style);
+static_assert(validate_template("{path:blod}").what == "blod");
+static_assert(validate_template("{path:cyan.blod}").error_at == 11);
+static_assert(validate_template("{path:cyan.blod}").what == "blod");
+
+static_assert(validate_template("{a:b:c:d:e:f}").error == template_error::too_many_fields);
+static_assert(validate_template("{a:b:c:d:e:f}").error_at == 10);
+static_assert(validate_template("{a:b:c:d:e:f:g}").error == template_error::too_many_fields);
+// Five colons with nothing after the last is the trailing colon, not a sixth
+// slot, and stays legal.
+static_assert(validate_template("{git::::!:}").ok);
+
+static_assert(validate_template("{}").error == template_error::empty_name);
+static_assert(validate_template("a\\qb").error == template_error::bad_escape);
+static_assert(validate_template("a\\qb").error_at == 1);
+static_assert(validate_template("a\\").error == template_error::bad_escape);
+static_assert(validate_template("{env::a\\qb}").error == template_error::bad_escape);
+
+// The unescape, which is the other half of the escape rule: the flag is what
+// says whether the loop runs at all, and the bytes are the same either way.
+constexpr bool unescapes(std::string_view raw, bool escaped, std::string_view expected) {
+	std::string out;
+	unescape_into(template_slice{raw, 0, escaped}, out);
+	return out == expected;
+}
+static_assert(unescapes("plain", false, "plain"));
+static_assert(unescapes("a\\:b", true, "a:b"));
+static_assert(unescapes("\\{\\}\\(\\)", true, "{}()"));
+static_assert(unescapes("a\\nb\\tc\\\\d", true, "a\nb\tc\\d"));
 
 static_assert(emits(style{}, "\x1b[0m"));
 static_assert(emits(kCyan, "\x1b[36m"));
