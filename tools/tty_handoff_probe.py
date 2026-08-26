@@ -14,6 +14,10 @@ human at a real terminal to watch (`nvim ./` taking the screen, `less` paging):
   d. `read` after a tty-taking command still gets the user's typing, which is
      the `nvim .; read x` shape and the reason the reclaim is per job.
 
+#161 adds a fifth, on the same mechanism: Ctrl-Z of a foreground job reports the
+stop, gives the terminal back, sets `$?` to 128+SIGTSTP and returns to a prompt,
+leaving the process alive and stopped for `kill -CONT`.
+
 Usage: tools/tty_handoff_probe.py [path-to-lesh]   (default ./build/release/lesh)
 """
 
@@ -223,6 +227,44 @@ def main():
 		ok = sh.wait_for(r"INTOK=130", timeout=5)
 		check("Ctrl-C of a foreground command returns to a usable prompt",
 		      ok, "" if ok else "no INTOK=130 (tail: %r)" % sh.log[-200:])
+
+		# #161, the sibling of the check above and the case the SIG_IGN leak was
+		# hiding until #159 removed it. `\x1a` is the driver's VSUSP, so with the
+		# child holding the terminal and SIGTSTP back at its default the job really
+		# stops - and the shell's foreground wait had no WUNTRACED, so it blocked
+		# here forever. Everything below is unreachable without the fix.
+		sh.send("sleep 30\n")
+		sh.pump(0.4)
+		sh.send("\x1a")
+		reported = sh.wait_for(r"stopped: pid \d+", timeout=5)
+		m = re.search(r"stopped: pid (\d+)", sh.log)
+		check("Ctrl-Z of a foreground command reports the stop and returns",
+		      reported, "" if reported else "no stopped report (tail: %r)" % sh.log[-200:])
+		check("the terminal is the shell's again after the stop",
+		      sh.fg_pgrp() == shell_pgrp, "tpgid=%d" % sh.fg_pgrp())
+		sh.send("echo TSTPOK=$?\n")
+		want = 128 + int(signal.SIGTSTP)
+		ok = sh.wait_for(r"TSTPOK=%d" % want, timeout=5)
+		check("$? is 128+SIGTSTP after the stop",
+		      ok, "" if ok else "no TSTPOK=%d (tail: %r)" % (want, sh.log[-200:]))
+		# STILL THERE, which is the other half of the contract: the shell reported a
+		# pid and walked away, and `kill -CONT` of it has to be a real way out. Then
+		# killed, because nothing else is going to - the shell keeps no job table,
+		# and a stopped process outliving this probe would be the probe's own leak.
+		stopped_pid = int(m.group(1)) if m else -1
+		alive = False
+		if stopped_pid > 0:
+			try:
+				os.kill(stopped_pid, signal.SIGCONT)
+				alive = True
+			except (ProcessLookupError, PermissionError):
+				alive = False
+			try:
+				os.kill(stopped_pid, signal.SIGKILL)
+			except (ProcessLookupError, PermissionError):
+				pass
+		check("the stopped process is alive and `kill -CONT` reaches it",
+		      alive, "pid=%d" % stopped_pid)
 	finally:
 		sh.close()
 

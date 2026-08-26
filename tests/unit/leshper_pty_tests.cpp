@@ -230,6 +230,26 @@ private:
 // `\x1b[?2004l` after everything else and a terminal draws nothing for it and
 // moves no cursor for it. fish and zsh both leave column 0 here; a shell that
 // does not is what zsh's inverse `%` marker is reporting.
+// The pid out of `stopped: pid N (job control not implemented)`, or -1 (#161).
+//
+// PARSED OFF THE WIRE ON PURPOSE. The shell keeps no job table, so that number is
+// the entire interface the user is given for a stopped process - reading it back
+// the way a reader would is what makes the report a contract rather than a
+// decoration. Digits only, and it refuses a marker with no digits behind it, so a
+// message that ever loses its pid fails here rather than turning into `kill 0`.
+[[nodiscard]] pid_t pid_in_stopped_report(std::string_view wire) {
+	constexpr std::string_view marker = "stopped: pid ";
+	const std::size_t at = wire.find(marker);
+	if (at == std::string_view::npos)
+		return -1;
+	std::size_t i = at + marker.size();
+	const std::size_t first_digit = i;
+	pid_t pid = 0;
+	for (; i < wire.size() && wire[i] >= '0' && wire[i] <= '9'; ++i)
+		pid = pid * 10 + (wire[i] - '0');
+	return i == first_digit ? -1 : pid;
+}
+
 [[nodiscard]] bool a_newline_follows_the_last_prompt(std::string_view wire,
                                                      std::string_view prompt) {
 	const std::size_t last = wire.rfind(prompt);
@@ -486,6 +506,72 @@ TEST(LeshperPty, ControlCDuringAForegroundCommandAbandonsTheRestOfTheLine) {
 
 	shell.type("echo status=$?\r");
 	EXPECT_TRUE(shell.wait_for("status=130")) << "saw: " << shell.seen();
+}
+
+TEST(LeshperPty, ControlZStopsTheForegroundCommandAndReturnsThePrompt) {
+	// #161, and the whole of it: #159 reset SIGTSTP to default in the child and
+	// gave it the terminal, so the suspend character now genuinely stops a
+	// foreground external - and every foreground `waitpid(pid, &st, 0)` in the
+	// executor blocked forever on a child that was never going to exit. WITHOUT
+	// THE FIX THIS TEST HANGS, which is why every assertion below is a budgeted
+	// `wait_for` and not a sleep: the harness turns the hang into a failed
+	// expectation with the transcript attached, rather than leaving it for ctest's
+	// global timeout to notice.
+	//
+	// `\x1a` IS THE TTY DRIVER'S VSUSP, not a key the editor binds. It only means
+	// SIGTSTP while the terminal is cooked and ISIG is on, which is exactly the
+	// state the loop restores before running a command - so this reaches the
+	// foreground process group the same way the Ctrl-C tests above reach it, and
+	// tests the during-a-command path rather than the at-the-prompt one.
+	//
+	// `sleep 30` and not `sleep 5`: the assertions below must run against a
+	// process that is still there, and a 5-second command could exit on its own
+	// under a loaded machine and pass this test for the wrong reason.
+	const scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type("sleep 30\r");
+	// Long enough that `sleep` is certainly the foreground job and the editor
+	// parked - the same wait the two Ctrl-C tests above take, for the same reason.
+	std::this_thread::sleep_for(std::chrono::milliseconds{300});
+	shell.type("\x1a");
+
+	ASSERT_TRUE(shell.wait_for("stopped: pid "))
+		<< "no stopped report - the shell is still waiting on a stopped child; saw: " << shell.seen();
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+		<< "no prompt after the stop; saw: " << shell.seen();
+
+	// 128 + WSTOPSIG, which for the suspend character is SIGTSTP. Computed rather
+	// than typed: `status=` is on the wire the moment it is keyed, so only the
+	// digits can distinguish a shell that ran the command from one that echoed it.
+	shell.type("echo status=$?\r");
+	EXPECT_TRUE(shell.wait_for("status=" + std::to_string(128 + SIGTSTP)))
+		<< "$? is not 128+SIGTSTP after the stop; saw: " << shell.seen();
+
+	// THE PID IN THE REPORT IS THE ONLY HANDLE THE USER IS GIVEN - there is no job
+	// table and no `fg`, which is what the parenthesis in the message says - so
+	// reading it back off the wire is the test standing exactly where the user
+	// stands. `kill -CONT` of it is the documented way out, and it can only work if
+	// the process is still alive and stopped rather than reaped or killed.
+	const pid_t stopped = pid_in_stopped_report(shell.seen());
+	ASSERT_GT(stopped, 0) << "no pid in the stopped report; saw: " << shell.seen();
+	EXPECT_EQ(::kill(stopped, 0), 0)
+		<< "the reported process is gone, so it was never stopped; saw: " << shell.seen();
+
+	shell.type("kill -CONT " + std::to_string(stopped) + "; echo cont=$?-$((1 + 1))\r");
+	EXPECT_TRUE(shell.wait_for("cont=0-2"))
+		<< "`kill -CONT` of the stopped pid did not succeed from a usable prompt; saw: "
+		<< shell.seen();
+
+	// Cleanup, and the reason the command above is `sleep 30`: continued, it would
+	// outlive this test by half a minute. Through the shell first, so the prompt is
+	// asserted usable a second time, and then directly - the shell keeps no job
+	// table, so nothing else is going to.
+	shell.type("kill -KILL " + std::to_string(stopped) + "\r");
+	EXPECT_TRUE(shell.wait_for(kPrompt, 5)) << "saw: " << shell.seen();
+	::kill(stopped, SIGKILL);
 }
 
 TEST(LeshperPty, ControlDAtAnEmptyPromptExitsAndRestoresTheTerminal) {
