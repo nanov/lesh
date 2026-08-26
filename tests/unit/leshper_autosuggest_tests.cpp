@@ -871,6 +871,300 @@ TEST(LeshperAutosuggest, TheFallthroughPathTakesNothingFromTheHeap) {
 	EXPECT_EQ(counters.heap_allocations, heap_before);
 }
 
+
+// ---------------------------------------------------------------------------
+// Accepting ONE CHARACTER (#149): fish's `forward-single-char`, unbound.
+//
+// The unit is a grapheme CLUSTER, not a byte, and that is what most of this
+// section is about - a precomposed `é`, a decomposed one, a flag and a ZWJ
+// sequence each come in on one press. The keymap suite asserts that neither of
+// the two new names is bound anywhere.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperAutosuggest, TheTwoPerCharacterNamesAreRegistered) {
+	suggest_fixture fixture;
+	for (const char* name : {"accept_autosuggestion_char",
+	                         "accept_suggestion_char_or_forward_char"}) {
+		int32_t exists = 0;
+		EXPECT_EQ(lesh_action_exists(&fixture.reg, name, &exists), LESH_OK);
+		EXPECT_EQ(exists, 1) << name << " is not registered";
+	}
+}
+
+TEST(LeshperAutosuggest, AcceptingACharacterTakesOneAsciiCharacterAndStops) {
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git ");
+	EXPECT_EQ(s.cursor.byte_offset(), 4u);
+}
+
+TEST(LeshperAutosuggest, APrecomposedAccentComesInOnOnePressAndAsTwoBytes) {
+	// U+00E9 is two bytes and one cluster. A byte rule would leave the buffer
+	// holding half a code point here, which is not a string any more.
+	suggest_fixture fixture{{"caf\xc3\xa9 latte"}};
+	lesh::leshper::state s = suggest_fixture::line("ca");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "caf");
+	fixture.show(s);
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "caf\xc3\xa9");
+	EXPECT_EQ(s.cursor.byte_offset(), 5u) << "the accent arrived a byte at a time";
+}
+
+TEST(LeshperAutosuggest, ADecomposedAccentComesInWholeOnOnePress) {
+	// `e` + U+0301 COMBINING ACUTE: three bytes, still ONE cluster, and the press
+	// that takes the `e` must take the mark with it. This is the case where the
+	// typed prefix can even sit INSIDE the cluster - the history holds `cafe` as
+	// a byte prefix of `café` - and the boundary question is asked of the
+	// editor, so the answer is the segmentation's rather than this action's.
+	suggest_fixture fixture{{"cafe\xcc\x81 latte"}};
+	lesh::leshper::state s = suggest_fixture::line("caf");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "cafe\xcc\x81");
+	EXPECT_EQ(s.cursor.byte_offset(), 6u) << "the combining mark was left behind";
+
+	// And the press after it takes the space, not the mark that is already in.
+	fixture.show(s);
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "cafe\xcc\x81 ");
+}
+
+TEST(LeshperAutosuggest, AZwjSequenceAndAFlagAreEachOnePress) {
+	// U+1F469 ZWJ U+1F4BB is eleven bytes and one image; the DE flag is two
+	// regional indicators, eight bytes and one image (GB11 and GB12/GB13). Both
+	// arrive whole, because `LESH_MOTION_NEXT_CLUSTER` is the same UAX-29 walk
+	// the renderer measures with.
+	const std::string woman_technologist = "\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb";
+	const std::string flag = "\xf0\x9f\x87\xa9\xf0\x9f\x87\xaa";
+	suggest_fixture fixture{{"echo " + woman_technologist + flag + "!"}};
+	lesh::leshper::state s = suggest_fixture::line("echo ");
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "echo " + woman_technologist);
+	fixture.show(s);
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "echo " + woman_technologist + flag)
+		<< "the flag came in one regional indicator at a time";
+	fixture.show(s);
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "echo " + woman_technologist + flag + "!");
+}
+
+TEST(LeshperAutosuggest, RepeatedPressesWalkTheSuggestionToItsEndAndThenDoNothing) {
+	// The whole point of a per-character accept: press it enough times and you
+	// have the candidate, one cluster at a time - and the press after that is the
+	// #133 no-op, because there is nothing past what is typed.
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	for (int press = 0; press < 4; ++press) {
+		fixture.show(s);
+		const action_result result =
+			fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{});
+		EXPECT_EQ(result.status, LESH_OK) << "press " << press;
+	}
+	EXPECT_EQ(s.buffer.text(), "gitk");
+	EXPECT_EQ(s.cursor.byte_offset(), 4u);
+
+	// One press past the end: LESH_OK, nothing written.
+	fixture.show(s);
+	const action_result spare =
+		fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{});
+	EXPECT_EQ(spare.status, LESH_OK);
+	EXPECT_FALSE(spare.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "gitk");
+}
+
+TEST(LeshperAutosuggest, AcceptingACharacterWithNothingSuggestedChangesNothing) {
+	suggest_fixture fixture{{"ls"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	const action_result result =
+		fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{});
+	EXPECT_EQ(result.status, LESH_OK);
+	EXPECT_FALSE(result.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, EachAcceptedClusterIsOneUndoEntry) {
+	// A-12 per press: three presses, three steps, and undo walks back one cluster
+	// at a time rather than unpicking the lot.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	const std::size_t before = s.undo.step_count();
+	for (int press = 0; press < 3; ++press) {
+		fixture.show(s);
+		ASSERT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+		          LESH_OK);
+	}
+	ASSERT_EQ(s.buffer.text(), "git st");
+	EXPECT_EQ(s.undo.step_count(), before + 3);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git s");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git ");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
+TEST(LeshperAutosuggest, AcceptingOneCharacterBreaksTheTypingRunItFollows) {
+	// #146'S RULE, APPLIED RATHER THAN REOPENED, and this is the case that makes
+	// the temptation concrete: accepting the `k` of `gitk` writes exactly what
+	// typing `k` would have written - one cluster, plain insertion, at the point.
+	// It still breaks the run, because the third mark is the bytes being the
+	// dispatching key's, and an accept's bytes come off the candidate. Two steps,
+	// and the typed `git` survives the first undo.
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	ASSERT_TRUE(s.undo.coalescing());
+	fixture.show(s);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "gitk");
+	EXPECT_FALSE(s.undo.coalescing()) << "the run was re-armed behind the accept";
+	EXPECT_EQ(s.undo.step_count(), 2u);
+
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "");
+}
+
+TEST(LeshperAutosuggest, TypingAfterAOneCharacterAcceptStartsItsOwnUndoStep) {
+	// The "after" half of the both-sides break (#121, #146). Without it the next
+	// typed character would fold into the acceptance.
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	fixture.show(s);
+	ASSERT_EQ(fixture.loop.invoke(s, "accept_autosuggestion_char", invocation{}).status,
+	          LESH_OK);
+	fixture.type(s, " -v");
+
+	ASSERT_EQ(s.buffer.text(), "gitk -v");
+	EXPECT_EQ(s.undo.step_count(), 3u);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "gitk");
+}
+
+TEST(LeshperAutosuggest, TheCharacterWrapperAcceptsOneClusterAtTheEnd) {
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+
+	const action_result result =
+		fixture.loop.invoke(s, "accept_suggestion_char_or_forward_char", invocation{});
+	EXPECT_EQ(result.status, LESH_OK);
+	EXPECT_TRUE(result.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "git ");
+	EXPECT_EQ(s.cursor.byte_offset(), 4u);
+}
+
+TEST(LeshperAutosuggest, TheCharacterWrapperWalksToTheEndAndThenFallsThrough) {
+	// Repeated presses take the candidate a cluster at a time; the press after
+	// the last one has nothing longer than the buffer to accept, so the wrapper
+	// is `forward_char` again - and `forward_char` at the end of the buffer moves
+	// nowhere, which is what makes the key harmless rather than dead.
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	ASSERT_EQ(
+		fixture.loop.invoke(s, "accept_suggestion_char_or_forward_char", invocation{}).status,
+		LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "gitk");
+
+	fixture.show(s);
+	const action_result spare =
+		fixture.loop.invoke(s, "accept_suggestion_char_or_forward_char", invocation{});
+	EXPECT_EQ(spare.status, LESH_OK);
+	EXPECT_FALSE(spare.buffer_changed);
+	EXPECT_EQ(s.buffer.text(), "gitk");
+	EXPECT_EQ(s.cursor.byte_offset(), 4u);
+}
+
+TEST(LeshperAutosuggest, TheCharacterWrappersFallthroughIsTheBareForwardChar) {
+	// #147's equivalence shape, for #149's row: buffer, cursor, step count and
+	// coalescing identical to the unwrapped motion. Not "the run survives" -
+	// undo.h ends a typing run on every non-inserting action, so a bare
+	// `forward_char` has always broken it.
+	const auto motion_from_mid_line = [](const char* action, lesh::leshper::state& s) {
+		suggest_fixture fixture{{"ls"}};
+		fixture.type(s, "git");
+		ASSERT_TRUE(s.undo.coalescing());
+		fixture.show(s);
+		s.cursor = lesh::leshper::position::from_byte_offset(1);
+		ASSERT_EQ(fixture.loop.invoke(s, action, invocation{}).status, LESH_OK);
+	};
+
+	lesh::leshper::state bare;
+	motion_from_mid_line("forward_char", bare);
+	lesh::leshper::state wrapped;
+	motion_from_mid_line("accept_suggestion_char_or_forward_char", wrapped);
+
+	EXPECT_EQ(wrapped.buffer.text(), bare.buffer.text());
+	EXPECT_EQ(wrapped.cursor.byte_offset(), bare.cursor.byte_offset());
+	EXPECT_EQ(wrapped.undo.step_count(), bare.undo.step_count());
+	EXPECT_EQ(wrapped.undo.coalescing(), bare.undo.coalescing());
+
+	EXPECT_EQ(wrapped.buffer.text(), "git");
+	EXPECT_EQ(wrapped.cursor.byte_offset(), 2u);
+	EXPECT_EQ(wrapped.undo.step_count(), 1u);
+}
+
+TEST(LeshperAutosuggest, MidLineTheCharacterWrapperMovesEvenWithASuggestionShowing) {
+	// The cursor is not at the end, so it is `<Right>` and nothing more - the
+	// same three questions #147 wrote, asked by the same implementation.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	s.cursor = lesh::leshper::position::from_byte_offset(1);
+
+	EXPECT_EQ(
+		fixture.loop.invoke(s, "accept_suggestion_char_or_forward_char", invocation{}).status,
+		LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+	EXPECT_EQ(s.cursor.byte_offset(), 2u);
+}
+
+TEST(LeshperAutosuggest, TheCharacterWrappersAcceptIsOneUndoEntryAndBreaksTheRun) {
+	// Both halves of the #146 pin through the wrapper, which composes the same
+	// action through `lesh_action_invoke` and so cannot be two steps (#110).
+	suggest_fixture fixture{{"gitk"}};
+	lesh::leshper::state s;
+	fixture.type(s, "git");
+	ASSERT_TRUE(s.undo.coalescing());
+	fixture.show(s);
+
+	EXPECT_EQ(
+		fixture.loop.invoke(s, "accept_suggestion_char_or_forward_char", invocation{}).status,
+		LESH_OK);
+	ASSERT_EQ(s.buffer.text(), "gitk");
+	EXPECT_FALSE(s.undo.coalescing());
+	EXPECT_EQ(s.undo.step_count(), 2u);
+	EXPECT_EQ(fixture.loop.invoke(s, "undo", invocation{}).status, LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git");
+}
+
 // ---------------------------------------------------------------------------
 // Multi-line candidates (#140 decision 3): suggested whole, no filter.
 // ---------------------------------------------------------------------------
