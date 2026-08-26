@@ -104,6 +104,7 @@ enum class numeric_site : uint8_t {
 	positional_parameter_index,   // `${12}`                        expander.cpp
 	csi_parameter,                // `ESC [ 1 ; 5 C`                  decode.cpp
 	editor_repeat_count,          // `3dd` at the prompt                  vi.cpp
+	option_argument,              // `-n 5` for any utility              args.cpp
 	count_,                       // must stay last
 };
 
@@ -171,6 +172,14 @@ inline constexpr numeric_policy kNumericPolicies[] = {
 	// command and starts being a hang - is the editor's knowledge, not this
 	// table's, exactly as the CSI row above says of key codes.
 	{numeric_site::editor_repeat_count,        0,              kNumericIntMax, false, numeric_blanks::none},
+	// An option-argument bound to an integral field by lesh::args. The range here
+	// is the REPRESENTATION - the widest field a row can bind - and the narrower
+	// bound is the caller's, exactly as the two rows above say of key codes and
+	// repeat counts: args.cpp knows the field's own width and signedness from the
+	// row and refuses what will not fit it. A `-1` for an unsigned field is
+	// refused there rather than here, because the sign is well formed and the
+	// field is what makes it wrong.
+	{numeric_site::option_argument,            INT64_MIN,      INT64_MAX,      true,  numeric_blanks::none},
 };
 
 // The registry guard, in #35's shape. The first catches a site added to the enum

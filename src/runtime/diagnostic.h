@@ -1,11 +1,13 @@
 #pragma once
 
 #include "runtime/shell_state.h"
+#include "substrate/args.h"
 #include "syntax/ast.h"
 #include "syntax/source_map.h"
 
 #include <cstdarg>
 #include <cstdio>
+#include <string_view>
 
 namespace lesh::runtime {
 
@@ -143,6 +145,46 @@ inline void report(const char* fmt, ...) {
 	va_start(args, fmt);
 	vreport(fmt, args);
 	va_end(args);
+}
+
+// THE ONE USAGE DIAGNOSTIC, for every utility that parses through lesh::args
+// (#148). Thirteen hand-rolled loops produced seven different wordings for the
+// same mistake; this is the wording, in one place, and the status with it.
+//
+// THE WORDING IS DASH'S, and it is kept rather than improved. The research note
+// (S3) measured what the conformance corpus actually asserts: stderr non-empty
+// (124 times) and a non-zero status (110 times), never the text. So the text was
+// free to change and is deliberately not changing - `cd: Illegal option -x` is
+// what this tree already printed, and a diagnostic that moves for no reason
+// costs a reader their memory of it. `option requires an argument -c` is
+// getopts' existing wording, carried over for the same reason.
+//
+// STATUS 2, because that is what a builtin's usage error is here today, and
+// POSIX only requires "greater than zero".
+//
+// An unknown LONG name has no letter to report - `error` is two bytes and holds
+// a character, not a string - so the letter is dropped from the wording rather
+// than printed as a nul. POSIX builtins declare no long names, so only a ported
+// command can reach that line.
+[[nodiscard]] inline int report_option_error(std::string_view name, args::error err) {
+	const int width = static_cast<int>(name.size());
+	switch (err.kind) {
+	case args::error_kind::unknown_option:
+		if (err.letter == '\0')
+			report("%.*s: Illegal option", width, name.data());
+		else
+			report("%.*s: Illegal option -%c", width, name.data(), err.letter);
+		break;
+	case args::error_kind::missing_argument:
+		report("%.*s: option requires an argument -%c", width, name.data(), err.letter);
+		break;
+	case args::error_kind::invalid_argument:
+		report("%.*s: invalid argument to option -%c", width, name.data(), err.letter);
+		break;
+	case args::error_kind::none:
+		break;
+	}
+	return 2;
 }
 
 } // namespace lesh::runtime

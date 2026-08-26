@@ -1,6 +1,7 @@
 #include "runtime/builtins.h"
 
 #include "runtime/diagnostic.h"
+#include "substrate/args.h"
 #include "substrate/numeric.h"
 
 #include <cctype>
@@ -79,48 +80,42 @@ enum class cd_mode {
 	physical,
 };
 
-// The option scan the two share. POSIX gives both utilities the same pair and the
-// same tie-break: the LAST of -L and -P wins, inside an option group as well as
-// across them, so `-P -L -PL` is -L for either. Returns the index of the first
-// argument that is not an option.
+// The options the two share, as two rows of a table rather than a scan (#148).
+// POSIX gives both utilities the same pair and the same tie-break: the LAST of
+// -L and -P wins, inside an option group as well as across them, so `-P -L -PL`
+// is -L for either. Binding both letters to ONE field is what makes that true -
+// the second write simply overwrites the first, with no group bookkeeping to get
+// wrong inside a cluster, which is what cd-p.tst:354 and :365 assert.
 //
-// `accept_e` is `cd`'s POSIX -e and is null for `pwd`, which has no such option -
-// dash reports `pwd -e` as illegal and so does this. `unknown` names the offending
-// letter so the caller can prefix the diagnostic with its own name, which is dash's
-// wording and the reason this reports rather than prints.
-size_t scan_directory_options(char** argv, cd_mode& mode, bool* accept_e, char& unknown) {
-	size_t at = 1;
-	for (; argv[at] != nullptr; ++at) {
-		const std::string_view arg{argv[at]};
-		if (arg == "--") {
-			++at;
-			break;
-		}
-		// A lone `-` is cd's OLDPWD OPERAND, not an option, so the scan stops at it
-		// rather than reading it as an empty option group.
-		if (arg.size() < 2 || arg[0] != '-')
-			break;
-		for (const char option : arg.substr(1)) {
-			if (option == 'L') {
-				mode = cd_mode::logical;
-			} else if (option == 'P') {
-				mode = cd_mode::physical;
-			} else if (option == 'e' && accept_e != nullptr) {
-				// POSIX -e: with -P, say so when the new working directory cannot be
-				// determined. It has no meaning under -L, where PWD is COMPUTED rather
-				// than read back and therefore always known, and POSIX leaves that
-				// combination unspecified - so it is accepted and has no effect. dash
-				// rejects -e outright, which is what fails it cd-p.tst's 'exit status of
-				// success with -e'; the divergence is deliberate and recorded in #46.
-				*accept_e = true;
-			} else {
-				unknown = option;
-				return at;
-			}
-		}
-	}
-	return at;
-}
+// -e IS CD'S ALONE, so `pwd` declares two rows where `cd` declares three and
+// `pwd -e` is an illegal option - which is dash's behaviour and this tree's.
+// POSIX -e: with -P, say so when the new working directory cannot be determined.
+// It has no meaning under -L, where PWD is COMPUTED rather than read back and
+// therefore always known, and POSIX leaves that combination unspecified - so it
+// is accepted and has no effect. dash rejects -e outright, which is what fails it
+// cd-p.tst's 'exit status of success with -e'; the divergence is deliberate and
+// recorded in #46.
+//
+// A lone `-` is cd's OLDPWD OPERAND rather than an empty option group, and the
+// parser knows it: XBD 12.2 says a word of one character is an operand.
+struct directory_opts {
+	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
+	bool require_pwd = false;          // -e
+};
+
+constexpr auto kCd = args::spec<directory_opts>(
+	args::option{'L', args::field<&directory_opts::mode>, cd_mode::logical}
+		.help("resolve .. against the logical working directory"),
+	args::option{'P', args::field<&directory_opts::mode>, cd_mode::physical}
+		.help("resolve .. against the physical working directory"),
+	args::option{'e', args::field<&directory_opts::require_pwd>}
+		.help("with -P, fail when the new working directory cannot be determined"));
+
+constexpr auto kPwd = args::spec<directory_opts>(
+	args::option{'L', args::field<&directory_opts::mode>, cd_mode::logical}
+		.help("report the logical working directory"),
+	args::option{'P', args::field<&directory_opts::mode>, cd_mode::physical}
+		.help("report the physical working directory"));
 
 // POSIX `pwd`. -L reports the LOGICAL working directory - $PWD, but only while it
 // still names the directory the shell is in - and -P reports the physical one.
@@ -130,13 +125,10 @@ size_t scan_directory_options(char** argv, cd_mode& mode, bool* accept_e, char& 
 // PWD; cd sub` - a cd that moved the shell and could not record it - `pwd` kept
 // printing the directory the shell had left (#51).
 builtin_result builtin_pwd(shell_state& state, char** argv) {
-	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
-	char unknown = '\0';
-	std::ignore = scan_directory_options(argv, mode, nullptr, unknown);
-	if (unknown != '\0') {
-		report("pwd: Illegal option -%c", unknown);
-		return {2};
-	}
+	const auto parsed = args::parse(kPwd, argv);
+	if (parsed.err)
+		return {report_option_error("pwd", parsed.err)};
+	const cd_mode mode = parsed.opts.mode;
 	// Operands are IGNORED rather than diagnosed, which is where `pwd` parts from
 	// `cd`: #46 diagnoses `cd a b` because taking the first operand and dropping the
 	// rest lands the shell somewhere the user did not name. An extra operand to `pwd`
@@ -273,16 +265,16 @@ bool search_cdpath(const shell_state& state, std::string_view operand,
 }
 
 builtin_result builtin_cd(shell_state& state, char** argv) {
-	cd_mode mode = cd_mode::logical;   // POSIX: the default is -L
-	bool require_pwd = false;          // -e
-	char unknown = '\0';
 	// cd-p.tst's 'the last option wins' is `cd -P -L -PL`, whose answer is -L; the
-	// scan is shared with `pwd`, which has the same pair and the same tie-break.
-	const size_t at = scan_directory_options(argv, mode, &require_pwd, unknown);
-	if (unknown != '\0') {
-		report("cd: Illegal option -%c", unknown);
-		return {2};
-	}
+	// table is shared in shape with `pwd`, which has the same pair and the same
+	// tie-break, and differs only by the row for -e.
+	const auto parsed = args::parse(kCd, argv);
+	if (parsed.err)
+		return {report_option_error("cd", parsed.err)};
+	const cd_mode mode = parsed.opts.mode;
+	const bool require_pwd = parsed.opts.require_pwd;
+	// The untouched operand tail, as an index into the caller's own argv.
+	const size_t at = static_cast<size_t>(parsed.rest - argv);
 
 	// At most ONE operand. dash takes the first and ignores the rest in silence,
 	// which turns `cd my dir` - an unquoted pathname with a space in it - into a
