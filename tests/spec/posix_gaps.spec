@@ -981,7 +981,7 @@ set -o pipefail; exit 1 | exit 2 | exit 0; echo "b $?"; exit 3 | exit 0 | exit 0
 b 2
 c 3
 
---- set -o lists only the options the shell has [divergence: dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have]
+--- set -o lists only the options the shell has [divergence: dash also lists interactive, stdin, emacs and debug, which POSIX does not name and lesh does not have; lesh lists leshnici, which no other shell has]
 set -o
 === expect
 Current option settings
@@ -996,6 +996,7 @@ nounset         off
 verbose         off
 xtrace          off
 ignoreeof       off
+leshnici        off
 nolog           off
 pipefail        off
 vi              off

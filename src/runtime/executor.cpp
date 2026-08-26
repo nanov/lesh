@@ -2720,7 +2720,7 @@ int tree_walking_executor::describe_command(const command_prefix& opts,
 		return 0;
 	}
 	std::string found;
-	if (const builtin_kind kind = classify_builtin(name); kind != builtin_kind::none) {
+	if (const builtin_kind kind = classify_builtin(_state, name); kind != builtin_kind::none) {
 		// A regular built-in UTILITY is written as the pathname the search finds for
 		// it and everything else as its own name; see builtin_report in builtins.h.
 		// The name is the fallback when the search comes up empty, because the name
@@ -2828,7 +2828,7 @@ bool tree_walking_executor::try_run_executor_builtin(
 	// than being restored, which is the difference from the regular-builtin path
 	// and from a function call; `command eval ...` demotes them and the prefix is
 	// restored after all.
-	const bool special = classify_builtin(name) == builtin_kind::special;
+	const bool special = classify_builtin(_state, name) == builtin_kind::special;
 	arena_array<saved_fd> saved{_pool, 4};
 	std::fflush(nullptr);
 	const bool ok = apply_redirections(t, n, &saved);
@@ -3120,7 +3120,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// fd is closed. The re-open on the real path then waits for a reader that has
 	// already gone, so `echo foo >fifo & cat fifo` lost its output and
 	// `cat fifo & echo foo >fifo` hung outright - a deadlock built out of a lookup.
-	if (!cmd.present && classify_builtin(argv[0]) != builtin_kind::special &&
+	if (!cmd.present && classify_builtin(_state, argv[0]) != builtin_kind::special &&
 	    _state.has_function(argv[0])) {
 		arena_array<saved_fd> saved{_pool, 4};
 		int status = 0;
@@ -3165,7 +3165,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// A builtin runs in THIS process - `cd` in a forked child would change the
 	// child's directory and exit, achieving nothing. So dispatch happens before
 	// the fork, not after.
-	if (classify_builtin(argv[0]) != builtin_kind::none) {
+	if (classify_builtin(_state, argv[0]) != builtin_kind::none) {
 		// A builtin runs in THIS process, so its redirections must be undone
 		// afterwards or they would leak into the shell's own fds. dash does the
 		// same save-and-restore; the alternative is forking, which would defeat
@@ -3192,7 +3192,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 		// in dash and printed `b` here, which is command-p.tst's 'assignment on
 		// special built-in is temporary'.
 		const bool persist =
-			classify_builtin(argv[0]) == builtin_kind::special && !cmd.present;
+			classify_builtin(_state, argv[0]) == builtin_kind::special && !cmd.present;
 		// POSIX 2.9.1 performs the assignments AFTER the redirections and BEFORE the
 		// command, so the builtin can READ them. They used to be applied after the
 		// call, and only in the persisting case, under a note saying no builtin read a
@@ -3225,7 +3225,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 			// `echo x </missing`. `command : </missing` is demoted to regular and
 			// survives, which is what bypass_functions records.
 			if (!cmd.present && !_state.interactive() &&
-			    classify_builtin(argv[0]) == builtin_kind::special)
+			    classify_builtin(_state, argv[0]) == builtin_kind::special)
 				_exit_requested = true;
 		}
 		std::fflush(nullptr);
@@ -3387,7 +3387,7 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 	// written `command f` where f is only a function is an external command that
 	// will not be found - which is what dash reports for it.
 	const bool in_process = (!cmd.present && _state.has_function(argv[0])) ||
-	                        classify_builtin(argv[0]) != builtin_kind::none;
+	                        classify_builtin(_state, argv[0]) != builtin_kind::none;
 	if (in_process) {
 		// The executor's own builtins are dispatched here rather than through
 		// try_run_builtin, which has no entry for any of them: `exec echo foo | cat`
@@ -3410,7 +3410,10 @@ int tree_walking_executor::run_pipeline_stage(const tree& t, node_index stage) {
 			// only when `in_process` above found classify_builtin() != none, and #35
 			// made the registry static_assert both ways, so a classified name always
 			// has a handler. Discarding this same return where that did NOT hold is
-			// what made `test 1 = 2` return 0.
+			// what made `test 1 = 2` return 0. #165's extension table keeps the
+			// invariant rather than weakening it: the classify above and the dispatch
+			// here read the SAME `state.extension_builtins_enabled()` gate through the
+			// same lookup, so a name one of them sees the other sees too.
 			// `cmd.present` for the same reason the branch above passes it, though this
 			// stage discards `r.flow` either way: a stage is its own process and has no
 			// shell left to end. Passing it keeps the two sites saying the same thing.

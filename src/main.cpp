@@ -35,6 +35,7 @@ x .d88"               z`    ^%    .uef^"
 #include <unistd.h>
 #include <vector>
 
+#include "leshnici/builtins.h"
 #include "leshnici/prompt_modules.h"
 #include "runtime/executor.h"
 #include "runtime/history_store.h"
@@ -257,6 +258,27 @@ int main(int argc, char **argv) {
 	lesh::runtime::shell_state state;
 	state.set_interactive(interactive);
 	state.opts() = inv.options;
+	// THE SHIPPED EXTENSION BUILTINS (#165), installed once and before either mode
+	// runs a byte. `lesh_leshnici` is linked by this executable and by nothing
+	// below it, so this is the one place in the program that can name them - the
+	// same argument, and the same line of the CMake graph, that makes
+	// `install_prompt_modules` main's to pass.
+	//
+	// INSTALLED IN BOTH MODES AND GATED BY THE OPTION, rather than installed only
+	// when interactive: `set -o leshnici` in a script has to be able to turn them
+	// on, and a table that was never handed over could not be turned on by
+	// anything. Which is also why the option and the install are two decisions -
+	// the install says what EXISTS, the option says whether this shell looks.
+	//
+	// A collision with a core builtin is reported by `set_extension_builtins` and
+	// leaves the shell running the core set; there is nothing useful to add here,
+	// and refusing to start over it would be a worse answer than a POSIX shell.
+	lesh::leshnici::install_builtins(state);
+	// `-o leshnici` ON THE COMMAND LINE WINS; otherwise the default is
+	// INTERACTIVE, which is #165's decision. A script sees the POSIX command
+	// search and nothing else - which is what keeps the conformance corpus, every
+	// line of it non-interactive, measuring the same shell it measured before.
+	state.opts().leshnici = inv.leshnici.value_or(interactive);
 	// $0. With -c the operand after the command string is the command name, not
 	// the first positional parameter - which is why first_argument is past it.
 	// parse_invocation falls back to argv[0] when no operand names $0, so this

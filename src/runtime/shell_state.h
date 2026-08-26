@@ -7,8 +7,10 @@
 #include "substrate/traits.h"
 
 #include <array>
+#include <cstddef>
 #include <deque>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -45,6 +47,12 @@ enum class builtin_kind {
 class binding_console;
 // The prompt's, on the same terms (#157). Two consoles, one rule.
 class prompt_console;
+// And the third thing installed on those terms (#165): one row of the extension
+// builtin table leshnici hands the runtime at startup. Declared in
+// runtime/builtins.h, where `builtin_result` is, and only NAMED here - the span
+// below holds an incomplete type on purpose, so this header keeps knowing
+// nothing about what a builtin returns.
+struct extension_builtin;
 
 // What a forked child is to the shell that forked it, and the ONE thing that
 // answer decides: whether the child keeps the saved terminal fd (#158 decision 3,
@@ -383,6 +391,14 @@ public:
 		bool no_log = false;          // -o nolog, inert
 		bool pipefail = false;        // -o pipefail
 		bool vi = false;              // -o vi, inert
+		// -o leshnici (#165). NOT a POSIX option and deliberately named for the
+		// layer it gates rather than for what it does: it turns leshnici's
+		// extension builtins on. Default ON in an interactive shell and OFF in
+		// every script, set in src/main.cpp beside set_interactive - so the
+		// conformance corpus, which is non-interactive throughout, sees the POSIX
+		// command search and nothing else, and a script that wants `ls` in-process
+		// says `set -o leshnici` at its top.
+		bool leshnici = false;        // -o leshnici
 	};
 
 	// One row per POSIX shell option: the letter, the `-o` spelling, and where the
@@ -396,7 +412,7 @@ public:
 		std::string_view name;  // empty when POSIX gives it no `-o` spelling
 		bool options::*field;
 	};
-	static constexpr size_t kOptionCount = 15;
+	static constexpr size_t kOptionCount = 16;
 	[[nodiscard]] static const std::array<option_descriptor, kOptionCount>&
 		option_table() noexcept;
 
@@ -621,6 +637,46 @@ public:
 	}
 	[[nodiscard]] prompt_console* prompts() const noexcept { return _prompt_console; }
 
+	// --- extension builtins (#165) ---------------------------------------------
+	//
+	// THE SECOND BUILTIN TABLE, and the first restructuring of `src/runtime/`
+	// before #93. The two `constexpr` tables in runtime/builtins.{h,cpp} are
+	// cross-checked by a `static_assert` and have no runtime registration at all,
+	// which is exactly what keeps them trustworthy; and `runtime` must not include
+	// `leshnici`. So the shipped extension set arrives the way the two consoles
+	// above do - declared here, filled in at the wiring site that links both, and
+	// BORROWED: `install_builtins` hands over a view of a `constexpr` array with
+	// static storage duration, so ADR-0007's "everything has an owner that frees
+	// it" is answered by there being nothing to free.
+	//
+	// EMPTY BY DEFAULT. A shell nobody installed anything on - a unit test's, a
+	// tool's - has the core set and only the core set, the same way an engine
+	// built by a test is the bare seven-module one (#163).
+	//
+	// CORE WINS ON COLLISION, and the refusal is at INSTALL time rather than at
+	// lookup time: a table naming `cd` is rejected whole, reported once at
+	// startup, and the shell runs with the core set. Deciding it per lookup would
+	// mean a name that shadows nothing today starts shadowing the day the core
+	// grows it, which is the kind of drift #35's static_assert exists to make
+	// impossible one layer down.
+	//
+	// Returns false when a name collides; the table is not installed and the
+	// caller reports. Defined in builtins.cpp, where `kBuiltinRegistry` is - the
+	// same place `classify_builtin` is defined and for the same reason.
+	[[nodiscard]] bool set_extension_builtins(std::span<const extension_builtin> table);
+	[[nodiscard]] std::span<const extension_builtin> extension_builtins() const noexcept;
+
+	// Whether the extension table is CONSULTED. `set -o leshnici`, default on iff
+	// the shell is interactive (src/main.cpp), so the conformance corpus - which
+	// is non-interactive throughout - never sees a name that is not POSIX's.
+	//
+	// A method rather than `opts().leshnici` at each site, because every reader of
+	// it is asking one question and it should have one spelling: an extension
+	// builtin is visible when there is a table AND the option is on.
+	[[nodiscard]] bool extension_builtins_enabled() const noexcept {
+		return _options.leshnici && _extension_builtin_count != 0;
+	}
+
 private:
 	struct variable {
 		std::string value;
@@ -682,6 +738,11 @@ private:
 	// which is what a prompt-configuration builtin will answer "no line editor"
 	// from, exactly as `bind` does today.
 	prompt_console* _prompt_console = nullptr;
+	// Non-owning; see set_extension_builtins. A view of a `constexpr` array with
+	// static storage duration, held as a pointer and a count rather than a
+	// `std::span` member so that `extension_builtin` may stay incomplete here.
+	const extension_builtin* _extension_builtins = nullptr;
+	std::size_t _extension_builtin_count = 0;
 	// Backing store for option_flags(). Rebuilt on demand and mutable because
 	// parameter_source::option_flags() is const, for the same reason
 	// environment_block() owns its strings: the returned view must outlive the call.

@@ -77,7 +77,11 @@ public:
 			return command_kind::alias;
 		if (_state->has_function(name))
 			return command_kind::function;
-		if (runtime::classify_builtin(name) != runtime::builtin_kind::none)
+		// The SHELL'S answer rather than the program's (#165): an extension builtin
+		// is a builtin to a shell with `set -o leshnici` on and nothing at all to
+		// one without it, and a highlighter that disagreed with the executor about
+		// that would be C-5's bug class wearing a colour once more.
+		if (runtime::classify_builtin(*_state, name) != runtime::builtin_kind::none)
 			return command_kind::builtin;
 		return command_kind::unknown;
 	}
@@ -103,6 +107,13 @@ public:
 			case name_domain::builtin:
 				for (const runtime::builtin_descriptor& one : runtime::kBuiltinRegistry)
 					into.emplace_back(one.name);
+				// And whatever leshnici installed, when this shell consults it (#165).
+				// The completer offers exactly what `classify` above would call a
+				// builtin; offering a name the classifier then called unknown is the
+				// drift this file's note is about.
+				if (_state->extension_builtins_enabled())
+					for (const runtime::extension_builtin& one : _state->extension_builtins())
+						into.emplace_back(one.name);
 				break;
 			case name_domain::function:
 				for (std::string_view name : _state->function_names())
