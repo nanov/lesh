@@ -1,3 +1,5 @@
+#include "leshper/history_search.h"
+#include "leshper/keymap.h"
 #include "leshper/loop.h"
 #include "leshper/shell_actor.h"
 #include "leshper/tty.h"
@@ -687,6 +689,60 @@ TEST(LeshperLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.dropped_batches() > 0; }));
 	EXPECT_EQ(loop.applied_batches(), 0u);
 	EXPECT_TRUE(loop.editor().marks.layers().empty());
+}
+
+TEST(LeshperLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
+	// #154's regression anchor for F-25 on the REAL loop path - the deterministic
+	// in-harness cousin of the pty accept test, with no terminal timing in it.
+	// The autosuggester runs on a HELPER worker; the whole point of the ticket is
+	// that its proposal, not only its virtual text, survives the completion-queue
+	// handoff into `state::proposals` where `lesh_proposal_read` walks. Type a
+	// prefix, let the batch drain, dispatch the DEFAULT accept key, and the
+	// buffer must become the whole candidate with one undo entry for the accept.
+	//
+	// The unit suite drove the accepting actions through `loop_harness::react` +
+	// `apply_batch` - a fake scheduler on the test thread - so it never exercised
+	// the worker pool, the pipe and `take_batch` end to end. This does, which is
+	// the seam #154 was filed against.
+	fake_tty tty;
+	registry reg;
+	worker_pool helpers{1};
+	vector_history_source history{{"echo hello"}};
+	owned_autosuggester self{&history};
+	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_registry(reg);
+	loop.attach_helpers(helpers);
+	loop.enter_read();
+
+	// Type a prefix of the remembered line and let the helper's batch arrive.
+	tty.type("ec");
+	ASSERT_TRUE(turn_until(loop, [&] {
+		return loop.applied_batches() > 0 && !loop.editor().proposals.empty();
+	})) << "the autosuggester's proposal never reached state.proposals";
+
+	// The proposal an accepting action would read is the WHOLE candidate.
+	const proposal* offer =
+		loop.editor().proposals.find(LESH_PROPOSAL_AUTOSUGGESTION, 0);
+	ASSERT_NE(offer, nullptr);
+	EXPECT_EQ(offer->bytes, "echo hello");
+
+	// Ctrl-F is the emacs default `accept_suggestion_or_forward_char`, chosen
+	// over `<Right>` because it is a single byte with no escape-timing to wait
+	// out - the cursor is at the end and a suggestion is showing, so it accepts.
+	tty.type("\x06");
+	ASSERT_TRUE(turn_until(loop, [&] {
+		return std::string{loop.editor().buffer.text()} == "echo hello";
+	})) << "the accept never committed; buffer=" << buffer_of(loop);
+
+	// One undo entry for the accept: the typing run is its own step and the
+	// accept broke it and added a second (undo.h: every non-inserting action ends
+	// the run), so undo puts back exactly what was typed.
+	EXPECT_EQ(loop.editor().undo.step_count(), 2u);
+	ASSERT_EQ(context_of(loop.editor()).loop().invoke(loop.editor(), "undo", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(buffer_of(loop), "ec");
 }
 
 // ===========================================================================

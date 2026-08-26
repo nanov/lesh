@@ -208,14 +208,23 @@ TEST(LeshperAutosuggest, AnEmptyBufferSuggestsNothing) {
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, ACursorAwayFromTheEndSuggestsNothing) {
+TEST(LeshperAutosuggest, ACursorAwayFromTheEndStillSuggests) {
+	// AMENDS #133 (#154, owner's call). #133 retracted the suggestion whenever
+	// the cursor left the end, fish-style; the owner reversed that: the ghost is
+	// anchored to the buffer and drawn at its end, and where the caret sits does
+	// not change which bytes it is. So a mid-line cursor no longer hides it - the
+	// reactor emits the same continuation and the same whole-candidate proposal.
+	// ACCEPTANCE is the half that still cares about the cursor, and that is
+	// `suggestion_is_acceptable`'s job (tested in the wrapper suite below), not
+	// this reactor's.
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	s.cursor = s.buffer.begin_position();
 	const reactor_batch batch = fixture.suggest(s);
 	EXPECT_EQ(batch.status, LESH_OK);
-	EXPECT_TRUE(batch.texts.empty());
-	EXPECT_TRUE(batch.proposals.empty());
+	EXPECT_EQ(batch.texts.size(), 1u);
+	ASSERT_EQ(batch.proposals.size(), 1u);
+	EXPECT_EQ(batch.proposals[0].bytes, "git status");
 }
 
 TEST(LeshperAutosuggest, AnEntryEqualToTheBufferIsNotSuggested) {
@@ -248,23 +257,21 @@ TEST(LeshperAutosuggest, AnEmptyHistorySuggestsNothingAndDoesNotFail) {
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, ItRecomputesWhenTheCursorMoves) {
-	// Fish's rule, and the one place this reactor differs from the highlighter:
-	// a suggestion is shown only at the end of the buffer, so moving off the end
-	// must retract it and moving back must bring it back. A highlight is a
-	// function of the text alone and asks for no such thing (A-10).
+TEST(LeshperAutosuggest, ItDoesNotSubscribeToCursorMoves) {
+	// AMENDS #133 (#154). #133 had this reactor listen to cursor_moved and
+	// recompute - retracting off the end, bringing it back at the end. The owner
+	// reversed the behaviour it was for: the suggestion is a function of the
+	// typed text alone (the highlighter's rule, A-10), so a cursor move is not an
+	// event it has any answer to and it no longer subscribes. `react` filtered by
+	// CURSOR_MOVED therefore returns NO batch from the autosuggester at all,
+	// which is the concrete shape of "the ghost is not touched when the cursor
+	// moves": the last buffer_changed batch stays applied, unretracted.
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
-
-	reactor_batch batch = fixture.suggest(s, LESH_EVENT_CURSOR_MOVED);
-	EXPECT_EQ(batch.proposals.size(), 1u);
-
+	EXPECT_TRUE(fixture.loop.react(s, LESH_EVENT_CURSOR_MOVED).empty());
+	// It does still answer buffer_changed, wherever the cursor is.
 	s.cursor = s.buffer.begin_position();
-	batch = fixture.suggest(s, LESH_EVENT_CURSOR_MOVED);
-	EXPECT_TRUE(batch.proposals.empty());
-
-	s.cursor = s.buffer.end_position();
-	batch = fixture.suggest(s, LESH_EVENT_CURSOR_MOVED);
+	const reactor_batch batch = fixture.suggest(s, LESH_EVENT_BUFFER_CHANGED);
 	EXPECT_EQ(batch.proposals.size(), 1u);
 }
 
@@ -729,6 +736,43 @@ TEST(LeshperAutosuggest, MidLineTheWrapperMovesEvenWithASuggestionShowing) {
 	          LESH_OK);
 	EXPECT_EQ(s.buffer.text(), "git");
 	EXPECT_EQ(s.cursor.byte_offset(), 2u);
+}
+
+TEST(LeshperAutosuggest, TheGhostStaysVisibleWhenTheCursorLeavesTheEnd) {
+	// #154's amendment to #133, end to end at the state level. Type a prefix at
+	// the end of the buffer and the suggestion shows - the drawn half in `marks`,
+	// the acceptable half in `proposals`. Move the cursor off the end and the
+	// ghost STAYS: a cursor move is not an event the autosuggester subscribes to
+	// any more, so nothing recomputes and nothing retracts the applied batch.
+	// #133 asserted the opposite here (a move retracted it); the owner reversed
+	// the behaviour, so this test asserts persistence.
+	//
+	// ACCEPTANCE is the half that still watches the cursor: mid-line the accept
+	// key is a plain motion, so the suggestion is on screen while `<Right>` just
+	// moves - the whole point of leaving the ghost up without changing what
+	// accepting means.
+	suggest_fixture fixture{{"git status"}};
+	lesh::leshper::state s = suggest_fixture::line("git");
+	fixture.show(s);
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	ASSERT_EQ(s.marks.texts().size(), 1u) << "the ghost is the virtual text";
+
+	// The cursor leaves the end. In the running loop this is a cursor_moved
+	// event, which the autosuggester no longer answers - so `react` filtered by
+	// it yields nothing to apply and the batch already on screen is untouched.
+	s.cursor = s.buffer.begin_position();
+	EXPECT_TRUE(fixture.loop.react(s, LESH_EVENT_CURSOR_MOVED).empty())
+		<< "a cursor move must not recompute the suggestion";
+	EXPECT_EQ(s.proposals.layers().size(), 1u) << "the proposal is still there";
+	EXPECT_EQ(s.marks.texts().size(), 1u) << "and the ghost is still drawn";
+
+	// The accept key mid-line moves the cursor and does NOT accept: the buffer is
+	// unchanged and the caret advanced by one cluster.
+	const std::size_t before = s.cursor.byte_offset();
+	EXPECT_EQ(fixture.loop.invoke(s, "accept_suggestion_or_forward_char", invocation{}).status,
+	          LESH_OK);
+	EXPECT_EQ(s.buffer.text(), "git") << "the accept key must not have accepted";
+	EXPECT_EQ(s.cursor.byte_offset(), before + 1u) << "it moved instead";
 }
 
 TEST(LeshperAutosuggest, EndMidLineFallsThroughAndTheNextPressAccepts) {

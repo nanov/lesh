@@ -609,18 +609,26 @@ std::size_t register_builtin_reactors(lesh_registry& reg, highlighter& self) {
 //
 // TWO EMISSIONS, ONE ANSWER, and the split is the design rather than an
 // accident. The virtual text is the CONTINUATION - the bytes past what is
-// typed - because that is what a renderer draws after the cursor. The proposal
+// typed - drawn at the end of the buffer, after what is typed. The proposal
 // is the WHOLE candidate, because that is what accepting means, and computing
 // "typed + continuation" at accept time would be an accepting action deriving
 // the answer a second time from two halves that a keystroke could have moved
 // between (N-4 again, one layer up).
 //
-// WHY IT LISTENS TO cursor_moved, where the highlighter does not. A highlight is
-// a function of the text alone, so a cursor move cannot change one (A-10). A
-// suggestion is not: it is shown only when the cursor is at the end, so moving
-// off the end must retract it and moving back must bring it back. Fish does
-// exactly this. The cost is one prefix walk per arrow key, which is a
-// starts_with per entry over memory the store already holds.
+// buffer_changed AND NOTHING ELSE, the highlighter's rule and for the
+// highlighter's reason (A-10): the suggestion is a function of the typed text
+// alone. It is the newest history entry that starts with the buffer, drawn as
+// virtual text at the END of the buffer - not at the cursor - so where the
+// cursor sits does not change which bytes it is or where they render. #133 had
+// this reactor also listen to cursor_moved and retract the suggestion whenever
+// the cursor left the end, fish-style; #154 amends that on the owner's call: the
+// ghost STAYS VISIBLE off the end (it is anchored to the buffer, not the caret),
+// so a cursor move is not an event this reactor has any answer to and asking for
+// it would be a prefix walk per arrow key for a batch identical to the last one.
+// ACCEPTANCE is unchanged and lives elsewhere: `suggestion_is_acceptable` still
+// requires the cursor at the end, so off the end the accept key is a plain
+// motion - the suggestion shows but Right just moves, which is exactly the split
+// #154 wanted. This compute therefore never reads the cursor at all.
 //
 // WHAT IS NOT HERE, and it is one thing: F-27's validity filter, which greys a
 // `cd` suggestion whose directory no longer exists. It needs the cwd and a path
@@ -742,16 +750,11 @@ std::int32_t autosuggest(lesh_request* request, void* userdata) {
 	if (length == 0)
 		return LESH_OK;
 
-	std::size_t cursor = 0;
-	status = lesh_request_cursor(request, &cursor);
-	if (status != LESH_OK)
-		return status;
-	// Only at the end. The continuation is drawn after the cursor and accepting
-	// appends; with the cursor in the middle of the line neither is what the user
-	// asked for, and drawing text that Right-arrow would not accept is worse than
-	// drawing nothing.
-	if (cursor != length)
-		return LESH_OK;
+	// NO CURSOR READ (#154). The continuation is drawn at the end of the buffer
+	// and the suggestion is a function of the typed text alone, so the reactor
+	// shows the same thing wherever the caret is. Whether the accept key accepts
+	// or merely moves is `suggestion_is_acceptable`'s call, made at accept time
+	// against the live cursor - not this reactor's.
 
 	// The snapshot, copied out of the token into the arena. No accessor lends a
 	// pointer (ADR-0006's WASM insurance), so the copy is the contract; the
@@ -821,8 +824,10 @@ std::size_t register_autosuggester(lesh_registry& reg, autosuggester& self) {
 	std::uint32_t id = LESH_STYLE_NONE;
 	if (lesh_style_intern(&reg, "suggestion", &id) == LESH_OK)
 		self.suggestion = id;
-	return lesh_reactor_register(&reg, "autosuggester",
-	                             LESH_EVENT_BUFFER_CHANGED | LESH_EVENT_CURSOR_MOVED,
+	// buffer_changed and nothing else (#154): the suggestion depends on the typed
+	// text, not the cursor, so a cursor move has no answer to recompute and the
+	// ghost stays visible off the end. See the banner above.
+	return lesh_reactor_register(&reg, "autosuggester", LESH_EVENT_BUFFER_CHANGED,
 	                             autosuggest, &self) == LESH_OK
 	       ? 1u : 0u;
 }
