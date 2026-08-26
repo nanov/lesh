@@ -1,4 +1,4 @@
-#include "leshper/git_head.h"
+#include "leshnici/git_head.h"
 
 #include "substrate/fork_guard.h"
 
@@ -25,12 +25,12 @@
 #include <crt_externs.h>
 #else
 // At file scope, and outside the namespace: a block-scope `extern` inside a
-// namespaced function would name `lesh::leshper::prompt::environ`, which does
+// namespaced function would name `lesh::leshnici::environ`, which does
 // not exist and would not link.
 extern "C" char** environ;
 #endif
 
-namespace lesh::leshper::prompt {
+namespace lesh::leshnici {
 
 namespace {
 
@@ -797,4 +797,4 @@ git_head read_git_head(std::string_view directory, const git_probe_options& opti
 	}
 }
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::leshnici

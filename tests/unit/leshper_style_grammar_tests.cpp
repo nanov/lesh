@@ -13,7 +13,7 @@
 // every short spec, which is cheap here and would just be restating the
 // selftest's cases as a loop if it lived there instead.
 
-#include "leshper/prompt.h"
+#include "leshper/prompt/prompt.h"
 #include "leshper/sgr.h"
 #include "leshper/style_grammar.h"
 #include "leshper/surface.h"

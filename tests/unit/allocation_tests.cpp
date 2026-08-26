@@ -1,7 +1,8 @@
 #include "leshper/editor.h"
 #include "leshper/loop.h"
 #include "leshper/event.h"
-#include "leshper/prompt.h"
+#include "leshnici/prompt_modules.h"
+#include "leshper/prompt/prompt.h"
 #include "leshper/state.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
@@ -477,6 +478,9 @@ TEST_F(AllocationTest, AWarmPromptRenderNeverReachesTheHeap) {
 	namespace prompt = leshper::prompt;
 
 	prompt::engine which;
+	// `git` below is leshnici's since #163, so the engine has to be handed the
+	// shipped extension set the way the wiring site hands it to the session's.
+	leshnici::install_prompt_modules(which);
 	std::string error;
 	// The owner's own example: a short cyan path, a magenta branch in a group that
 	// vanishes with it, red brackets round `$?` that vanish with the number, and

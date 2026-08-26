@@ -20,7 +20,7 @@
 // ordinary `module` object, which is the entire cost of NG-4's promise that the
 // Lua binding reuses these verbs unchanged.
 
-#include "leshper/prompt.h"
+#include "leshper/prompt/prompt.h"
 
 #include "leshper/registry.h"
 #include "substrate/assert.h"
@@ -307,10 +307,15 @@ protected:
 // Construction
 // ---------------------------------------------------------------------------
 
-// The eight built-ins go in through `register_module` and by no other route -
+// The seven built-ins go in through `register_module` and by no other route -
 // A-11's no-side-door rule, one layer up from the ABI. A user module replacing
-// `git` replaces the one a template resolves, because there is only ever one
+// `path` replaces the one a template resolves, because there is only ever one
 // table and one lookup.
+//
+// SEVEN AND NOT EIGHT (#163): `git` is leshnici's, not a built-in, and arrives
+// through this same door when the wiring site calls `install_prompt_modules`.
+// An engine built by anybody else does not have it, and a template naming it is
+// refused as an unknown module rather than special-cased anywhere.
 engine::engine() {
 	for (const builtin_module& one : kBuiltinModules)
 		register_module(one.name, one.which);

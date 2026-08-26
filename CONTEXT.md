@@ -269,6 +269,17 @@ lesh Prompt Editing & Reading — the shell's own line editor, the largest
 resident of the UI. Integrated: compiled into the lesh binary, not a library.
 _Avoid_: LLE, the retired earlier name; the reader; readline.
 
+**leshnici** _[lesh]_:
+The shipped extension set: what lesh ships on top of leshper but does not owe
+it — prompt modules now, builtins later. A layer ABOVE leshper (`lesh_leshnici`
+links `lesh_leshper`, never the other way), and it arrives on an engine by being
+installed: the wiring site calls `install_prompt_modules`, so an engine built
+anywhere else is the bare built-in one. `git` is its first resident, and it is
+there rather than among the built-ins because it reads a filesystem where every
+built-in is a pure function of the facts struct.
+_Avoid_: calling a leshnici module a built-in; a template naming one on an
+engine without leshnici is refused as an unknown module, like any other name.
+
 **Widget** _[lesh]_:
 Reserved for a future UI surface a plugin can draw into — panels, pickers,
 floating surfaces. Nothing ships under this name yet.
