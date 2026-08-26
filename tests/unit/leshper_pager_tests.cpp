@@ -755,8 +755,8 @@ int32_t propose_all(lesh_request* request, void* self) {
 	return LESH_OK;
 }
 
-// The loop's own objects, because `lesh_proposal_read` reads what the LOOP has
-// applied - the state's lazily-built context has nothing applied to it.
+// One registry and one harness for dispatch; what is APPLIED lives in the state
+// (#144), which is where `lesh_proposal_read` reads it from.
 struct proposal_fixture {
 	registry reg;
 	loop_harness loop{reg};
@@ -771,7 +771,7 @@ struct proposal_fixture {
 
 	void show(state& s) {
 		for (reactor_batch& one : loop.react(s, LESH_EVENT_BUFFER_CHANGED))
-			loop.apply(s, std::move(one));
+			apply_batch(s, one);
 	}
 };
 

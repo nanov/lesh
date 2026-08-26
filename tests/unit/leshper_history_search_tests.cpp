@@ -523,14 +523,14 @@ TEST(LeshperHistorySearch, AStaleBatchIsNotApplied) {
 	// The user typed while the worker was walking the history.
 	s.buffer.replace(s.buffer.end_position(), s.buffer.end_position(), " ");
 	s.gen.bump();
-	EXPECT_FALSE(loop.apply(s, std::move(batches[0])));
-	EXPECT_TRUE(loop.applied().empty());
+	EXPECT_FALSE(apply_batch(s, batches[0]));
+	EXPECT_TRUE(s.proposals.empty());
 
 	batches = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 	ASSERT_EQ(batches.size(), 1u);
-	EXPECT_TRUE(loop.apply(s, std::move(batches[0])));
-	ASSERT_EQ(loop.applied().size(), 1u);
-	EXPECT_EQ(loop.applied()[0].proposals.size(), 1u);
+	EXPECT_TRUE(apply_batch(s, batches[0]));
+	ASSERT_EQ(s.proposals.layers().size(), 1u);
+	EXPECT_EQ(s.proposals.layers()[0].items.size(), 1u);
 }
 
 TEST(LeshperHistorySearch, AProviderWiredUpWithoutASourceSaysSoRatherThanGuessing) {
