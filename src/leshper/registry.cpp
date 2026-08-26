@@ -1757,14 +1757,38 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	const difference change = diff_of(target.buffer.text(), _handle.staged);
 
 	// F-4's coalescing rule, decided from what the action DID rather than from
-	// which action it was. The enum path in editor.cpp knows `self_insert` by
-	// name and breaks the run for everything else; the loop has no names to go
-	// by and does not need any - a run of plain typing is a run of single plain
-	// insertions, and anything else ends it. The two rules agree on all nine
-	// built-ins and this one also covers the actions nobody has written yet.
-	const bool plain_insertion =
-		change.any && change.from == change.to && !change.inserted.empty();
-	if (!plain_insertion)
+	// which action it was. The loop has no names to go by and does not need any:
+	// a typing run is a run of KEYSTROKES, and the commit can recognise one
+	// without being told which action produced it.
+	//
+	// A keystroke leaves three marks together, and all three are checked here
+	// because a block write can wear any two of them:
+	//
+	//   it is a plain insertion at one point - nothing removed;
+	//   it is ONE grapheme cluster - a key produces one, F-3's unit;
+	//   the bytes ARE the key that dispatched the action (`how.keys`) - which is
+	//   `self_insert`'s whole definition, and is what a candidate cannot fake.
+	//
+	// The third is the one #146 turns on. An accepted autosuggestion is shaped
+	// exactly like a plain insertion at the cursor - #121 said the same of a
+	// paste - so length was the only thing separating them, and length fails at
+	// the case that matters: accepting `gitk` over `git` writes a single `k`.
+	// What never coincides is the text: an accept arrives under `<Right>` or
+	// `<Tab>`, which contribute no bytes at all (`encoded_keys_as_text`), and an
+	// accept bound to a printable would still have to suggest exactly that
+	// character to be mistaken for it.
+	//
+	// AND THE RUN IS BROKEN ON BOTH SIDES, #121's ruling applied here. Breaking
+	// only before stops a block write from extending the preceding run;
+	// apply_edit's record() would then re-arm coalescing behind it - a plain
+	// insertion is a plain insertion to the history - and the next typed
+	// character would fold into the acceptance. Accepting is its own undo step,
+	// full stop.
+	const bool typed_keystroke =
+		change.any && change.from == change.to && !change.inserted.empty()
+		&& change.inserted == how.keys
+		&& lesh::grapheme::next_boundary(change.inserted, 0) == change.inserted.size();
+	if (!typed_keystroke)
 		target.undo.break_coalescing();
 
 	if (change.any) {
@@ -1778,6 +1802,9 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 			position::from_byte_offset(snap_back(_handle.staged, _handle.staged_cursor));
 		apply_edit(target, position::from_byte_offset(change.from),
 		           position::from_byte_offset(change.to), change.inserted, &landing);
+		// The second half of the both-sides break. See above.
+		if (!typed_keystroke)
+			target.undo.break_coalescing();
 		result.buffer_changed = true;
 	} else if (_handle.cursor_written) {
 		target.cursor = position::from_byte_offset(snap_back(target.buffer.text(),
