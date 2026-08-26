@@ -214,6 +214,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/keymap.h
 	src/leshper/kill_store.cpp
 	src/leshper/kill_store.h
+	src/leshper/vi.cpp
+	src/leshper/vi.h
 	src/leshper/state.h
 	src/leshper/surface.cpp
 	src/leshper/surface.h

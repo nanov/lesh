@@ -1939,6 +1939,12 @@ TEST(LeshperAbiEquivalence, TheAbiPathAndTheKeymapPathAgreeOnEveryBuiltIn) {
 		EXPECT_EQ(abi.produced.size(), keymap.size()) << one.abi_name;
 	}
 
+	// The change record (#119) is DISPATCH's, and this test's ABI side does not
+	// dispatch - it calls the action directly, which is the whole shape of the
+	// comparison. So the one field a direct invocation cannot produce is aligned
+	// before the whole-state compare, rather than dropped from state equality
+	// where N-3's replay needs it.
+	through_abi.repeat = through_keymap.repeat;
 	EXPECT_TRUE(through_abi == through_keymap);
 	EXPECT_FALSE(through_abi.buffer.empty());   // and the script did something
 

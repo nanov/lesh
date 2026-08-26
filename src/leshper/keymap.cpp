@@ -443,6 +443,18 @@ void encoded_keys_as_text(std::string_view encoded, std::string& into) {
 	}
 }
 
+bool encoded_keys_are_text(std::string_view encoded) noexcept {
+	std::size_t at = 0;
+	key_event key;
+	bool any = false;
+	while (decode_key(encoded, at, key)) {
+		if (key.named || key.modifiers.alt || key.modifiers.ctrl)
+			return false;
+		any = true;
+	}
+	return any;
+}
+
 // ---------------------------------------------------------------------------
 // keymap
 // ---------------------------------------------------------------------------
@@ -545,6 +557,59 @@ void bind_notation(keymap& into, std::string_view notation, std::string_view act
 		into.bind(keys, action);
 }
 
+// The motions, in one place because three keymaps want the same ones (#119).
+//
+// vi_command has them because a user moves; vi_operator_pending has them because
+// `dw` is a motion after a verb and the map is opaque; writing them twice would
+// be the kind of duplication that drifts by one binding and is then a bug
+// nobody can see.
+void bind_vi_motions(keymap& into) {
+	bind_notation(into, "h", "vi_backward_char");
+	bind_notation(into, "l", "vi_forward_char");
+	bind_notation(into, " ", "vi_forward_char");
+	bind_notation(into, "j", "vi_line_down");
+	bind_notation(into, "k", "vi_line_up");
+	bind_notation(into, "^", "vi_first_nonblank");
+	bind_notation(into, "$", "end_of_line");
+	bind_notation(into, "w", "vi_word_next");
+	bind_notation(into, "b", "vi_word_prev");
+	bind_notation(into, "e", "vi_word_end");
+	bind_notation(into, "W", "vi_blank_word_next");
+	bind_notation(into, "B", "vi_blank_word_prev");
+	bind_notation(into, "E", "vi_blank_word_end");
+	bind_notation(into, "f", "vi_find_forward");
+	bind_notation(into, "F", "vi_find_backward");
+	bind_notation(into, "t", "vi_till_forward");
+	bind_notation(into, "T", "vi_till_backward");
+	bind_notation(into, ";", "vi_find_repeat");
+	bind_notation(into, ",", "vi_find_repeat_reverse");
+	bind_notation(into, "<Left>", "vi_backward_char");
+	bind_notation(into, "<Right>", "vi_forward_char");
+	bind_notation(into, "<Up>", "vi_line_up");
+	bind_notation(into, "<Down>", "vi_line_down");
+}
+
+// The text objects (#99 answer 2), in one place because operator-pending and
+// visual both want them: `diw` and `viw` are the same action reached from two
+// stacks, which is exactly what "an object is one action that sets the
+// selection" bought.
+void bind_vi_objects(keymap& into) {
+	bind_notation(into, "iw", "vi_object_inner_word");
+	bind_notation(into, "aw", "vi_object_a_word");
+	bind_notation(into, "iW", "vi_object_inner_blank_word");
+	bind_notation(into, "aW", "vi_object_a_blank_word");
+	static constexpr std::string_view delimiters[] = {"(", ")", "b", "[", "]",
+	                                                  "{", "}", "B", "\"", "'", "`"};
+	std::string inner;
+	std::string around;
+	for (const std::string_view one : delimiters) {
+		inner.assign("i").append(one);
+		around.assign("a").append(one);
+		bind_notation(into, inner, "vi_object_inner_pair");
+		bind_notation(into, around, "vi_object_a_pair");
+	}
+}
+
 } // namespace
 
 void keymap_registry::install_defaults() {
@@ -572,12 +637,14 @@ void keymap_registry::install_defaults() {
 	bind_notation(*emacs_map, "<Home>", "beginning_of_line");
 	bind_notation(*emacs_map, "<End>", "end_of_line");
 
-	// --- vi_insert: a SKELETON, and it says so -----------------------------
+	// The emacs side of the ONE kill store (#99 answer 3): `C-y` reads what a
+	// kill wrote, which is the same table vi's `p` reads.
+	bind_notation(*emacs_map, "<C-y>", "yank");
+
+	// --- vi_insert ---------------------------------------------------------
 	//
-	// The editing keys that work the same in every mode, plus F-40's indicator.
-	// Escape is NOT bound, because the action that would leave insert mode does
-	// not exist: mode-entry actions are #119's, and a binding to an unregistered
-	// name would be a dispatch miss dressed up as a feature.
+	// The editing keys that work the same in every mode, plus F-40's indicator,
+	// plus the one key that makes it a mode: Escape back to command.
 	keymap* insert_map = create(vi_insert);
 	insert_map->indicator = "INSERT";
 	bind_notation(*insert_map, "<BS>", "delete_backward_char");
@@ -588,28 +655,117 @@ void keymap_registry::install_defaults() {
 	bind_notation(*insert_map, "<Right>", "forward_char");
 	bind_notation(*insert_map, "<Home>", "beginning_of_line");
 	bind_notation(*insert_map, "<End>", "end_of_line");
+	bind_notation(*insert_map, "<Esc>", "vi_command_mode");
 
-	// --- vi_command: a SKELETON, and OPAQUE --------------------------------
+	// --- vi_command: the repertoire (#99, #119, spec §6.5) ------------------
 	//
 	// Opaque is what makes command mode command mode. The `self_insert` floor is
 	// the bottom of the stack, and a mode where an unbound `z` types a `z` is not
 	// vi - so the map that must swallow unbound printables says exactly that,
 	// through the same flag the completion pager will use (F-29), with no default
-	// action to catch them. Its repertoire - motions, operators, counts, text
-	// objects, `.` - is #119's and stops here on purpose.
+	// action to catch them.
 	keymap* command_map = create(vi_command);
 	command_map->indicator = "NORMAL";
 	command_map->opaque = true;
-	bind_notation(*command_map, "h", "backward_char");
-	bind_notation(*command_map, "l", "forward_char");
-	bind_notation(*command_map, "0", "beginning_of_line");
-	bind_notation(*command_map, "$", "end_of_line");
+	bind_vi_motions(*command_map);
+	bind_notation(*command_map, "0", "vi_digit_or_line_start");
+	bind_notation(*command_map, "1", "vi_digit_argument");
+	bind_notation(*command_map, "2", "vi_digit_argument");
+	bind_notation(*command_map, "3", "vi_digit_argument");
+	bind_notation(*command_map, "4", "vi_digit_argument");
+	bind_notation(*command_map, "5", "vi_digit_argument");
+	bind_notation(*command_map, "6", "vi_digit_argument");
+	bind_notation(*command_map, "7", "vi_digit_argument");
+	bind_notation(*command_map, "8", "vi_digit_argument");
+	bind_notation(*command_map, "9", "vi_digit_argument");
+	bind_notation(*command_map, "d", "vi_delete_operator");
+	bind_notation(*command_map, "c", "vi_change_operator");
+	bind_notation(*command_map, "y", "vi_yank_operator");
+	bind_notation(*command_map, "x", "vi_delete_char");
+	bind_notation(*command_map, "s", "vi_substitute_char");
+	bind_notation(*command_map, "r", "vi_replace_char");
+	bind_notation(*command_map, "~", "vi_toggle_case");
+	bind_notation(*command_map, "D", "vi_delete_to_line_end");
+	bind_notation(*command_map, "C", "vi_change_to_line_end");
+	bind_notation(*command_map, "Y", "vi_yank_line");
+	bind_notation(*command_map, "p", "vi_put_after");
+	bind_notation(*command_map, "P", "vi_put_before");
+	bind_notation(*command_map, "i", "vi_insert_mode");
+	bind_notation(*command_map, "I", "vi_insert_at_line_start");
+	bind_notation(*command_map, "a", "vi_append");
+	bind_notation(*command_map, "A", "vi_append_at_line_end");
+	bind_notation(*command_map, "o", "vi_open_below");
+	bind_notation(*command_map, "O", "vi_open_above");
+	bind_notation(*command_map, "v", "vi_visual_mode");
+	bind_notation(*command_map, ".", "vi_repeat");
+	bind_notation(*command_map, "<Esc>", "vi_normal_reset");
 	bind_notation(*command_map, "u", "undo");
 	bind_notation(*command_map, "<C-r>", "redo");
-	bind_notation(*command_map, "<Left>", "backward_char");
-	bind_notation(*command_map, "<Right>", "forward_char");
 	bind_notation(*command_map, "<Home>", "beginning_of_line");
 	bind_notation(*command_map, "<End>", "end_of_line");
+
+	// --- vi_operator_pending: zle's `viopp` ---------------------------------
+	//
+	// OPAQUE, and that is the decision worth naming. Non-opaque would have let
+	// the motions fall through to vi_command for free - and would have let `p`
+	// and `i` fall through with them, so `dp` would paste and `di` would enter
+	// insert mode with a delete still pending. A map that is the whole vocabulary
+	// of what may follow an operator is what vi means by operator-pending, and it
+	// costs one call to the shared motion table.
+	keymap* pending_map = create("vi_operator_pending");
+	pending_map->indicator = "PENDING";
+	pending_map->opaque = true;
+	bind_vi_motions(*pending_map);
+	bind_vi_objects(*pending_map);
+	bind_notation(*pending_map, "0", "vi_digit_or_line_start");
+	bind_notation(*pending_map, "1", "vi_digit_argument");
+	bind_notation(*pending_map, "2", "vi_digit_argument");
+	bind_notation(*pending_map, "3", "vi_digit_argument");
+	bind_notation(*pending_map, "4", "vi_digit_argument");
+	bind_notation(*pending_map, "5", "vi_digit_argument");
+	bind_notation(*pending_map, "6", "vi_digit_argument");
+	bind_notation(*pending_map, "7", "vi_digit_argument");
+	bind_notation(*pending_map, "8", "vi_digit_argument");
+	bind_notation(*pending_map, "9", "vi_digit_argument");
+	// The doubled forms. All three name one action, which refuses a mismatched
+	// pair - `dc` is not `dd`, and vi says so.
+	bind_notation(*pending_map, "d", "vi_line_object");
+	bind_notation(*pending_map, "c", "vi_line_object");
+	bind_notation(*pending_map, "y", "vi_line_object");
+	bind_notation(*pending_map, "<Esc>", "vi_operator_abort");
+
+	// --- vi_visual ----------------------------------------------------------
+	//
+	// NOT opaque: the motions below it in vi_command move the head, and a
+	// selection whose head is the cursor follows for free (#96). What is bound
+	// here is only what visual mode means DIFFERENTLY - the verbs, which act on
+	// the region instead of starting an operator, and `o`, which flips it.
+	keymap* visual_map = create("vi_visual");
+	visual_map->indicator = "VISUAL";
+	bind_vi_objects(*visual_map);
+	bind_notation(*visual_map, "d", "vi_visual_delete");
+	bind_notation(*visual_map, "x", "vi_visual_delete");
+	bind_notation(*visual_map, "c", "vi_visual_change");
+	bind_notation(*visual_map, "s", "vi_visual_change");
+	bind_notation(*visual_map, "y", "vi_visual_yank");
+	bind_notation(*visual_map, "o", "vi_visual_swap_ends");
+	bind_notation(*visual_map, "v", "vi_visual_exit");
+	bind_notation(*visual_map, "<Esc>", "vi_visual_exit");
+
+	// --- The two one-shot maps ----------------------------------------------
+	//
+	// `f`, `F`, `t`, `T` and `r` all need the NEXT key as an argument rather than
+	// as a binding, and #117 already built the shape for it: an opaque keymap
+	// whose default action catches whatever arrives. No second input mode, no
+	// "read a character" call anywhere - the same machinery the completion pager
+	// uses to route unbound printables to its filter (F-29).
+	keymap* find_map = create("vi_find_char");
+	find_map->opaque = true;
+	find_map->default_action = "vi_find_char_target";
+
+	keymap* replace_map = create("vi_replace_char");
+	replace_map->opaque = true;
+	replace_map->default_action = "vi_replace_char_with";
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +774,10 @@ void keymap_registry::install_defaults() {
 
 editing_context::editing_context() {
 	register_builtin_actions(_actions);
+	// The vi repertoire, registered through the same ABI and by the same rule
+	// (#119). Its context is a member above, which is what gives the userdata
+	// pointer in every one of those registrations an owner (ADR-0007).
+	register_vi_actions(_actions, _vi.get());
 	_keymaps.install_defaults();
 }
 

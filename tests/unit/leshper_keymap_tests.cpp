@@ -266,12 +266,19 @@ TEST(LeshperKeymap, AKeymapIsDataAndACopyDivergesFromItsOriginal) {
 // The registry: the name is the identity (#117 decision 8).
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKeymapRegistry, TheDefaultsAreTheThreeTheTicketNames) {
+TEST(LeshperKeymapRegistry, TheDefaultsAreTheModesPlusVisSubModes) {
+	// Three when #118 wrote this, seven since #119 filled the vi repertoire in:
+	// the two vi MODES gained the four sub-modes they push - operator-pending,
+	// visual, and the two one-shot maps that catch the argument key of `f` and
+	// `r`. Every one of them is an ordinary keymap, which is the point: nothing
+	// in dispatch knows that four of these are pushed rather than swapped.
 	keymap_registry maps;
 	maps.install_defaults();
 	std::vector<std::string> names;
 	maps.names(names);
-	EXPECT_EQ(names, (std::vector<std::string>{"emacs", "vi_command", "vi_insert"}));
+	EXPECT_EQ(names, (std::vector<std::string>{"emacs", "vi_command", "vi_find_char",
+	                                           "vi_insert", "vi_operator_pending",
+	                                           "vi_replace_char", "vi_visual"}));
 }
 
 TEST(LeshperKeymapRegistry, TheEmacsDefaultsAreTheHardcodedTableMovedIn) {
@@ -910,7 +917,9 @@ TEST(LeshperKeymapBind, ListsTheKeymapsItHas) {
 	const console_guard guard{context_of(s)};
 	const bind_run ran = run_bind({"bind", "-l"});
 	EXPECT_EQ(ran.status, 0);
-	EXPECT_EQ(ran.output, "emacs\nvi_command\nvi_insert\n");
+	EXPECT_EQ(ran.output,
+	          "emacs\nvi_command\nvi_find_char\nvi_insert\nvi_operator_pending\n"
+	          "vi_replace_char\nvi_visual\n");
 }
 
 TEST(LeshperKeymapBind, BindsAndThenAnswersWhatItBound) {
@@ -930,7 +939,9 @@ TEST(LeshperKeymapBind, BindsAndThenAnswersWhatItBound) {
 	EXPECT_EQ(cursor_of(s), 7u);
 
 	// An unbound sequence prints nothing and answers 1, so it is a test.
-	const bind_run missing = run_bind({"bind", "<C-y>"});
+	// `<C-q>` rather than `<C-y>`: #119 gave `<C-y>` to `yank`, the emacs side of
+	// the one kill store.
+	const bind_run missing = run_bind({"bind", "<C-q>"});
 	EXPECT_EQ(missing.status, 1);
 	EXPECT_TRUE(missing.output.empty());
 }

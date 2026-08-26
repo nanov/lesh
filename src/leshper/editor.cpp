@@ -152,6 +152,14 @@ void invoke_action(state& current, std::string_view name, std::string_view keys,
 	// inserts and what the ABI documents `keys` to be. A named key contributes
 	// nothing: `<Up>` is not text.
 	encoded_keys_as_text(keys, how.keys);
+	// THE COUNT (#119), read and CLEARED before the call. An action that leaves
+	// a numeric argument behind (`lesh_numeric_argument_set` - vi's digits,
+	// emacs's `universal-argument`) is always setting the NEXT dispatch's and
+	// never re-reading its own, which is what makes `d2w` two dispatches that
+	// compose instead of one that has to remember.
+	how.numeric_argument = current.keymaps.pending_count;
+	how.has_numeric_argument = current.keymaps.has_pending_count;
+	current.keymaps.clear_count();
 
 	action_result ran = context.loop().invoke(current, name, how);
 	// A miss is a miss and not a crash (ADR-0008): a keymap naming an action
@@ -170,6 +178,88 @@ void invoke_action(state& current, std::string_view name, std::string_view keys,
 	}
 	out.insert(out.end(), std::make_move_iterator(ran.produced.begin()),
 	           std::make_move_iterator(ran.produced.end()));
+}
+
+// --- The count, the operator, and the record: dispatch's three hooks (#119) --
+
+// One dispatch, with everything that has to happen AROUND an action wrapped
+// where every caller gets it: `handle_key` and `keymap_expire` both come here.
+//
+// The three hooks, and what each of them is:
+//
+//   THE OPERATOR-PENDING CONSUMPTION (#117 decision 6, zle's `viopp` written
+//   down). A verb parked its name in `pending_operator` and pushed; the next
+//   key's action runs with the anchor dropped where the cursor was, so whatever
+//   it moves the cursor to IS the span; then the layer pops, the verb runs on
+//   the region, and the slot clears. The verb sees a selection and nothing else,
+//   which is why an operator and a visual-mode verb are the same action.
+//
+//   THE COUNT, handed to the action in its invocation and cleared (see
+//   invoke_action).
+//
+//   THE CHANGE RECORD, accumulated as keys and completed by a generation bump.
+//
+// Nothing here names vi. An operator slot no mode sets costs one comparison
+// against an empty string per keystroke; helix mode, which never sets it, pays
+// exactly that and gets the record for its own `.` for free.
+void run_binding(state& current, std::string_view name, std::string_view candidate,
+                 effects& out) {
+	change_replay& record = current.repeat;
+	if (record.in_progress.empty())
+		record.begin(current.keymaps.mode(), current.keymaps.layers.size());
+	encoded_keys_as_text(candidate, record.in_progress);
+	record.in_progress_typable =
+		record.in_progress_typable && encoded_keys_are_text(candidate);
+
+	const generation before = current.gen;
+	const std::size_t depth_before = current.keymaps.layers.size();
+	const bool operator_pending = !current.keymaps.pending_operator.empty();
+	if (operator_pending) {
+		// EXTEND SEMANTICS, and they are one line because #96 made them one: the
+		// anchor goes where the cursor is and the cursor is the head, so a motion
+		// that moves is a motion that selected. A text object overrides both ends
+		// and is no special case at all.
+		current.set_anchor(current.cursor);
+	}
+
+	invoke_action(current, name, candidate, out);
+
+	// Consume the pending operator unless the machine is still asking for input.
+	// Four ways it can be: the action cleared the slot (an abort, or a doubled
+	// form that did not match its verb), it pushed a layer (`f`, waiting for the
+	// character to find), it left a count behind (the `2` of `d2w`), or a prefix
+	// is being held.
+	const bool still_asking = current.keymaps.pending_operator.empty()
+	                       || current.keymaps.layers.size() > depth_before
+	                       || current.keymaps.has_pending_count
+	                       || current.keymaps.holding();
+	if (operator_pending && !still_asking) {
+		std::string verb;
+		verb.swap(current.keymaps.pending_operator);
+		current.keymaps.pop();   // the operator-pending layer the verb pushed
+		invoke_action(current, verb, {}, out);
+	}
+
+	// The record. A generation bump - and only that - completes a change (A-10
+	// makes the generation the one honest answer to "did the buffer move").
+	if (!(current.gen == before)) {
+		record.present = true;
+		record.keys.assign(record.in_progress);
+		record.mode.assign(record.started_in);
+		record.mode_changed = current.keymaps.mode() != record.started_in;
+		record.typable = record.in_progress_typable;
+		record.abandon();
+		return;
+	}
+	// No change, and nothing is waiting for more of this command: the sequence is
+	// over and was not a change, so it is forgotten rather than prefixed onto the
+	// next one.
+	const bool mid_command = current.keymaps.holding()
+	                      || !current.keymaps.pending_operator.empty()
+	                      || current.keymaps.has_pending_count
+	                      || current.keymaps.layers.size() > record.in_progress_depth;
+	if (!mid_command)
+		record.abandon();
 }
 
 void handle_key(state& current, const key_event& key,
@@ -196,7 +286,7 @@ void handle_key(state& current, const key_event& key,
 
 	current.keymaps.clear_hold();
 	if (what.what == resolution::kind::dispatch)
-		invoke_action(current, what.action, candidate, out);
+		run_binding(current, what.action, candidate, out);
 }
 
 void drain_pending(state& current, effects& out) {
@@ -325,7 +415,7 @@ effects keymap_expire(state& current, std::chrono::steady_clock::time_point now)
 	// recovery from a mistake.
 	const resolution what = resolve_expired_keys(context.keymaps(), current.keymaps, held);
 	if (what.what == resolution::kind::dispatch)
-		invoke_action(current, what.action, held, out);
+		run_binding(current, what.action, held, out);
 	return out;
 }
 
