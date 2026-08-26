@@ -2,6 +2,11 @@
 
 // The terminal, and the only file that touches it (#98, #129).
 //
+// THE HOST'S, AND IN `src/ui/` SINCE #168. A device is not something the editor
+// has an opinion about: leshper consumes events and emits a render buffer, and
+// the syscalls that turn one into the other live here, beside the loop that
+// makes them.
+//
 // #98's principle in one sentence: ALL tty interaction goes through the event
 // loop - `tcsetpgrp`, mode changes, winsize queries, the redraw itself - and a
 // tty syscall anywhere else is a defect. This file is where the loop keeps
@@ -91,7 +96,7 @@
 #include <termios.h>
 #include <sys/types.h>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // What a `tcsetpgrp` attempt meant. fish's four cases, plus the two errnos that
 // are about the descriptor rather than about the group.
@@ -334,4 +339,4 @@ int install_fatal_restore_handlers() noexcept;
 inline constexpr std::string_view kBracketedPasteOn = "\x1b[?2004h";
 inline constexpr std::string_view kBracketedPasteOff = "\x1b[?2004l";
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

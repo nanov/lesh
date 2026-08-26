@@ -161,8 +161,10 @@ out of. The order is
 names every dependency it uses rather than inheriting one: a layer violation is a
 link failure, not a review comment. Two rules are load-bearing and worth saying
 out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
-shapes; the ui layer fills them in over shell state), and `lesh_ui` is the ONE
-library that links both halves.
+shapes; the host fills them in over shell state), and `lesh_ui` is the ONE
+library that links both halves. The editor/host line runs between the last two:
+`loop`, `tty`, `workers` and `shell_actor` are `src/ui/` (#168), so nothing under
+`src/leshper/` holds a thread, a descriptor or a clock.
 _Avoid_: reaching for a symbol across a link the target does not declare; adding
 a dependency by relying on transitivity.
 
@@ -227,12 +229,14 @@ _Avoid_: front end, dialect.
 **UI** _[lesh]_:
 Two senses, and both are in use. The layer as a whole is everything an
 interactive shell has that `lesh -c` does not — leshper, prompts, rendering.
-`src/ui/` is the narrower thing: the GLUE. The session that runs an interactive
-shell to its end, and the shell-side adapters that answer the shapes leshper
-declares — `shell_state_knowledge` over shell state, `history_store_source` over
-the history file, the prompt and binding consoles in the other direction.
-leshper is the editor BENEATH it; leshnici the extension set ABOVE it. The shell
-proper is everything else.
+`src/ui/` is the narrower thing: the **host**. It owns the poll loop, the
+terminal, the timers, the workers, the shell handoff, and the session that runs
+an interactive shell to its end; it drives leshper by sending **events** and
+performing **effects**, and by nothing else. It also holds the shell-side
+adapters that answer the shapes leshper declares — `shell_state_knowledge` over
+shell state, `history_store_source` over the history file, the prompt and binding
+consoles in the other direction. leshper is the editor BENEATH it; leshnici the
+extension set ABOVE it. The shell proper is everything else.
 
 **Front end** _[retired]_:
 A word that carried three meanings at once and now carries none. What it
@@ -286,12 +290,14 @@ nothing to continue and answers the defect with a diagnostic.
 
 **leshper** _[lesh]_:
 lesh Prompt Editing & Reading — the shell's own line editor, the largest piece
-of the interactive layer and the one BENEATH `src/ui/`. Integrated: linked into
-the lesh binary, not shipped as a library anyone else builds against, and it
-never sees the shell — `lesh_leshper` does not link `lesh_runtime`, so it
-declares shapes that `src/ui/` fills in.
+of the interactive layer and the one BENEATH `src/ui/`. A pure editor:
+`step(state, event, now) -> effects`, with **no thread, fd, poll, timer or
+mailbox** anywhere in it, driven by a **host**. Integrated: linked into the lesh
+binary, not shipped as a library anyone else builds against, and it never sees
+the shell — `lesh_leshper` does not link `lesh_runtime`, so it declares shapes
+that `src/ui/` fills in.
 _Avoid_: LLE, the retired earlier name; the reader; readline; calling the
-session or its adapters "leshper" — those are `src/ui/`.
+session, the loop or the adapters "leshper" — those are `src/ui/`.
 
 **leshnici** _[lesh]_:
 The shipped extension set: what lesh ships on top of leshper but does not owe
@@ -369,11 +375,27 @@ A namespaced annotation anchored to buffer positions: a highlight span or
 virtual text. Survives edits. The one system highlighting and autosuggestions
 both render through.
 
+**Host** _[lesh]_:
+Whatever drives the editor — `src/ui/` in the shell, a fake in a test. It owns
+the loop, the terminal, the timers, the workers and the shell handoff, sends
+**events** in and performs the **effects** that come back. The editor never calls
+it and never reaches into it.
+_Avoid_: calling the host "leshper", or a driver "the editor".
+
+**Event** _[lesh]_:
+The only way into the editor: a closed variant the host constructs and hands to
+`step`. A key, a resize, a worker result, a job notice, injected input, a signal,
+a paste, a timer expiry. There is no side channel — an eighth kind of input has
+to be argued for by adding an alternative to the variant.
+
 **Effect** _[lesh]_:
-What one turn of the editor's state machine emits alongside the new state:
-render output and worker requests. Synchronous, owned by the loop.
+The only way out of the editor: what one turn of its state machine emits
+alongside the new state. A repaint, a worker request, a spawn, an armed or
+disarmed timer, and the three that end a line — accepted, cancelled, end of
+file. Synchronous, returned as a value, and carried out by the **host**.
 _Avoid_: using it for a reactor's output, which is a decoration or proposal
-arriving later as an event.
+arriving later as an event; a host reaching into the editor for something an
+effect should have carried.
 
 **Surface** _[lesh]_:
 The grid of styled cells leshper renders into. A blitter turns surfaces into
@@ -429,9 +451,11 @@ _Avoid_: reading shell state from any other thread; a definitions version or
 concurrent collection for it — one owner makes both unnecessary (ADR-0009).
 
 **Loop thread** _[lesh]_:
-leshper's spawned thread: owns editor state and the tty while editing, waits in
-`poll` on its topics, blocks across execution, and drops any shell-thread
-message whose generation is not current.
+The **host's** spawned thread — `src/ui/loop.cpp`, not leshper's (#168): owns
+editor state and the tty while editing, waits in `poll` on its topics, blocks
+across execution, and drops any shell-thread message whose generation is not
+current. That it is a thread at all is the host's private choice; the editor it
+drives is told nothing about it.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,

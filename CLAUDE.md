@@ -60,8 +60,12 @@ a script on a pipe, and nothing in it ever enters the line editor. Iterate with
 `./build/debug/lesh_tests --gtest_filter='Leshper*:Leshnici*'` (milliseconds),
 adding `:Grapheme*` when positions or width are involved. The full sanitized gate
 still runs once at merge; the exemption is from the sweeps, not the gate.
-**`src/ui/` is NOT exempt** - the session is the interactive path itself, and
-`LeshperPty` execs the real `lesh` binary, so a change there can move both.
+**`src/ui/` is NOT exempt** - the host is the interactive path itself, and
+`LeshperPty` execs the real `lesh` binary, so a change there can move both. Its
+suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiWorkers`, `UiKnowledge*`,
+`UiLoopProposals`), and the filter above deliberately leaves them out: `Leshper*`
+is the editor, `Ui*` is the host that drives it (#168). A `src/ui/` change runs
+`--gtest_filter='Ui*:Leshper*'` and then the sweeps.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered

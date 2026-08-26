@@ -3,13 +3,13 @@
 #include "leshper/abi.h"
 #include "leshper/complete.h"
 #include "leshper/keymap.h"
-#include "leshper/loop.h"
+#include "ui/loop.h"
 #include "leshper/prompt/prompt.h"
 #include "leshper/registry.h"
-#include "leshper/shell_actor.h"
+#include "ui/shell_actor.h"
 #include "ui/shell_state_knowledge.h"
-#include "leshper/tty.h"
-#include "leshper/workers.h"
+#include "ui/tty.h"
+#include "ui/workers.h"
 #include "runtime/builtins.h"
 #include "runtime/executor.h"
 #include "runtime/history_store.h"
@@ -324,7 +324,7 @@ void fill_wall_clock(prompt_facts& into) noexcept {
 // adapters all die together and in the reverse order they were built. Nothing
 // here is a global and nothing is leaked on any exit path, which is what lets
 // the leak gate expect zero.
-class session final : public leshper::shell_side {
+class session final : public shell_side {
 public:
 	session(runtime::shell_state& state, buffer_pool& pool, const provider_bundle& providers,
 	        int in, int out, prompt_extension_installer install_extensions);
@@ -398,8 +398,8 @@ private:
 	shell_state_knowledge _knowledge;
 	leshper::owned_highlighter _highlighter;
 	leshper::owned_autosuggester _autosuggester;
-	leshper::worker_pool _helpers;
-	leshper::signal_hub _signals;
+	worker_pool _helpers;
+	signal_hub _signals;
 	// DECLARED BEFORE THE LOOP, and for the actor's reason one line down: the
 	// registry the loop owns holds a borrowed pointer to this engine (see the
 	// constructor), and members die in reverse - so the loop, and the registry
@@ -411,8 +411,8 @@ private:
 	// channel the ACTOR owns (ADR-0007), so an actor destroyed first would have
 	// the loop locking a mutex whose storage had gone. Members die in reverse,
 	// so declaring it first is how the loop dies first.
-	leshper::shell_actor _actor;
-	leshper::event_loop _loop;
+	shell_actor _actor;
+	event_loop _loop;
 	std::optional<leshper_binding_console> _console;
 	std::optional<leshper_prompt_console> _prompt_console;
 
@@ -474,8 +474,8 @@ private:
 // The loop's options, built once. A function rather than an initializer list in
 // the member init, because half of it is environment reading and the ctor is
 // already long enough.
-leshper::loop_options options_for(const provider_bundle& providers, bool manage_terminal) {
-	leshper::loop_options options;
+loop_options options_for(const provider_bundle& providers, bool manage_terminal) {
+	loop_options options;
 	if (providers.prompt != nullptr) {
 		providers.prompt->left(options.prompt);
 		providers.prompt->continuation(options.continuation);
@@ -498,7 +498,7 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _knowledge(state, &_writing),
 	  _autosuggester(providers.history),
 	  _actor(*this, &_knowledge, &_writing),
-	  _loop(leshper::loop_fds{in, out}, options_for(providers, true)),
+	  _loop(loop_fds{in, out}, options_for(providers, true)),
 	  _completer(&_knowledge) {
 	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163),
 	// THROUGH A HOOK THIS LAYER CANNOT NAME ITSELF (#164).
@@ -534,7 +534,13 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	register_autosuggester(context.actions(), _autosuggester.get());
 	register_line_actions();
 	bind_line_keys();
-	context.loop().set_shell_knowledge(&_knowledge);
+	// WHAT THE SHELL KNOWS, LENT TO THE REGISTRY (#135, re-seated by #168). It
+	// used to be pushed in through `context.loop()`, which made the editor's fake
+	// host the route by which the real host told the editor about itself. It is a
+	// borrowed pointer on the registry now, on exactly the terms the two below it
+	// are: null is "no shell attached", and the owner outlives the registry.
+	// Phase B retires the field with the last leshper-side consumer.
+	context.actions().knowledge = &_knowledge;
 	// #94's `Completer` override point, filled (#139). The bundle's field wins
 	// when a caller supplied one - which is what makes it an override point and
 	// not a hard-wired provider - and the session's own trio is the default.
@@ -1008,7 +1014,7 @@ int session::run(std::string_view rc_path) {
 	// terminal and re-raise. From THE UI LAYER and not from the loop, because
 	// process-wide dispositions belong to whoever owns the process - and only
 	// where the disposition is still SIG_DFL, so ASan keeps its own.
-	leshper::install_fatal_restore_handlers();
+	install_fatal_restore_handlers();
 
 	// #101 decision 3: state, then rc, THEN the first read. The editing context
 	// and the binding console already exist - this object's constructor built

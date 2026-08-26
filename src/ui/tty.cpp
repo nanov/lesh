@@ -1,4 +1,4 @@
-#include "leshper/tty.h"
+#include "ui/tty.h"
 
 #include "substrate/log.h"
 
@@ -9,7 +9,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 namespace {
 
 // The armed exit restore (#98 decision 5).
@@ -368,4 +368,4 @@ void disarm_exit_restore() noexcept {
 
 bool exit_restore_armed() noexcept { return g_exit_restore.armed != 0; }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

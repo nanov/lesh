@@ -1,4 +1,4 @@
-#include "leshper/loop.h"
+#include "ui/loop.h"
 
 #include "leshper/keymap.h"
 #include "substrate/assert.h"
@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 namespace {
 
 // The pid this process started as, captured before any handler can run.
@@ -426,10 +426,7 @@ event_loop::~event_loop() {
 
 void event_loop::attach_helpers(worker_pool& pool) noexcept { _helpers = &pool; }
 
-void event_loop::attach_registry(registry& reg) noexcept {
-	_registry = &reg;
-	_dispatch.emplace(reg);
-}
+void event_loop::attach_registry(leshper::registry& reg) noexcept { _registry = &reg; }
 
 void event_loop::attach_shell(shell_actor& shell) noexcept { _shell = &shell; }
 
@@ -534,18 +531,26 @@ int event_loop::poll_timeout_ms() const noexcept {
 // The turn
 // ---------------------------------------------------------------------------
 
-turn_result event_loop::turn() { return turn(poll_timeout_ms()); }
+turn_result event_loop::turn() {
+	// THE REGISTRY'S QUEUE BEFORE THE DEADLINE (#168). A timer armed while this
+	// thread was parked - the prompt's tick, rearmed from the shell thread on its
+	// way out of a command - has to be in the table before the poll timeout is
+	// computed from it, or the wake it asked for waits on the next input instead.
+	drain_registry_effects();
+	return turn(poll_timeout_ms());
+}
 
 turn_result event_loop::turn(int timeout_ms) {
 	turn_result result;
 	_events.clear();
 	_needs_render = false;
+	drain_registry_effects();
 
 	// Anything a blocked wait deferred is delivered first, in the order it
 	// arrived: a resize that landed while a command ran has been waiting for the
 	// editor to exist again.
 	if (!_deferred.empty()) {
-		for (event& one : _deferred)
+		for (leshper::event& one : _deferred)
 			_events.push_back(std::move(one));
 		_deferred.clear();
 	}
@@ -587,7 +592,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	}
 	result.timed_out = ready == 0;
 
-	const input_instant now = clock::now();
+	const leshper::input_instant now = clock::now();
 
 	// TTY FIRST. fish's `readb` gives stdin explicit priority over its other two
 	// descriptors - "This gives priority to the foreground" - and the ordering
@@ -612,7 +617,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	if (shell_at >= 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0)
 		drain_shell_topic(result);
 
-	for (const event& one : _events) {
+	for (const leshper::event& one : _events) {
 		handle(one, result);
 		if (_exiting)
 			break;
@@ -627,7 +632,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	return result;
 }
 
-void event_loop::drain_tty(input_instant now, turn_result& result) {
+void event_loop::drain_tty(leshper::input_instant now, turn_result& result) {
 	++result.topics_drained;
 	_read_buffer.clear();
 
@@ -671,7 +676,7 @@ void event_loop::drain_tty(input_instant now, turn_result& result) {
 		_decoder.feed(_read_buffer, now, _events);
 
 	if (hangup) {
-		_events.push_back(signal_event{SIGHUP});
+		_events.push_back(leshper::signal_event{SIGHUP});
 		_exiting = true;
 	}
 }
@@ -695,63 +700,48 @@ void event_loop::drain_signal_topic(turn_result& result) {
 		// #128's trap 12: the counter was read BEFORE this ioctl.
 		_resizes_seen = resizes;
 		const terminal_size size = _terminal.size();
-		_events.push_back(resize_event{size.columns, size.rows});
+		_events.push_back(leshper::resize_event{size.columns, size.rows});
 	}
 
 	for (int signo : _signal_numbers) {
 		LESH_LOG(log::level::debug, log::category::loop, "topic=signal signo=%d", signo);
-		_events.push_back(signal_event{signo});
+		_events.push_back(leshper::signal_event{signo});
 	}
 }
 
-void event_loop::fire_timers(input_instant now, turn_result& result) {
-	if (_registry == nullptr || _registry->timers.empty()) {
-		_timers.clear();
+void event_loop::fire_timers(leshper::input_instant now, turn_result& result) {
+	// A timer can only be in the table because a registry produced the `arm_timer`
+	// that put it there, so the second half of this is an invariant rather than a
+	// case - written down because the log line below resolves a handle through it.
+	if (_timers.empty() || _registry == nullptr)
 		return;
-	}
-
-	// Arm anything the registry has that we have not seen, and forget anything
-	// it no longer has. The registry knows no clock, which is why the due
-	// instants live here and not beside the intervals.
-	for (const auto& armed : _registry->timers) {
-		const auto known = std::find_if(_timers.begin(), _timers.end(),
-		                                [&](const timer_due& d) { return d.id == armed.id; });
-		if (known == _timers.end())
-			_timers.push_back(timer_due{armed.id, now + std::chrono::milliseconds(armed.interval_ms)});
-	}
-	_timers.erase(std::remove_if(_timers.begin(), _timers.end(),
-	                             [&](const timer_due& d) {
-		                             return std::none_of(_registry->timers.begin(),
-		                                                 _registry->timers.end(),
-		                                                 [&](const auto& t) { return t.id == d.id; });
-	                             }),
-	              _timers.end());
 
 	for (timer_due& armed : _timers) {
 		if (armed.due > now)
 			continue;
-		const auto entry = std::find_if(_registry->timers.begin(), _registry->timers.end(),
-		                                [&](const auto& t) { return t.id == armed.id; });
-		if (entry == _registry->timers.end())
-			continue;
 		// Rearmed from NOW rather than from the missed due instant: a loop that
 		// was blocked in an execution for a minute must not then fire a
 		// one-second timer sixty times.
-		armed.due = now + std::chrono::milliseconds(entry->interval_ms);
+		armed.due = now + std::chrono::milliseconds(armed.interval_ms);
 		++result.topics_drained;
 		++_timer_dispatches;
-		LESH_LOG(log::level::debug, log::category::loop, "topic=timer id=%llu action=%s",
-		         static_cast<unsigned long long>(entry->id), entry->action.c_str());
-		if (_dispatch.has_value()) {
-			const action_result what = _dispatch->invoke(_state, entry->action, invocation{});
-			apply_outcome(what, result);
-			if (_exiting)
-				return;
-		}
+		// The name is resolved ONLY here, and `LESH_LOG` evaluates its arguments
+		// only when the category is on: an expiry that nobody is logging costs a
+		// due-instant comparison and an event push.
+		LESH_LOG(log::level::debug, log::category::loop, "topic=timer id=%llu action=%.*s",
+		         static_cast<unsigned long long>(armed.id),
+		         static_cast<int>(leshper::timer_action_name(*_registry, armed.action).size()),
+		         leshper::timer_action_name(*_registry, armed.action).data());
+		// AN EVENT, NOT A DISPATCH (#168). What the host knows is that a timer
+		// came due; which action that is and how to run it is the editor's, and
+		// `step` runs it through the same registry a keystroke reaches. The loop
+		// used to invoke it here, through a `loop_harness` of its own, which is
+		// how a timer expiry and a key came to run through two different objects.
+		_events.push_back(leshper::timer_fired{armed.id, armed.action});
 	}
 }
 
-void event_loop::take_batch(reactor_batch& answer) {
+void event_loop::take_batch(leshper::reactor_batch& answer) {
 	// THE DROP RULE lives in `apply_batch` (N-4, ADR-0008), which is the one
 	// applier both this and the harness path go through (#144). A batch computed
 	// against a generation the editor has moved past is not rejected so much as
@@ -797,16 +787,16 @@ void event_loop::drain_worker_topic(turn_result& result) {
 	for (completion& done : _completions) {
 		if (done.empty())
 			continue;
-		reactor_batch& answer = done.batch();
+		leshper::reactor_batch& answer = done.batch();
 		LESH_LOG(log::level::debug, log::category::event,
 		         "topic=worker reactor=%s gen=%llu status=%d", answer.reactor.c_str(),
 		         static_cast<unsigned long long>(answer.computed_against.value()),
 		         static_cast<int>(answer.status));
-		const generation at = answer.computed_against;
+		const leshper::generation at = answer.computed_against;
 		take_batch(answer);
 		// The editor sees the arrival too: `step` carries the same drop rule and
 		// emits the redraw, and the replay file records it (#109's `event`).
-		_events.push_back(worker_result{at});
+		_events.push_back(leshper::worker_result{at});
 	}
 	// Every message goes home the moment its batch has been taken.
 	_completions.clear();
@@ -833,7 +823,7 @@ void event_loop::handle_shell_message(shell_message& answer) {
 			         static_cast<unsigned long long>(answer.computed_against.value()),
 			         static_cast<int>(answer.status));
 			take_batch(answer.batch);
-			_events.push_back(worker_result{answer.computed_against});
+			_events.push_back(leshper::worker_result{answer.computed_against});
 			break;
 		case shell_message::kind::port_call_done:
 			// Nobody is waiting: the action that asked has already given up, or
@@ -855,15 +845,17 @@ void event_loop::handle_shell_message(shell_message& answer) {
 // One event
 // ---------------------------------------------------------------------------
 
-void event_loop::handle(const event& incoming, turn_result& result) {
+void event_loop::handle(const leshper::event& incoming, turn_result& result) {
 	// EVERYTHING BEFORE AND AFTER, so `selection_changed` can be fired by
 	// COMPARISON. #116 deliberately left the state emitting no events - it is a
 	// data structure - so noticing that a region moved is the loop's job, and
 	// doing it by comparison rather than by having every action remember to
 	// announce itself is what makes it impossible to forget.
-	const generation before_gen = _state.gen;
-	const position before_cursor = _state.cursor;
-	const position before_anchor = _state.selection_anchor();
+	leshper::effects interrupted;
+
+	const leshper::generation before_gen = _state.gen;
+	const leshper::position before_cursor = _state.cursor;
+	const leshper::position before_anchor = _state.selection_anchor();
 	const bool before_active = _state.selection_active();
 
 	// KEYBOARD INTERRUPT, BEFORE THE EDITOR SEES IT (#98 decision 2). Ctrl-C in
@@ -872,21 +864,26 @@ void event_loop::handle(const event& incoming, turn_result& result) {
 	// much: the entrance for a signal exists and the binding does not. The
 	// binding is HERE, by action name, so it is still the rebindable
 	// `cancel_line` of F-13 and not a hardcoded behaviour.
-	if (const auto* signal = std::get_if<signal_event>(&incoming);
+	if (const auto* signal = std::get_if<leshper::signal_event>(&incoming);
 	    signal != nullptr && signal->signal_number == SIGINT && !_options.interrupt_action.empty()) {
-		editing_context& context = context_of(_state);
-		const action_result what = context.loop().invoke(_state, _options.interrupt_action,
-		                                                 invocation{});
+		leshper::editing_context& context = context_of(_state);
+		leshper::action_result what =
+			context.loop().invoke(_state, _options.interrupt_action, leshper::invocation{});
 		if (what.status == LESH_ERR_NOTFOUND)
 			LESH_LOG(log::level::warn, log::category::dispatch,
 			         "no action registered for the interrupt: %s",
 			         _options.interrupt_action.c_str());
+		else
+			// Its effects are this turn's too: the interrupt action is the
+			// rebindable `cancel_line`, and what it asks for arrives the way every
+			// other request does now rather than through a latch (#168).
+			interrupted = std::move(what.produced);
 	}
 
 	// `step` logs the event itself, at #109's `event` category and into the
 	// replay file - the one event serialization, and the reason this loop does
 	// not write a second one for the events that reach the editor.
-	const effects produced = step(_state, incoming);
+	const leshper::effects produced = step(_state, incoming);
 
 	std::uint32_t kinds = 0;
 	if (!(_state.gen == before_gen))
@@ -900,40 +897,82 @@ void event_loop::handle(const event& incoming, turn_result& result) {
 	if (kinds != 0)
 		notify_reactors(kinds);
 
-	carry_out(produced, result);
-
-	// THE OUTCOME AN ACTION ASKED FOR, taken here (#134). Dispatch on the
-	// keystroke path happens inside `step`, which is a pure function over state
-	// and events and has nowhere to put a request to accept, cancel or exit - so
-	// the harness latches it and the loop, which is the only thing that can carry
-	// one out, takes it the moment the event is done. The timer path reads its
-	// outcome off `invoke`'s return value and never reaches this.
-	const loop_harness::requested_outcome asked = context_of(_state).loop().take_outcome();
-	if (asked.what != loop_outcome::none) {
-		action_result carried;
-		carried.outcome = asked.what;
-		carried.exit_status = asked.exit_status;
-		apply_outcome(carried, result);
-	}
+	// EVERYTHING THE TURN ASKED FOR, IN ORDER (#168). What an action requested -
+	// accept, cancel, exit - is an effect in this list now, so there is no second
+	// pass afterwards that reaches back into the editor for a latched outcome.
+	// Two verbs on one key still means the second one wins, because the effects
+	// are carried out in the order they were produced.
+	carry_out(interrupted);
+	carry_out(produced);
+	(void)result;
 }
 
-void event_loop::carry_out(const effects& produced, turn_result& result) {
-	for (const effect& one : produced) {
-		if (std::holds_alternative<render_request>(one)) {
+void event_loop::carry_out(const leshper::effects& produced) {
+	for (const leshper::effect& one : produced) {
+		if (std::holds_alternative<leshper::render_request>(one)) {
 			_needs_render = true;
-		} else if (std::holds_alternative<worker_request>(one)) {
+		} else if (std::holds_alternative<leshper::worker_request>(one)) {
 			// The fan-out already happened in `handle`, from the comparison -
 			// which is strictly more information than this effect carries, since
 			// it knows WHICH of the three kinds changed. Nothing to do.
-		} else if (const auto* spawn = std::get_if<spawn_request>(&one)) {
+		} else if (const auto* spawn = std::get_if<leshper::spawn_request>(&one)) {
 			// #92's lane 2. The implementation is the shell side's (#134 wires
 			// it); what the loop owes is not to silently drop it.
 			LESH_LOG(log::level::warn, log::category::spawn,
 			         "spawn_request with no spawner attached: %s",
 			         spawn->argv.empty() ? "" : spawn->argv.front().c_str());
+		} else if (std::holds_alternative<leshper::line_accepted>(one)) {
+			accept_current_line();
+		} else if (std::holds_alternative<leshper::line_cancelled>(one)) {
+			// #98 decision 2: discard the buffer, paint the indicator, fresh
+			// prompt. `$?` = 130 and the user's INT trap are the SHELL's, and
+			// `finish_cancelled_line` is how they are asked for - the loop still
+			// does not own exit statuses, it owns the handoff.
+			if (_options.manage_terminal || _fds.output >= 0)
+				write_all(_fds.output, "^C\r\n");
+			apply_edit(_state, leshper::position{}, _state.buffer.end_position(), "");
+			_state.undo.break_coalescing();
+			// The same rule accept follows, on both halves of what was applied.
+			_state.marks.clear();
+			_state.proposals.clear();
+			_have_previous = false;
+			_needs_render = true;
+			finish_cancelled_line();
+		} else if (const auto* eof = std::get_if<leshper::end_of_file>(&one)) {
+			_exiting = true;
+			_exit_status = eof->status;
+		} else if (std::holds_alternative<leshper::recursive_edit_request>(one)) {
+			// F-18's recovery shape. Nothing in v1 nests reads, and inventing
+			// half of it here would be building the thing its ticket must.
+			LESH_LOG(log::level::warn, log::category::dispatch,
+			         "recursive_edit requested; not implemented in v1");
+		} else if (const auto* arm = std::get_if<leshper::arm_timer>(&one)) {
+			// Re-arming an id that is already here is not a thing the registry
+			// can produce - ids are minted once and never reused - so this is an
+			// append, and the due instant is put on at the moment the host hears
+			// about it.
+			_timers.push_back(timer_due{arm->id, arm->interval_ms, arm->action,
+			                            clock::now() + std::chrono::milliseconds(arm->interval_ms)});
+		} else if (const auto* disarm = std::get_if<leshper::disarm_timer>(&one)) {
+			_timers.erase(std::remove_if(_timers.begin(), _timers.end(),
+			                             [&](const timer_due& armed) {
+				                             return armed.id == disarm->id;
+			                             }),
+			              _timers.end());
 		}
 	}
-	(void)result;
+}
+
+void event_loop::drain_registry_effects() {
+	if (_registry == nullptr || _registry->pending.empty())
+		return;
+	// SWAPPED OUT FIRST, then carried: an effect that arms a timer while this
+	// runs would otherwise be walked by the loop that is draining the queue it
+	// was appended to. The member keeps its capacity, which is what N-2 asks of
+	// everything a turn touches.
+	_carried.clear();
+	_carried.swap(_registry->pending);
+	carry_out(_carried);
 }
 
 void event_loop::notify_reactors(std::uint32_t kinds) {
@@ -965,45 +1004,6 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 	}
 }
 
-void event_loop::apply_outcome(const action_result& what, turn_result& result) {
-	switch (what.outcome) {
-		case loop_outcome::none:
-			break;
-		case loop_outcome::accept_line:
-			accept_current_line();
-			break;
-		case loop_outcome::cancel_line:
-			// #98 decision 2: discard the buffer, paint the indicator, fresh
-			// prompt. `$?` = 130 and the user's INT trap are the SHELL's, and
-			// `finish_cancelled_line` is how they are asked for - the loop still
-			// does not own exit statuses, it owns the handoff.
-			if (_options.manage_terminal || _fds.output >= 0)
-				write_all(_fds.output, "^C\r\n");
-			apply_edit(_state, position{}, _state.buffer.end_position(), "");
-			_state.undo.break_coalescing();
-			// The same rule accept follows, on both halves of what was applied.
-			_state.marks.clear();
-			_state.proposals.clear();
-			_have_previous = false;
-			_needs_render = true;
-			finish_cancelled_line();
-			break;
-		case loop_outcome::exit:
-			_exiting = true;
-			_exit_status = what.exit_status;
-			break;
-		case loop_outcome::recursive_edit:
-			// F-18's recovery shape. Nothing in v1 nests reads, and inventing
-			// half of it here would be building the thing its ticket must.
-			LESH_LOG(log::level::warn, log::category::dispatch,
-			         "recursive_edit requested; not implemented in v1");
-			break;
-	}
-	if (what.buffer_changed || what.cursor_moved)
-		_needs_render = true;
-	(void)result;
-}
-
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -1015,7 +1015,7 @@ void event_loop::render() {
 		return;
 	}
 
-	layout_input in = input_for(_state, _options.prompt, _options.continuation);
+	leshper::layout_input in = input_for(_state, _options.prompt, _options.continuation);
 	in.width = _options.width;
 	in.prompt_pen = _options.prompt_pen;
 	in.text_pen = _options.text_pen;
@@ -1030,7 +1030,7 @@ void event_loop::render() {
 		in.theme = &_theme;
 	}
 
-	layout desired = lay_out(_pool, in);
+	leshper::layout desired = lay_out(_pool, in);
 
 	_out.clear();
 	if (_have_previous && can_diff(_previous, desired))
@@ -1109,7 +1109,7 @@ void event_loop::assert_quiesced() const noexcept {
 
 std::optional<std::int32_t> event_loop::accept_current_line() {
 	_accepted.assign(_state.buffer.text());
-	const generation at = _state.gen;
+	const leshper::generation at = _state.gen;
 
 	// The cursor is left wherever the layout put it; the command's output has to
 	// start on a fresh row below the edit line (F-39 scrolls output above the
@@ -1163,7 +1163,7 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	// A fresh line: the accepted text is gone, and it is gone as ONE edit so
 	// that undo does not walk back into a command that has already run.
 	if (!_state.buffer.text().empty()) {
-		apply_edit(_state, position{}, _state.buffer.end_position(), "");
+		apply_edit(_state, leshper::position{}, _state.buffer.end_position(), "");
 		_state.undo.break_coalescing();
 	}
 	_needs_render = true;
@@ -1250,7 +1250,7 @@ std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
 			// read entry, which re-queries unconditionally - which is what makes
 			// a missed resize structurally impossible rather than handled.
 			for (int signo : _signal_numbers)
-				_deferred.push_back(signal_event{signo});
+				_deferred.push_back(leshper::signal_event{signo});
 		}
 
 		if (ready > 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0) {
@@ -1344,4 +1344,4 @@ void event_loop::stop() {
 
 bool event_loop::running() const noexcept { return _thread.joinable(); }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

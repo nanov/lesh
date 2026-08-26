@@ -4,6 +4,11 @@
 // pool that parks at accept (#126; the resolutions of #90 and #91; architecture
 // spec §5).
 //
+// THE HOST'S, AND IN `src/ui/` SINCE #168. Where a reactor runs is the host's
+// private choice - threads today, #145's fibers tomorrow - and leshper is not
+// told either way: it emits `worker_request` and applies whatever comes back
+// that is still current.
+//
 // WHAT IS HERE AND WHAT IS NOT. This is the pool only. The event loop is
 // #128's and is not written; posix_spawn of user providers is #94's; no reactor
 // exists yet. The one place this file reaches toward the loop is
@@ -73,7 +78,7 @@
 #include <thread>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // ---------------------------------------------------------------------------
 // The snapshot a request is computed against.
@@ -89,7 +94,7 @@ struct request_snapshot {
 	std::size_t selection_start = 0;
 	std::size_t selection_end = 0;
 	bool selection_active = false;
-	generation computed_against;
+	leshper::generation computed_against;
 	std::uint32_t event_kind = 0;
 
 	// What the shell knows (#135), for the reactor that asks - today only the
@@ -108,14 +113,14 @@ struct request_snapshot {
 	// `$PATH` is the process environment's. A submit that leaves it null is
 	// therefore honest rather than broken, and is what every state-free reactor
 	// does.
-	const shell_knowledge* knowledge = nullptr;
+	const leshper::shell_knowledge* knowledge = nullptr;
 };
 
 // The snapshot of an editor state, as the loop would take it.
 //
 // Selection reads as inactive because #96 has not landed the model; the fields
 // exist so that filling them in later is a change here and nowhere else.
-[[nodiscard]] request_snapshot snapshot_of(const state& target, std::uint32_t event_kind);
+[[nodiscard]] request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind);
 
 // ---------------------------------------------------------------------------
 // Pooled messages.
@@ -140,19 +145,19 @@ public:
 
 	[[nodiscard]] bool empty() const noexcept { return _batch == nullptr; }
 
-	[[nodiscard]] const reactor_batch& batch() const noexcept { return *_batch; }
-	[[nodiscard]] reactor_batch& batch() noexcept { return *_batch; }
+	[[nodiscard]] const leshper::reactor_batch& batch() const noexcept { return *_batch; }
+	[[nodiscard]] leshper::reactor_batch& batch() noexcept { return *_batch; }
 
 	// Hands the message back early. Idempotent.
 	void recycle() noexcept;
 
 private:
 	friend class message_pool;
-	completion(message_pool* owner, reactor_batch* batch) noexcept
+	completion(message_pool* owner, leshper::reactor_batch* batch) noexcept
 		: _owner(owner), _batch(batch) {}
 
 	message_pool* _owner = nullptr;
-	reactor_batch* _batch = nullptr;
+	leshper::reactor_batch* _batch = nullptr;
 };
 
 // The free list behind those messages.
@@ -169,7 +174,7 @@ public:
 	message_pool& operator=(const message_pool&) = delete;
 
 	[[nodiscard]] completion acquire();
-	void release(reactor_batch* batch) noexcept;
+	void release(leshper::reactor_batch* batch) noexcept;
 
 	// Messages currently out on loan.
 	[[nodiscard]] std::size_t live() const noexcept;
@@ -179,8 +184,8 @@ public:
 
 private:
 	mutable std::mutex _mutex;
-	std::vector<std::unique_ptr<reactor_batch>> _owned;
-	std::vector<reactor_batch*> _free;
+	std::vector<std::unique_ptr<leshper::reactor_batch>> _owned;
+	std::vector<leshper::reactor_batch*> _free;
 	std::size_t _live = 0;
 };
 
@@ -341,7 +346,7 @@ private:
 	void run(worker& me);
 	// `job` is consumed: the snapshot's buffer moves into the token rather than
 	// being copied a second time on the worker.
-	void compute(task& job, slot& owner, reactor_batch& into);
+	void compute(task& job, slot& owner, leshper::reactor_batch& into);
 
 	mutable std::mutex _mutex;
 	std::condition_variable _work;     // a worker waits here for something to do
@@ -393,4 +398,4 @@ private:
 // ABI never sees it - ADR-0006 hands no arena pointer across that boundary.
 [[nodiscard]] buffer_pool* current_worker_arena() noexcept;
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

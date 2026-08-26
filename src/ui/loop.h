@@ -3,6 +3,14 @@
 // The event loop: `poll(2)`, five topics, and quiesce (#129; #128's resolution;
 // architecture spec §4 and §4.1; ADR-0009).
 //
+// THE HOST'S, AND IN `src/ui/` SINCE #168. This file drives leshper; it is not
+// part of it. The editor is `step(state, event, now) -> effects` and knows no
+// thread, fd, poll, timer or mailbox; everything on this side of that sentence -
+// the loop, the tty, the workers, the timers, the shell handoff - is the host,
+// which sends events in and performs the effects that come back. `lesh_ui` links
+// both `lesh_leshper` and `lesh_runtime`, so the arrow that used to be a rule
+// about includes is now a rule about which target a file is compiled into.
+//
 // ONE BACKEND, AND NO SEAM FOR A SECOND. `poll(2)`, POSIX, one file. #115
 // measured wake-to-callback at 1.8-2.4 us on every backend with the run-to-run
 // spread wider than the backend spread, so what was left to decide was not
@@ -68,11 +76,11 @@
 #include "leshper/editor.h"
 #include "leshper/layout.h"
 #include "leshper/registry.h"
-#include "leshper/shell_actor.h"
+#include "ui/shell_actor.h"
 #include "leshper/state.h"
 #include "leshper/surface.h"
-#include "leshper/tty.h"
-#include "leshper/workers.h"
+#include "ui/tty.h"
+#include "ui/workers.h"
 #include "substrate/grapheme.h"
 
 #include <array>
@@ -88,7 +96,7 @@
 #include <thread>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // ---------------------------------------------------------------------------
 // The signal topic.
@@ -107,7 +115,7 @@ inline constexpr int kMaxTrackedSignal = 32;
 // DELIVERY IS PINNED TO THE SHELL THREAD, and this is the whole mechanism (#142).
 // A process-directed signal is delivered to any one thread that does not block
 // it, so before this existed a Ctrl-C could land on the loop thread, on a helper,
-// or on main, chosen by the kernel afresh each time. Every thread leshper spawns
+// or on main, chosen by the kernel afresh each time. Every thread the host spawns
 // calls this first thing in its body; main does not, so main is the one thread
 // left unblocked and the handler runs there - which is where it ran before
 // leshper existed at all.
@@ -367,11 +375,11 @@ struct loop_options {
 	std::string prompt = "$ ";
 	std::string continuation;
 
-	std::chrono::milliseconds escape_timeout = default_escape_timeout;
-	terminal_capabilities capabilities = terminal_capabilities::floor();
+	std::chrono::milliseconds escape_timeout = leshper::default_escape_timeout;
+	leshper::terminal_capabilities capabilities = leshper::terminal_capabilities::floor();
 	grapheme::width_policy width{};
-	style prompt_pen{};
-	style text_pen{};
+	leshper::style prompt_pen{};
+	leshper::style text_pen{};
 
 	// The reactor routed to the SHELL thread rather than to the helper pool
 	// (ADR-0009: the highlighter reads shell state, and shell state has one
@@ -425,8 +433,8 @@ public:
 
 	// THE EDITOR STATE, owned here. ADR-0009: the loop thread owns it, and
 	// nothing else may touch it while the loop is running.
-	[[nodiscard]] state& editor() noexcept { return _state; }
-	[[nodiscard]] const state& editor() const noexcept { return _state; }
+	[[nodiscard]] leshper::state& editor() noexcept { return _state; }
+	[[nodiscard]] const leshper::state& editor() const noexcept { return _state; }
 
 	[[nodiscard]] const loop_options& options() const noexcept { return _options; }
 	[[nodiscard]] loop_options& options() noexcept { return _options; }
@@ -444,7 +452,7 @@ public:
 	[[nodiscard]] signal_hub& signals() noexcept { return *_signals; }
 
 	void attach_helpers(worker_pool& pool) noexcept;
-	void attach_registry(registry& reg) noexcept;
+	void attach_registry(leshper::registry& reg) noexcept;
 	void attach_shell(shell_actor& shell) noexcept;
 	void attach_signals(signal_hub& hub) noexcept;
 
@@ -559,7 +567,7 @@ public:
 	void render();
 	// Forgets `previous`, so the next render repaints everything.
 	void invalidate() noexcept { _have_previous = false; }
-	[[nodiscard]] const layout& last_layout() const noexcept { return _previous; }
+	[[nodiscard]] const leshper::layout& last_layout() const noexcept { return _previous; }
 	// The bytes the last render wrote - what a test asserts instead of a screen.
 	[[nodiscard]] std::string_view last_output() const noexcept { return _out; }
 
@@ -583,17 +591,23 @@ public:
 private:
 	using clock = std::chrono::steady_clock;
 
-	void drain_tty(input_instant now, turn_result& result);
+	void drain_tty(leshper::input_instant now, turn_result& result);
 	void drain_signal_topic(turn_result& result);
 	void drain_worker_topic(turn_result& result);
 	void drain_shell_topic(turn_result& result);
-	void fire_timers(input_instant now, turn_result& result);
+	void fire_timers(leshper::input_instant now, turn_result& result);
 
-	void handle(const event& incoming, turn_result& result);
-	void carry_out(const effects& produced, turn_result& result);
+	void handle(const leshper::event& incoming, turn_result& result);
+	// Everything a turn's effects ask for, and the ONE place any of it happens
+	// (#168): the repaint flag, the timer table, and the line outcomes that used
+	// to be pulled off the editor as a latch.
+	void carry_out(const leshper::effects& produced);
+	// The effects an ABI verb queued on the registry with no dispatch to return
+	// them through - `lesh_timer_start` from the wiring site is the whole of it
+	// today. Taken on the loop thread, at the top of a turn.
+	void drain_registry_effects();
 	void notify_reactors(std::uint32_t kinds);
-	void take_batch(reactor_batch& answer);
-	void apply_outcome(const action_result& what, turn_result& result);
+	void take_batch(leshper::reactor_batch& answer);
 	// Blocks in poll on the `shell` and `signal` topics only, until a message of
 	// `until` (and, for a port call, of `sequence`) arrives.
 	std::optional<std::int32_t> wait_on_shell(shell_message::kind until,
@@ -604,12 +618,12 @@ private:
 	loop_fds _fds;
 	loop_options _options;
 
-	state _state;
+	leshper::state _state;
 	terminal _terminal;
-	input_decoder _decoder;
-	cluster_pool _pool;
-	blitter _blitter;
-	layout _previous;
+	leshper::input_decoder _decoder;
+	leshper::cluster_pool _pool;
+	leshper::blitter _blitter;
+	leshper::layout _previous;
 	bool _have_previous = false;
 
 	// What a span's interned semantic id looks like (#124, #141). Held by the
@@ -618,34 +632,48 @@ private:
 	// state must not fork it nor N-3's equality compare it. Refreshed from the
 	// registry's intern table on the render path, where it costs a size
 	// comparison once the names have stopped arriving.
-	style_table _theme;
+	leshper::style_table _theme;
 
 	worker_pool* _helpers = nullptr;
-	registry* _registry = nullptr;
+	leshper::registry* _registry = nullptr;
 	shell_actor* _shell = nullptr;
 	signal_hub* _signals = nullptr;
-	// Minted when a registry is attached: the loop's own dispatch of an action
-	// by name, which is what a timer expiry needs.
-	std::optional<loop_harness> _dispatch;
+	// THE LOOP HAS NO DISPATCHER OF ITS OWN any more (#168). `_dispatch` was a
+	// second `loop_harness`, minted at `attach_registry`, and it existed for one
+	// caller: a timer expiry, which the loop invoked by name itself. A timer is an
+	// event now (`timer_fired`), `step` dispatches it through the state's own
+	// context, and the last place where two harnesses could disagree about what
+	// had been applied (#144) is gone with it.
 	// Set when this loop constructed its own hub, which is the ordinary case;
 	// an attached one belongs to the caller.
 	std::optional<signal_hub> _own_signals;
 
 	// --- Reused storage. Every one of these is why a warm turn allocates. ---
 	std::string _read_buffer;
-	std::vector<event> _events;
-	std::vector<event> _deferred;      // signals that arrived while executing
+	std::vector<leshper::event> _events;
+	std::vector<leshper::event> _deferred;      // signals that arrived while executing
 	std::vector<int> _signal_numbers;
 	std::vector<completion> _completions;
 	std::vector<shell_message> _inbox;
 	std::string _out;
 	std::string _accepted;
+	leshper::effects _carried;         // what the registry queued, taken per turn
 	std::array<struct pollfd, static_cast<std::size_t>(topic::count_)> _poll{};
 
-	// One armed timer's next due instant, kept beside the registry's table
-	// because the registry knows no clock.
+	// One armed timer, WHOLE (#168). The declaration - the action's name and the
+	// interval - used to live in the registry and the due instant here, so arming
+	// was the loop diffing two tables on every turn and neither side owned a
+	// timer. The host owns them now: an `arm_timer` effect puts one here, a
+	// `disarm_timer` takes it away, and the registry keeps nothing but the id.
+	//
+	// The action is the registry's INTERNED HANDLE and not its name, for the
+	// reason the effect that delivered it carries one: nothing on the expiry path
+	// allocates, and the driver has no use for the text except in a log line,
+	// where it resolves it (`fire_timers`).
 	struct timer_due {
 		std::uint64_t id = 0;
+		std::uint64_t interval_ms = 0;
+		std::uint32_t action = 0;
 		clock::time_point due{};
 	};
 	std::vector<timer_due> _timers;
@@ -663,4 +691,4 @@ private:
 	std::thread _thread;
 };
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

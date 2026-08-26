@@ -134,23 +134,55 @@ struct lesh_registry {
 	std::map<std::string, action_entry, std::less<>> actions;
 	std::map<std::string, reactor_entry, std::less<>> reactors;
 
-	// An armed timer (#128 decision 3, #129's `timer` topic).
+	// THE TIMER TABLE IS THE HOST'S NOW (#168). What was here was a declaration -
+	// `{id, interval_ms, action}` - which the driver walked on every turn to diff
+	// against its own list of due instants, so each side held half a scheduler and
+	// the arming was a table comparison rather than news. `lesh_timer_start` and
+	// `lesh_timer_stop` emit `arm_timer`/`disarm_timer` effects instead, and
+	// `{id, action, interval, due}` lives whole in the host.
 	//
-	// The INTERVAL lives here and the next DUE INSTANT does not: the registry
-	// has never heard of a clock, and the loop that polls is the only thing that
-	// knows what "now" is. So the loop keeps a due instant beside each id and
-	// this table stays the declaration rather than the schedule.
-	struct timer_entry {
-		std::uint64_t id = 0;
-		std::uint64_t interval_ms = 0;
-		std::string action;
-	};
-
-	// A vector rather than a map: a session has a handful of timers, they are
-	// walked in full on every turn to find the minimum deadline, and a walk is
-	// what a vector is for.
-	std::vector<timer_entry> timers;
+	// TWO THINGS STAY, and neither is a schedule. The id counter, because minting
+	// ids is what hands the caller its handle; and the ids currently armed,
+	// because the ABI promises that stopping a timer twice is LESH_ERR_NOTFOUND -
+	// an id the caller has lost track of may now be somebody else's - and an
+	// answer no side of the boundary can give is a promise that cannot be kept.
+	// No interval, no action name, no clock.
+	std::vector<std::uint64_t> armed_timers;
 	std::uint64_t next_timer_id = 0;
+
+	// The action names those timers name, interned (#168).
+	//
+	// THERE IS A TABLE AT ALL because an effect and an event must be trivially
+	// copyable - they are values on the channel between the editor and its host,
+	// and a `std::string` in one is a heap allocation per arm and another per
+	// expiry, which on a `{time}` prompt is one per second forever.
+	//
+	// THE HANDLE IS THE INDEX, not a pointer and not a view: a
+	// `std::vector<std::string>` MOVES its elements when it grows, so a view into
+	// one is stable only until the next arm, while an index into one is stable for
+	// the registry's life. (`styles` above is interned the same way, for the same
+	// reason.)
+	//
+	// The name is still resolved at DISPATCH and not here: a timer armed before
+	// its action is registered is legal, and re-registering the action replaces
+	// what the timer runs. Interning fixes the allocation without touching that.
+	std::vector<std::string> timer_actions;
+
+	// Effects an ABI verb produced with no action dispatch to hang them on
+	// (#168), drained by the host on its next turn.
+	//
+	// THE VERBS THAT NEED IT TAKE A REGISTRY AND NOT AN EDITOR. `lesh_timer_start`
+	// is called from the wiring site - the prompt arms its own tick from
+	// `src/ui/session.cpp`, outside any dispatch - so there is no `action_result`
+	// in scope to return an effect through. A queue on the object the verb was
+	// handed is the smallest thing that reaches the driver, and it keeps the ABI
+	// signature frozen (abi.h grows additively or not at all).
+	//
+	// LOOP-THREAD-ORDERED, not synchronised, exactly as the timer table it
+	// replaces was: the shell thread touches this only while the driver is parked
+	// in `wait_on_shell`, which is ADR-0008's "the registry is the loop's" holding
+	// rather than being bent.
+	lesh::leshper::effects pending;
 
 	// Interned style names. Index 0 is LESH_STYLE_NONE and is never a name.
 	std::vector<std::string> styles{std::string{}};
@@ -169,6 +201,21 @@ struct lesh_registry {
 	// Whoever set it owns it and must outlive the registry (ADR-0007: the owner
 	// takes the view away as it takes the object).
 	const lesh::leshper::completer* completion = nullptr;
+
+	// What the shell knows (#135), for the tokens this registry's reactors are
+	// minted against.
+	//
+	// A BORROWED POINTER ON THE REGISTRY, beside `completion` and for the same
+	// reason (#168): it was reached through `editing_context::loop()` and pushed
+	// in with a setter on `loop_harness`, which made the fake host the route by
+	// which a real shell told the editor about itself. The registry is where a
+	// borrowed provider hangs, and the wiring site fills this in the same line it
+	// fills the other two. Null is "no shell attached" and is not an error.
+	//
+	// PHASE B REMOVES IT. `shell_knowledge` has consumers inside leshper only
+	// until the highlighter, the autosuggester and the completion sources move to
+	// `src/ui/` (#168 Phase B); the field goes with the last of them.
+	const lesh::leshper::shell_knowledge* knowledge = nullptr;
 
 	// The prompt engine the `lesh_prompt_*` verbs configure (#157, §6.10).
 	//
@@ -378,6 +425,17 @@ struct reactor_batch {
 // function rather than a member because there is exactly ONE of it (#144).
 // ---------------------------------------------------------------------------
 
+// Interns an action name for a timer effect, answering the handle (#168).
+//
+// Deduplicated, so arming the same name twice is the same handle and the table is
+// bounded by the distinct names ever armed rather than by how often a cadence
+// changed. The allocation is here, at arm time, and nowhere on the expiry path.
+std::uint32_t intern_timer_action(registry& reg, std::string_view name);
+
+// The name behind a handle; empty for a handle this registry never minted.
+[[nodiscard]] std::string_view timer_action_name(const registry& reg,
+                                                 std::uint32_t handle) noexcept;
+
 // Applies a batch, if and only if it was computed against the generation the
 // editor is still at. Answers whether it was applied.
 //
@@ -433,52 +491,31 @@ public:
 	// on; called by a test from inside a reactor to watch the poll notice.
 	void supersede() noexcept { _superseded.store(true, std::memory_order_relaxed); }
 
-	// The loop outcome the last dispatched action REQUESTED, latched here and
-	// taken by the loop (#134).
-	//
-	// WHY A LATCH AND NOT THE RETURN VALUE. `invoke` answers with the whole
-	// `action_result`, and the loop's own dispatch - a timer expiry - reads the
-	// outcome straight off it. The KEYSTROKE path does not: a key goes through
-	// editor.cpp's `step`, which is a pure function of state and events and has
-	// no loop to hand an outcome to, so before this existed `accept_line`,
-	// `cancel_line` and `exit` requested from a bound key went nowhere at all.
-	// The harness is the one object both paths already share, so it holds the
-	// request until the loop takes it after `step` returns.
-	//
-	// LAST WINS within one turn. A turn that dispatched two actions asking for
-	// two different outcomes is a keymap that bound two verbs to one key, and
-	// the second is the one that ran.
-	struct requested_outcome {
-		loop_outcome what = loop_outcome::none;
-		std::int32_t exit_status = 0;
-	};
-
-	[[nodiscard]] requested_outcome take_outcome() noexcept {
-		const requested_outcome taken = _requested;
-		_requested = requested_outcome{};
-		return taken;
-	}
+	// THE OUTCOME LATCH IS GONE (#168). `take_outcome` parked what an action had
+	// asked for - accept, cancel, exit, recursive edit - and the driver pulled it
+	// off this object after `step` returned, because `step` answers with effects
+	// and a latch was the only way an outcome could ride out of the keystroke
+	// path. It rides out as an EFFECT now: `invoke` pushes `line_accepted`,
+	// `line_cancelled`, `end_of_file` or `recursive_edit_request` onto
+	// `action_result::produced`, `invoke_action` folds that into what `step`
+	// returns, and the driver carries it out with every other effect. Same "last
+	// wins" for two verbs on one key, now because effects are carried out in
+	// order rather than because a slot was overwritten.
 
 	// The handle the last invoke used. Exposed so a test can hold what an action
 	// would have stashed and see that it went dead, without a death test having
 	// to be the only evidence that handle validity is enforced.
 	[[nodiscard]] const editor_handle* handle() const noexcept { return &_handle; }
 
-	// The shell's tables, put on every token this mints (#135). Null - the
-	// default - is "no shell attached"; see the field on the token. `knowledge`
-	// must outlive this harness.
-	void set_shell_knowledge(const shell_knowledge* knowledge) noexcept {
-		_knowledge = knowledge;
-	}
-
-
+	// THE SHELL'S TABLES ARE THE REGISTRY'S (#168). `set_shell_knowledge` was here,
+	// which made a setter on the fake host the way a real shell told the editor
+	// where its own tables were; the pointer hangs off `registry::knowledge` now,
+	// beside `completion` and `prompt_engine`, and `react` reads it from there.
 
 private:
 	registry* _registry;
 	editor_handle _handle;
 	std::atomic<bool> _superseded{false};
-	const shell_knowledge* _knowledge = nullptr;
-	requested_outcome _requested;
 };
 
 // True when the handle is one a call is currently allowed to use. The predicate

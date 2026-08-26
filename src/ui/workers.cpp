@@ -1,10 +1,10 @@
-#include "leshper/workers.h"
+#include "ui/workers.h"
 
 // FOR THE SIGNAL MASK ONLY (#142). `block_caught_signals_on_this_thread` is
 // declared with the hub whose caught set it names, and a helper thread has to
 // call it before it does anything else. `loop.h` includes this header and not
 // the other way round, so there is no cycle.
-#include "leshper/loop.h"
+#include "ui/loop.h"
 #include "substrate/assert.h"
 #include "substrate/log.h"
 
@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 namespace {
 
@@ -42,7 +42,7 @@ std::uint64_t worker_thread_key() noexcept {
 
 buffer_pool* current_worker_arena() noexcept { return t_worker_arena; }
 
-request_snapshot snapshot_of(const state& target, std::uint32_t event_kind) {
+request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind) {
 	request_snapshot taken;
 	taken.buffer.assign(target.buffer.text());
 	taken.cursor = target.cursor.byte_offset();
@@ -105,23 +105,23 @@ completion message_pool::acquire() {
 	std::lock_guard lock(_mutex);
 	++_live;
 	if (!_free.empty()) {
-		reactor_batch* const reused = _free.back();
+		leshper::reactor_batch* const reused = _free.back();
 		_free.pop_back();
 		return completion{this, reused};
 	}
-	_owned.push_back(std::make_unique<reactor_batch>());
+	_owned.push_back(std::make_unique<leshper::reactor_batch>());
 	// Room for this one to come home, reserved now: release() is noexcept and a
 	// free list that could fail to grow would have nowhere to put the message.
 	_free.reserve(_owned.size());
 	return completion{this, _owned.back().get()};
 }
 
-void message_pool::release(reactor_batch* batch) noexcept {
+void message_pool::release(leshper::reactor_batch* batch) noexcept {
 	// clear(), never shrink. Keeping the vectors' capacity across reuse is the
 	// whole of what "pooled" buys: a highlight batch the size of the last one
 	// allocates nothing at all (N-2).
 	batch->reactor.clear();
-	batch->computed_against = generation{};
+	batch->computed_against = leshper::generation{};
 	batch->event_kind = 0;
 	batch->status = LESH_OK;
 	batch->spans.clear();
@@ -485,14 +485,14 @@ void worker_pool::run(worker& me) {
 	t_worker_arena = nullptr;
 }
 
-void worker_pool::compute(task& job, slot& owner, reactor_batch& into) {
+void worker_pool::compute(task& job, slot& owner, leshper::reactor_batch& into) {
 	into.reactor = owner.name;
 	into.computed_against = job.snapshot.computed_against;
 	into.event_kind = job.snapshot.event_kind;
 
 	// The token is registry.h's, unchanged. This ticket runs it on a worker; it
 	// does not redesign it.
-	request_token token;
+	leshper::request_token token;
 	token.buffer = std::move(job.snapshot.buffer);
 	token.cursor = job.snapshot.cursor;
 	token.selection_start = job.snapshot.selection_start;
@@ -510,7 +510,7 @@ void worker_pool::compute(task& job, slot& owner, reactor_batch& into) {
 
 	// The one thing that would silently break if the duplicated thread key
 	// above ever disagreed with registry.cpp's: every accessor would refuse.
-	LESH_ASSERT(token_is_live(&token));
+	LESH_ASSERT(leshper::token_is_live(&token));
 
 	into.status = job.fn(&token, job.userdata);
 
@@ -519,4 +519,4 @@ void worker_pool::compute(task& job, slot& owner, reactor_batch& into) {
 	token.owner_thread = 0;
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

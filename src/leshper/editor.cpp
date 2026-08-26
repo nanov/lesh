@@ -89,6 +89,14 @@ void log_event(const event& incoming) {
 		LESH_LOG(log::level::debug, log::category::event, "paste %zu bytes", paste->text.size());
 		LESH_LOG_TRACE(log::category::event, "paste text=%.*s",
 		               static_cast<int>(paste->text.size()), paste->text.data());
+	} else if (const auto* timer = std::get_if<timer_fired>(&incoming)) {
+		// The name, only on the logging path: the handle is what the event
+		// carries, and turning it back into text is the cost of being logged
+		// rather than the cost of firing.
+		entry.text("kind", "timer").number("id", timer->id).number("action", static_cast<std::uint64_t>(timer->action));
+		LESH_LOG(log::level::debug, log::category::event, "timer id=%llu action=%u",
+		         static_cast<unsigned long long>(timer->id),
+		         static_cast<unsigned>(timer->action));
 	}
 	entry.commit();
 }
@@ -451,6 +459,26 @@ effects step(state& current, const event& incoming,
 		// #98 settled the behaviour - Ctrl-C while typing runs the rebindable
 		// `cancel-line` action AND fires the INT trap, the zsh way - but a signal
 		// binding is keymap data like any other, and keymaps are #93's.
+	} else if (const auto* timer = std::get_if<timer_fired>(&incoming)) {
+		// #168: THE HOST SAID WHEN, AND THE DISPATCH IS HERE. The driver owns the
+		// clock, the due instants and the table of armed timers, so it is the only
+		// side that can notice one came due; running the action is dispatch by
+		// name through the registry, which is what this function does for a key
+		// and which the driver used to do a second time, through a harness of its
+		// own, for a timer. One dispatcher.
+		//
+		// `invoke_action` and not `run_binding`: no keys were typed, so there is
+		// no sequence to fold into the change record and nothing for `.` to
+		// repeat. A timer runs its action and commits it, which is exactly what
+		// the driver's own dispatch did.
+		//
+		// ONE INDEXED READ turns the handle back into a name, and the name is
+		// resolved through the registry here rather than at arm time - which is
+		// what keeps a timer armed before its action is registered legal.
+		const std::string_view named =
+			timer_action_name(context_of(current).actions(), timer->action);
+		if (!named.empty())
+			invoke_action(current, named, {}, out);
 	} else if (const auto* pasted = std::get_if<paste_event>(&incoming)) {
 		// F-6, #111's decoder having already established the wholeness: the
 		// payload lands through the one apply_edit as ONE buffer mutation, ONE

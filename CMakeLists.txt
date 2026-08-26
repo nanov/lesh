@@ -110,6 +110,8 @@ enable_testing()
 #                                                             │                        ▲
 #                                                             └─► lesh_leshnici ───────┘
 #
+# `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
+#
 # One directory, one namespace, one target: `src/X/Y` is `lesh::X::Y`, with
 # `substrate/` the one flat exception. `lesh_ui` is the ONE library that links
 # both `lesh_runtime` and `lesh_leshper`; `lesh_leshnici` is the layer above it
@@ -183,6 +185,12 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 
 # leshper: the line editor's state machine, its events and its effects.
 #
+# THE EDITOR, AND NOTHING THAT DRIVES IT (#168). `loop`, `tty`, `workers` and
+# `shell_actor` were here and are `lesh_ui`'s now: leshper is
+# `step(state, event, now) -> effects` with no thread, fd, poll, timer or
+# mailbox in it, and a host sends it events and performs its effects. What is
+# left here compiles with no `<poll.h>`, no `<thread>` and no `<termios.h>`.
+#
 # Links syntax and the substrate, and NOT lesh_runtime. That is spec §4.4's rule
 # made enforceable the same way every other one here is: the editor may depend on
 # the lexer, the parser and shell state, never on the executor - so a call into
@@ -229,12 +237,6 @@ add_library(lesh_leshper STATIC
 	src/leshper/sgr.h
 	src/leshper/style_grammar.h
 	src/leshper/theme.h
-	src/leshper/loop.cpp
-	src/leshper/loop.h
-	src/leshper/shell_actor.cpp
-	src/leshper/shell_actor.h
-	src/leshper/tty.cpp
-	src/leshper/tty.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
 	src/leshper/shell_knowledge.h
@@ -251,9 +253,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/surface.cpp
 	src/leshper/surface.h
 	src/leshper/text.h
-	src/leshper/undo.h
-	src/leshper/workers.cpp
-	src/leshper/workers.h)
+	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
 
 # leshnici: the shipped extension set (#163).
@@ -278,8 +278,13 @@ add_library(lesh_leshnici STATIC
 	src/leshnici/prompt_modules.h)
 target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
 
-# ui: the glue. The session that runs an interactive shell, and the adapters
-# that carry shell facts across to the editor (#164).
+# ui: THE HOST. The session that runs an interactive shell, the loop that drives
+# the editor, the terminal, the workers, the timers, and the adapters that carry
+# shell facts across (#164, #168).
+#
+# It owns everything with a thread, a descriptor or a clock in it, and drives
+# leshper by sending events and performing the effects that come back - and by
+# nothing else. `src/ui/loop.cpp` is the only caller of `step`.
 #
 # THE ONE LIBRARY THAT LINKS BOTH HALVES. `lesh_leshper` does not link
 # `lesh_runtime` - spec §4.4 - so the shapes leshper declares have to be filled
@@ -292,9 +297,17 @@ target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
 # `src/main.cpp` fills in with `install_prompt_modules`. A
 # `#include "leshnici/..."` from here would not link.
 add_library(lesh_ui STATIC
+	src/ui/loop.cpp
+	src/ui/loop.h
 	src/ui/session.cpp
 	src/ui/session.h
-	src/ui/shell_state_knowledge.h)
+	src/ui/shell_actor.cpp
+	src/ui/shell_actor.h
+	src/ui/shell_state_knowledge.h
+	src/ui/tty.cpp
+	src/ui/tty.h
+	src/ui/workers.cpp
+	src/ui/workers.h)
 target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
 
 add_subdirectory("tools")
@@ -328,7 +341,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_tests.cpp
 	tests/unit/leshper_paste_tests.cpp
 	tests/unit/leshper_pty_tests.cpp
-	tests/unit/leshper_read_tests.cpp
+	tests/unit/ui_session_tests.cpp
 	tests/unit/leshper_replay_tests.cpp
 	tests/unit/log_tests.cpp
 	tests/unit/leshper_decoration_tests.cpp
@@ -338,8 +351,9 @@ add_executable(lesh_tests
 	tests/unit/leshper_prompt_tests.cpp
 	tests/unit/leshper_style_grammar_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
-	tests/unit/leshper_loop_tests.cpp
-	tests/unit/leshper_workers_tests.cpp
+	tests/unit/ui_proposal_tests.cpp
+	tests/unit/ui_loop_tests.cpp
+	tests/unit/ui_workers_tests.cpp
 	tests/unit/args_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
@@ -349,6 +363,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/leshper_vi_tests.cpp
 	tests/unit/leshper_knowledge_tests.cpp
+	tests/unit/ui_knowledge_tests.cpp
 	tests/unit/leshper_complete_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp

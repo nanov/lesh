@@ -2,8 +2,12 @@
 
 // The shell thread's side of the two-owner split (ADR-0009, #136, #129).
 //
+// THE HOST'S, AND IN `src/ui/` SINCE #168. The handoff between a shell and an
+// editor is the binding layer's whole job, so this is the one of the four driver
+// files that was always going to end up here.
+//
 // THE ARRANGEMENT, in one paragraph. The shell is the main thread and owns
-// `shell_state`; leshper's loop is a spawned thread and owns editor state and
+// `shell_state`; the host's loop is a spawned thread and owns editor state and
 // the terminal while editing. The shell reaches the loop through one wakeup
 // pipe - the loop's fifth topic - and the loop reaches the shell by filling one
 // of three LATEST-WINS SLOTS, checked in priority order: `execute`, `port_call`
@@ -36,11 +40,12 @@
 // both directions; the loop drops what does not match, which is the request
 // token's existing rule pointed the other way.
 //
-// WHAT THE SHELL SIDE PROVIDES is `shell_side` below - the A-5 interface
-// leshper defines and the wiring site (#134) implements over the real
-// `shell_state`. leshper does not link `lesh_runtime` and this file includes no
-// runtime header, which is what makes that a compiler-enforced boundary rather
-// than a convention. Tests fake it in twelve lines.
+// WHAT THE SHELL SIDE PROVIDES is `shell_side` below - the A-5 interface the
+// host declares and `src/ui/session.cpp` implements over the real `shell_state`.
+// It stays an interface now that both halves are in `lesh_ui`, and the reason is
+// the same one it was written for: the loop must be drivable with no shell
+// behind it at all, which is what every test in `ui_loop_tests.cpp` does. Tests
+// fake it in twelve lines.
 //
 // WHAT THE SHELL KNOWS IS THE ACTOR'S, NOT THE LOOP'S (#151). The actor is
 // constructed with the session's `shell_knowledge*` and stamps it on EVERY token
@@ -63,7 +68,7 @@
 #include "leshper/registry.h"
 #include "leshper/shell_knowledge.h"
 #include "leshper/state.h"
-#include "leshper/workers.h"
+#include "ui/workers.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -74,7 +79,7 @@
 #include <string_view>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // ---------------------------------------------------------------------------
 // What comes back.
@@ -108,7 +113,7 @@ struct shell_message {
 	// `execute_done` carries the generation the line was accepted at, which is
 	// necessarily stale by the time it lands; the loop does not apply it to
 	// anything, so the drop rule is not consulted for that kind.
-	generation computed_against;
+	leshper::generation computed_against;
 
 	// The status the shell reported: an exit status for `execute_done` and
 	// `port_call_done`, a LESH_* status for `highlight_done`.
@@ -118,7 +123,7 @@ struct shell_message {
 	std::uint64_t sequence = 0;
 
 	// `highlight_done` only.
-	reactor_batch batch;
+	leshper::reactor_batch batch;
 };
 
 // The loop's `shell` topic: a pipe read end and a queue behind one mutex.
@@ -176,13 +181,15 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// A-5: what leshper needs from the shell, and nothing more.
+// A-5: what the editing session needs from the shell, and nothing more.
 // ---------------------------------------------------------------------------
 
-// The interface leshper DEFINES and the wiring site implements (#134), the same
-// shape `history_source` (#125) has and for the same reason: `lesh_leshper`
-// does not link `lesh_runtime`, so the dependency points at a shape rather than
-// at `shell_state`.
+// The interface the host DECLARES and `ui/session.cpp` implements (#134), the
+// same shape `history_source` (#125) has. The reason is no longer a link rule -
+// `lesh_ui` links `lesh_runtime` - but the one that outlived it: the actor and
+// the loop must be drivable with no shell behind them, which is what every test
+// in `ui_loop_tests.cpp` and `ui_knowledge_tests.cpp` does, and a direct call
+// into `shell_state` would make a shell a prerequisite for editing at all.
 //
 // TWO METHODS, and their narrowness is the decision. Everything else the shell
 // knows reaches leshper through `shell_knowledge` - stamped on the token for a
@@ -241,13 +248,13 @@ public:
 	// `writing` is ADR-0009's tripwire, raised around `execute` and `port_call`.
 	// Null is "unchecked", which is what a test with no adapter to protect wants.
 	// Neither pointer is owned; both must outlive the actor.
-	shell_actor(shell_side& shell, const shell_knowledge* knowledge,
-	            shell_writing_flag* writing = nullptr) noexcept
+	shell_actor(shell_side& shell, const leshper::shell_knowledge* knowledge,
+	            leshper::shell_writing_flag* writing = nullptr) noexcept
 		: _shell(&shell), _knowledge(knowledge), _writing(writing) {}
 
 	// What every token this actor mints reads through. Exposed so the wiring site
 	// can assert the actor and the completer are looking at one object.
-	[[nodiscard]] const shell_knowledge* knowledge() const noexcept { return _knowledge; }
+	[[nodiscard]] const leshper::shell_knowledge* knowledge() const noexcept { return _knowledge; }
 
 	shell_actor(const shell_actor&) = delete;
 	shell_actor& operator=(const shell_actor&) = delete;
@@ -261,12 +268,12 @@ public:
 
 	// Fills the `execute` slot: the highest priority, and the one that makes the
 	// shell thread stop serving highlights until it is done.
-	void post_execute(std::string_view line, generation computed_against);
+	void post_execute(std::string_view line, leshper::generation computed_against);
 
 	// Fills the `port_call` slot and answers the sequence number the reply will
 	// carry, which is what the blocked action matches on.
 	[[nodiscard]] std::uint64_t post_port_call(std::string_view code,
-	                                           generation computed_against);
+	                                           leshper::generation computed_against);
 
 	// Fills the `highlight` slot, OVERWRITING whatever was pending and
 	// superseding whatever is in flight. That overwrite is the cancellation
@@ -300,13 +307,13 @@ public:
 private:
 	struct execute_slot {
 		std::string line;
-		generation computed_against;
+		leshper::generation computed_against;
 		bool filled = false;
 	};
 
 	struct port_slot {
 		std::string code;
-		generation computed_against;
+		leshper::generation computed_against;
 		std::uint64_t sequence = 0;
 		bool filled = false;
 	};
@@ -325,8 +332,8 @@ private:
 
 	shell_side* _shell;
 	// The executing shell's own tables, stamped on every token served below.
-	const shell_knowledge* _knowledge;
-	shell_writing_flag* _writing;
+	const leshper::shell_knowledge* _knowledge;
+	leshper::shell_writing_flag* _writing;
 	shell_channel _replies;
 
 	mutable std::mutex _mutex;
@@ -362,6 +369,6 @@ private:
 // the call.
 void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
                       request_snapshot snapshot, const std::atomic<bool>& superseded,
-                      reactor_batch& into);
+                      leshper::reactor_batch& into);
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

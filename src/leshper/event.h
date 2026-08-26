@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <type_traits>
 #include <variant>
 
 namespace lesh::leshper {
@@ -191,15 +192,51 @@ struct paste_event {
 	std::string text;
 };
 
+// An armed timer came due (#168; #128 decision 3's `timer` topic).
+//
+// THE HOST SAYS WHEN AND THE EDITOR SAYS WHAT. The driver owns the clock and the
+// due instants, so it is the only side that can notice; the dispatch is the
+// editor's, because dispatching a name through the action registry is what
+// `step` does for every other input and a second dispatcher in the driver was a
+// second implementation of it. Before this, the loop looked the name up in the
+// registry's timer table and invoked it through a harness of its own - which is
+// how a timer expiry and a keystroke came to run through two different objects
+// (#144's defect, in the one place it had survived).
+//
+// THE ACTION IS AN INTERNED HANDLE (see `registry::timer_actions`). It travels
+// beside the id because the driver holds the timer table now and is the side that
+// knows which action an id means - and it is a handle rather than a name because
+// this event is constructed on every expiry, once a second on a `{time}` prompt,
+// and an event that allocates is an event that allocates forever. `step` turns it
+// back into a name with one indexed read.
+struct timer_fired {
+	std::uint64_t id = 0;
+	std::uint32_t action = 0;
+};
+
+// NOTHING THE HOST CONSTRUCTS PER TURN ALLOCATES (N-2), and the compiler says so.
+//
+// TWO EXCEPTIONS, both of them text the user produced and neither of them a
+// per-turn event: `injected_input` is `zle -U`'s payload and `paste_event` is a
+// whole bracketed paste, which F-6 requires to arrive as ONE event precisely
+// because the alternative is a thousand of them. A pasted kilobyte has to live
+// somewhere; a timer's action name does not.
+static_assert(std::is_trivially_copyable_v<key_event>);
+static_assert(std::is_trivially_copyable_v<resize_event>);
+static_assert(std::is_trivially_copyable_v<worker_result>);
+static_assert(std::is_trivially_copyable_v<job_notice>);
+static_assert(std::is_trivially_copyable_v<signal_event>);
+static_assert(std::is_trivially_copyable_v<timer_fired>);
+
 // The only way into the editor (A-9).
 //
 // A closed variant rather than an interface with methods, so that "no side
 // channel calls" is a property of the type: to make the editor do something you
-// construct one of these seven and hand it to step(). There is no other entry
-// point, and an eighth kind of input has to be argued for by adding an
+// construct one of these eight and hand it to step(). There is no other entry
+// point, and a ninth kind of input has to be argued for by adding an
 // alternative here - which is what #111 did for paste_event, F-6 being
-// unstateable in the other six.
+// unstateable in the other six, and what #168 did for timer_fired.
 using event = std::variant<key_event, resize_event, worker_result, job_notice,
-                           injected_input, signal_event, paste_event>;
+                           injected_input, signal_event, paste_event, timer_fired>;
 
 } // namespace lesh::leshper
