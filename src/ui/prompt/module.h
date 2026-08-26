@@ -23,7 +23,22 @@
 #include <string_view>
 #include <type_traits>
 
-namespace lesh::leshper::prompt {
+namespace lesh::ui::prompt {
+
+// ---------------------------------------------------------------------------
+// The pen vocabulary, which is the EDITOR's (#170)
+// ---------------------------------------------------------------------------
+//
+// The prompt moved to `ui/` and the style types did not. `style`, `color`,
+// `color_kind` and `attribute` are `leshper/surface.h`'s, because a surface cell
+// is what a pen finally paints and the highlighter's theme is the other consumer;
+// `style_grammar.h` stayed there for the same reason. Naming them once here is
+// what keeps every body below reading as it did, and the dependency is the right
+// way round - `ui/` includes `leshper/`, never the reverse.
+using leshper::attribute;
+using leshper::color;
+using leshper::color_kind;
+using leshper::style;
 
 // ---------------------------------------------------------------------------
 // Status
@@ -497,4 +512,4 @@ constexpr bool refuse_any_type(std::string_view type, parse_error& err) noexcept
 	return false;
 }
 
-} // namespace lesh::leshper::prompt
+} // namespace lesh::ui::prompt

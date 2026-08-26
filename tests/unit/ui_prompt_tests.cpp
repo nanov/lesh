@@ -8,10 +8,11 @@
 // INVOKED, which is the whole of recalculation-by-cause, and everything that
 // crosses the C ABI.
 
-#include "leshper/abi.h"
 #include "leshnici/prompt_modules.h"
-#include "leshper/prompt/prompt.h"
+#include "leshper/abi.h"
 #include "leshper/registry.h"
+#include "ui/prompt/abi.h"
+#include "ui/prompt/prompt.h"
 // The runtime's half of the seam (#157): `prompt_console` is declared there and
 // installed on `shell_state`, and this file is one of the places both halves are
 // linked - the same standing `leshper_keymap_tests.cpp` has for `bind`.
@@ -33,10 +34,10 @@
 
 namespace {
 
-using lesh::leshper::prompt::element_status;
-using lesh::leshper::prompt::engine;
-using lesh::leshper::prompt::surface_id;
-namespace prompt = lesh::leshper::prompt;
+using lesh::ui::prompt::element_status;
+using lesh::ui::prompt::engine;
+using lesh::ui::prompt::surface_id;
+namespace prompt = lesh::ui::prompt;
 
 // One module, run on its own - through its OWN type-slot grammar, because that
 // is now half of what a module is. `parse` then `render`, which is exactly the
@@ -188,7 +189,7 @@ std::int32_t abi_module(lesh_prompt_context* context, void* userdata) {
 // The built-in modules
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptModules, PathContractsHomeByComponent) {
+TEST(UiPromptModules, PathContractsHomeByComponent) {
 	EXPECT_EQ(run_module(prompt::kModulePath, "", quiet()).bytes, "~/src");
 
 	prompt::state facts = quiet();
@@ -205,7 +206,7 @@ TEST(LeshperPromptModules, PathContractsHomeByComponent) {
 	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).bytes, "/home/u/src");
 }
 
-TEST(LeshperPromptModules, PathOmitsWithoutAPwd) {
+TEST(UiPromptModules, PathOmitsWithoutAPwd) {
 	prompt::state facts;
 	EXPECT_EQ(run_module(prompt::kModulePath, "", facts).status, element_status::omitted);
 	EXPECT_TRUE(run_module(prompt::kModulePath, "", facts).bytes.empty());
@@ -216,7 +217,7 @@ TEST(LeshperPromptModules, PathOmitsWithoutAPwd) {
 // the two questions a constant expression cannot ask - what a variant does to a
 // path with no home in it, and what the module says to a spelling it does not
 // know.
-TEST(LeshperPromptModules, PathHasFiveVariantsAndRefusesAnySixth) {
+TEST(UiPromptModules, PathHasFiveVariantsAndRefusesAnySixth) {
 	prompt::state facts = quiet();
 	facts.pwd = "/home/u/private/github/lesh";
 
@@ -257,7 +258,7 @@ TEST(LeshperPromptModules, PathHasFiveVariantsAndRefusesAnySixth) {
 	EXPECT_TRUE(refuses_type(prompt::kModulePath, "SHORT"));
 }
 
-TEST(LeshperPromptModules, StatusOmitsOnSuccess) {
+TEST(UiPromptModules, StatusOmitsOnSuccess) {
 	EXPECT_EQ(run_module(prompt::kModuleStatus, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
@@ -275,7 +276,7 @@ TEST(LeshperPromptModules, StatusOmitsOnSuccess) {
 
 // THE SYMBOL FORM: the type slot IS the mark, so there is no vocabulary for a
 // typo to fall outside of - only a ceiling on how long a mark may be.
-TEST(LeshperPromptModules, StatusShowsASymbolInsteadOfANumber) {
+TEST(UiPromptModules, StatusShowsASymbolInsteadOfANumber) {
 	prompt::state facts = quiet();
 	facts.status = 1;
 
@@ -291,7 +292,7 @@ TEST(LeshperPromptModules, StatusShowsASymbolInsteadOfANumber) {
 	EXPECT_FALSE(refuses_type(prompt::kModuleStatus, std::string(16, 'x')));
 }
 
-TEST(LeshperPromptModules, JobsOmitsWhenThereAreNone) {
+TEST(UiPromptModules, JobsOmitsWhenThereAreNone) {
 	EXPECT_EQ(run_module(prompt::kModuleJobs, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
@@ -299,7 +300,7 @@ TEST(LeshperPromptModules, JobsOmitsWhenThereAreNone) {
 	EXPECT_EQ(run_module(prompt::kModuleJobs, "", facts).bytes, "12");
 }
 
-TEST(LeshperPromptModules, ModeIsWhateverTheKeymapDeclared) {
+TEST(UiPromptModules, ModeIsWhateverTheKeymapDeclared) {
 	EXPECT_EQ(run_module(prompt::kModuleMode, "", quiet()).status, element_status::omitted);
 
 	prompt::state facts = quiet();
@@ -311,7 +312,7 @@ TEST(LeshperPromptModules, ModeIsWhateverTheKeymapDeclared) {
 // because a `{jobs::x}` that was quietly ignored is a user who believes they
 // asked for something. (leshnici's `git` is the fourth, and says it the same
 // way through the same `refuse_any_type` - see leshnici_git_tests.cpp.)
-TEST(LeshperPromptModules, TheParameterlessModulesTakeNoType) {
+TEST(UiPromptModules, TheParameterlessModulesTakeNoType) {
 	const prompt::module* const parameterless[] = {
 		&prompt::kModuleJobs,
 		&prompt::kModuleMode,
@@ -323,7 +324,7 @@ TEST(LeshperPromptModules, TheParameterlessModulesTakeNoType) {
 	}
 }
 
-TEST(LeshperPromptModules, TimeHasFourFormsAndACadenceForEach) {
+TEST(UiPromptModules, TimeHasFourFormsAndACadenceForEach) {
 	prompt::state facts = quiet();
 	facts.hours = 9;
 	facts.minutes = 5;
@@ -366,7 +367,7 @@ TEST(LeshperPromptModules, TimeHasFourFormsAndACadenceForEach) {
 	EXPECT_TRUE(refuses_type(prompt::kModuleTime, "13h"));
 }
 
-TEST(LeshperPromptModules, DurationHasAFloorAndThreeFormats) {
+TEST(UiPromptModules, DurationHasAFloorAndThreeFormats) {
 	prompt::state facts = quiet();
 
 	facts.duration_ms = 1999;
@@ -388,7 +389,7 @@ TEST(LeshperPromptModules, DurationHasAFloorAndThreeFormats) {
 	EXPECT_EQ(run_module(prompt::kModuleDuration, "", facts).bytes, "2h3m4s");
 }
 
-TEST(LeshperPromptModules, EnvReadsTheVariableItsTypeSlotNames) {
+TEST(UiPromptModules, EnvReadsTheVariableItsTypeSlotNames) {
 	prompt::state facts = quiet();
 	facts.getvar = &fake_getvar;
 
@@ -415,7 +416,7 @@ TEST(LeshperPromptModules, EnvReadsTheVariableItsTypeSlotNames) {
 // Configuration
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptEngine, RegistersTheBuiltInsAndListsThemSorted) {
+TEST(UiPromptEngine, RegistersTheBuiltInsAndListsThemSorted) {
 	engine which;
 
 	std::vector<std::string> names;
@@ -432,7 +433,7 @@ TEST(LeshperPromptEngine, RegistersTheBuiltInsAndListsThemSorted) {
 	EXPECT_FALSE(which.module_exists("weather"));
 }
 
-TEST(LeshperPromptEngine, RegistrationReplacesAndValidatesTheName) {
+TEST(UiPromptEngine, RegistrationReplacesAndValidatesTheName) {
 	engine which;
 	test_module first{"probe", "first"};
 	test_module second{"probe", "second"};
@@ -461,7 +462,7 @@ TEST(LeshperPromptEngine, RegistrationReplacesAndValidatesTheName) {
 // separately. This is the property the typed-module split exists for: the type
 // slot is interpreted where a user can be told about it, and the render path
 // never looks at a string again.
-TEST(LeshperPromptEngine, AModulesTypeSlotIsParsedOnceAndNotPerRender) {
+TEST(UiPromptEngine, AModulesTypeSlotIsParsedOnceAndNotPerRender) {
 	engine which;
 	test_module probe{"probe", "p"};
 	probe.constant = true;
@@ -490,7 +491,7 @@ TEST(LeshperPromptEngine, AModulesTypeSlotIsParsedOnceAndNotPerRender) {
 	EXPECT_EQ(which.output(surface_id::left), "ptag");
 }
 
-TEST(LeshperPromptEngine, DefaultAndClearRoundTrip) {
+TEST(UiPromptEngine, DefaultAndClearRoundTrip) {
 	engine which;
 
 	// THE SHIPPED PROMPT, ALL OF IT (owner's ruling on #157): the working
@@ -525,14 +526,14 @@ TEST(LeshperPromptEngine, DefaultAndClearRoundTrip) {
 	EXPECT_EQ(which.output(surface_id::left), "~/src> ");
 }
 
-TEST(LeshperPromptEngine, AddModuleAnswersFalseForAnUnknownName) {
+TEST(UiPromptEngine, AddModuleAnswersFalseForAnUnknownName) {
 	engine which;
 	which.clear(surface_id::left);
 	EXPECT_FALSE(which.add_module(surface_id::left, "weather", ""));
 	EXPECT_TRUE(which.add_module(surface_id::left, "path", ""));
 }
 
-TEST(LeshperPromptEngine, GroupsDoNotNestAndCloseNeedsAnOpen) {
+TEST(UiPromptEngine, GroupsDoNotNestAndCloseNeedsAnOpen) {
 	engine which;
 	EXPECT_FALSE(which.close_group(surface_id::left));
 	EXPECT_TRUE(which.open_group(surface_id::left));
@@ -545,7 +546,7 @@ TEST(LeshperPromptEngine, GroupsDoNotNestAndCloseNeedsAnOpen) {
 // The memo
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerParams) {
+TEST(UiPromptEngine, OneRenderComputesAModuleOncePerParams) {
 	engine which;
 	test_module probe{"probe", "x"};
 	probe.constant = true;
@@ -583,7 +584,7 @@ TEST(LeshperPromptEngine, OneRenderComputesAModuleOncePerParams) {
 // differs; one module with two different params is two questions, because the
 // bytes differ. Neither half alone would be enough, and a memo that got this
 // wrong would show one segment's bytes under another segment's name.
-TEST(LeshperPromptEngine, TheMemoKeysOnTheModuleAndItsParamsTogether) {
+TEST(UiPromptEngine, TheMemoKeysOnTheModuleAndItsParamsTogether) {
 	engine which;
 	test_module first{"one", "A"};
 	test_module second{"two", "B"};
@@ -611,7 +612,7 @@ TEST(LeshperPromptEngine, TheMemoKeysOnTheModuleAndItsParamsTogether) {
 // The tick wheel - recalculation by cause
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptEngine, ATickReInvokesOnlyWhatIsDue) {
+TEST(UiPromptEngine, ATickReInvokesOnlyWhatIsDue) {
 	test_module early{"early", "a"};
 	test_module late{"late", "b"};
 	test_module still{"still", "c"};
@@ -672,7 +673,7 @@ TEST(LeshperPromptEngine, ATickReInvokesOnlyWhatIsDue) {
 	EXPECT_EQ(which.output(surface_id::left), "a3b2c");
 }
 
-TEST(LeshperPromptEngine, ATickThatChangesNothingOwesNoWrite) {
+TEST(UiPromptEngine, ATickThatChangesNothingOwesNoWrite) {
 	test_module steady{"steady", "tick"};
 	steady.constant = true;
 	steady.wake = 3;
@@ -696,7 +697,7 @@ TEST(LeshperPromptEngine, ATickThatChangesNothingOwesNoWrite) {
 	EXPECT_EQ(which.output(surface_id::left), "tick");
 }
 
-TEST(LeshperPromptEngine, AStaticPromptArmsNoTimer) {
+TEST(UiPromptEngine, AStaticPromptArmsNoTimer) {
 	engine which;
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
@@ -715,7 +716,7 @@ TEST(LeshperPromptEngine, AStaticPromptArmsNoTimer) {
 	EXPECT_FALSE(which.render_tick(facts));
 }
 
-TEST(LeshperPromptEngine, TheTimeModuleDrivesTheWheel) {
+TEST(UiPromptEngine, TheTimeModuleDrivesTheWheel) {
 	engine which;
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
@@ -757,9 +758,9 @@ TEST(LeshperPromptEngine, TheTimeModuleDrivesTheWheel) {
 // The C ABI
 // ---------------------------------------------------------------------------
 
-TEST(LeshperPromptAbi, EveryVerbNeedsAnEngineOnTheRegistry) {
+TEST(UiPromptAbi, EveryVerbNeedsAnEngineOnTheRegistry) {
 	lesh_registry bare;
-	ASSERT_EQ(bare.prompt_engine, nullptr);
+	ASSERT_EQ(bare.host_prompt, nullptr);
 
 	std::int32_t exists = 0;
 	EXPECT_EQ(lesh_prompt_module_register(&bare, "x", &abi_module, nullptr), LESH_ERR_NOTFOUND);
@@ -775,10 +776,10 @@ TEST(LeshperPromptAbi, EveryVerbNeedsAnEngineOnTheRegistry) {
 	EXPECT_EQ(lesh_prompt_clear(nullptr, LESH_PROMPT_LEFT), LESH_ERR_INVAL);
 }
 
-TEST(LeshperPromptAbi, RejectsBadSurfacesAndBadNames) {
+TEST(UiPromptAbi, RejectsBadSurfacesAndBadNames) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	const lesh_prompt_placement path[] = { { .module = "path" } };
 	EXPECT_EQ(lesh_prompt_clear(&registry, 7u), LESH_ERR_INVAL);
@@ -838,10 +839,10 @@ TEST(LeshperPromptAbi, RejectsBadSurfacesAndBadNames) {
 	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, typed_literal, 1), 1);
 }
 
-TEST(LeshperPromptAbi, CountZeroIsTheEmptySurfaceAndItemsGoesUnread) {
+TEST(UiPromptAbi, CountZeroIsTheEmptySurfaceAndItemsGoesUnread) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	const lesh_prompt_placement items[] = { { .module = "path" } };
 	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
@@ -864,10 +865,10 @@ TEST(LeshperPromptAbi, CountZeroIsTheEmptySurfaceAndItemsGoesUnread) {
 // the identical program - which is what "one builder, two front doors" (#157,
 // owner's ruling) buys: the ABI and the string are one configuration language
 // with two spellings.
-TEST(LeshperPromptAbi, SetPlacementsSpellsExactlyWhatATemplateDoes) {
+TEST(UiPromptAbi, SetPlacementsSpellsExactlyWhatATemplateDoes) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	// `{path:cyan:s}{status:red::[:]}> `.
 	const lesh_prompt_placement items[] = {
@@ -930,10 +931,10 @@ TEST(LeshperPromptAbi, SetPlacementsSpellsExactlyWhatATemplateDoes) {
 
 // NESTING, WHICH THE OLD VERB STREAM COULD NOT SAY (#157): a group inside a
 // group, built directly as a tree rather than refused as a second `open`.
-TEST(LeshperPromptAbi, GroupsNestToAnyDepthAsATree) {
+TEST(UiPromptAbi, GroupsNestToAnyDepthAsATree) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	// `(a(b{status}))` - the inner group votes with `status`, and the outer
 	// group votes because the inner one does. Two levels of `.children`, which
@@ -962,12 +963,12 @@ TEST(LeshperPromptAbi, GroupsNestToAnyDepthAsATree) {
 	EXPECT_EQ(which.output(surface_id::left), "");
 }
 
-TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
+TEST(UiPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
 	abi_probe probe;
 
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &probe), LESH_OK);
 
@@ -1002,13 +1003,13 @@ TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
 	EXPECT_EQ(which.next_wake(), 49u);
 }
 
-TEST(LeshperPromptAbi, ARegisteredModuleIsReplacedNotStacked) {
+TEST(UiPromptAbi, ARegisteredModuleIsReplacedNotStacked) {
 	abi_probe first;
 	abi_probe second;
 
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &first), LESH_OK);
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &second), LESH_OK);
@@ -1036,11 +1037,11 @@ std::int32_t only_ok_validate(const char* type, std::size_t length, void*, char*
 	return 1;
 }
 
-TEST(LeshperPromptAbi, RegisterWithNoValidatorAcceptsAnyType) {
+TEST(UiPromptAbi, RegisterWithNoValidatorAcceptsAnyType) {
 	abi_probe probe;
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	// `options.validate` left at its zero default is exactly the plain verb: no
 	// grammar to check, so any type slot reaches the module as written.
@@ -1052,11 +1053,11 @@ TEST(LeshperPromptAbi, RegisterWithNoValidatorAcceptsAnyType) {
 	EXPECT_EQ(probe.arg, "whatever");
 }
 
-TEST(LeshperPromptAbi, RegisterWithAValidatorRefusesAndNamesWhy) {
+TEST(UiPromptAbi, RegisterWithAValidatorRefusesAndNamesWhy) {
 	abi_probe probe;
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	ASSERT_EQ(lesh_prompt_module_register_with(&registry, "checked", &abi_module, &probe,
 	                                           { .validate = &only_ok_validate }),
@@ -1078,10 +1079,10 @@ TEST(LeshperPromptAbi, RegisterWithAValidatorRefusesAndNamesWhy) {
 	EXPECT_EQ(error, "checked: must be 'ok' at byte 10");
 }
 
-TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
+TEST(UiPromptAbi, AGroupVanishesWithItsModule) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	const lesh_prompt_placement group[] = {
 		{ .module = "literal", .options = { .prefix = " [" } },
@@ -1105,7 +1106,7 @@ TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
 	EXPECT_EQ(which.output(surface_id::left), " [130]$ ");
 }
 
-TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
+TEST(UiPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 	test_module inner{"shout", "!"};
 
 	engine which;
@@ -1113,7 +1114,7 @@ TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 	// engine has to be given it first (#163).
 	lesh::leshnici::install_prompt_modules(which);
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	// A module that never says anything, so the group can never be shown.
 	const lesh_prompt_placement group_git[] = {
@@ -1171,12 +1172,12 @@ std::int32_t measuring_module(lesh_prompt_context* context, void* userdata) {
 	return LESH_PROMPT_READY;
 }
 
-TEST(LeshperPromptAbi, ArgFollowsTheCopyOutConvention) {
+TEST(UiPromptAbi, ArgFollowsTheCopyOutConvention) {
 	abi_probe probe;
 
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "measure", &measuring_module, &probe),
 	          LESH_OK);
@@ -1199,10 +1200,10 @@ std::int32_t failing_module(lesh_prompt_context* context, void*) {
 	return LESH_ERR_INVAL;
 }
 
-TEST(LeshperPromptAbi, ANegativeStatusReadsAsOmitted) {
+TEST(UiPromptAbi, ANegativeStatusReadsAsOmitted) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "broken", &failing_module, nullptr),
 	          LESH_OK);
@@ -1286,7 +1287,7 @@ private:
 using console_surface = lesh::runtime::prompt_console::surface;
 using console_outcome = lesh::runtime::prompt_console::outcome;
 
-TEST(LeshperPromptWiring, TheConsoleRoundTripsOnTheShellState) {
+TEST(UiPromptWiring, TheConsoleRoundTripsOnTheShellState) {
 	lesh::runtime::shell_state shell;
 	// A non-interactive shell has no prompt engine and says so rather than
 	// pretending - `bind`'s "no line editor", one seam over.
@@ -1303,7 +1304,7 @@ TEST(LeshperPromptWiring, TheConsoleRoundTripsOnTheShellState) {
 	EXPECT_EQ(shell.prompts(), nullptr);
 }
 
-TEST(LeshperPromptWiring, TheConsoleVerbsReachTheEngineAndBothSurfaces) {
+TEST(UiPromptWiring, TheConsoleVerbsReachTheEngineAndBothSurfaces) {
 	engine which;
 	// With the shipped extension set on it, the way the wiring site builds one -
 	// so the list the console hands back covers an installed module as well as a
@@ -1355,7 +1356,7 @@ TEST(LeshperPromptWiring, TheConsoleVerbsReachTheEngineAndBothSurfaces) {
 // engine supersedes it the moment anybody configures one. The wiring asks it
 // once per prompt (`session::refresh_prompt`), so what it answers on a shell
 // nobody has touched is the whole of whether today's prompts still work.
-TEST(LeshperPromptEngine, ConfiguredIsFalseUntilAVerbRunsAndIsNeverRegained) {
+TEST(UiPromptEngine, ConfiguredIsFalseUntilAVerbRunsAndIsNeverRegained) {
 	{
 		engine fresh;
 		EXPECT_FALSE(fresh.configured());
@@ -1458,7 +1459,7 @@ prompt::state loud() {
 	return facts;
 }
 
-TEST(LeshperPromptTemplate, EveryRowOfTheOmissionTableRenders) {
+TEST(UiPromptTemplate, EveryRowOfTheOmissionTableRenders) {
 	engine which;
 	const prompt::state facts = loud();
 
@@ -1484,7 +1485,7 @@ TEST(LeshperPromptTemplate, EveryRowOfTheOmissionTableRenders) {
 	EXPECT_EQ(set_and_render(which, "[{status}]", quiet()), "[]");
 }
 
-TEST(LeshperPromptTemplate, TheStandaloneLiteralCarriesItsTextInTheAffixSlots) {
+TEST(UiPromptTemplate, TheStandaloneLiteralCarriesItsTextInTheAffixSlots) {
 	engine which;
 
 	EXPECT_EQ(set_and_render(which, "{literal:blue::your mother}", quiet()),
@@ -1512,7 +1513,7 @@ TEST(LeshperPromptTemplate, TheStandaloneLiteralCarriesItsTextInTheAffixSlots) {
 	EXPECT_EQ(error, "literal needs text at byte 1");
 }
 
-TEST(LeshperPromptTemplate, AStyledLiteralIsGrammarAndDoesNotVote) {
+TEST(UiPromptTemplate, AStyledLiteralIsGrammarAndDoesNotVote) {
 	engine which;
 	lesh::leshnici::install_prompt_modules(which);
 
@@ -1528,7 +1529,7 @@ TEST(LeshperPromptTemplate, AStyledLiteralIsGrammarAndDoesNotVote) {
 	EXPECT_EQ(set_and_render(which, "{literal:dim::on} x", quiet()), "\x1b[2mon\x1b[0m x");
 }
 
-TEST(LeshperPromptTemplate, TheEscapesReachTheBytes) {
+TEST(UiPromptTemplate, TheEscapesReachTheBytes) {
 	engine which;
 	const prompt::state facts = loud();
 
@@ -1546,7 +1547,7 @@ TEST(LeshperPromptTemplate, TheEscapesReachTheBytes) {
 	EXPECT_EQ(set_and_render(which, "}x", facts), "}x");
 }
 
-TEST(LeshperPromptTemplate, EveryRefusalIsOneSentenceWithTheByteItPointsAt) {
+TEST(UiPromptTemplate, EveryRefusalIsOneSentenceWithTheByteItPointsAt) {
 	engine which;
 	// `{git::x}` below is a module's own refusal, and the module is leshnici's.
 	lesh::leshnici::install_prompt_modules(which);
@@ -1592,7 +1593,7 @@ TEST(LeshperPromptTemplate, EveryRefusalIsOneSentenceWithTheByteItPointsAt) {
 	EXPECT_TRUE(which.set_template(surface_id::left, "{path:cyan:s}", ok)) << ok;
 }
 
-TEST(LeshperPromptTemplate, ARefusedTemplateLeavesEverythingExactlyAsItWas) {
+TEST(UiPromptTemplate, ARefusedTemplateLeavesEverythingExactlyAsItWas) {
 	engine which;
 	std::string error;
 
@@ -1613,7 +1614,7 @@ TEST(LeshperPromptTemplate, ARefusedTemplateLeavesEverythingExactlyAsItWas) {
 	EXPECT_EQ(which.template_text(surface_id::left), remembered);
 }
 
-TEST(LeshperPromptTemplate, TheDefaultTableAndItsTemplateAgree) {
+TEST(UiPromptTemplate, TheDefaultTableAndItsTemplateAgree) {
 	// THE SHIPPED PROMPT, TWICE OVER: the `constexpr` table an untouched engine
 	// holds, and the string `use_default` remembers for it. That the two render
 	// the same bytes is what makes `prompt` printing `{path}> ` on a fresh shell a
@@ -1642,13 +1643,13 @@ TEST(LeshperPromptTemplate, TheDefaultTableAndItsTemplateAgree) {
 	EXPECT_EQ(table_side.template_text(surface_id::continuation), "> ");
 }
 
-TEST(LeshperPromptTemplate, TheDefaultAlsoAgreesWithItsOwnArrayForm) {
+TEST(UiPromptTemplate, TheDefaultAlsoAgreesWithItsOwnArrayForm) {
 	// A THIRD SPELLING OF THE SAME PROMPT (#157): `{path}> ` as `lesh_prompt_
 	// set_placements` items, proving "one builder, two front doors" on the one
 	// prompt every fresh shell actually shows.
 	engine array_side;
 	lesh_registry registry;
-	registry.prompt_engine = &array_side;
+	registry.host_prompt = &array_side;
 
 	const lesh_prompt_placement left[] = {
 		{ .module = "path" },
@@ -1687,7 +1688,7 @@ TEST(LeshperPromptTemplate, TheDefaultAlsoAgreesWithItsOwnArrayForm) {
 	EXPECT_EQ(length, 0u);
 }
 
-TEST(LeshperPromptTemplate, TheRememberedTextIsTheSourceOrNothingAtAll) {
+TEST(UiPromptTemplate, TheRememberedTextIsTheSourceOrNothingAtAll) {
 	engine which;
 
 	EXPECT_EQ(which.template_text(surface_id::left), "{path}> ");
@@ -1713,7 +1714,7 @@ TEST(LeshperPromptTemplate, TheRememberedTextIsTheSourceOrNothingAtAll) {
 	EXPECT_EQ(which.template_text(surface_id::left), "{path}> ");
 }
 
-TEST(LeshperPromptTemplate, TheValidatorsBuiltInTableIsTheRegistrys) {
+TEST(UiPromptTemplate, TheValidatorsBuiltInTableIsTheRegistrys) {
 	// The `constexpr` validator resolves names against a table in the header; the
 	// engine resolves them against the registry its constructor filled. Two lists
 	// that must not drift, and this is the only place they can be compared.
@@ -1742,11 +1743,11 @@ TEST(LeshperPromptTemplate, TheValidatorsBuiltInTableIsTheRegistrys) {
 	EXPECT_EQ(added, std::vector<std::string>{"git"});
 }
 
-TEST(LeshperPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
+TEST(UiPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
 	abi_probe probe;
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &probe), LESH_OK);
 
 	// The grammar has nothing to say about a type slot it did not define: the
@@ -1782,7 +1783,7 @@ TEST(LeshperPromptTemplate, AModuleTheAbiRegisteredOwnsItsOwnArgument) {
 // cannot be red no matter what is around it.
 //
 // The bytes are the ones the old spelling produced, unchanged.
-TEST(LeshperPromptEngine, APlacementsPenIsScopedToThatPlacement) {
+TEST(UiPromptEngine, APlacementsPenIsScopedToThatPlacement) {
 	engine which;
 	which.clear(surface_id::left);
 	which.clear(surface_id::continuation);
@@ -1810,10 +1811,10 @@ TEST(LeshperPromptEngine, APlacementsPenIsScopedToThatPlacement) {
 	EXPECT_EQ(which.output(surface_id::left), "\x1b[1;31m[7]\x1b[0m$");
 }
 
-TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConvention) {
+TEST(UiPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConvention) {
 	engine which;
 	lesh_registry registry;
-	registry.prompt_engine = &which;
+	registry.host_prompt = &which;
 
 	constexpr std::string_view kTemplate = "{path}> ";
 	std::size_t length = 7;
@@ -1874,7 +1875,7 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	// The argument errors, and the one that is a missing engine rather than a
 	// malformed call.
 	lesh_registry bare;
-	ASSERT_EQ(bare.prompt_engine, nullptr);
+	ASSERT_EQ(bare.host_prompt, nullptr);
 	EXPECT_EQ(lesh_prompt_set(&bare, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, &needed),
 	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_text(&bare, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),

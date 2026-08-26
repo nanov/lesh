@@ -18,7 +18,7 @@
 #include "leshnici/git_head.h"
 #include "leshnici/module_git.h"
 #include "leshnici/prompt_modules.h"
-#include "leshper/prompt/prompt.h"
+#include "ui/prompt/prompt.h"
 #include "temp_path.h"
 
 #include <gtest/gtest.h>
@@ -62,10 +62,10 @@ namespace {
 using lesh::leshnici::git_head;
 using lesh::leshnici::git_probe_options;
 using lesh::leshnici::read_git_head;
-using lesh::leshper::prompt::element_status;
-using lesh::leshper::prompt::engine;
-using lesh::leshper::prompt::surface_id;
-namespace prompt = lesh::leshper::prompt;
+using lesh::ui::prompt::element_status;
+using lesh::ui::prompt::engine;
+using lesh::ui::prompt::surface_id;
+namespace prompt = lesh::ui::prompt;
 
 // The handful of doubles these cases share with the engine's own suite,
 // restated here rather than exported: a test double is not an interface, and a
@@ -369,7 +369,7 @@ TEST_F(LeshniciGit, DetachedHeadAcceptsASha256ObjectName) {
 TEST_F(LeshniciGit, DiscoveryClimbsOutOfANestedDirectory) {
 	const std::string repo = make_repo("nested", "ref: refs/heads/trunk\n");
 	write_text(repo + "/.git/refs/heads/trunk", sha40('8') + "\n");
-	const std::string deep = repo + "/src/leshper/prompt";
+	const std::string deep = repo + "/src/ui/prompt";
 	make_dirs(deep);
 
 	const git_head head = read_git_head(deep);

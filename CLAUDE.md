@@ -55,8 +55,9 @@ masqueraded as a shell bug, and this is the cheapest one to fall into.
 **Editor-only changes need no sweep.** A change confined to `src/leshper/` or
 `src/leshnici/` cannot move the corpus or the conformance score - not because
 the binary leaves that code out (`lesh` links `lesh_leshper`, and `lesh_leshnici`
-above it), but because the conformance corpus is non-interactive: every case runs
-a script on a pipe, and nothing in it ever enters the line editor. Iterate with
+above `lesh_ui` since #170), but because the conformance corpus is
+non-interactive: every case runs a script on a pipe, and nothing in it ever
+enters the line editor. Iterate with
 `./build/debug/lesh_tests --gtest_filter='Leshper*:Leshnici*'` (milliseconds),
 adding `:Grapheme*` when positions or width are involved. The full sanitized gate
 still runs once at merge; the exemption is from the sweeps, not the gate.
@@ -66,14 +67,17 @@ suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiWorkers`, `UiKnowledge*`,
 `UiLoopProposals`, and since #168 Phase B `UiHighlight`, `UiAutosuggest`,
 `UiHistorySearch`, `UiComplete*`, `UiCommandKind`, `UiReactorTheme`, `UiPty` -
 which was `LeshperPty` and is renamed for the same rule: a suite that execs the
-real binary over a pty is the host's, not the editor's), and the
-filter above deliberately leaves them out: `Leshper*` is the editor, `Ui*` is the
-host that drives it (#168). A `src/ui/` change runs
+real binary over a pty is the host's, not the editor's - and since #170
+`UiPrompt*`, which was `LeshperPrompt*`: the prompt engine is `src/ui/prompt/`
+because a prompt renders shell facts), and the filter above deliberately leaves
+them out: `Leshper*` is the editor, `Ui*` is the host that drives it (#168). A
+`src/ui/` change runs
 `--gtest_filter='Ui*:Leshper*'` and then the sweeps. **`src/ui/` is where the
 KNOWLEDGE lives now** - the highlighter, the autosuggester, the history searcher,
-the completion sources and the shell's tables all moved there in Phase B - so a
-change that looks like "just the editor" is a `src/leshper/` change and a change
-to any of those is not. The one exception the exemption still leans on:
+the completion sources, the shell's tables and, since #170, the prompt engine
+all live there - so a change that looks like "just the editor" is a
+`src/leshper/` change and a change to any of those is not. The one exception the
+exemption still leans on:
 `lesh_leshper` links `lesh_substrate` and nothing else, so a `src/leshper/` change
 provably cannot reach syntax, the runtime or a file descriptor.
 
