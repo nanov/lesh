@@ -446,11 +446,13 @@ public:
 	// --- What the loop learned -----------------------------------------------
 
 	// What each reactor last said, applied under the generation drop rule, is
-	// `editor().marks` and is not accessible from anywhere else. #129 left a
-	// `decorations()` accessor here standing in for `state::decorations` while
-	// that was still a placeholder, and said that when it gained a type the
+	// `editor().marks` and `editor().proposals` - the painted half and the half
+	// an accepting action reads - and is not accessible from anywhere else. #129
+	// left a `decorations()` accessor here standing in for `state::decorations`
+	// while that was still a placeholder, and said that when it gained a type the
 	// application would land in `take_batch` and the accessor would go with it.
-	// #141 gave it a type; this is the accessor going.
+	// #141 gave it a type and #144 gave the proposals one beside it; what is left
+	// here is a COUNT, which is what a test waits on.
 	[[nodiscard]] std::size_t applied_batches() const noexcept { return _applied; }
 	// Batches dropped because their generation had moved on (N-4, counted).
 	[[nodiscard]] std::size_t dropped_batches() const noexcept { return _dropped; }
