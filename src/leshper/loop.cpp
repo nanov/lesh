@@ -55,6 +55,45 @@ void fish_style_handler(int signo) {
 	errno = saved;
 }
 
+// What the kernel currently has, reduced to the four cases the ownership rules
+// distinguish (#142; the rules themselves are on `reassert` in the header).
+enum class disposition_kind : std::uint8_t { ours, defaulted, ignored, foreign };
+
+// SA_SIGINFO IS ANSWERED FIRST, and not out of tidiness: `sa_handler` and
+// `sa_sigaction` are a union on every platform this builds for, so reading
+// `sa_handler` out of a three-argument handler is reading the wrong member. Such
+// a handler is `foreign` by every rule that matters - it is not ours, it is not a
+// disposition, and `deliver` declines to chain to it for want of a `siginfo_t`.
+disposition_kind kind_of(const struct sigaction& current) noexcept {
+	if ((current.sa_flags & SA_SIGINFO) != 0)
+		return disposition_kind::foreign;
+	if (current.sa_handler == &fish_style_handler)
+		return disposition_kind::ours;
+	if (current.sa_handler == SIG_DFL)
+		return disposition_kind::defaulted;
+	if (current.sa_handler == SIG_IGN)
+		return disposition_kind::ignored;
+	return disposition_kind::foreign;
+}
+
+// The pointer `deliver` may call for this disposition, or null for "there is
+// nothing to call".
+//
+// THE FLAGS ARE CONSUMED HERE rather than carried into the slot. A handler
+// installed with SA_SIGINFO is not chainable - `deliver` has only a signal
+// number, and inventing a `siginfo_t` to pass would be worse than declining -
+// and `sa_handler` is the wrong member of the union to read for one anyway. It
+// is still TAKEN like any other foreign handler; it is simply chained to by
+// nobody. Nothing lesh installs uses SA_SIGINFO, and the sanitizers' handlers
+// are for signals this hub never touches.
+void (*chain_target_of(const struct sigaction& current) noexcept)(int) {
+	if ((current.sa_flags & SA_SIGINFO) != 0)
+		return nullptr;
+	if (current.sa_handler == SIG_DFL || current.sa_handler == SIG_IGN)
+		return nullptr;
+	return current.sa_handler;
+}
+
 bool make_wakeup_pipe(int& read_fd, int& write_fd) noexcept {
 	int fds[2] = {-1, -1};
 	if (::pipe(fds) != 0)
@@ -96,6 +135,22 @@ const char* name_of(topic which) noexcept {
 // signal_hub
 // ---------------------------------------------------------------------------
 
+bool block_caught_signals_on_this_thread() noexcept {
+	// EXACTLY THE CAUGHT SET, and nothing more. The ignored set needs no mask -
+	// SIG_IGN is process-wide and a blocked-and-ignored signal is the same
+	// nothing - and masking anything the hub does not take would be this
+	// function quietly deciding policy for signals it knows nothing about.
+	sigset_t caught;
+	sigemptyset(&caught);
+	sigaddset(&caught, SIGINT);
+	sigaddset(&caught, SIGCHLD);
+	sigaddset(&caught, SIGWINCH);
+	// `pthread_sigmask` and not `sigprocmask`: in a multi-threaded process the
+	// latter's behaviour is unspecified, and this is called from precisely the
+	// threads that make it one.
+	return ::pthread_sigmask(SIG_BLOCK, &caught, nullptr) == 0;
+}
+
 signal_hub::signal_hub() {
 	const bool made = make_wakeup_pipe(_read_fd, _write_fd);
 	LESH_ASSERT(made);
@@ -132,14 +187,23 @@ void signal_hub::deliver(int signo) noexcept {
 	// sets `g_pending` - runs with nothing of ours left to lose. Calling a
 	// function pointer is async-signal-safe; the function on the other end is the
 	// shell's business and is written to the same rule.
-	if (signo <= 0 || signo >= kMaxTrackedSignal || !_saved_valid[signo])
+	//
+	// `_chain` AND NOT `_saved` (#142): the target is whatever the kernel had at
+	// the LAST take, so a `trap` typed five commands into the session is the
+	// thing called. `_saved` is the entry-time disposition and is `uninstall`'s
+	// alone.
+	//
+	// ONE RELAXED LOAD OF A LOCK-FREE POINTER, which is what makes this safe from
+	// a handler: no lock, no tear, and no ordering needed because the pointer is
+	// the whole of the information. SIG_DFL and SIG_IGN were resolved to null at
+	// the store (`chain_target_of`), and they are re-checked here anyway -
+	// calling address 1 would be a jump into nothing.
+	if (signo <= 0 || signo >= kMaxTrackedSignal)
 		return;
-	const struct sigaction& previous = _saved[signo];
-	if ((previous.sa_flags & SA_SIGINFO) != 0)
-		return;  // no siginfo_t to give it; see the header
-	if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN)
-		return;  // a disposition, not a handler: there is nothing to call
-	previous.sa_handler(signo);
+	void (*const previous)(int) = _chain[signo].load(std::memory_order_relaxed);
+	if (previous == nullptr || previous == SIG_DFL || previous == SIG_IGN)
+		return;
+	previous(signo);
 }
 
 void signal_hub::poke() noexcept {
@@ -197,16 +261,51 @@ bool signal_hub::reassert() noexcept {
 
 bool signal_hub::take_dispositions() noexcept {
 	bool complete = true;
-	// ONCE PER SIGNAL. See `reassert` in the header: the chain target must stay
-	// the handler that was there before us, and re-saving would capture either
-	// our own handler or the shell's newest one.
-	const auto save = [this](int signo) {
-		if (signo <= 0 || signo >= kMaxTrackedSignal || _saved_valid[signo])
+
+	// THE ENTRY-TIME DISPOSITION, AT MOST ONCE. `uninstall`'s only source: what
+	// the process had before this hub touched the signal at all. The caller
+	// already asked the kernel, so this takes the answer rather than asking
+	// again - a second query could see a handler installed in between and record
+	// the wrong original.
+	const auto save_once = [this](int signo, const struct sigaction& current) {
+		if (_saved_valid[signo])
 			return;
-		_saved_valid[signo] = ::sigaction(signo, nullptr, &_saved[signo]) == 0;
+		_saved[signo] = current;
+		_saved_valid[signo] = true;
 	};
+
+	// THE CHAIN TARGET, AT EVERY TAKE. One relaxed store of a lock-free pointer,
+	// and NOT a `sigprocmask` fence: a mask is per-thread and says nothing about
+	// delivery to another thread, so it would have fenced nothing. What makes the
+	// race benign is that the slot is a single un-tearable pointer - an in-flight
+	// signal chains to the old target or the new one, and both are real handlers.
+	const auto retarget = [this](int signo, void (*to)(int)) {
+		_chain[signo].store(to, std::memory_order_relaxed);
+	};
+
+	// The caught set: ours to take unless the kernel says otherwise. Rules 1-4a
+	// on `reassert` in the header, in the order they are written there.
 	const auto catch_it = [&](int signo, int flags) {
-		save(signo);
+		struct sigaction current{};
+		if (::sigaction(signo, nullptr, &current) != 0) {
+			complete = false;
+			return;
+		}
+		switch (kind_of(current)) {
+			case disposition_kind::ours:
+				return;  // rule 1: held already, and self-chaining excluded here
+			case disposition_kind::ignored:
+				return;  // rule 3: the newest ignore stands, whoever set it
+			case disposition_kind::defaulted:
+			case disposition_kind::foreign:
+				// Rule 2 and rule 4a, and they are one line because
+				// `chain_target_of` already answers both: a default resolves to
+				// null (nothing to call), a real handler to itself (take it AND
+				// call through).
+				save_once(signo, current);
+				retarget(signo, chain_target_of(current));
+				break;
+		}
 		struct sigaction action{};
 		action.sa_handler = &fish_style_handler;
 		sigemptyset(&action.sa_mask);
@@ -214,8 +313,20 @@ bool signal_hub::take_dispositions() noexcept {
 		if (::sigaction(signo, &action, nullptr) != 0)
 			complete = false;
 	};
+
+	// The ignored set: SIG_DFL is the ONLY thing here that is ours to overwrite.
+	// An inherited ignore is rule 3 and a user's `trap` is rule 4b, and both come
+	// out the same way - we stand aside. The hub never consumed these signals, so
+	// there is nothing to chain and `_chain` stays empty for them.
 	const auto ignore_it = [&](int signo) {
-		save(signo);
+		struct sigaction current{};
+		if (::sigaction(signo, nullptr, &current) != 0) {
+			complete = false;
+			return;
+		}
+		if (kind_of(current) != disposition_kind::defaulted)
+			return;
+		save_once(signo, current);
 		struct sigaction action{};
 		action.sa_handler = SIG_IGN;
 		sigemptyset(&action.sa_mask);
@@ -233,18 +344,17 @@ bool signal_hub::take_dispositions() noexcept {
 	catch_it(SIGCHLD, SA_RESTART);
 	catch_it(SIGWINCH, SA_RESTART);
 
-	// SIGHUP ONLY IF IT IS CURRENTLY SIG_DFL. `nohup` sets it to SIG_IGN before
-	// exec, and a shell that installed a handler over that would be undoing what
-	// the user asked for.
-	struct sigaction hup_now{};
-	if (::sigaction(SIGHUP, nullptr, &hup_now) == 0
-	    && (hup_now.sa_handler == SIG_DFL || hup_now.sa_handler == &fish_style_handler))
-		catch_it(SIGHUP, SA_RESTART);
+	// SIGHUP IS NOT HERE, and its absence is the decision (#142). The editor's
+	// hangup is the tty's POLLHUP, which `drain_tty` already turns into
+	// `signal_event{SIGHUP}` and `_exiting`; a real SIGHUP is the shell's own,
+	// which makes `trap - HUP` fatal as POSIX says and `nohup` respected by
+	// construction rather than by the conditional that used to sit here. The
+	// termios residual is written down on `install()` in the header.
 
-	// "We are a shell, we know what is best for the user" (fish). SIGTTOU and
-	// SIGTTIN also go through tty.h's `ignore_background_write_signals`, because
-	// they must be ignored before a mode change even in a process that never
-	// installed a hub.
+	// "We are a shell, we know what is best for the user" (fish) - but only over
+	// the default. SIGTTOU and SIGTTIN also go through tty.h's
+	// `ignore_background_write_signals`, because they must be ignored before a
+	// mode change even in a process that never installed a hub.
 	ignore_it(SIGPIPE);
 	ignore_it(SIGQUIT);
 	ignore_it(SIGTSTP);
@@ -258,10 +368,16 @@ void signal_hub::uninstall() noexcept {
 	if (!_installed)
 		return;
 	for (int signo = 1; signo < kMaxTrackedSignal; ++signo) {
-		if (!_saved_valid[signo])
-			continue;
-		::sigaction(signo, &_saved[signo], nullptr);
-		_saved_valid[signo] = false;
+		// THE ENTRY-TIME DISPOSITION, not the newest one. A signal never taken -
+		// an inherited SIG_IGN, a user's `trap` on the ignored set - has no
+		// `_saved_valid` and is correctly left exactly as it is.
+		if (_saved_valid[signo]) {
+			::sigaction(signo, &_saved[signo], nullptr);
+			_saved_valid[signo] = false;
+		}
+		// The chain goes with it: our handler is unpublished by the line above,
+		// so nothing can be reading this any more.
+		_chain[signo].store(nullptr, std::memory_order_relaxed);
 	}
 	if (g_installed_hub == this)
 		g_installed_hub = nullptr;
@@ -359,15 +475,13 @@ void event_loop::enter_read() {
 	// #98 decision 6: the winsize is re-queried at EVERY read start, which is
 	// what makes a resize missed during a command impossible rather than
 	// handled. The SIGWINCH counter is realigned here for the same reason.
-	if (_signals != nullptr) {
+	// THE COUNTER ONLY, AND NO `sigaction` (#142). Re-asserting the dispositions
+	// used to happen here, and it was the loop thread writing process-wide state
+	// that the shell thread's `trap` builtin writes too. It moved to the shell
+	// side of the wiring site (`read.cpp`), which leaves one writer; this thread
+	// only ever READS the hub.
+	if (_signals != nullptr)
 		_resizes_seen = _signals->resize_count();
-		// TAKEN AGAIN, because the shell may have given them away (#134). A
-		// `trap ... INT` run at the prompt installs the shell's own handler over
-		// ours, after which Ctrl-C sets `g_pending` and rings no pipe. Re-asserting
-		// is nine `sigaction` calls once per read entry, and `reassert` keeps what
-		// it saved the first time so the chain still reaches the shell's handler.
-		_signals->reassert();
-	}
 	refresh_size_from_terminal();
 	_needs_render = true;
 }
@@ -941,11 +1055,11 @@ void event_loop::resume_after_execution() {
 		_terminal.enter_raw();
 	}
 	if (_park_depth == 0) {
-		if (_signals != nullptr) {
+		// The counter only; see `enter_read`. The command that just ran may well
+		// have been a `trap`, but the side that ran it re-asserts before it hands
+		// the loop back - one thread writes dispositions (#142).
+		if (_signals != nullptr)
 			_resizes_seen = _signals->resize_count();
-			// The command that just ran may have been a `trap`; see enter_read.
-			_signals->reassert();
-		}
 		refresh_size_from_terminal();
 		// The screen is whatever the command left behind, so there is nothing to
 		// diff against: the next render is a full repaint.
@@ -1134,6 +1248,20 @@ void event_loop::start() {
 	LESH_ASSERT(!_thread.joinable());
 	_stopping.store(false, std::memory_order_relaxed);
 	_thread = std::thread([this] {
+		// FIRST THING IN THE BODY (#142). A process-directed signal goes to any
+		// one thread that does not block it, so without this a Ctrl-C landed on
+		// the loop thread, on a helper or on main by the kernel's choice. Blocked
+		// here, it lands on main - the shell thread, where the handler ran before
+		// leshper existed, and where the dispositions and `g_pending` are written.
+		// This thread hears about it as the self-pipe byte, which is all it ever
+		// needed: the `poll` wakeup is the byte, never the EINTR.
+		//
+		// Safe here and NOT on main because a mask survives `execve`: main is the
+		// thread that forks (ADR-0009), and a child born with a shell's mask would
+		// ignore the `kill -INT` meant for it.
+		if (!block_caught_signals_on_this_thread())
+			LESH_LOG(log::level::warn, log::category::loop,
+			         "the loop thread could not block the caught signals");
 		run();
 		// THE LOOP THREAD RELEASES THE SHELL THREAD, and nothing else can
 		// (ADR-0009, #134). The shell is the main thread and is parked in
