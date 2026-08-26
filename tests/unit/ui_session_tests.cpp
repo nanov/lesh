@@ -24,7 +24,7 @@ using namespace lesh::ui;
 //
 // WHAT IS NOT HERE is the session itself - it spawns a thread, takes the
 // process's dispositions and owns a terminal, which is a pty and a fork rather
-// than a unit test. That is `leshper_pty_tests.cpp`, and it drives the real
+// than a unit test. That is `ui_pty_tests.cpp`, and it drives the real
 // binary's path end to end.
 
 // ===========================================================================

@@ -6,9 +6,6 @@
 #include "substrate/assert.h"
 #include "substrate/grapheme.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -19,24 +16,17 @@
 
 namespace {
 
-using lesh::leshper::command_kind;
 using lesh::leshper::command_kind_memo;
 using lesh::leshper::decoration_span;
-using lesh::leshper::environment_knowledge;
 using lesh::leshper::loop_outcome;
 using lesh::leshper::position;
 using lesh::leshper::proposal;
-using lesh::leshper::shell_knowledge;
 using lesh::leshper::virtual_text;
 
-// The C numbers and the C++ enumerators are one space, and this is what keeps
-// them one. A reordered enum would otherwise repaint every command name in the
-// wrong colour and compile silently.
-static_assert(static_cast<std::uint32_t>(command_kind::unknown) == LESH_COMMAND_UNKNOWN);
-static_assert(static_cast<std::uint32_t>(command_kind::external) == LESH_COMMAND_EXTERNAL);
-static_assert(static_cast<std::uint32_t>(command_kind::builtin) == LESH_COMMAND_BUILTIN);
-static_assert(static_cast<std::uint32_t>(command_kind::function) == LESH_COMMAND_FUNCTION);
-static_assert(static_cast<std::uint32_t>(command_kind::alias) == LESH_COMMAND_ALIAS);
+// THE COMMAND-KIND ENUM IS THE HOST'S (#168 Phase B). `command_kind` and the
+// static_asserts that pinned it to LESH_COMMAND_* moved to `src/ui/` with the
+// tables it names; what crosses this boundary is the ABI's own `std::uint32_t`,
+// which is the space the C header already declared.
 
 // The completer speaks the pager's kinds and nothing of its own (#139), so the
 // only agreement left to keep is #138's - already asserted beside the pager
@@ -405,93 +395,20 @@ std::int32_t copy_out(std::string_view source, char* out, std::size_t capacity,
 }
 
 // ---------------------------------------------------------------------------
-// Classifying a command name (#135; spec §6.7, narrowed by ADR-0009).
+// Classifying a command name (#135; spec §6.7, ADR-0009; #168 Phase B).
 //
-// The tables are the shell's and come through `shell_knowledge`; the $PATH walk
-// is HERE, on leshper's side of the link boundary, because it is the half that
-// touches the filesystem and the half the token memoizes. `lesh_leshper` does
-// not link `lesh_runtime`, so this file cannot look a name up in `shell_state`
-// and does not try to.
+// THE RESOLUTION IS THE HOST'S NOW, whole. The shell's tables always were, and
+// the `$PATH` sweep - a `stat` per directory, off a `string_view` the shell
+// lent us - used to be HERE, on leshper's side, because this file is where the
+// memo is. Phase B moved the sweep out with everything else that touches the
+// filesystem or knows what a shell is: `host::classify_command` answers, and
+// `ui::editor_host` is what answers it.
+//
+// WHAT STAYED IS THE MEMO, and only because it can never change an answer. A
+// line repeats command names - `git log | git shortlog` - and a repeat has to
+// cost a comparison rather than a second sweep. Its life is one request's, it is
+// a fixed inline array, and it caches whatever the host said.
 // ---------------------------------------------------------------------------
-
-// Longer than any PATH_MAX this runs on. A candidate that would not fit is
-// DECLINED rather than truncated, because a truncated path names a different
-// file - and answering about a different file is worse than not answering.
-constexpr std::size_t kPathBytes = 4096;
-
-// Moved here verbatim from builtin_reactors.cpp, where it was the highlighter's
-// private getenv-based guess (#124).
-//
-// access(X_OK) alone says yes for a DIRECTORY, so `echo /tmp` would paint as a
-// command. The mode test is what makes the answer mean "this is a thing exec
-// would run".
-bool is_executable_file(const char* path) noexcept {
-	struct stat info;
-	if (::stat(path, &info) != 0)
-		return false;
-	if (!S_ISREG(info.st_mode))
-		return false;
-	return ::access(path, X_OK) == 0;
-}
-
-// One stat per directory in `path`, in order, first hit wins - the search the
-// shell itself would do (POSIX 2.9.1.1).
-bool resolves_on_path(std::string_view path, std::string_view name) noexcept {
-	char candidate[kPathBytes];
-	std::string_view rest = path;
-	for (;;) {
-		const std::size_t colon = rest.find(':');
-		std::string_view dir = colon == std::string_view::npos ? rest : rest.substr(0, colon);
-		// POSIX: an empty PATH element means the current directory.
-		if (dir.empty())
-			dir = std::string_view{"."};
-		if (dir.size() + name.size() + 2 <= sizeof(candidate)) {
-			std::memcpy(candidate, dir.data(), dir.size());
-			candidate[dir.size()] = '/';
-			std::memcpy(candidate + dir.size() + 1, name.data(), name.size());
-			candidate[dir.size() + 1 + name.size()] = '\0';
-			if (is_executable_file(candidate))
-				return true;
-		}
-		if (colon == std::string_view::npos)
-			break;
-		rest.remove_prefix(colon + 1);
-	}
-	return false;
-}
-
-// A name with a slash is a PATHNAME, not a lookup: POSIX 2.9.1.1 sends it
-// straight to the filesystem, past every table. `./configure` is not shadowed by
-// an alias called `./configure`, and could not be - no table can hold that name.
-bool names_a_pathname(std::string_view name) noexcept {
-	return name.find('/') != std::string_view::npos;
-}
-
-bool resolves_as_pathname(std::string_view name) noexcept {
-	char candidate[kPathBytes];
-	if (name.size() >= sizeof(candidate))
-		return false;
-	std::memcpy(candidate, name.data(), name.size());
-	candidate[name.size()] = '\0';
-	return is_executable_file(candidate);
-}
-
-// The whole resolution, tables then filesystem. No memo, no validity - the ABI
-// entry point owns both.
-command_kind classify_command_name(const shell_knowledge& shell,
-                                   std::string_view name) noexcept {
-	if (!names_a_pathname(name)) {
-		const command_kind known = shell.classify(name);
-		if (known != command_kind::unknown)
-			return known;
-	} else {
-		return resolves_as_pathname(name) ? command_kind::external : command_kind::unknown;
-	}
-	std::string_view path;
-	if (!shell.path(path))
-		return command_kind::unknown;
-	return resolves_on_path(path, name) ? command_kind::external : command_kind::unknown;
-}
 
 // The memo. Linear, because `capacity` is small and the thing it is racing is a
 // sweep of the filesystem.
@@ -529,7 +446,8 @@ using lesh::leshper::pager_kind;
 using lesh::leshper::pager_state;
 
 // The C numbers and the C++ enumerators are one space, and this is what keeps
-// them one - the same guard `command_kind` gets above, for the same reason.
+// them one - the same guard `ui::command_kind` gets in `editor_host.cpp`, for
+// the same reason.
 static_assert(static_cast<std::uint32_t>(pager_kind::plain) == LESH_PAGER_PLAIN);
 static_assert(static_cast<std::uint32_t>(pager_kind::word) == LESH_PAGER_WORD);
 static_assert(static_cast<std::uint32_t>(pager_kind::directory) == LESH_PAGER_DIRECTORY);
@@ -1308,24 +1226,23 @@ int32_t lesh_request_command_kind(const lesh_request* request, const char* name,
 		return LESH_OK;
 
 	const std::string_view given{name, length};
-	// A NUL inside the name would truncate the candidate handed to stat(2), and
-	// a truncated name is a different name. The buffer is bytes and may contain
-	// one, so this is a real input and not a theoretical one.
+	// A NUL inside the name would truncate the candidate the host hands to
+	// stat(2), and a truncated name is a different name. The buffer is bytes and
+	// may contain one, so this is a real input and not a theoretical one; refusing
+	// it here rather than at the door means every host is spared the check.
 	if (given.find('\0') != std::string_view::npos)
 		return LESH_OK;
 
 	if (memo_find(request->command_kinds, given, *out))
 		return LESH_OK;
 
-	// The documented fallback when no shell is attached: empty tables, and the
-	// process environment's PATH. A file-scope instance rather than one per
-	// call, because it holds nothing and constructing a vtable pointer per
-	// command name is work for no answer.
-	static const environment_knowledge kEnvironment;
-	const shell_knowledge& shell =
-		request->knowledge != nullptr ? *request->knowledge : kEnvironment;
-
-	*out = static_cast<std::uint32_t>(classify_command_name(shell, given));
+	// No host attached: LESH_COMMAND_UNKNOWN, already in `*out`, and memoized so
+	// a line full of names costs one miss each rather than one miss each twice.
+	// The documented fallback that used to live here - empty tables and the
+	// process environment's `$PATH` - is `ui::environment_knowledge`'s, behind
+	// `host::classify_command`, where the `$PATH` sweep it needs now lives too.
+	if (request->host != nullptr)
+		*out = request->host->classify_command(given);
 	memo_store(request->command_kinds, given, *out);
 	return LESH_OK;
 }
@@ -1414,9 +1331,9 @@ int32_t lesh_complete(lesh_editor* editor, size_t* count_out) {
 	if (count_out == nullptr)
 		return LESH_ERR_INVAL;
 	*count_out = 0;
-	editor->completion.clear();
+	editor->completion = lesh::leshper::completion_candidates{};
 	editor->completion_ran = false;
-	if (editor->registry == nullptr || editor->registry->completion == nullptr)
+	if (editor->registry == nullptr || editor->registry->host == nullptr)
 		return LESH_ERR_NOTFOUND;
 
 	// THE STAGED BUFFER, not the target's. An action may have edited before it
@@ -1424,12 +1341,27 @@ int32_t lesh_complete(lesh_editor* editor, size_t* count_out) {
 	// that pushed a key - and completing text the user can no longer see would be
 	// the class of bug staging exists to prevent. The staging area is what
 	// `lesh_position_move` reads too, for exactly this reason (#133).
-	lesh::leshper::completion_query query;
-	query.buffer = editor->staged;
-	query.cursor = editor->staged_cursor;
-	editor->registry->completion->complete(query, editor->completion);
+	//
+	// BORROWED INTO THE EFFECT and not copied: `staged` is alive for the whole of
+	// this call, which is the whole of the round trip (#168 Phase B, effect.h).
+	lesh::leshper::want_completion asked;
+	asked.computed_against =
+		editor->target != nullptr ? editor->target->gen : lesh::leshper::generation{};
+	asked.buffer = editor->staged.data();
+	asked.length = editor->staged.size();
+	asked.cursor = editor->staged_cursor;
+
+	// CARRIED OUT WHERE IT IS RAISED. Every other effect leaves on the vector
+	// `step` returns and is performed by the driver afterwards; this one cannot
+	// be, because the count below is read back inside the same ABI call. So the
+	// host performs it through the door it is holding - which is the same object,
+	// the same value types and the same generation as the deferred path would
+	// use, and is why moving completion to a worker later is a change to
+	// `editor_host` rather than to `complete_word`.
+	if (!editor->registry->host->carry_out(asked, editor->completion))
+		return LESH_ERR_NOTFOUND;
 	editor->completion_ran = true;
-	*count_out = editor->completion.candidates.size();
+	*count_out = editor->completion.count;
 	return LESH_OK;
 }
 
@@ -1450,9 +1382,11 @@ int32_t lesh_completion_candidate(lesh_editor* editor, size_t index, char* out,
 	if (length_out == nullptr)
 		return LESH_ERR_INVAL;
 	*length_out = 0;
-	if (!editor->completion_ran || index >= editor->completion.candidates.size())
+	if (!editor->completion_ran || index >= editor->completion.count
+	    || editor->completion.items == nullptr)
 		return LESH_ERR_NOTFOUND;
-	const lesh::leshper::candidate& one = editor->completion.candidates[index];
+	// The host's storage, borrowed - see `completion_candidates` for how long.
+	const lesh::leshper::pager_candidate& one = editor->completion.items[index];
 	// The KIND FIRST, so a caller that got LESH_ERR_TOOSMALL still knows what it
 	// was about to add and can ask again with a bigger buffer.
 	if (kind_out != nullptr)
@@ -1734,10 +1668,10 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.dismissed_kind = 0;
 	_handle.dismiss_requested = false;
 	// Cleared per call and not per Tab: an action that did not ask for a
-	// completion must not read the last one's candidates back (#139). `clear`
-	// keeps the vectors' capacity, which is the point of the handle being a
-	// member at all.
-	_handle.completion.clear();
+	// completion must not read the last one's candidates back (#139). It is a
+	// view since #168 Phase B, so clearing it costs nothing and the CAPACITY that
+	// used to be the reason this is a member lives in the host's own storage.
+	_handle.completion = lesh::leshper::completion_candidates{};
 	_handle.completion_ran = false;
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
@@ -1921,7 +1855,7 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		token.computed_against = target.gen;
 		token.event_kind = kinds;
 		token.superseded = &_superseded;
-		token.knowledge = _registry->knowledge;
+		token.host = _registry->host;
 		token.spans = &batch.spans;
 		token.texts = &batch.texts;
 		token.proposals = &batch.proposals;

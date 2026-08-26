@@ -1,5 +1,5 @@
 #include "leshper/abi.h"
-#include "leshper/history_search.h"
+#include "ui/history_search.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
 
@@ -16,6 +16,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // The searcher's tests feed VECTORS and never open a file (#125).
 //
@@ -94,7 +95,7 @@ state buffer_of(std::string_view text, std::size_t cursor) {
 // The source, and the order everything comes back in
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, TheSourceWalksNewestFirst) {
+TEST(UiHistorySearch, TheSourceWalksNewestFirst) {
 	// "Newest first" falls out of "append-only" (#113), and the vector source
 	// says so by holding entries in APPEND order and walking them backwards -
 	// so a test reads like a session, oldest command written first.
@@ -108,7 +109,7 @@ TEST(LeshperHistorySearch, TheSourceWalksNewestFirst) {
 	EXPECT_EQ(seen, (std::vector<std::string>{"third", "second", "first"}));
 }
 
-TEST(LeshperHistorySearch, TheSourceStopsWhenTheWalkSaysStop) {
+TEST(UiHistorySearch, TheSourceStopsWhenTheWalkSaysStop) {
 	const vector_history_source source{{"a", "b", "c"}};
 	std::size_t seen = 0;
 	source.for_each_newest_first([&](std::string_view) {
@@ -118,7 +119,7 @@ TEST(LeshperHistorySearch, TheSourceStopsWhenTheWalkSaysStop) {
 	EXPECT_EQ(seen, 2u);
 }
 
-TEST(LeshperHistorySearch, AnEmptySourceIsZeroMatchesAndNotAnError) {
+TEST(UiHistorySearch, AnEmptySourceIsZeroMatchesAndNotAnError) {
 	const vector_history_source source;
 	history_search search = searcher_for(history_search::mode::line);
 	const history_search::outcome result =
@@ -129,7 +130,7 @@ TEST(LeshperHistorySearch, AnEmptySourceIsZeroMatchesAndNotAnError) {
 	EXPECT_FALSE(result.cancelled);
 }
 
-TEST(LeshperHistorySearch, MatchesComeBackNewestFirst) {
+TEST(UiHistorySearch, MatchesComeBackNewestFirst) {
 	const vector_history_source source{{"git status", "ls -l", "git commit"}};
 	history_search search = searcher_for(history_search::mode::line);
 	const std::vector<kept> found = collect(search, "git", source);
@@ -143,14 +144,14 @@ TEST(LeshperHistorySearch, MatchesComeBackNewestFirst) {
 // F-32, line mode: substring anywhere
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, LineModeMatchesASubstringAnywhere) {
+TEST(UiHistorySearch, LineModeMatchesASubstringAnywhere) {
 	history_search search = searcher_for(history_search::mode::line);
 	EXPECT_TRUE(search.matches("status", "git status"));
 	EXPECT_TRUE(search.matches("tat", "git status"));
 	EXPECT_FALSE(search.matches("commit", "git status"));
 }
 
-TEST(LeshperHistorySearch, LineModeRangesCoverEveryOccurrence) {
+TEST(UiHistorySearch, LineModeRangesCoverEveryOccurrence) {
 	// Both `git`s are why the entry is in the list, so both are highlighted.
 	history_search search = searcher_for(history_search::mode::line);
 	ASSERT_TRUE(search.matches("git", "git log | git diff"));
@@ -160,7 +161,7 @@ TEST(LeshperHistorySearch, LineModeRangesCoverEveryOccurrence) {
 	EXPECT_EQ(ranges[1], (history_search::range{10, 13}));
 }
 
-TEST(LeshperHistorySearch, LineModeOccurrencesDoNotOverlap) {
+TEST(UiHistorySearch, LineModeOccurrencesDoNotOverlap) {
 	history_search search = searcher_for(history_search::mode::line);
 	ASSERT_TRUE(search.matches("aa", "aaaa"));
 	const std::span<const history_search::range> ranges = search.last_ranges();
@@ -173,7 +174,7 @@ TEST(LeshperHistorySearch, LineModeOccurrencesDoNotOverlap) {
 // F-33, prefix mode: navigation constrained to what is typed
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, PrefixModeConstrainsNavigationToTheTypedPrefix) {
+TEST(UiHistorySearch, PrefixModeConstrainsNavigationToTheTypedPrefix) {
 	// F-33 in the shape the requirement states it: up-arrow with `git c` typed
 	// cycles matches only.
 	const vector_history_source source{
@@ -188,7 +189,7 @@ TEST(LeshperHistorySearch, PrefixModeConstrainsNavigationToTheTypedPrefix) {
 	EXPECT_EQ(found[0].ranges[0], (history_search::range{0, 5}));
 }
 
-TEST(LeshperHistorySearch, PrefixModeIsNotSubstringSearch) {
+TEST(UiHistorySearch, PrefixModeIsNotSubstringSearch) {
 	history_search search = searcher_for(history_search::mode::prefix);
 	EXPECT_TRUE(search.matches("git", "git status"));
 	EXPECT_FALSE(search.matches("status", "git status"));
@@ -202,7 +203,7 @@ TEST(LeshperHistorySearch, PrefixModeIsNotSubstringSearch) {
 // F-32, token mode: whole tokens, via C-6's lexer
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, TokenModeMatchesWholeTokensOnly) {
+TEST(UiHistorySearch, TokenModeMatchesWholeTokensOnly) {
 	history_search search = searcher_for(history_search::mode::token);
 	EXPECT_TRUE(search.matches("git", "git status"));
 	EXPECT_TRUE(search.matches("status", "git status"));
@@ -212,7 +213,7 @@ TEST(LeshperHistorySearch, TokenModeMatchesWholeTokensOnly) {
 	EXPECT_TRUE(searcher_for(history_search::mode::line).matches("git", "github-cli auth"));
 }
 
-TEST(LeshperHistorySearch, TokenModeUsesTheLexersBoundariesAndNotBlanks) {
+TEST(UiHistorySearch, TokenModeUsesTheLexersBoundariesAndNotBlanks) {
 	history_search search = searcher_for(history_search::mode::token);
 	// `foo|bar` is three tokens even without a blank in sight.
 	EXPECT_TRUE(search.matches("foo", "foo|bar"));
@@ -222,7 +223,7 @@ TEST(LeshperHistorySearch, TokenModeUsesTheLexersBoundariesAndNotBlanks) {
 	EXPECT_TRUE(search.matches("'foo bar'", "echo 'foo bar'"));
 }
 
-TEST(LeshperHistorySearch, TokenModeComparesSourceBytesWithoutQuoteRemoval) {
+TEST(UiHistorySearch, TokenModeComparesSourceBytesWithoutQuoteRemoval) {
 	// The argued decision (see match_token): a token is compared AS WRITTEN.
 	// The searcher has a lexer and not an expander, and a match established
 	// after quote removal would cover bytes that are not in the entry, leaving
@@ -234,7 +235,7 @@ TEST(LeshperHistorySearch, TokenModeComparesSourceBytesWithoutQuoteRemoval) {
 	EXPECT_TRUE(search.matches("\"foo\"", "echo \"foo\""));
 }
 
-TEST(LeshperHistorySearch, TokenModeMatchesAContiguousRunOfTokens) {
+TEST(UiHistorySearch, TokenModeMatchesAContiguousRunOfTokens) {
 	history_search search = searcher_for(history_search::mode::token);
 	ASSERT_TRUE(search.matches("git commit", "git commit -m x"));
 	const std::span<const history_search::range> ranges = search.last_ranges();
@@ -248,7 +249,7 @@ TEST(LeshperHistorySearch, TokenModeMatchesAContiguousRunOfTokens) {
 	EXPECT_FALSE(search.matches("git x", "git commit -m x"));
 }
 
-TEST(LeshperHistorySearch, TokenModeRangesLandOnTheTokenAndNotOnTheBlanks) {
+TEST(UiHistorySearch, TokenModeRangesLandOnTheTokenAndNotOnTheBlanks) {
 	history_search search = searcher_for(history_search::mode::token);
 	ASSERT_TRUE(search.matches("status", "git status --short"));
 	const std::span<const history_search::range> ranges = search.last_ranges();
@@ -256,7 +257,7 @@ TEST(LeshperHistorySearch, TokenModeRangesLandOnTheTokenAndNotOnTheBlanks) {
 	EXPECT_EQ(ranges[0], (history_search::range{4, 10}));
 }
 
-TEST(LeshperHistorySearch, TokenModeSurvivesAHalfTypedQuery) {
+TEST(UiHistorySearch, TokenModeSurvivesAHalfTypedQuery) {
 	// The lexer never fails (#9): an unterminated quote is a token that says
 	// so, not an error path. An incremental search sees this on every other
 	// keystroke and must simply not match.
@@ -270,7 +271,7 @@ TEST(LeshperHistorySearch, TokenModeSurvivesAHalfTypedQuery) {
 // F-34: multi-line entries stay multi-line
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, MultiLineEntriesComeBackWithTheirNewlinesIntact) {
+TEST(UiHistorySearch, MultiLineEntriesComeBackWithTheirNewlinesIntact) {
 	// F-34: a recalled multi-line entry reconstructs as a 2D buffer. The
 	// searcher's contribution is to never flatten one on the way through.
 	const std::string loop_entry = "for f in *; do\n  echo $f\ndone";
@@ -284,7 +285,7 @@ TEST(LeshperHistorySearch, MultiLineEntriesComeBackWithTheirNewlinesIntact) {
 	EXPECT_EQ(std::count(found[0].entry.begin(), found[0].entry.end(), '\n'), 2);
 }
 
-TEST(LeshperHistorySearch, TokenModeLexesAcrossTheNewlinesOfAMultiLineEntry) {
+TEST(UiHistorySearch, TokenModeLexesAcrossTheNewlinesOfAMultiLineEntry) {
 	const std::string loop_entry = "for f in *; do\n  echo $f\ndone";
 	history_search search = searcher_for(history_search::mode::token);
 	ASSERT_TRUE(search.matches("echo", loop_entry));
@@ -296,7 +297,7 @@ TEST(LeshperHistorySearch, TokenModeLexesAcrossTheNewlinesOfAMultiLineEntry) {
 	EXPECT_TRUE(search.matches("echo $f\ndone", loop_entry));
 }
 
-TEST(LeshperHistorySearch, PrefixModeOnAMultiLineEntryMatchesTheFirstLine) {
+TEST(UiHistorySearch, PrefixModeOnAMultiLineEntryMatchesTheFirstLine) {
 	// F-33 with a multi-line entry: the typed prefix is compared against the
 	// whole entry, newlines and all, so a partly typed `for f in` still finds
 	// the loop the user ran yesterday.
@@ -310,7 +311,7 @@ TEST(LeshperHistorySearch, PrefixModeOnAMultiLineEntryMatchesTheFirstLine) {
 // The degenerate query, and the caps
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, AnEmptyQueryMatchesEverythingInEveryMode) {
+TEST(UiHistorySearch, AnEmptyQueryMatchesEverythingInEveryMode) {
 	// Not a guard - it is plain history navigation, and all three modes have to
 	// agree on it or the search UI's first keystroke would change the list out
 	// from under the user.
@@ -326,13 +327,13 @@ TEST(LeshperHistorySearch, AnEmptyQueryMatchesEverythingInEveryMode) {
 	}
 }
 
-TEST(LeshperHistorySearch, ATokenQueryOfNothingButBlanksIsTheEmptyQuery) {
+TEST(UiHistorySearch, ATokenQueryOfNothingButBlanksIsTheEmptyQuery) {
 	history_search search = searcher_for(history_search::mode::token);
 	EXPECT_TRUE(search.matches("   ", "anything at all"));
 	EXPECT_TRUE(search.last_ranges().empty());
 }
 
-TEST(LeshperHistorySearch, MaxMatchesStopsTheWalk) {
+TEST(UiHistorySearch, MaxMatchesStopsTheWalk) {
 	const vector_history_source source{{"git a", "git b", "git c", "git d"}};
 	history_search::options opts;
 	opts.search = history_search::mode::prefix;
@@ -354,7 +355,7 @@ TEST(LeshperHistorySearch, MaxMatchesStopsTheWalk) {
 	EXPECT_EQ(result.entries_examined, 2u);
 }
 
-TEST(LeshperHistorySearch, MaxRangesCapsHighlightsWithoutDroppingTheMatch) {
+TEST(UiHistorySearch, MaxRangesCapsHighlightsWithoutDroppingTheMatch) {
 	history_search::options opts;
 	opts.search = history_search::mode::line;
 	opts.max_ranges = 2;
@@ -363,7 +364,7 @@ TEST(LeshperHistorySearch, MaxRangesCapsHighlightsWithoutDroppingTheMatch) {
 	EXPECT_EQ(search.last_ranges().size(), 2u);
 }
 
-TEST(LeshperHistorySearch, ASinkThatSaysStopEndsTheWalk) {
+TEST(UiHistorySearch, ASinkThatSaysStopEndsTheWalk) {
 	const vector_history_source source{{"a1", "a2", "a3"}};
 	history_search search = searcher_for(history_search::mode::line);
 	std::size_t seen = 0;
@@ -377,7 +378,7 @@ TEST(LeshperHistorySearch, ASinkThatSaysStopEndsTheWalk) {
 	EXPECT_EQ(result.entries_examined, 1u);
 }
 
-TEST(LeshperHistorySearch, TheCancelPollRunsBetweenEntries) {
+TEST(UiHistorySearch, TheCancelPollRunsBetweenEntries) {
 	// #94's supersede poll: it runs BEFORE an entry is examined, so a cancelled
 	// walk has nothing half-done and the sink was not called for work about to
 	// be thrown away.
@@ -400,7 +401,7 @@ TEST(LeshperHistorySearch, TheCancelPollRunsBetweenEntries) {
 	EXPECT_FALSE(result.stopped);
 }
 
-TEST(LeshperHistorySearch, OneSearcherServesManySearches) {
+TEST(UiHistorySearch, OneSearcherServesManySearches) {
 	// The scratch is a member so an incremental search that reruns on every
 	// keystroke stops allocating. What has to be true for that to be safe is
 	// that consecutive runs do not contaminate each other.
@@ -418,7 +419,7 @@ TEST(LeshperHistorySearch, OneSearcherServesManySearches) {
 // The provider face: a request token, streaming proposals, generation gating
 // ---------------------------------------------------------------------------
 
-TEST(LeshperHistorySearch, TheProviderEmitsMatchesAsProposalsNewestFirst) {
+TEST(UiHistorySearch, TheProviderEmitsMatchesAsProposalsNewestFirst) {
 	registry reg;
 	const vector_history_source source{{"ls -l", "git status", "git commit"}};
 	history_search_provider provider;
@@ -439,7 +440,7 @@ TEST(LeshperHistorySearch, TheProviderEmitsMatchesAsProposalsNewestFirst) {
 	EXPECT_EQ(batches[0].proposals[0].kind, LESH_PROPOSAL_HISTORY_MATCH);
 }
 
-TEST(LeshperHistorySearch, TheQueryIsTheSnapshotsTypedPrefix) {
+TEST(UiHistorySearch, TheQueryIsTheSnapshotsTypedPrefix) {
 	// buffer[0, cursor), taken from the TOKEN - which is what makes the result
 	// generation-bound (N-4). Text to the right of the cursor is not part of
 	// what the user has typed towards a match.
@@ -464,7 +465,7 @@ TEST(LeshperHistorySearch, TheQueryIsTheSnapshotsTypedPrefix) {
 	EXPECT_EQ(batches[0].proposals[0].bytes, "git commit");
 }
 
-TEST(LeshperHistorySearch, TheProviderCarriesTheModeAndTheProposalKind) {
+TEST(UiHistorySearch, TheProviderCarriesTheModeAndTheProposalKind) {
 	registry reg;
 	const vector_history_source source{{"github-cli auth", "git status"}};
 	history_search_provider provider;
@@ -484,7 +485,7 @@ TEST(LeshperHistorySearch, TheProviderCarriesTheModeAndTheProposalKind) {
 	EXPECT_EQ(batches[0].proposals[0].kind, LESH_PROPOSAL_COMPLETION);
 }
 
-TEST(LeshperHistorySearch, ThePollNoticesMidWalkAndTheAnswerIsDroppedAnyway) {
+TEST(UiHistorySearch, ThePollNoticesMidWalkAndTheAnswerIsDroppedAnyway) {
 	registry reg;
 	loop_harness loop(reg);
 	const superseding_source source{loop, {"git a", "git b", "git c"}};
@@ -504,7 +505,7 @@ TEST(LeshperHistorySearch, ThePollNoticesMidWalkAndTheAnswerIsDroppedAnyway) {
 	EXPECT_EQ(batches[0].status, LESH_ERR_SUPERSEDED);
 }
 
-TEST(LeshperHistorySearch, AStaleBatchIsNotApplied) {
+TEST(UiHistorySearch, AStaleBatchIsNotApplied) {
 	// N-4, and nothing here does the checking: the loop is the only applier and
 	// it refuses a batch whose generation has moved on.
 	registry reg;
@@ -533,7 +534,7 @@ TEST(LeshperHistorySearch, AStaleBatchIsNotApplied) {
 	EXPECT_EQ(s.proposals.layers()[0].items.size(), 1u);
 }
 
-TEST(LeshperHistorySearch, AProviderWiredUpWithoutASourceSaysSoRatherThanGuessing) {
+TEST(UiHistorySearch, AProviderWiredUpWithoutASourceSaysSoRatherThanGuessing) {
 	// Not an empty history: F-17's null history is a vector source with nothing
 	// in it, so a null pointer here is a wiring bug and gets a wiring bug's
 	// answer.
@@ -550,7 +551,7 @@ TEST(LeshperHistorySearch, AProviderWiredUpWithoutASourceSaysSoRatherThanGuessin
 	EXPECT_TRUE(batches[0].proposals.empty());
 }
 
-TEST(LeshperHistorySearch, ANullHistoryProducesNothingAndIsNotAnError) {
+TEST(UiHistorySearch, ANullHistoryProducesNothingAndIsNotAnError) {
 	// F-17: vared passes a bundle with a null history, and the whole of that is
 	// a default-constructed source.
 	registry reg;
@@ -568,7 +569,7 @@ TEST(LeshperHistorySearch, ANullHistoryProducesNothingAndIsNotAnError) {
 	EXPECT_TRUE(batches[0].proposals.empty());
 }
 
-TEST(LeshperHistorySearch, AMultiLineMatchCrossesTheAbiUnflattened) {
+TEST(UiHistorySearch, AMultiLineMatchCrossesTheAbiUnflattened) {
 	// F-34 through the provider face: the proposal carries the newlines, so
 	// what an accepting action puts back in the buffer is the 2D construct the
 	// user originally typed.

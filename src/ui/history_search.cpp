@@ -1,11 +1,11 @@
-#include "leshper/history_search.h"
+#include "ui/history_search.h"
 
 #include "syntax/lexer.h"
 
 #include <string>
 #include <utility>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 namespace {
 
@@ -290,4 +290,4 @@ std::int32_t history_search_compute(lesh_request* request, void* userdata) {
 	return emit_status;
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

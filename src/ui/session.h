@@ -6,10 +6,15 @@
 // Everything below this line in the dependency graph is arranged so that the
 // editor and the shell never see each other. `lesh_leshper` does not link
 // `lesh_runtime` - CMakeLists says so and spec §4.4 is why - so leshper declares
-// SHAPES and the shell fills them in: `history_source` (#125) over #113's store,
-// `shell_knowledge` (#135) over `shell_state`, `shell_side` (ADR-0009) over the
-// executor, and `binding_console` in the other direction, declared by the
-// runtime for `bind` and implemented here over the keymap registry.
+// SHAPES and the shell fills them in. #168 Phase B cut that list down: the
+// editor's own doors are now `leshper::host` (one door, `ui::editor_host` behind
+// it, answering command kinds and completion) and `shell_side` (ADR-0009, over
+// the executor), plus `binding_console` in the other direction, declared by the
+// runtime for `bind` and implemented here over the keymap registry. What used to
+// be leshper's `history_source` (#125), `shell_knowledge` (#135) and `completer`
+// (#94) are all `lesh::ui` types now - the shell's knowledge never was the
+// editor's, and the editor only colours regions and inserts what the pager
+// committed.
 //
 // THIS FILE IS NOT IN `lesh_leshper`. `lesh_ui` is the ONE library that links
 // both `lesh_leshper` and `lesh_runtime`, and this is what it is for. If any of
@@ -34,7 +39,8 @@
 // (see `shell_prompt_source`), job-control UI, `vared` (#102), and the
 // autosuggestion accept keys (#140, undecided - so nothing is bound to them).
 
-#include "leshper/history_search.h"
+#include "ui/completion.h"
+#include "ui/history_search.h"
 
 #include <string>
 #include <string_view>
@@ -50,17 +56,6 @@ class shell_state;
 
 namespace lesh::leshper::prompt {
 class engine;
-}
-
-namespace lesh::leshper {
-// The `Completer` override point (#94), DEFINED IN `complete.h` since #139.
-//
-// Forward-declared here rather than included, because this header hands a
-// pointer through and never touches one - the same arrangement `history_source`
-// has. `provider_bundle::completion` below keeps its meaning and gains a
-// default: null now means "the session builds its own trio" rather than "there
-// is no completer".
-class completer;
 }
 
 namespace lesh::ui {
@@ -190,7 +185,7 @@ private:
 // store's walk on the floor rather than truly stopping it: the v1 store reads
 // the whole file before it calls anybody, so what that costs is a loop over
 // spans already in memory and no further I/O at all (#125's note).
-class history_store_source final : public leshper::history_source {
+class history_store_source final : public history_source {
 public:
 	explicit history_store_source(const runtime::history_store& store) noexcept
 		: _store(&store) {}
@@ -209,13 +204,13 @@ private:
 // providers for at least as long as the read.
 struct provider_bundle {
 	const syntax_layer* syntax = nullptr;
-	const leshper::history_source* history = nullptr;
+	const history_source* history = nullptr;
 	const prompt_source* prompt = nullptr;
 	// Null means the session builds the default `shell_completer` (#139): the
 	// three sources of spec 6.9 over the shell's own tables. A caller that
 	// supplies one replaces the whole trio, which is #94's override point, at one
 	// indirect call per Tab.
-	const leshper::completer* completion = nullptr;
+	const completer* completion = nullptr;
 
 	// The OTHER half of #94's `HistoryStore`, and the only non-const member here.
 	// `history_source` above is the read side, which is all the searcher and the

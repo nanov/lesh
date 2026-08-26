@@ -232,33 +232,10 @@ TEST(LeshperDecorationNormalize, VirtualTextsSortByOffsetAndTiesKeepEmissionOrde
 // The theme (theme.h)
 // ===========================================================================
 
-TEST(LeshperDecorationTheme, EverySemanticNameTheBuiltinReactorsInternHasADefault) {
-	// The thing that makes the feature VISIBLE rather than merely wired: an id
-	// the theme has no row for renders as ordinary text, so a vocabulary name
-	// missing from the table is a highlight silently not happening. Asked of the
-	// real registrations rather than of a copy of the list, because a copy is
-	// exactly what would go stale.
-	registry reg;
-	owned_highlighter painter;
-	ASSERT_EQ(register_builtin_reactors(reg, painter.get()), 1u);
-	owned_autosuggester suggester{nullptr};
-	ASSERT_EQ(register_autosuggester(reg, suggester.get()), 1u);
-
-	style_table table;
-	table.sync(reg.styles);
-
-	ASSERT_GT(reg.styles.size(), 1u);
-	for (std::size_t id = 1; id < reg.styles.size(); ++id) {
-		EXPECT_TRUE(table.knows(static_cast<std::uint32_t>(id)))
-			<< "no default pen for the interned name \"" << reg.styles[id] << '"';
-	}
-	// #133's, by name, because the autosuggester's whole visible half depends on
-	// it being muted rather than absent.
-	std::uint32_t suggestion = 0;
-	ASSERT_EQ(lesh_style_intern(&reg, "suggestion", &suggestion), LESH_OK);
-	table.sync(reg.styles);
-	EXPECT_TRUE(table.knows(suggestion));
-}
+// EVERY NAME THE BUILT-IN REACTORS INTERN HAS A DEFAULT PEN is asserted in
+// `ui_highlight_tests.cpp` (#168 Phase B), because the reactors that intern them
+// are `lesh::ui`'s now. The assertion is the same one and is deliberately not
+// restated over a copy of the list here - a copy is exactly what goes stale.
 
 TEST(LeshperDecorationTheme, ThePensAreTruecolorAndNothingHereQuantizes) {
 	// #97: the theme authors at full precision and `blit.cpp` owns the downmap,

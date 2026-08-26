@@ -2,6 +2,10 @@
 #include "leshper/registry.h"
 #include "leshper/state.h"
 #include "substrate/arena.h"
+#include "ui/editor_host.h"
+#include "ui/reactors.h"
+#include "leshper/theme.h"
+#include "ui/shell_knowledge.h"
 
 #include <gtest/gtest.h>
 
@@ -13,6 +17,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // The highlighter reactor (#124: F-20/F-21/F-22, on #93's ABI).
 //
@@ -36,10 +41,21 @@ namespace {
 // reactor's context pointer.
 struct highlight_fixture {
 	owned_highlighter self;
+	// NO SHELL, WHICH IS THE POINT (#168 Phase B). The tables read empty and
+	// `$PATH` comes from the process environment - what the highlighter did
+	// before #135's door existed, and what a leshper embedded in something that
+	// is not this shell sees. It used to be a fallback inside leshper's own ABI
+	// verb; it is a host now, because the `$PATH` sweep behind it is filesystem
+	// knowledge and there is exactly one door for that.
+	environment_knowledge environment;
+	editor_host host{&environment};
 	registry reg;
 	loop_harness loop{reg};
 
-	highlight_fixture() { register_builtin_reactors(reg, self.get()); }
+	highlight_fixture() {
+		reg.host = &host;
+		register_builtin_reactors(reg, self.get());
+	}
 
 	[[nodiscard]] reactor_batch paint(std::string_view line) {
 		lesh::leshper::state s;
@@ -118,7 +134,7 @@ private:
 
 } // namespace
 
-TEST(LeshperHighlight, ItRegistersThroughTheAbiExactlyAsAPluginWould) {
+TEST(UiHighlight, ItRegistersThroughTheAbiExactlyAsAPluginWould) {
 	// A-11: built-in reactors MUST use the subscription interface, not a special
 	// path. The evidence is that the ABI can see it - the name is in the reactor
 	// registry, and there is no second table for native ones.
@@ -130,7 +146,7 @@ TEST(LeshperHighlight, ItRegistersThroughTheAbiExactlyAsAPluginWould) {
 	EXPECT_EQ(exists, 0);
 }
 
-TEST(LeshperHighlight, ACursorMoveDoesNotAskForARepaint) {
+TEST(UiHighlight, ACursorMoveDoesNotAskForARepaint) {
 	// A highlight is a function of the text. Subscribing to cursor_moved would be
 	// a full re-parse per arrow key for a byte-identical answer.
 	highlight_fixture fixture;
@@ -139,7 +155,7 @@ TEST(LeshperHighlight, ACursorMoveDoesNotAskForARepaint) {
 	EXPECT_EQ(fixture.loop.react(s, LESH_EVENT_BUFFER_CHANGED).size(), 1u);
 }
 
-TEST(LeshperHighlight, TheStyleVocabularyIsInternedSemanticNames) {
+TEST(UiHighlight, TheStyleVocabularyIsInternedSemanticNames) {
 	// F-21's "independently themeable", stated as the thing that makes it true:
 	// the reactor emits `command.unknown`, never a colour. The theme maps these
 	// at render, which is the other half of the feature and not this ticket.
@@ -159,7 +175,7 @@ TEST(LeshperHighlight, TheStyleVocabularyIsInternedSemanticNames) {
 	}
 }
 
-TEST(LeshperHighlight, OneLineWhole) {
+TEST(UiHighlight, OneLineWhole) {
 	// The batch for one ordinary line, in order, as a reader would describe it.
 	// Here so that a change to the emission contract has to be stated rather than
 	// discovered - the ordering IS the contract, since the renderer that consumes
@@ -177,7 +193,7 @@ TEST(LeshperHighlight, OneLineWhole) {
 	EXPECT_EQ(fixture.painted(line), want);
 }
 
-TEST(LeshperHighlight, AnUnresolvableCommandNameIsUnknownAndAResolvableOneIsAPath) {
+TEST(UiHighlight, AnUnresolvableCommandNameIsUnknownAndAResolvableOneIsAPath) {
 	highlight_fixture fixture;
 	scoped_path path{"/bin"};
 	EXPECT_TRUE(fixture.has("sh -c x", "sh", "command.path"));
@@ -185,7 +201,7 @@ TEST(LeshperHighlight, AnUnresolvableCommandNameIsUnknownAndAResolvableOneIsAPat
 	                        "command.unknown"));
 }
 
-TEST(LeshperHighlight, ANameWithASlashIsAPathAndNotAPathLookup) {
+TEST(UiHighlight, ANameWithASlashIsAPathAndNotAPathLookup) {
 	// POSIX 2.9.1.1. With PATH emptied, an absolute name still resolves and a
 	// bare one cannot - which is the difference the rule makes.
 	highlight_fixture fixture;
@@ -195,14 +211,14 @@ TEST(LeshperHighlight, ANameWithASlashIsAPathAndNotAPathLookup) {
 	                        "command.unknown"));
 }
 
-TEST(LeshperHighlight, ADirectoryIsNotACommand) {
+TEST(UiHighlight, ADirectoryIsNotACommand) {
 	// access(X_OK) says yes for a directory, so the mode test is what keeps
 	// `/tmp` from painting as something exec would run.
 	highlight_fixture fixture;
 	EXPECT_TRUE(fixture.has("/tmp arg", "/tmp", "command.unknown"));
 }
 
-TEST(LeshperHighlight, AWordThatIsNotProvablyLiteralIsNotClassifiedAtAll) {
+TEST(UiHighlight, AWordThatIsNotProvablyLiteralIsNotClassifiedAtAll) {
 	// `$cmd` names a command only after expansion. Painting it red for being a
 	// variable is the behaviour that makes highlighting untrustworthy, so the
 	// classifier declines and the expansion segment paints instead.
@@ -216,7 +232,7 @@ TEST(LeshperHighlight, AWordThatIsNotProvablyLiteralIsNotClassifiedAtAll) {
 	EXPECT_TRUE(fixture.has("'sh' -c x", "'sh'", "string.single"));
 }
 
-TEST(LeshperHighlight, QuotedStringsArePaintedByKind) {
+TEST(UiHighlight, QuotedStringsArePaintedByKind) {
 	// F-21 asks for quoted string BY KIND, and #95 found the syntax layer
 	// already answers it: re-lexing a word interior through C-6 yields the kinds
 	// with exact spans, no second scanner involved.
@@ -227,7 +243,7 @@ TEST(LeshperHighlight, QuotedStringsArePaintedByKind) {
 	EXPECT_TRUE(fixture.has(line, "$'c'", "string.ansi_c"));
 }
 
-TEST(LeshperHighlight, ExpansionsAndSubstitutionsArePaintedByKind) {
+TEST(UiHighlight, ExpansionsAndSubstitutionsArePaintedByKind) {
 	highlight_fixture fixture;
 	const std::string_view line = "echo $x $(ls) $((1+2)) ~/d";
 	EXPECT_TRUE(fixture.has(line, "$x", "expansion.parameter"));
@@ -236,7 +252,7 @@ TEST(LeshperHighlight, ExpansionsAndSubstitutionsArePaintedByKind) {
 	EXPECT_TRUE(fixture.has(line, "~", "expansion.tilde"));
 }
 
-TEST(LeshperHighlight, AnAssignmentsValueIsLexedTheWayTheExecutorLexesIt) {
+TEST(UiHighlight, AnAssignmentsValueIsLexedTheWayTheExecutorLexesIt) {
 	// POSIX 2.6.1 confines the after-a-colon tilde to assignments, which is the
 	// whole of what lex_mode::assignment_interior is for. Painted as a plain word
 	// interior, `PATH=~/a:~/b` gets its first tilde and calls the second literal
@@ -254,7 +270,7 @@ TEST(LeshperHighlight, AnAssignmentsValueIsLexedTheWayTheExecutorLexesIt) {
 		EXPECT_EQ(bytes, "~") << "painted " << style << " over the name";
 }
 
-TEST(LeshperHighlight, TheAfterColonTildeIsAnAssignmentsAloneAndNotAnArguments) {
+TEST(UiHighlight, TheAfterColonTildeIsAnAssignmentsAloneAndNotAnArguments) {
 	// The mirror of the test above, and the reason the mode has to come from the
 	// tree rather than from the bytes: `x=~/a` and `echo x=~/a` are the same
 	// bytes, and a tilde is eligible in exactly one of them. Only the parser
@@ -268,7 +284,7 @@ TEST(LeshperHighlight, TheAfterColonTildeIsAnAssignmentsAloneAndNotAnArguments) 
 	EXPECT_TRUE(fixture.has("echo ~/a", "~", "expansion.tilde"));
 }
 
-TEST(LeshperHighlight, AnAssignmentsValueStillPaintsItsQuotingAndExpansions) {
+TEST(UiHighlight, AnAssignmentsValueStillPaintsItsQuotingAndExpansions) {
 	// The mode change must not have cost the ordinary cases.
 	highlight_fixture fixture;
 	const std::string_view line = "x='a'\"b $y\"$(sh -c ls)";
@@ -278,7 +294,7 @@ TEST(LeshperHighlight, AnAssignmentsValueStillPaintsItsQuotingAndExpansions) {
 	EXPECT_TRUE(fixture.has(line, "$(sh -c ls)", "expansion.command"));
 }
 
-TEST(LeshperHighlight, ExpansionsInsideDoubleQuotesStillPaint) {
+TEST(UiHighlight, ExpansionsInsideDoubleQuotesStillPaint) {
 	// A single quote inside double quotes is an ordinary byte, so the interior
 	// has to be re-lexed in the right mode; lexed as a plain word interior,
 	// `"it's $x"` loses the parameter behind a phantom single-quoted run.
@@ -288,7 +304,7 @@ TEST(LeshperHighlight, ExpansionsInsideDoubleQuotesStillPaint) {
 	EXPECT_TRUE(fixture.has(line, "$x", "expansion.parameter"));
 }
 
-TEST(LeshperHighlight, ItDescendsIntoCommandSubstitutionInteriors) {
+TEST(UiHighlight, ItDescendsIntoCommandSubstitutionInteriors) {
 	// #104's sub-parses, which is the whole reason `$(ls -l foo)` is not one
 	// blob. The outer span comes FIRST and the interior's classification second,
 	// which is the emission order the batch promises: later refines earlier.
@@ -310,7 +326,7 @@ TEST(LeshperHighlight, ItDescendsIntoCommandSubstitutionInteriors) {
 	EXPECT_LT(outer, inner) << "the container must be emitted before what it contains";
 }
 
-TEST(LeshperHighlight, CommentsComeFromTheSideListAndNothingElseMoves) {
+TEST(UiHighlight, CommentsComeFromTheSideListAndNothingElseMoves) {
 	// #103 made comments tokens the parser records beside the tree. A painter
 	// greys them from that list; the grammar never sees one, so `ls` is still a
 	// command name with a comment after it.
@@ -321,7 +337,7 @@ TEST(LeshperHighlight, CommentsComeFromTheSideListAndNothingElseMoves) {
 	EXPECT_TRUE(fixture.has(line, "sh", "command.path"));
 }
 
-TEST(LeshperHighlight, RedirectTargetsArePainted) {
+TEST(UiHighlight, RedirectTargetsArePainted) {
 	// #103 gave the target a word node with a role, which is the span this
 	// paints and the footing completion stands on.
 	highlight_fixture fixture;
@@ -329,7 +345,7 @@ TEST(LeshperHighlight, RedirectTargetsArePainted) {
 	EXPECT_TRUE(fixture.has("echo x >> /tmp/out", "/tmp/out", "redirect.target"));
 }
 
-TEST(LeshperHighlight, KeywordsArePaintedWherePositionMakesThemKeywords) {
+TEST(UiHighlight, KeywordsArePaintedWherePositionMakesThemKeywords) {
 	// #105's flag, and the reason it has to be a flag the PARSER sets: the bytes
 	// are the same either way, and only the grammar knows which `done` is which.
 	highlight_fixture fixture;
@@ -341,7 +357,7 @@ TEST(LeshperHighlight, KeywordsArePaintedWherePositionMakesThemKeywords) {
 	EXPECT_FALSE(fixture.any_of_style("echo done", "keyword"));
 }
 
-TEST(LeshperHighlight, AMalformedLineGetsASquiggleAndAnIncompleteOneDoesNot) {
+TEST(UiHighlight, AMalformedLineGetsASquiggleAndAnIncompleteOneDoesNot) {
 	// C-2's tristate, which is the whole reason it is a tristate rather than a
 	// boolean. `echo "x` is incomplete AND defective; an editor answers that
 	// with a continuation prompt, not with red, because more input fixes it.
@@ -359,7 +375,7 @@ TEST(LeshperHighlight, AMalformedLineGetsASquiggleAndAnIncompleteOneDoesNot) {
 	EXPECT_FALSE(fixture.any_of_style("echo hi", "error.syntax"));
 }
 
-TEST(LeshperHighlight, ADefectInsideACommandSubstitutionIsNotThisLinesDefect) {
+TEST(UiHighlight, ADefectInsideACommandSubstitutionIsNotThisLinesDefect) {
 	// #104's watermark, read forward. The expander reports an interior defect at
 	// expansion time, at status 2, and has_errors() declines to see it - so
 	// painting it here would put the tree and the paint in disagreement about
@@ -369,7 +385,7 @@ TEST(LeshperHighlight, ADefectInsideACommandSubstitutionIsNotThisLinesDefect) {
 	EXPECT_TRUE(fixture.has("echo $(if true)", "$(if true)", "expansion.command"));
 }
 
-TEST(LeshperHighlight, AliasesAreNotSubstitutedSoSpansPointAtWhatWasTyped) {
+TEST(UiHighlight, AliasesAreNotSubstitutedSoSpansPointAtWhatWasTyped) {
 	// The highlight parse passes no alias table - parse()'s default, and #95's
 	// finding. There is no table to pass here, which is exactly the point: the
 	// reactor cannot reach shell state through the ABI, so it could not paint
@@ -382,7 +398,7 @@ TEST(LeshperHighlight, AliasesAreNotSubstitutedSoSpansPointAtWhatWasTyped) {
 	}
 }
 
-TEST(LeshperHighlight, ThePollIsCheckedAndTheReactorGivesUpCooperatively) {
+TEST(UiHighlight, ThePollIsCheckedAndTheReactorGivesUpCooperatively) {
 	// ADR-0008's cancellation. The harness resets the flag at the top of react(),
 	// so the way to be superseded mid-sweep is to be superseded by something
 	// running in the same sweep - a reactor whose name sorts before
@@ -411,7 +427,7 @@ TEST(LeshperHighlight, ThePollIsCheckedAndTheReactorGivesUpCooperatively) {
 	EXPECT_EQ(highlighter_batch->status, LESH_ERR_SUPERSEDED);
 }
 
-TEST(LeshperHighlight, AStaleHighlightHasNowhereToBeApplied) {
+TEST(UiHighlight, AStaleHighlightHasNowhereToBeApplied) {
 	// N-4 through the highlighter rather than through a toy reactor: the batch
 	// was computed against a generation the buffer has left behind, and there is
 	// no apply function in abi.h for it to reach.
@@ -434,7 +450,7 @@ TEST(LeshperHighlight, AStaleHighlightHasNowhereToBeApplied) {
 	EXPECT_EQ(s.marks.layers().size(), 1u);
 }
 
-TEST(LeshperHighlight, TheComputePathTakesNothingFromTheHeap) {
+TEST(UiHighlight, TheComputePathTakesNothingFromTheHeap) {
 	// #90's rule: a reactor computes out of the arena its request hands it, and
 	// nothing else. The instrument is the repo's own - `heap_allocations` counts
 	// ONLY the arena's malloc fallback, so a non-zero reading means the parse
@@ -464,7 +480,7 @@ TEST(LeshperHighlight, TheComputePathTakesNothingFromTheHeap) {
 	EXPECT_EQ(again.size(), 1u);
 }
 
-TEST(LeshperHighlight, AnEmptyBufferPaintsNothingAndDoesNotFail) {
+TEST(UiHighlight, AnEmptyBufferPaintsNothingAndDoesNotFail) {
 	highlight_fixture fixture;
 	const reactor_batch batch = fixture.paint("");
 	EXPECT_EQ(batch.status, LESH_OK);
@@ -473,7 +489,7 @@ TEST(LeshperHighlight, AnEmptyBufferPaintsNothingAndDoesNotFail) {
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperHighlight, TheHighlighterEmitsSpansAndNothingElse) {
+TEST(UiHighlight, TheHighlighterEmitsSpansAndNothingElse) {
 	// The emitting reactor IS the decoration namespace, and this one's whole
 	// output is decoration: virtual text and proposals belong to the
 	// autosuggester (F-24), which is a different reactor and a different ticket.
@@ -482,4 +498,36 @@ TEST(LeshperHighlight, TheHighlighterEmitsSpansAndNothingElse) {
 	EXPECT_FALSE(batch.spans.empty());
 	EXPECT_TRUE(batch.texts.empty());
 	EXPECT_TRUE(batch.proposals.empty());
+}
+
+// THE OTHER HALF OF F-21, and it lives here rather than beside the theme
+// (`leshper_decoration_tests.cpp`) since #168 Phase B: the names come from the
+// reactors, the reactors are `lesh::ui`'s, and asking the real registrations is
+// the whole point - a copy of the list is exactly what would go stale.
+TEST(UiReactorTheme, EverySemanticNameTheBuiltinReactorsInternHasADefault) {
+	// The thing that makes the feature VISIBLE rather than merely wired: an id
+	// the theme has no row for renders as ordinary text, so a vocabulary name
+	// missing from the table is a highlight silently not happening. Asked of the
+	// real registrations rather than of a copy of the list, because a copy is
+	// exactly what would go stale.
+	registry reg;
+	owned_highlighter painter;
+	ASSERT_EQ(register_builtin_reactors(reg, painter.get()), 1u);
+	owned_autosuggester suggester{nullptr};
+	ASSERT_EQ(register_autosuggester(reg, suggester.get()), 1u);
+
+	style_table table;
+	table.sync(reg.styles);
+
+	ASSERT_GT(reg.styles.size(), 1u);
+	for (std::size_t id = 1; id < reg.styles.size(); ++id) {
+		EXPECT_TRUE(table.knows(static_cast<std::uint32_t>(id)))
+			<< "no default pen for the interned name \"" << reg.styles[id] << '"';
+	}
+	// #133's, by name, because the autosuggester's whole visible half depends on
+	// it being muted rather than absent.
+	std::uint32_t suggestion = 0;
+	ASSERT_EQ(lesh_style_intern(&reg, "suggestion", &suggestion), LESH_OK);
+	table.sync(reg.styles);
+	EXPECT_TRUE(table.knows(suggestion));
 }

@@ -2,6 +2,7 @@
 
 #include "leshper/state.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <type_traits>
@@ -214,6 +215,33 @@ struct timer_fired {
 	std::uint32_t action = 0;
 };
 
+// The HOST's answer to `want_completion` (#168 Phase B).
+//
+// BORROWED, AND THE HOST OWNS THE STORAGE. `items` points into a list the host
+// keeps across Tabs - `ui::editor_host` reuses one `completion_result` - and it
+// is valid until the next `want_completion` that host carries out. That is the
+// whole lifetime contract, and it is enough because the only consumer is
+// `lesh_complete`'s caller reading candidates out one at a time inside the call
+// that asked (`offer_completion` in builtin_actions.cpp copies each into its own
+// scratch before it feeds the pager). A `std::vector<pager_candidate>` here
+// would put the shell's candidate list, strings and all, on a channel N-2 says
+// allocates nothing - and would be a second copy of a list the host already has.
+//
+// The generation is the one it was computed against, so the pair reads the same
+// as `worker_request`/`worker_result` and stays droppable if #139's index stage
+// ever moves this off the loop. Today the round trip is inside one turn and the
+// generation cannot have moved.
+struct completion_candidates {
+	generation computed_against;
+	const pager_candidate* items = nullptr;
+	std::size_t count = 0;
+	// The half-open byte range of the buffer the candidates REPLACE - the
+	// COMPONENT under the cursor, not the whole token, so a `~/` or a `$` stays
+	// in the buffer. `lesh_completion_range` hands these two out unchanged.
+	std::size_t replace_from = 0;
+	std::size_t replace_to = 0;
+};
+
 // NOTHING THE HOST CONSTRUCTS PER TURN ALLOCATES (N-2), and the compiler says so.
 //
 // TWO EXCEPTIONS, both of them text the user produced and neither of them a
@@ -227,6 +255,7 @@ static_assert(std::is_trivially_copyable_v<worker_result>);
 static_assert(std::is_trivially_copyable_v<job_notice>);
 static_assert(std::is_trivially_copyable_v<signal_event>);
 static_assert(std::is_trivially_copyable_v<timer_fired>);
+static_assert(std::is_trivially_copyable_v<completion_candidates>);
 
 // The only way into the editor (A-9).
 //

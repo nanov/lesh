@@ -145,11 +145,63 @@ public:
 	}
 
 private:
+	// One end of one span, in `rebuild`'s sweep.
+	//
+	// IN THE HEADER because the sweep's buffer is a member now (below) and a
+	// member needs a complete type. It was a file-local struct in decoration.cpp
+	// until #168 Phase B, which is where the sweep still is - nothing outside
+	// `rebuild` constructs one, and `private` is what says so.
+	struct edge {
+		std::size_t at = 0;
+		std::uint32_t which = 0;   // the span's index in emission order
+		bool opening = false;
+	};
+
+	// THE SWEEP'S WORKING MEMORY, HELD RATHER THAN BUILT (#168 Phase B).
+	//
+	// `rebuild` runs on every applied batch, which is once per reactor per
+	// keystroke: a highlight and a suggestion on every character typed. It used
+	// to declare these three as locals, so a warm line cost three mallocs and
+	// three frees per keystroke forever - N-2's own rule, broken on the one path
+	// N-2 was written for. They are members now, cleared at the top of the sweep
+	// and grown only when a line has more spans in it than any line before it, so
+	// the steady state reaches the heap zero times
+	// (`AllocationTest.ApplyingAWarmHighlightBatchCostsNoHeap`).
+	//
+	// A COPY STARTS EMPTY, and that is the whole reason this is a type rather
+	// than three more fields. `decorations` is a member of `state`, `state` is
+	// copyable, and F-38's replay compares copies - so scratch that travelled
+	// would hand a copy capacity it never asked for and make an equality
+	// question ("are these two states the same?") depend on how much work each
+	// one happened to have done. Equality is `_layers` and only `_layers`, which
+	// this leaves untouched; the copy is a fresh empty scratch that fills itself
+	// the first time the copy is applied to.
+	struct rebuild_scratch {
+		std::vector<decoration_span> flat;
+		std::vector<edge> edges;
+		// The set open at the current offset. A small vector scanned for its
+		// maximum rather than a heap: the set is the NESTING DEPTH of a command
+		// line's highlights, which is two or three.
+		std::vector<std::uint32_t> active;
+
+		rebuild_scratch() = default;
+		~rebuild_scratch() = default;
+
+		rebuild_scratch(const rebuild_scratch&) noexcept {}
+		rebuild_scratch& operator=(const rebuild_scratch&) noexcept { return *this; }
+
+		// Moving DOES carry it: a moved-from state is not going to be applied to
+		// again, and taking the buffers with it is the point of a move.
+		rebuild_scratch(rebuild_scratch&&) noexcept = default;
+		rebuild_scratch& operator=(rebuild_scratch&&) noexcept = default;
+	};
+
 	void rebuild();
 
 	std::vector<layer> _layers;
 	std::vector<decoration_span> _painted;
 	std::vector<virtual_text> _texts;
+	rebuild_scratch _scratch;
 };
 
 } // namespace lesh::leshper

@@ -1,5 +1,6 @@
 #include "leshper/abi.h"
-#include "leshper/history_search.h"
+#include "ui/history_search.h"
+#include "ui/reactors.h"
 #include "leshper/layout.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
@@ -18,6 +19,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // The autosuggester reactor and F-25's accepting actions (#133).
 //
@@ -165,7 +167,7 @@ int32_t probe_action(lesh_editor* editor, const lesh_invocation*, void* userdata
 // The reactor
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, TheNewestPrefixMatchBecomesVirtualTextAndAProposal) {
+TEST(UiAutosuggest, TheNewestPrefixMatchBecomesVirtualTextAndAProposal) {
 	suggest_fixture fixture{{"ls -l", "git status"}};
 	const lesh::leshper::state s = suggest_fixture::line("git");
 	const reactor_batch batch = fixture.suggest(s);
@@ -190,14 +192,14 @@ TEST(LeshperAutosuggest, TheNewestPrefixMatchBecomesVirtualTextAndAProposal) {
 	EXPECT_TRUE(batch.spans.empty());
 }
 
-TEST(LeshperAutosuggest, TheNEWESTMatchWins) {
+TEST(UiAutosuggest, TheNEWESTMatchWins) {
 	suggest_fixture fixture{{"git status", "git commit", "ls"}};
 	const reactor_batch batch = fixture.suggest(suggest_fixture::line("git "));
 	ASSERT_EQ(batch.proposals.size(), 1u);
 	EXPECT_EQ(batch.proposals[0].bytes, "git commit");
 }
 
-TEST(LeshperAutosuggest, AnEmptyBufferSuggestsNothing) {
+TEST(UiAutosuggest, AnEmptyBufferSuggestsNothing) {
 	// An empty query matches every entry in every mode (#125), so without the
 	// guard an empty line would suggest the last command - which is what the
 	// up-arrow is for.
@@ -208,7 +210,7 @@ TEST(LeshperAutosuggest, AnEmptyBufferSuggestsNothing) {
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, ACursorAwayFromTheEndStillSuggests) {
+TEST(UiAutosuggest, ACursorAwayFromTheEndStillSuggests) {
 	// AMENDS #133 (#154, owner's call). #133 retracted the suggestion whenever
 	// the cursor left the end, fish-style; the owner reversed that: the ghost is
 	// anchored to the buffer and drawn at its end, and where the caret sits does
@@ -227,14 +229,14 @@ TEST(LeshperAutosuggest, ACursorAwayFromTheEndStillSuggests) {
 	EXPECT_EQ(batch.proposals[0].bytes, "git status");
 }
 
-TEST(LeshperAutosuggest, AnEntryEqualToTheBufferIsNotSuggested) {
+TEST(UiAutosuggest, AnEntryEqualToTheBufferIsNotSuggested) {
 	suggest_fixture fixture{{"git"}};
 	const reactor_batch batch = fixture.suggest(suggest_fixture::line("git"));
 	EXPECT_TRUE(batch.texts.empty());
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, AnEntryEqualToTheBufferIsWalkedPastRatherThanGivenUpOn) {
+TEST(UiAutosuggest, AnEntryEqualToTheBufferIsWalkedPastRatherThanGivenUpOn) {
 	// The commonest case in a history the user is retyping from. Stopping on the
 	// identical entry would mean a line you have run before can never be
 	// suggested past.
@@ -244,20 +246,20 @@ TEST(LeshperAutosuggest, AnEntryEqualToTheBufferIsWalkedPastRatherThanGivenUpOn)
 	EXPECT_EQ(batch.proposals[0].bytes, "git status");
 }
 
-TEST(LeshperAutosuggest, AnEntryThatOnlyCONTAINSTheQueryIsNotAPrefixMatch) {
+TEST(UiAutosuggest, AnEntryThatOnlyCONTAINSTheQueryIsNotAPrefixMatch) {
 	suggest_fixture fixture{{"sudo git status"}};
 	const reactor_batch batch = fixture.suggest(suggest_fixture::line("git"));
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, AnEmptyHistorySuggestsNothingAndDoesNotFail) {
+TEST(UiAutosuggest, AnEmptyHistorySuggestsNothingAndDoesNotFail) {
 	suggest_fixture fixture;
 	const reactor_batch batch = fixture.suggest(suggest_fixture::line("git"));
 	EXPECT_EQ(batch.status, LESH_OK);
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, ItDoesNotSubscribeToCursorMoves) {
+TEST(UiAutosuggest, ItDoesNotSubscribeToCursorMoves) {
 	// AMENDS #133 (#154). #133 had this reactor listen to cursor_moved and
 	// recompute - retracting off the end, bringing it back at the end. The owner
 	// reversed the behaviour it was for: the suggestion is a function of the
@@ -275,7 +277,7 @@ TEST(LeshperAutosuggest, ItDoesNotSubscribeToCursorMoves) {
 	EXPECT_EQ(batch.proposals.size(), 1u);
 }
 
-TEST(LeshperAutosuggest, ASupersededWalkGivesUpAndSaysSo) {
+TEST(UiAutosuggest, ASupersededWalkGivesUpAndSaysSo) {
 	suggest_fixture fixture;
 	const superseding_source source{fixture.loop, {"git status", "git log", "git diff"}};
 	owned_autosuggester self{&source};
@@ -290,7 +292,7 @@ TEST(LeshperAutosuggest, ASupersededWalkGivesUpAndSaysSo) {
 	EXPECT_TRUE(batch.proposals.empty());
 }
 
-TEST(LeshperAutosuggest, AReactorWithNoHistoryWiredInRefusesRatherThanLooksEmpty) {
+TEST(UiAutosuggest, AReactorWithNoHistoryWiredInRefusesRatherThanLooksEmpty) {
 	// #125's rule: a provider wired up wrong should say so. F-17's null history
 	// is a `vector_history_source` with nothing in it, which is a different
 	// thing and answers LESH_OK.
@@ -305,7 +307,7 @@ TEST(LeshperAutosuggest, AReactorWithNoHistoryWiredInRefusesRatherThanLooksEmpty
 	EXPECT_EQ(batches[0].status, LESH_ERR_INVAL);
 }
 
-TEST(LeshperAutosuggest, TheComputePathTakesNothingFromTheHeap) {
+TEST(UiAutosuggest, TheComputePathTakesNothingFromTheHeap) {
 	// #90's rule, on the same instrument the highlighter is held to:
 	// `heap_allocations` counts ONLY the arena's malloc fallback, so a non-zero
 	// reading means the snapshot outgrew the pool. The searcher itself is asked
@@ -337,7 +339,7 @@ TEST(LeshperAutosuggest, TheComputePathTakesNothingFromTheHeap) {
 // lesh_proposal_read
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, AnActionReadsTheProposalThatIsOnScreen) {
+TEST(UiAutosuggest, AnActionReadsTheProposalThatIsOnScreen) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -350,7 +352,7 @@ TEST(LeshperAutosuggest, AnActionReadsTheProposalThatIsOnScreen) {
 	EXPECT_EQ(seen.length, 10u);
 }
 
-TEST(LeshperAutosuggest, NothingOnScreenReadsAsNotFoundRatherThanAsEmpty) {
+TEST(UiAutosuggest, NothingOnScreenReadsAsNotFoundRatherThanAsEmpty) {
 	suggest_fixture fixture{{"ls"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -362,7 +364,7 @@ TEST(LeshperAutosuggest, NothingOnScreenReadsAsNotFoundRatherThanAsEmpty) {
 	EXPECT_EQ(seen.length, 0u);
 }
 
-TEST(LeshperAutosuggest, AProposalOfAnotherKindIsNotThisOne) {
+TEST(UiAutosuggest, AProposalOfAnotherKindIsNotThisOne) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -374,7 +376,7 @@ TEST(LeshperAutosuggest, AProposalOfAnotherKindIsNotThisOne) {
 	EXPECT_EQ(seen.status, LESH_ERR_NOTFOUND);
 }
 
-TEST(LeshperAutosuggest, PastTheLastProposalOfAKindIsNotFound) {
+TEST(UiAutosuggest, PastTheLastProposalOfAKindIsNotFound) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -390,7 +392,7 @@ TEST(LeshperAutosuggest, PastTheLastProposalOfAKindIsNotFound) {
 // The accepting actions (F-25)
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, AcceptingTheWholeSuggestionMakesItTheLine) {
+TEST(UiAutosuggest, AcceptingTheWholeSuggestionMakesItTheLine) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -403,7 +405,7 @@ TEST(LeshperAutosuggest, AcceptingTheWholeSuggestionMakesItTheLine) {
 	EXPECT_EQ(s.cursor.byte_offset(), 18u);
 }
 
-TEST(LeshperAutosuggest, AcceptingIsOneUndoEntry) {
+TEST(UiAutosuggest, AcceptingIsOneUndoEntry) {
 	// A-12: a proposal reaches the buffer through staged writes and by no other
 	// route, so accepting is one edit and undo puts back exactly what was typed.
 	suggest_fixture fixture{{"git status --short"}};
@@ -420,7 +422,7 @@ TEST(LeshperAutosuggest, AcceptingIsOneUndoEntry) {
 // would fold it into the typing run that preceded it and re-arm the run behind
 // it. It breaks the run on BOTH sides instead: accept is its own undo step, and
 // the `git` the user typed survives one undo.
-TEST(LeshperAutosuggest, AcceptingBreaksTheTypingRunItFollows) {
+TEST(UiAutosuggest, AcceptingBreaksTheTypingRunItFollows) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s;
 	fixture.type(s, "git");   // a REAL run, coalescing armed
@@ -438,7 +440,7 @@ TEST(LeshperAutosuggest, AcceptingBreaksTheTypingRunItFollows) {
 	EXPECT_EQ(s.buffer.text(), "");
 }
 
-TEST(LeshperAutosuggest, TypingAfterAnAcceptStartsItsOwnUndoStep) {
+TEST(UiAutosuggest, TypingAfterAnAcceptStartsItsOwnUndoStep) {
 	// The "after" break, which is the load-bearing half (#121): apply_edit's
 	// record() would otherwise leave the history coalescing again, and the next
 	// typed character would fold into the acceptance.
@@ -458,7 +460,7 @@ TEST(LeshperAutosuggest, TypingAfterAnAcceptStartsItsOwnUndoStep) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, AcceptingASingleCharacterCandidateBreaksTheRunToo) {
+TEST(UiAutosuggest, AcceptingASingleCharacterCandidateBreaksTheRunToo) {
 	// The length-1 case, and the reason the discriminator is not "how long was
 	// it". Accepting `gitk` after `git` writes ONE cluster - the same shape a
 	// keystroke writes - and only the fact that it is not the keystroke that
@@ -475,7 +477,7 @@ TEST(LeshperAutosuggest, AcceptingASingleCharacterCandidateBreaksTheRunToo) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, AcceptingAWordBreaksTheTypingRunItFollows) {
+TEST(UiAutosuggest, AcceptingAWordBreaksTheTypingRunItFollows) {
 	// The word-at-a-time twin, which stages TWO writes and still commits one
 	// insertion - so it reaches the coalescing rule looking exactly like the
 	// whole-line accept and has to be told apart the same way.
@@ -492,7 +494,7 @@ TEST(LeshperAutosuggest, AcceptingAWordBreaksTheTypingRunItFollows) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, TypingItselfStillCoalescesThroughTheSameDoor) {
+TEST(UiAutosuggest, TypingItselfStillCoalescesThroughTheSameDoor) {
 	// The other side of the discriminator, pinned here because the rule that
 	// tells an acceptance from a keystroke lives in the commit path both use. A
 	// run of self_insert is still ONE undo step.
@@ -505,7 +507,7 @@ TEST(LeshperAutosuggest, TypingItselfStillCoalescesThroughTheSameDoor) {
 	EXPECT_EQ(s.buffer.text(), "");
 }
 
-TEST(LeshperAutosuggest, AcceptingAWordTakesOneWordAndStops) {
+TEST(UiAutosuggest, AcceptingAWordTakesOneWordAndStops) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -516,7 +518,7 @@ TEST(LeshperAutosuggest, AcceptingAWordTakesOneWordAndStops) {
 	EXPECT_EQ(s.cursor.byte_offset(), 10u);
 }
 
-TEST(LeshperAutosuggest, AcceptingAWordTwiceWalksTheSuggestion) {
+TEST(UiAutosuggest, AcceptingAWordTwiceWalksTheSuggestion) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -531,7 +533,7 @@ TEST(LeshperAutosuggest, AcceptingAWordTwiceWalksTheSuggestion) {
 	EXPECT_EQ(s.buffer.text(), "git status --short");
 }
 
-TEST(LeshperAutosuggest, AcceptingAWordWithOneWordLeftTakesTheRest) {
+TEST(UiAutosuggest, AcceptingAWordWithOneWordLeftTakesTheRest) {
 	suggest_fixture fixture{{"gitk"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -540,7 +542,7 @@ TEST(LeshperAutosuggest, AcceptingAWordWithOneWordLeftTakesTheRest) {
 	EXPECT_EQ(s.buffer.text(), "gitk");
 }
 
-TEST(LeshperAutosuggest, AcceptingWithNothingSuggestedChangesNothing) {
+TEST(UiAutosuggest, AcceptingWithNothingSuggestedChangesNothing) {
 	// Pressing the key with no suggestion showing is the ordinary case, not an
 	// error - the rule undo already follows for pressing undo once too often.
 	suggest_fixture fixture{{"ls"}};
@@ -559,7 +561,7 @@ TEST(LeshperAutosuggest, AcceptingWithNothingSuggestedChangesNothing) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, DismissingTakesTheWholeBatchOffTheScreen) {
+TEST(UiAutosuggest, DismissingTakesTheWholeBatchOffTheScreen) {
 	// The drawn half of a suggestion is its virtual text, so a dismissal that
 	// left that showing would have dismissed nothing the user can see.
 	suggest_fixture fixture{{"git status"}};
@@ -579,7 +581,7 @@ TEST(LeshperAutosuggest, DismissingTakesTheWholeBatchOffTheScreen) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, DismissingWithNothingShowingIsNotAnError) {
+TEST(UiAutosuggest, DismissingWithNothingShowingIsNotAnError) {
 	suggest_fixture fixture{{"ls"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -592,7 +594,7 @@ TEST(LeshperAutosuggest, DismissingWithNothingShowingIsNotAnError) {
 		EXPECT_TRUE(one.items.empty());
 }
 
-TEST(LeshperAutosuggest, ADismissedSuggestionComesBackOnTheNextEvent) {
+TEST(UiAutosuggest, ADismissedSuggestionComesBackOnTheNextEvent) {
 	// Dismissal is about what is showing, not a mute: the reactor is free to
 	// propose again, and the loop is free to apply it.
 	suggest_fixture fixture{{"git status"}};
@@ -608,7 +610,7 @@ TEST(LeshperAutosuggest, ADismissedSuggestionComesBackOnTheNextEvent) {
 	EXPECT_EQ(s.buffer.text(), "git status");
 }
 
-TEST(LeshperAutosuggest, TheThreeActionsAreRegisteredUnderTheirNames) {
+TEST(UiAutosuggest, TheThreeActionsAreRegisteredUnderTheirNames) {
 	suggest_fixture fixture;
 	for (const char* name : {"accept_autosuggestion", "accept_autosuggestion_word",
 	                         "dismiss_autosuggestion"}) {
@@ -618,7 +620,7 @@ TEST(LeshperAutosuggest, TheThreeActionsAreRegisteredUnderTheirNames) {
 	}
 }
 
-TEST(LeshperAutosuggest, AStaleBatchIsNeverAcceptable) {
+TEST(UiAutosuggest, AStaleBatchIsNeverAcceptable) {
 	// N-4, from the accepting side: the loop applies only what was computed
 	// against the generation the editor is still at, so there is no way for an
 	// action to read a proposal about text the buffer no longer holds.
@@ -646,7 +648,7 @@ TEST(LeshperAutosuggest, AStaleBatchIsNeverAcceptable) {
 // reach any of it.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, TheFiveWrappersAreRegisteredAndSoIsTheMotionOneOfThemNeeded) {
+TEST(UiAutosuggest, TheFiveWrappersAreRegisteredAndSoIsTheMotionOneOfThemNeeded) {
 	suggest_fixture fixture;
 	for (const char* name : {"accept_suggestion_or_forward_char",
 	                         "accept_suggestion_or_end_of_line",
@@ -662,7 +664,7 @@ TEST(LeshperAutosuggest, TheFiveWrappersAreRegisteredAndSoIsTheMotionOneOfThemNe
 	}
 }
 
-TEST(LeshperAutosuggest, AtTheEndWithASuggestionShowingTheWrapperAccepts) {
+TEST(UiAutosuggest, AtTheEndWithASuggestionShowingTheWrapperAccepts) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -675,7 +677,7 @@ TEST(LeshperAutosuggest, AtTheEndWithASuggestionShowingTheWrapperAccepts) {
 	EXPECT_EQ(s.cursor.byte_offset(), 18u);
 }
 
-TEST(LeshperAutosuggest, EveryWholeLineWrapperAcceptsTheSameWayAtTheEnd) {
+TEST(UiAutosuggest, EveryWholeLineWrapperAcceptsTheSameWayAtTheEnd) {
 	// `<Right>`, `<C-f>`, `<End>` and `<C-e>` are two names, and both accept the
 	// WHOLE candidate: #140's table gives command mode the partial accepts and
 	// the inserting keymaps both halves.
@@ -689,7 +691,7 @@ TEST(LeshperAutosuggest, EveryWholeLineWrapperAcceptsTheSameWayAtTheEnd) {
 	}
 }
 
-TEST(LeshperAutosuggest, TheWordWrapperTakesOneWordTheWayTheActionItComposesDoes) {
+TEST(UiAutosuggest, TheWordWrapperTakesOneWordTheWayTheActionItComposesDoes) {
 	suggest_fixture fixture{{"git status --short"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -700,7 +702,7 @@ TEST(LeshperAutosuggest, TheWordWrapperTakesOneWordTheWayTheActionItComposesDoes
 	EXPECT_EQ(s.cursor.byte_offset(), 10u);
 }
 
-TEST(LeshperAutosuggest, WithNothingSuggestedTheWrapperIsTheMotionAndNothingElse) {
+TEST(UiAutosuggest, WithNothingSuggestedTheWrapperIsTheMotionAndNothingElse) {
 	// The half that matters most: these are the keys `<Right>` and `<End>` have
 	// always been, and a user with no history must not be able to tell that
 	// anything was wrapped around them.
@@ -722,7 +724,7 @@ TEST(LeshperAutosuggest, WithNothingSuggestedTheWrapperIsTheMotionAndNothingElse
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, MidLineTheWrapperMovesEvenWithASuggestionShowing) {
+TEST(UiAutosuggest, MidLineTheWrapperMovesEvenWithASuggestionShowing) {
 	// The cursor is not at the end, so `<Right>` moves one cluster - and it does
 	// so with the batch still applied, which is the case a rule written as "is
 	// anything showing" alone would have got wrong.
@@ -738,7 +740,7 @@ TEST(LeshperAutosuggest, MidLineTheWrapperMovesEvenWithASuggestionShowing) {
 	EXPECT_EQ(s.cursor.byte_offset(), 2u);
 }
 
-TEST(LeshperAutosuggest, TheGhostStaysVisibleWhenTheCursorLeavesTheEnd) {
+TEST(UiAutosuggest, TheGhostStaysVisibleWhenTheCursorLeavesTheEnd) {
 	// #154's amendment to #133, end to end at the state level. Type a prefix at
 	// the end of the buffer and the suggestion shows - the drawn half in `marks`,
 	// the acceptable half in `proposals`. Move the cursor off the end and the
@@ -775,7 +777,7 @@ TEST(LeshperAutosuggest, TheGhostStaysVisibleWhenTheCursorLeavesTheEnd) {
 	EXPECT_EQ(s.cursor.byte_offset(), before + 1u) << "it moved instead";
 }
 
-TEST(LeshperAutosuggest, EndMidLineFallsThroughAndTheNextPressAccepts) {
+TEST(UiAutosuggest, EndMidLineFallsThroughAndTheNextPressAccepts) {
 	// FISH'S BEHAVIOUR, pinned because it looks like a bug and is not. `<End>`
 	// with the cursor mid-line is not at the end, so it falls through to
 	// `end_of_line` - which lands it at the end, where the suggestion is now
@@ -797,7 +799,7 @@ TEST(LeshperAutosuggest, EndMidLineFallsThroughAndTheNextPressAccepts) {
 	EXPECT_EQ(s.buffer.text(), "git status");
 }
 
-TEST(LeshperAutosuggest, ASuggestionNoLongerThanTheBufferFallsThroughRatherThanSwallowingTheKey) {
+TEST(UiAutosuggest, ASuggestionNoLongerThanTheBufferFallsThroughRatherThanSwallowingTheKey) {
 	// A proposal that has nothing left past what is typed is not something to
 	// accept, and a key that vanished into an accept-that-did-nothing would be a
 	// dead `<Right>`. The autosuggester never proposes one, so this is built by
@@ -819,7 +821,7 @@ TEST(LeshperAutosuggest, ASuggestionNoLongerThanTheBufferFallsThroughRatherThanS
 	EXPECT_EQ(s.cursor.byte_offset(), 2u) << "the key was swallowed by an empty accept";
 }
 
-TEST(LeshperAutosuggest, TheWrapperIsOneUndoEntryOnBothPaths) {
+TEST(UiAutosuggest, TheWrapperIsOneUndoEntryOnBothPaths) {
 	// #110's wrapper rule, which is what `lesh_action_invoke` buys: the delegate
 	// stages into the caller's staging area and its undo group, so neither half
 	// of this key can be two steps.
@@ -839,7 +841,7 @@ TEST(LeshperAutosuggest, TheWrapperIsOneUndoEntryOnBothPaths) {
 // #146, from both sides of the same key. The rule that landed there is about
 // what a BLOCK WRITE does to the typing run; the fallthrough stages nothing at
 // all, so it must leave the history exactly where the bare motion leaves it.
-TEST(LeshperAutosuggest, TheFallthroughLeavesTheUndoHistoryWhereTheBareMotionLeavesIt) {
+TEST(UiAutosuggest, TheFallthroughLeavesTheUndoHistoryWhereTheBareMotionLeavesIt) {
 	// EQUIVALENCE IS THE ASSERTION, and it is deliberately not "the run
 	// survives". F-4 ends a typing run on any cursor move - undo.h: "an edit
 	// somewhere else in the buffer - ends the run, which is why the editor calls
@@ -873,7 +875,7 @@ TEST(LeshperAutosuggest, TheFallthroughLeavesTheUndoHistoryWhereTheBareMotionLea
 	EXPECT_EQ(wrapped.undo.step_count(), 1u);
 }
 
-TEST(LeshperAutosuggest, TheWrappersAcceptBreaksTheTypingRunTheWayTheBareAcceptDoes) {
+TEST(UiAutosuggest, TheWrappersAcceptBreaksTheTypingRunTheWayTheBareAcceptDoes) {
 	// The other side: the accept half reaches the buffer as a block write, and
 	// #146's rule does not care which name dispatched it.
 	suggest_fixture fixture{{"git status --short"}};
@@ -894,7 +896,7 @@ TEST(LeshperAutosuggest, TheWrappersAcceptBreaksTheTypingRunTheWayTheBareAcceptD
 	EXPECT_EQ(s.buffer.text(), "");
 }
 
-TEST(LeshperAutosuggest, TheFallthroughPathTakesNothingFromTheHeap) {
+TEST(UiAutosuggest, TheFallthroughPathTakesNothingFromTheHeap) {
 	// A keystroke path, held to #90's instrument: the wrapper asks for the
 	// proposal's LENGTH with capacity zero rather than copying it, so the key
 	// that only moved the cursor copies nothing at all.
@@ -925,7 +927,7 @@ TEST(LeshperAutosuggest, TheFallthroughPathTakesNothingFromTheHeap) {
 // the two new names is bound anywhere.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, TheTwoPerCharacterNamesAreRegistered) {
+TEST(UiAutosuggest, TheTwoPerCharacterNamesAreRegistered) {
 	suggest_fixture fixture;
 	for (const char* name : {"accept_autosuggestion_char",
 	                         "accept_suggestion_char_or_forward_char"}) {
@@ -935,7 +937,7 @@ TEST(LeshperAutosuggest, TheTwoPerCharacterNamesAreRegistered) {
 	}
 }
 
-TEST(LeshperAutosuggest, AcceptingACharacterTakesOneAsciiCharacterAndStops) {
+TEST(UiAutosuggest, AcceptingACharacterTakesOneAsciiCharacterAndStops) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -946,7 +948,7 @@ TEST(LeshperAutosuggest, AcceptingACharacterTakesOneAsciiCharacterAndStops) {
 	EXPECT_EQ(s.cursor.byte_offset(), 4u);
 }
 
-TEST(LeshperAutosuggest, APrecomposedAccentComesInOnOnePressAndAsTwoBytes) {
+TEST(UiAutosuggest, APrecomposedAccentComesInOnOnePressAndAsTwoBytes) {
 	// U+00E9 is two bytes and one cluster. A byte rule would leave the buffer
 	// holding half a code point here, which is not a string any more.
 	suggest_fixture fixture{{"caf\xc3\xa9 latte"}};
@@ -963,7 +965,7 @@ TEST(LeshperAutosuggest, APrecomposedAccentComesInOnOnePressAndAsTwoBytes) {
 	EXPECT_EQ(s.cursor.byte_offset(), 5u) << "the accent arrived a byte at a time";
 }
 
-TEST(LeshperAutosuggest, ADecomposedAccentComesInWholeOnOnePress) {
+TEST(UiAutosuggest, ADecomposedAccentComesInWholeOnOnePress) {
 	// `e` + U+0301 COMBINING ACUTE: three bytes, still ONE cluster, and the press
 	// that takes the `e` must take the mark with it. This is the case where the
 	// typed prefix can even sit INSIDE the cluster - the history holds `cafe` as
@@ -985,7 +987,7 @@ TEST(LeshperAutosuggest, ADecomposedAccentComesInWholeOnOnePress) {
 	EXPECT_EQ(s.buffer.text(), "cafe\xcc\x81 ");
 }
 
-TEST(LeshperAutosuggest, AZwjSequenceAndAFlagAreEachOnePress) {
+TEST(UiAutosuggest, AZwjSequenceAndAFlagAreEachOnePress) {
 	// U+1F469 ZWJ U+1F4BB is eleven bytes and one image; the DE flag is two
 	// regional indicators, eight bytes and one image (GB11 and GB12/GB13). Both
 	// arrive whole, because `LESH_MOTION_NEXT_CLUSTER` is the same UAX-29 walk
@@ -1010,7 +1012,7 @@ TEST(LeshperAutosuggest, AZwjSequenceAndAFlagAreEachOnePress) {
 	EXPECT_EQ(s.buffer.text(), "echo " + woman_technologist + flag + "!");
 }
 
-TEST(LeshperAutosuggest, RepeatedPressesWalkTheSuggestionToItsEndAndThenDoNothing) {
+TEST(UiAutosuggest, RepeatedPressesWalkTheSuggestionToItsEndAndThenDoNothing) {
 	// The whole point of a per-character accept: press it enough times and you
 	// have the candidate, one cluster at a time - and the press after that is the
 	// #133 no-op, because there is nothing past what is typed.
@@ -1034,7 +1036,7 @@ TEST(LeshperAutosuggest, RepeatedPressesWalkTheSuggestionToItsEndAndThenDoNothin
 	EXPECT_EQ(s.buffer.text(), "gitk");
 }
 
-TEST(LeshperAutosuggest, AcceptingACharacterWithNothingSuggestedChangesNothing) {
+TEST(UiAutosuggest, AcceptingACharacterWithNothingSuggestedChangesNothing) {
 	suggest_fixture fixture{{"ls"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -1046,7 +1048,7 @@ TEST(LeshperAutosuggest, AcceptingACharacterWithNothingSuggestedChangesNothing) 
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, EachAcceptedClusterIsOneUndoEntry) {
+TEST(UiAutosuggest, EachAcceptedClusterIsOneUndoEntry) {
 	// A-12 per press: three presses, three steps, and undo walks back one cluster
 	// at a time rather than unpicking the lot.
 	suggest_fixture fixture{{"git status"}};
@@ -1068,7 +1070,7 @@ TEST(LeshperAutosuggest, EachAcceptedClusterIsOneUndoEntry) {
 	EXPECT_EQ(s.buffer.text(), "git");
 }
 
-TEST(LeshperAutosuggest, AcceptingOneCharacterBreaksTheTypingRunItFollows) {
+TEST(UiAutosuggest, AcceptingOneCharacterBreaksTheTypingRunItFollows) {
 	// #146'S RULE, APPLIED RATHER THAN REOPENED, and this is the case that makes
 	// the temptation concrete: accepting the `k` of `gitk` writes exactly what
 	// typing `k` would have written - one cluster, plain insertion, at the point.
@@ -1093,7 +1095,7 @@ TEST(LeshperAutosuggest, AcceptingOneCharacterBreaksTheTypingRunItFollows) {
 	EXPECT_EQ(s.buffer.text(), "");
 }
 
-TEST(LeshperAutosuggest, TypingAfterAOneCharacterAcceptStartsItsOwnUndoStep) {
+TEST(UiAutosuggest, TypingAfterAOneCharacterAcceptStartsItsOwnUndoStep) {
 	// The "after" half of the both-sides break (#121, #146). Without it the next
 	// typed character would fold into the acceptance.
 	suggest_fixture fixture{{"gitk"}};
@@ -1110,7 +1112,7 @@ TEST(LeshperAutosuggest, TypingAfterAOneCharacterAcceptStartsItsOwnUndoStep) {
 	EXPECT_EQ(s.buffer.text(), "gitk");
 }
 
-TEST(LeshperAutosuggest, TheCharacterWrapperAcceptsOneClusterAtTheEnd) {
+TEST(UiAutosuggest, TheCharacterWrapperAcceptsOneClusterAtTheEnd) {
 	suggest_fixture fixture{{"git status"}};
 	lesh::leshper::state s = suggest_fixture::line("git");
 	fixture.show(s);
@@ -1123,7 +1125,7 @@ TEST(LeshperAutosuggest, TheCharacterWrapperAcceptsOneClusterAtTheEnd) {
 	EXPECT_EQ(s.cursor.byte_offset(), 4u);
 }
 
-TEST(LeshperAutosuggest, TheCharacterWrapperWalksToTheEndAndThenFallsThrough) {
+TEST(UiAutosuggest, TheCharacterWrapperWalksToTheEndAndThenFallsThrough) {
 	// Repeated presses take the candidate a cluster at a time; the press after
 	// the last one has nothing longer than the buffer to accept, so the wrapper
 	// is `forward_char` again - and `forward_char` at the end of the buffer moves
@@ -1145,7 +1147,7 @@ TEST(LeshperAutosuggest, TheCharacterWrapperWalksToTheEndAndThenFallsThrough) {
 	EXPECT_EQ(s.cursor.byte_offset(), 4u);
 }
 
-TEST(LeshperAutosuggest, TheCharacterWrappersFallthroughIsTheBareForwardChar) {
+TEST(UiAutosuggest, TheCharacterWrappersFallthroughIsTheBareForwardChar) {
 	// #147's equivalence shape, for #149's row: buffer, cursor, step count and
 	// coalescing identical to the unwrapped motion. Not "the run survives" -
 	// undo.h ends a typing run on every non-inserting action, so a bare
@@ -1174,7 +1176,7 @@ TEST(LeshperAutosuggest, TheCharacterWrappersFallthroughIsTheBareForwardChar) {
 	EXPECT_EQ(wrapped.undo.step_count(), 1u);
 }
 
-TEST(LeshperAutosuggest, MidLineTheCharacterWrapperMovesEvenWithASuggestionShowing) {
+TEST(UiAutosuggest, MidLineTheCharacterWrapperMovesEvenWithASuggestionShowing) {
 	// The cursor is not at the end, so it is `<Right>` and nothing more - the
 	// same three questions #147 wrote, asked by the same implementation.
 	suggest_fixture fixture{{"git status"}};
@@ -1190,7 +1192,7 @@ TEST(LeshperAutosuggest, MidLineTheCharacterWrapperMovesEvenWithASuggestionShowi
 	EXPECT_EQ(s.cursor.byte_offset(), 2u);
 }
 
-TEST(LeshperAutosuggest, TheCharacterWrappersAcceptIsOneUndoEntryAndBreaksTheRun) {
+TEST(UiAutosuggest, TheCharacterWrappersAcceptIsOneUndoEntryAndBreaksTheRun) {
 	// Both halves of the #146 pin through the wrapper, which composes the same
 	// action through `lesh_action_invoke` and so cannot be two steps (#110).
 	suggest_fixture fixture{{"gitk"}};
@@ -1213,7 +1215,7 @@ TEST(LeshperAutosuggest, TheCharacterWrappersAcceptIsOneUndoEntryAndBreaksTheRun
 // Multi-line candidates (#140 decision 3): suggested whole, no filter.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperAutosuggest, AMultiLineCandidateIsSuggestedWholeAndItsContinuationLinesRender) {
+TEST(UiAutosuggest, AMultiLineCandidateIsSuggestedWholeAndItsContinuationLinesRender) {
 	// NO CODE CHANGED FOR THIS, which is the assertion. #141 made virtual bytes
 	// buffer bytes and #123 treats a line break as a cluster, so a remembered
 	// `for` loop suggests all three of its lines and the layout draws the two

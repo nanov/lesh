@@ -13,7 +13,7 @@
 // WHY ITS OWN HEADER, and not `registry.{h,cpp}` beside the interning. The
 // interning is an ABI service - a binding asks for an id by name and the
 // registry hands one back - and it lives in a header that drags `abi.h`,
-// `effect.h`, `shell_knowledge.h` and the three handle definitions with it.
+// `effect.h`, `host.h` and the three handle definitions with it.
 // `layout.cpp` must not include that: layout produces a surface and the blitter
 // consumes one, and they are siblings over `surface.h` rather than a stack.
 // This is the same shape and the same argument `sgr.h` was given in #131 - a

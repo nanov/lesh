@@ -1,6 +1,8 @@
 #include "leshper/abi.h"
 #include "leshper/registry.h"
-#include "leshper/shell_knowledge.h"
+#include "ui/editor_host.h"
+#include "ui/reactors.h"
+#include "ui/shell_knowledge.h"
 #include "leshper/state.h"
 #include "substrate/arena.h"
 #include "syntax/parser.h"
@@ -22,6 +24,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // What the shell knows, on the request token (#135; #130's verb, ADR-0009's
 // thread model) - the EDITOR's half of it.
@@ -134,12 +137,13 @@ struct verb_fixture {
 	loop_harness loop{reg};
 	probe asked;
 	fake_knowledge shell;
+	editor_host host{&shell};
 
 	verb_fixture() {
 		EXPECT_EQ(lesh_reactor_register(&reg, "probe", LESH_EVENT_BUFFER_CHANGED,
 		                                probe_reactor, &asked),
 		          LESH_OK);
-		reg.knowledge = &shell;
+		reg.host = &host;
 	}
 
 	// One request, asking about every name in order. Returns what came back.
@@ -208,7 +212,7 @@ private:
 // The verb: resolution order.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKnowledge, AnAliasOutranksEverythingElseOfTheSameName) {
+TEST(UiCommandKind, AnAliasOutranksEverythingElseOfTheSameName) {
 	// POSIX 2.3.1 substitutes the alias in the lexer, before the command search
 	// in 2.9.1.1 ever runs, so a name that is all four things is an alias.
 	lesh::testing::temp_path scratch;
@@ -219,7 +223,7 @@ TEST(LeshperKnowledge, AnAliasOutranksEverythingElseOfTheSameName) {
 	EXPECT_EQ(fixture.kind_of("ll"), LESH_COMMAND_ALIAS);
 }
 
-TEST(LeshperKnowledge, AFunctionOutranksABuiltinAndPath) {
+TEST(UiCommandKind, AFunctionOutranksABuiltinAndPath) {
 	lesh::testing::temp_path scratch;
 	make_executable(scratch.file("deploy"));
 	verb_fixture fixture;
@@ -228,7 +232,7 @@ TEST(LeshperKnowledge, AFunctionOutranksABuiltinAndPath) {
 	EXPECT_EQ(fixture.kind_of("deploy"), LESH_COMMAND_FUNCTION);
 }
 
-TEST(LeshperKnowledge, ABuiltinOutranksPath) {
+TEST(UiCommandKind, ABuiltinOutranksPath) {
 	lesh::testing::temp_path scratch;
 	make_executable(scratch.file("echo"));
 	verb_fixture fixture;
@@ -237,7 +241,7 @@ TEST(LeshperKnowledge, ABuiltinOutranksPath) {
 	EXPECT_EQ(fixture.kind_of("echo"), LESH_COMMAND_BUILTIN);
 }
 
-TEST(LeshperKnowledge, ANameNoTableHoldsIsLookedUpOnPath) {
+TEST(UiCommandKind, ANameNoTableHoldsIsLookedUpOnPath) {
 	lesh::testing::temp_path scratch;
 	make_executable(scratch.file("mytool"));
 	verb_fixture fixture;
@@ -246,7 +250,7 @@ TEST(LeshperKnowledge, ANameNoTableHoldsIsLookedUpOnPath) {
 	EXPECT_EQ(fixture.kind_of("nosuchtool"), LESH_COMMAND_UNKNOWN);
 }
 
-TEST(LeshperKnowledge, TheWalkTakesTheFirstDirectoryThatHasIt) {
+TEST(UiCommandKind, TheWalkTakesTheFirstDirectoryThatHasIt) {
 	lesh::testing::temp_path first;
 	lesh::testing::temp_path second;
 	make_plain_file(first.file("tool"));  // present, but not executable
@@ -258,7 +262,7 @@ TEST(LeshperKnowledge, TheWalkTakesTheFirstDirectoryThatHasIt) {
 	EXPECT_EQ(fixture.kind_of("tool"), LESH_COMMAND_EXTERNAL);
 }
 
-TEST(LeshperKnowledge, ANonExecutableFileIsNotACommand) {
+TEST(UiCommandKind, ANonExecutableFileIsNotACommand) {
 	lesh::testing::temp_path scratch;
 	make_plain_file(scratch.file("notes"));
 	verb_fixture fixture;
@@ -266,7 +270,7 @@ TEST(LeshperKnowledge, ANonExecutableFileIsNotACommand) {
 	EXPECT_EQ(fixture.kind_of("notes"), LESH_COMMAND_UNKNOWN);
 }
 
-TEST(LeshperKnowledge, ADirectoryIsNotACommand) {
+TEST(UiCommandKind, ADirectoryIsNotACommand) {
 	// access(X_OK) says yes for a directory; S_ISREG is what makes the answer
 	// mean "a thing exec would run" (#124's finding, moved with the walk).
 	lesh::testing::temp_path scratch;
@@ -276,13 +280,13 @@ TEST(LeshperKnowledge, ADirectoryIsNotACommand) {
 	EXPECT_EQ(fixture.kind_of("sub"), LESH_COMMAND_UNKNOWN);
 }
 
-TEST(LeshperKnowledge, AnUnsetPathResolvesNothing) {
+TEST(UiCommandKind, AnUnsetPathResolvesNothing) {
 	verb_fixture fixture;
 	fixture.shell.unset_path();
 	EXPECT_EQ(fixture.kind_of("sh"), LESH_COMMAND_UNKNOWN);
 }
 
-TEST(LeshperKnowledge, ANameWithASlashGoesStraightToTheFilesystem) {
+TEST(UiCommandKind, ANameWithASlashGoesStraightToTheFilesystem) {
 	// POSIX 2.9.1.1: a command name containing a slash is a pathname, and no
 	// table is consulted for it - which is also why the tables are never asked.
 	lesh::testing::temp_path scratch;
@@ -295,7 +299,7 @@ TEST(LeshperKnowledge, ANameWithASlashGoesStraightToTheFilesystem) {
 	EXPECT_EQ(fixture.kind_of(scratch.file("missing")), LESH_COMMAND_UNKNOWN);
 }
 
-TEST(LeshperKnowledge, AnAliasIsResolvedOneLevelAndTheBodyIsNeverAsked) {
+TEST(UiCommandKind, AnAliasIsResolvedOneLevelAndTheBodyIsNeverAsked) {
 	// `alias ll='ls -l'` makes `ll` an alias, and the answer stops there. The
 	// body is not re-resolved to discover what `ls` is, and is never expanded:
 	// #95's rule is that a span names bytes the user typed, and an expanded
@@ -311,7 +315,7 @@ TEST(LeshperKnowledge, AnAliasIsResolvedOneLevelAndTheBodyIsNeverAsked) {
 // The verb: boundaries.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKnowledge, AnEmptyNameIsUnknownAndNotAnError) {
+TEST(UiCommandKind, AnEmptyNameIsUnknownAndNotAnError) {
 	verb_fixture fixture;
 	fixture.shell.define("", command_kind::alias);
 	EXPECT_EQ(fixture.kind_of(""), LESH_COMMAND_UNKNOWN);
@@ -319,7 +323,7 @@ TEST(LeshperKnowledge, AnEmptyNameIsUnknownAndNotAnError) {
 	EXPECT_TRUE(fixture.shell.asked.empty());
 }
 
-TEST(LeshperKnowledge, ANulInsideTheNameIsNotTruncated) {
+TEST(UiCommandKind, ANulInsideTheNameIsNotTruncated) {
 	// The buffer is bytes and may hold a NUL. Truncating at it would hand stat(2)
 	// a candidate that names a DIFFERENT file, and answer confidently about it.
 	lesh::testing::temp_path scratch;
@@ -330,7 +334,7 @@ TEST(LeshperKnowledge, ANulInsideTheNameIsNotTruncated) {
 	EXPECT_EQ(fixture.kind_of("tool"), LESH_COMMAND_EXTERNAL);
 }
 
-TEST(LeshperKnowledge, ANullArgumentIsRefusedAndAnswersNothing) {
+TEST(UiCommandKind, ANullArgumentIsRefusedAndAnswersNothing) {
 	verb_fixture fixture;
 	fixture.asked.ask_with_null_out = true;
 	fixture.kinds_of({});
@@ -342,7 +346,7 @@ TEST(LeshperKnowledge, ANullArgumentIsRefusedAndAnswersNothing) {
 // The memo.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKnowledge, ANameRepeatedInOneRequestIsResolvedOnce) {
+TEST(UiCommandKind, ANameRepeatedInOneRequestIsResolvedOnce) {
 	// The claim the memo makes, and the only way to see it: one request, the same
 	// name three times, one trip to the tables and one $PATH walk.
 	lesh::testing::temp_path scratch;
@@ -358,7 +362,7 @@ TEST(LeshperKnowledge, ANameRepeatedInOneRequestIsResolvedOnce) {
 	EXPECT_EQ(fixture.shell.path_reads, 1);
 }
 
-TEST(LeshperKnowledge, TheMemoDiesWithItsRequest) {
+TEST(UiCommandKind, TheMemoDiesWithItsRequest) {
 	// Per request, not per reactor and not per process: the next keystroke's
 	// highlight must see an alias defined between the two.
 	verb_fixture fixture;
@@ -368,7 +372,7 @@ TEST(LeshperKnowledge, TheMemoDiesWithItsRequest) {
 	EXPECT_EQ(fixture.shell.asked.size(), 2u);
 }
 
-TEST(LeshperKnowledge, MoreDistinctNamesThanTheMemoHoldsStillAnswerCorrectly) {
+TEST(UiCommandKind, MoreDistinctNamesThanTheMemoHoldsStillAnswerCorrectly) {
 	// The memo is fixed and inline, so it can fill up. Overflow must cost a
 	// second walk and never a wrong answer.
 	verb_fixture fixture;
@@ -386,7 +390,7 @@ TEST(LeshperKnowledge, MoreDistinctNamesThanTheMemoHoldsStillAnswerCorrectly) {
 			<< "at " << names[i];
 }
 
-TEST(LeshperKnowledge, ANameTooLongToMemoizeIsStillAnsweredCorrectly) {
+TEST(UiCommandKind, ANameTooLongToMemoizeIsStillAnsweredCorrectly) {
 	const std::string name(command_kind_memo::name_capacity + 8, 'x');
 	verb_fixture fixture;
 	fixture.shell.define(name, command_kind::function);
@@ -402,7 +406,7 @@ TEST(LeshperKnowledge, ANameTooLongToMemoizeIsStillAnsweredCorrectly) {
 // No shell attached.
 // ---------------------------------------------------------------------------
 
-TEST(LeshperKnowledge, WithNoShellAttachedThePathIsTheProcessEnvironments) {
+TEST(UiCommandKind, WithNoShellAttachedThePathIsTheProcessEnvironments) {
 	// The documented fallback, and what leshper embedded in something that is not
 	// this shell would see: empty tables, `getenv("PATH")`. It is also exactly
 	// what the highlighter did before this door existed (#124).
@@ -410,13 +414,18 @@ TEST(LeshperKnowledge, WithNoShellAttachedThePathIsTheProcessEnvironments) {
 	make_executable(scratch.file("tool"));
 	const scoped_env_path path{scratch.dir().c_str()};
 	verb_fixture fixture;
-	fixture.reg.knowledge = nullptr;
+	// The fallback is a HOST over `environment_knowledge` now (#168 Phase B), not
+	// a null pointer inside the ABI verb: the `$PATH` sweep behind it is
+	// filesystem knowledge and lives on the far side of the one door.
+	const environment_knowledge environment;
+	editor_host bare{&environment};
+	fixture.reg.host = &bare;
 	EXPECT_EQ(fixture.kind_of("tool"), LESH_COMMAND_EXTERNAL);
 	EXPECT_EQ(fixture.kind_of("nosuchtool"), LESH_COMMAND_UNKNOWN);
 	EXPECT_TRUE(fixture.shell.asked.empty());
 }
 
-TEST(LeshperKnowledge, TheEnvironmentFallbackKnowsNoTables) {
+TEST(UiCommandKind, TheEnvironmentFallbackKnowsNoTables) {
 	const environment_knowledge environment;
 	EXPECT_EQ(environment.classify("cd"), command_kind::unknown);
 	std::string_view path;
@@ -436,10 +445,11 @@ struct paint_fixture {
 	registry reg;
 	loop_harness loop{reg};
 	fake_knowledge shell;
+	editor_host host{&shell};
 
 	paint_fixture() {
 		register_builtin_reactors(reg, self.get());
-		reg.knowledge = &shell;
+		reg.host = &host;
 	}
 
 	[[nodiscard]] std::string style_name(std::uint32_t id) {
@@ -471,7 +481,7 @@ struct paint_fixture {
 
 } // namespace
 
-TEST(LeshperKnowledge, TheThreeMissingClassesAreInternedSemanticNames) {
+TEST(UiCommandKind, TheThreeMissingClassesAreInternedSemanticNames) {
 	// #124 landed 13 style ids and recorded these three as blocked on this door.
 	// They are names, not colours: the theme maps them at render (F-21).
 	paint_fixture fixture;
@@ -482,25 +492,25 @@ TEST(LeshperKnowledge, TheThreeMissingClassesAreInternedSemanticNames) {
 	}
 }
 
-TEST(LeshperKnowledge, AnAliasPaintsAsCommandAlias) {
+TEST(UiCommandKind, AnAliasPaintsAsCommandAlias) {
 	paint_fixture fixture;
 	fixture.shell.define("ll", command_kind::alias);
 	EXPECT_TRUE(fixture.has("ll -a", "ll", "command.alias"));
 }
 
-TEST(LeshperKnowledge, AFunctionPaintsAsCommandFunction) {
+TEST(UiCommandKind, AFunctionPaintsAsCommandFunction) {
 	paint_fixture fixture;
 	fixture.shell.define("deploy", command_kind::function);
 	EXPECT_TRUE(fixture.has("deploy staging", "deploy", "command.function"));
 }
 
-TEST(LeshperKnowledge, ABuiltinPaintsAsCommandBuiltin) {
+TEST(UiCommandKind, ABuiltinPaintsAsCommandBuiltin) {
 	paint_fixture fixture;
 	fixture.shell.define("cd", command_kind::builtin);
 	EXPECT_TRUE(fixture.has("cd /tmp", "cd", "command.builtin"));
 }
 
-TEST(LeshperKnowledge, ANameOnTheShellsPathPaintsAsCommandPath) {
+TEST(UiCommandKind, ANameOnTheShellsPathPaintsAsCommandPath) {
 	lesh::testing::temp_path scratch;
 	make_executable(scratch.file("mytool"));
 	paint_fixture fixture;
@@ -508,7 +518,7 @@ TEST(LeshperKnowledge, ANameOnTheShellsPathPaintsAsCommandPath) {
 	EXPECT_TRUE(fixture.has("mytool x", "mytool", "command.path"));
 }
 
-TEST(LeshperKnowledge, WithAPathThatResolvesNothingACommandNameIsUnknown) {
+TEST(UiCommandKind, WithAPathThatResolvesNothingACommandNameIsUnknown) {
 	// The ticket's own case: `PATH=/nonexistent` turns `ls` unknown, and it is
 	// the SHELL's PATH that decides, not the process environment's - so this
 	// holds however the machine running the test is set up.
@@ -517,7 +527,7 @@ TEST(LeshperKnowledge, WithAPathThatResolvesNothingACommandNameIsUnknown) {
 	EXPECT_TRUE(fixture.has("ls -l", "ls", "command.unknown"));
 }
 
-TEST(LeshperKnowledge, ACommandNameInsideASubstitutionIsClassifiedToo) {
+TEST(UiCommandKind, ACommandNameInsideASubstitutionIsClassifiedToo) {
 	// #104 parses interiors after the top level, so an interior command name is a
 	// node like any other and needs no second code path (#124).
 	paint_fixture fixture;
@@ -525,7 +535,7 @@ TEST(LeshperKnowledge, ACommandNameInsideASubstitutionIsClassifiedToo) {
 	EXPECT_TRUE(fixture.has("echo $(ll)", "ll", "command.alias"));
 }
 
-TEST(LeshperKnowledge, AWordThatIsNotProvablyLiteralIsStillNotClassified) {
+TEST(UiCommandKind, AWordThatIsNotProvablyLiteralIsStillNotClassified) {
 	// The rule #124 set and this ticket does not relax: `$cmd` names a command
 	// only after expansion, so it gets no command class at all - not even now
 	// that the tables can be reached.
@@ -535,7 +545,7 @@ TEST(LeshperKnowledge, AWordThatIsNotProvablyLiteralIsStillNotClassified) {
 	EXPECT_FALSE(fixture.has("$cmd a", "$cmd", "command.unknown"));
 }
 
-TEST(LeshperKnowledge, TheTablesAreNotConsultedForAWordThatIsNotACommandName) {
+TEST(UiCommandKind, TheTablesAreNotConsultedForAWordThatIsNotACommandName) {
 	// Only the command-name role asks. An argument that happens to be an alias's
 	// name is an argument.
 	paint_fixture fixture;

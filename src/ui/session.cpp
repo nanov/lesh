@@ -1,11 +1,13 @@
 #include "ui/session.h"
 
 #include "leshper/abi.h"
-#include "leshper/complete.h"
 #include "leshper/keymap.h"
-#include "ui/loop.h"
 #include "leshper/prompt/prompt.h"
 #include "leshper/registry.h"
+#include "ui/completion.h"
+#include "ui/editor_host.h"
+#include "ui/loop.h"
+#include "ui/reactors.h"
 #include "ui/shell_actor.h"
 #include "ui/shell_state_knowledge.h"
 #include "ui/tty.h"
@@ -394,10 +396,41 @@ private:
 	// because both borrow it: the actor raises it around `execute` and
 	// `port_call` below, and the adapter asserts it is down on every read. One
 	// flag, so the two cannot be talking about different windows.
-	leshper::shell_writing_flag _writing;
+	shell_writing_flag _writing;
 	shell_state_knowledge _knowledge;
-	leshper::owned_highlighter _highlighter;
-	leshper::owned_autosuggester _autosuggester;
+	// --- The completer, and the one door the editor has ----------------------
+
+	// THE SAME ADAPTER THE HIGHLIGHTER'S TOKENS READ THROUGH, called on the LOOP
+	// thread (#139, direct since #151). There is one statement anywhere in this
+	// tree of what the editor may see of `shell_state`, and both readers go
+	// through it.
+	//
+	// #139 put a `name_source` and a round trip on the actor between these two
+	// lines; the owner's reading of ADR-0009 removed the need. `complete` is
+	// called from inside an action, dispatched by the loop; the only writers are
+	// `execute` and `port_call`, both of which the loop itself requests and then
+	// blocks on for their whole duration. So while this call runs, nothing is
+	// writing - and `_writing` above is what says so out loud if that ever stops
+	// being true.
+	shell_completer _completer;
+
+	// THE ONE DOOR THE EDITOR HAS (#168 Phase B, `leshper/host.h`).
+	//
+	// It replaces two borrowed pointers on the registry, `knowledge` and
+	// `completion`, which were the same idea said twice: the editor asking the
+	// side that knows the shell a question it cannot answer itself. It answers
+	// `lesh_request_command_kind` on a worker and carries out `want_completion`
+	// on the loop.
+	//
+	// DECLARED HERE AND NOT AT THE BOTTOM, which is the same lifetime rule the
+	// actor and the loop are placed by: the actor stamps this on every token it
+	// serves and the registry the loop owns holds a borrowed pointer to it, and
+	// members die in reverse - so it has to outlive both. The two IT borrows are
+	// the two lines above it.
+	editor_host _host;
+
+	owned_highlighter _highlighter;
+	owned_autosuggester _autosuggester;
 	worker_pool _helpers;
 	signal_hub _signals;
 	// DECLARED BEFORE THE LOOP, and for the actor's reason one line down: the
@@ -454,20 +487,6 @@ private:
 	std::uint64_t _prompt_timer_id = 0;
 	std::uint64_t _prompt_timer_interval = 0;
 
-	// --- The completer's door to the shell (#139, direct since #151) ---------
-
-	// THE SAME ADAPTER THE HIGHLIGHTER'S TOKENS READ THROUGH, called on the LOOP
-	// thread. There is one statement anywhere in this tree of what leshper may
-	// see of `shell_state`, and both readers go through it.
-	//
-	// #139 put a `name_source` and a round trip on the actor between these two
-	// lines; the owner's reading of ADR-0009 removed the need. `complete` is
-	// called from inside an action, dispatched by the loop; the only writers are
-	// `execute` and `port_call`, both of which the loop itself requests and then
-	// blocks on for their whole duration. So while this call runs, nothing is
-	// writing - and `_writing` above is what says so out loud if that ever stops
-	// being true.
-	leshper::shell_completer _completer;
 };
 
 
@@ -496,10 +515,15 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _providers(providers),
 	  _executor(pool, state),
 	  _knowledge(state, &_writing),
+	  _completer(&_knowledge),
+	  // #94's `Completer` override point, filled (#139). The bundle's field wins
+	  // when a caller supplied one - which is what makes it an override point and
+	  // not a hard-wired provider - and the session's own trio is the default.
+	  _host(&_knowledge,
+	        providers.completion != nullptr ? providers.completion : &_completer),
 	  _autosuggester(providers.history),
-	  _actor(*this, &_knowledge, &_writing),
-	  _loop(loop_fds{in, out}, options_for(providers, true)),
-	  _completer(&_knowledge) {
+	  _actor(*this, &_host, &_writing),
+	  _loop(loop_fds{in, out}, options_for(providers, true)) {
 	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163),
 	// THROUGH A HOOK THIS LAYER CANNOT NAME ITSELF (#164).
 	//
@@ -534,18 +558,12 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	register_autosuggester(context.actions(), _autosuggester.get());
 	register_line_actions();
 	bind_line_keys();
-	// WHAT THE SHELL KNOWS, LENT TO THE REGISTRY (#135, re-seated by #168). It
-	// used to be pushed in through `context.loop()`, which made the editor's fake
-	// host the route by which the real host told the editor about itself. It is a
-	// borrowed pointer on the registry now, on exactly the terms the two below it
-	// are: null is "no shell attached", and the owner outlives the registry.
-	// Phase B retires the field with the last leshper-side consumer.
-	context.actions().knowledge = &_knowledge;
-	// #94's `Completer` override point, filled (#139). The bundle's field wins
-	// when a caller supplied one - which is what makes it an override point and
-	// not a hard-wired provider - and the session's own trio is the default.
-	context.actions().completion =
-		providers.completion != nullptr ? providers.completion : &_completer;
+	// THE HOST, LENT TO THE REGISTRY (#135, #139, re-seated by #168 Phase B).
+	// `knowledge` and `completion` were two borrowed pointers here; they are one
+	// now, on the same terms - null would be "no host attached", the owner
+	// outlives the registry, and it is the route every `lesh_request_command_kind`
+	// and every `lesh_complete` takes out of the editor.
+	context.actions().host = &_host;
 	// §6.10's engine, lent to the registry the same way and on the same terms:
 	// BORROWED, null when there is no session, and the route every
 	// `lesh_prompt_*` verb takes into the composer. A binding that registers a
@@ -569,8 +587,11 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// #135's door is NOT attached to the loop (#151). The actor was given it at
 	// construction and stamps it on every token it serves, so the loop never
 	// holds a pointer to state it does not own; see `event_loop`'s note where
-	// `attach_shell_knowledge` used to be.
-	LESH_ASSERT(_actor.knowledge() == &_knowledge);
+	// `attach_shell_knowledge` used to be. One object, and this is what says so:
+	// a token minted on the shell thread and a Tab dispatched on the loop reach
+	// the same host.
+	LESH_ASSERT(_actor.host() == &_host);
+	LESH_ASSERT(context.actions().host == &_host);
 
 	// THE FIRST PAINT, and it needs saying here or the first prompt of every
 	// session is the wrong one. `options_for` seeded the loop's options from the

@@ -109,11 +109,15 @@ struct request_snapshot {
 	// running - which is why #130's copy-on-write definitions version was deleted
 	// rather than kept as insurance.
 	//
-	// Null - the default - is "no shell attached": the tables read empty and
-	// `$PATH` is the process environment's. A submit that leaves it null is
-	// therefore honest rather than broken, and is what every state-free reactor
-	// does.
-	const leshper::shell_knowledge* knowledge = nullptr;
+	// Null - the default - is "no host attached": every name classifies as
+	// LESH_COMMAND_UNKNOWN. A submit that leaves it null is therefore honest
+	// rather than broken, and is what every state-free reactor does.
+	//
+	// `leshper::host` since #168 Phase B, where this was a `shell_knowledge*`.
+	// The tables are still what answers - `ui::editor_host` holds them - but the
+	// `$PATH` sweep that used to run inside the editor moved behind the same
+	// door, so what the snapshot carries is the door and not one room of it.
+	const leshper::host* host = nullptr;
 };
 
 // The snapshot of an editor state, as the loop would take it.

@@ -152,7 +152,7 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	std::optional<lesh::runtime::history_store> history;
 	if (const std::optional<std::string> path = lesh::runtime::history_store::default_path())
 		history.emplace(*path);
-	const lesh::leshper::vector_history_source empty_history;
+	const lesh::ui::vector_history_source empty_history;
 	std::optional<lesh::ui::history_store_source> recorded;
 	if (history.has_value())
 		recorded.emplace(*history);
@@ -161,8 +161,8 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	providers.syntax = &syntax;
 	providers.prompt = &prompt;
 	providers.history = recorded.has_value()
-		? static_cast<const lesh::leshper::history_source*>(&*recorded)
-		: static_cast<const lesh::leshper::history_source*>(&empty_history);
+		? static_cast<const lesh::ui::history_source*>(&*recorded)
+		: static_cast<const lesh::ui::history_source*>(&empty_history);
 	providers.store = history.has_value() ? &*history : nullptr;
 	// The completer is #94's fourth provider and v1 has none. Null, and the
 	// bundle says so.

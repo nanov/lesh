@@ -1,4 +1,5 @@
-#include "leshper/history_search.h"
+#include "ui/history_search.h"
+#include "ui/reactors.h"
 #include "leshper/keymap.h"
 #include "ui/loop.h"
 #include "ui/shell_actor.h"

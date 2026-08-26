@@ -3,7 +3,6 @@
 #include "leshper/abi.h"
 #include "leshper/editor.h"
 #include "leshper/event.h"
-#include "leshper/history_search.h"
 #include "leshper/keymap.h"
 #include "leshper/kill_store.h"
 #include "leshper/registry.h"
@@ -12,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -69,22 +69,41 @@ bool kill_is_linewise(const state& s) {
 constexpr char32_t escape_key = 0x1B;
 
 // A suggestion on screen, put there the way the loop puts one there (#140,
-// #147): a real autosuggester registered into the state's OWN context, one
+// #147): a reactor registered into the state's OWN context through the ABI, one
 // react, one `apply_batch`. Nothing is written into `state::proposals` by hand,
 // because the question these tests ask is what a KEY does with a suggestion the
 // loop applied, and a hand-built one would not have gone through the applier
 // that decides whether it is stale.
 //
-// Declared BEFORE the state in every test that uses it, so the history and the
-// reactor outlive the registry that points at them (ADR-0007).
+// A FAKE REACTOR AND NOT THE AUTOSUGGESTER (#168 Phase B). The real one is
+// `lesh::ui`'s now, and it has to be: what it does is walk a history, which is
+// knowledge. `Leshper*` runs with no terminal, no thread and no knowledge, so
+// what these tests need from a suggester is the two emissions and not the search
+// behind them - a proposal under LESH_PROPOSAL_AUTOSUGGESTION and virtual text
+// for its tail. Both go out through `abi.h` exactly as the real one's do, which
+// is the surface the accepting actions read on. If the two ever disagree the
+// autosuggester's own tests are where that shows (`ui_autosuggest_tests.cpp`);
+// what is asserted HERE is dispatch.
+//
+// Declared BEFORE the state in every test that uses it, so the candidate and the
+// context pointer outlive the registry that points at them (ADR-0007).
 class suggests {
 public:
-	explicit suggests(std::vector<std::string> entries) : _history(std::move(entries)) {}
+	explicit suggests(std::vector<std::string> entries) {
+		if (!entries.empty())
+			_candidate = std::move(entries.front());
+	}
 
 	suggests(const suggests&) = delete;
 	suggests& operator=(const suggests&) = delete;
 
-	void into(state& s) { register_autosuggester(context_of(s).actions(), _self.get()); }
+	void into(state& s) {
+		ASSERT_EQ(lesh_style_intern(&context_of(s).actions(), "suggestion", &_style),
+		          LESH_OK);
+		ASSERT_EQ(lesh_reactor_register(&context_of(s).actions(), "autosuggester",
+		                                LESH_EVENT_BUFFER_CHANGED, compute, this),
+		          LESH_OK);
+	}
 
 	void show(state& s) {
 		for (reactor_batch& one : context_of(s).loop().react(s, LESH_EVENT_BUFFER_CHANGED))
@@ -92,8 +111,42 @@ public:
 	}
 
 private:
-	vector_history_source _history;
-	owned_autosuggester _self{&_history};
+	// The autosuggester's two emissions, in its order: the tail as styled virtual
+	// text at the end of the typed bytes, then the WHOLE candidate as the
+	// proposal an accepting action reads (F-25).
+	static std::int32_t compute(lesh_request* request, void* userdata) {
+		auto* const self = static_cast<suggests*>(userdata);
+		if (self == nullptr)
+			return LESH_ERR_INVAL;
+		if (self->_candidate.empty())
+			return LESH_OK;
+
+		std::size_t length = 0;
+		if (lesh_request_buffer_length(request, &length) != LESH_OK)
+			return LESH_ERR_INVAL;
+		if (length == 0)
+			return LESH_OK;
+		std::string typed(length, '\0');
+		std::size_t copied = 0;
+		if (lesh_request_buffer(request, typed.data(), typed.size(), &copied) != LESH_OK)
+			return LESH_ERR_INVAL;
+		typed.resize(copied);
+
+		const std::string_view whole{self->_candidate};
+		if (!whole.starts_with(typed) || whole.size() <= typed.size())
+			return LESH_OK;
+		const std::string_view rest = whole.substr(typed.size());
+
+		const std::int32_t status = lesh_emit_virtual_text_styled(
+			request, typed.size(), rest.data(), rest.size(), self->_style);
+		if (status != LESH_OK)
+			return status;
+		return lesh_propose(request, LESH_PROPOSAL_AUTOSUGGESTION, whole.data(),
+		                    whole.size());
+	}
+
+	std::string _candidate;
+	std::uint32_t _style = LESH_STYLE_NONE;
 };
 
 } // namespace

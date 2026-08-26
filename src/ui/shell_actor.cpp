@@ -95,7 +95,7 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	// function resolved `unknown` while `cd` passed only because macOS ships
 	// `/usr/bin/cd`. The stamp itself is `shell_actor`'s (it knows whose shell
 	// this is); what belongs here is that the copy is now COMPLETE.
-	token.knowledge = snapshot.knowledge;
+	token.host = snapshot.host;
 	token.superseded = &superseded;
 	token.spans = &into.spans;
 	token.texts = &into.texts;
@@ -351,7 +351,7 @@ void shell_actor::serve_execute(execute_slot& job) {
 		// session's adapter while it runs would be reading a table mid-rewrite,
 		// and the assertion there says so instead of the reader finding out
 		// later.
-		const leshper::shell_writing_flag::scope writing{_writing};
+		const shell_writing_flag::scope writing{_writing};
 		answer.status = _shell->execute(job.line);
 	}
 	answer.sequence = 0;
@@ -368,7 +368,7 @@ void shell_actor::serve_port_call(port_slot& job) {
 	{
 		// The other writer: an action's shell code is arbitrary and may define,
 		// unset or export anything (#92).
-		const leshper::shell_writing_flag::scope writing{_writing};
+		const shell_writing_flag::scope writing{_writing};
 		answer.status = _shell->port_call(job.code);
 	}
 	_replies.post(std::move(answer));
@@ -381,8 +381,8 @@ void shell_actor::serve_highlight(highlight_slot& job) {
 	answer.sequence = 0;
 	// THE STAMP (#151). Not the loop's to put on the snapshot and not this
 	// function's to remember per call site: the actor serves one shell, and this
-	// is that shell's knowledge, on every token it mints.
-	job.snapshot.knowledge = _knowledge;
+	// is that shell's host, on every token it mints.
+	job.snapshot.host = _host;
 	run_reactor_here(job.reactor, job.fn, job.userdata, std::move(job.snapshot), _superseded,
 	                 answer.batch);
 	answer.status = answer.batch.status;

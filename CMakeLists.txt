@@ -104,13 +104,19 @@ enable_testing()
 #
 # Current graph:
 #
-#   lesh_options ──► lesh_substrate ──► lesh_syntax ──┬─► lesh_runtime ──┐
-#                                                     │                  ▼
-#                                                     └─► lesh_leshper ─► lesh_ui ──► lesh
-#                                                             │                        ▲
-#                                                             └─► lesh_leshnici ───────┘
+#   lesh_options ──► lesh_substrate ──► lesh_syntax ──► lesh_runtime ──┐
+#                            │                                          ▼
+#                            └───────────► lesh_leshper ──────────► lesh_ui ──► lesh
+#                                               │                              ▲
+#                                               └─► lesh_leshnici ─────────────┘
 #
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
+#
+# THE EDITOR HANGS OFF THE SUBSTRATE AND NOTHING ELSE, since #168 Phase B. It
+# used to link `lesh_syntax` for the highlighter's parse and the completer's lex;
+# both moved to `lesh_ui` with the rest of the knowledge, and a `syntax/` include
+# under `src/leshper/` would now fail to compile. What the editor depends on is
+# text, arenas, grapheme widths and logging.
 #
 # One directory, one namespace, one target: `src/X/Y` is `lesh::X::Y`, with
 # `substrate/` the one flat exception. `lesh_ui` is the ONE library that links
@@ -191,16 +197,21 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # mailbox in it, and a host sends it events and performs its effects. What is
 # left here compiles with no `<poll.h>`, no `<thread>` and no `<termios.h>`.
 #
-# Links syntax and the substrate, and NOT lesh_runtime. That is spec §4.4's rule
-# made enforceable the same way every other one here is: the editor may depend on
-# the lexer, the parser and shell state, never on the executor - so a call into
-# execution does not compile rather than being caught in review. Running user
-# code goes through the port #92 shaped, whose lane-2 half is a spawn_request
-# effect the loop carries out; nothing in this target executes anything.
+# Links THE SUBSTRATE AND NOTHING ELSE (#168 Phase B). Not lesh_runtime, which
+# is spec §4.4's rule made enforceable the same way every other one here is - a
+# call into execution does not compile rather than being caught in review - and
+# no longer lesh_syntax either. Running user code goes through the port #92
+# shaped, whose lane-2 half is a spawn_request effect the host carries out;
+# nothing in this target executes, parses or lexes anything.
 #
-# syntax is linked ahead of its first use: C-1 to C-6 froze as leshper's public
-# API when #104 landed, and the highlighter reactor is the client that will call
-# it. Nothing here calls it yet.
+# AND NOT lesh_syntax EITHER, since #168 Phase B. It was linked here for one
+# client: the highlighter called `parse()` and `complete.cpp` lexed to find the
+# token under the cursor. Both were KNOWLEDGE - what a line MEANS and what a name
+# COULD be - and both are `lesh_ui`'s now, so no file under `src/leshper/`
+# includes `syntax/` at all. The editor's dependency is the substrate and nothing
+# else: text, arena, grapheme widths, logging. C-1 to C-6 are still leshper's
+# public API in the sense §4 means - the layer above may call them - but the
+# editor itself does not, and the link line is what says so.
 add_library(lesh_leshper STATIC
 	src/leshper/decode.cpp
 	src/leshper/decode.h
@@ -208,14 +219,12 @@ add_library(lesh_leshper STATIC
 	src/leshper/blit.h
 	src/leshper/abi.h
 	src/leshper/builtin_actions.cpp
-	src/leshper/complete.cpp
-	src/leshper/complete.h
-	src/leshper/builtin_reactors.cpp
 	src/leshper/decoration.cpp
 	src/leshper/decoration.h
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
+	src/leshper/host.h
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/pager.cpp
@@ -239,10 +248,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/theme.h
 	src/leshper/registry.cpp
 	src/leshper/registry.h
-	src/leshper/shell_knowledge.h
 	src/leshper/event.h
-	src/leshper/history_search.cpp
-	src/leshper/history_search.h
 	src/leshper/keymap.cpp
 	src/leshper/keymap.h
 	src/leshper/kill_store.cpp
@@ -254,7 +260,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/surface.h
 	src/leshper/text.h
 	src/leshper/undo.h)
-target_link_libraries(lesh_leshper PUBLIC lesh_syntax)
+target_link_libraries(lesh_leshper PUBLIC lesh_substrate)
 
 # leshnici: the shipped extension set (#163).
 #
@@ -297,10 +303,19 @@ target_link_libraries(lesh_leshnici PUBLIC lesh_leshper)
 # `src/main.cpp` fills in with `install_prompt_modules`. A
 # `#include "leshnici/..."` from here would not link.
 add_library(lesh_ui STATIC
+	src/ui/completion.cpp
+	src/ui/completion.h
+	src/ui/editor_host.cpp
+	src/ui/editor_host.h
+	src/ui/history_search.cpp
+	src/ui/history_search.h
 	src/ui/loop.cpp
 	src/ui/loop.h
+	src/ui/reactors.cpp
+	src/ui/reactors.h
 	src/ui/session.cpp
 	src/ui/session.h
+	src/ui/shell_knowledge.h
 	src/ui/shell_actor.cpp
 	src/ui/shell_actor.h
 	src/ui/shell_state_knowledge.h
@@ -336,11 +351,11 @@ add_executable(lesh_tests
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_selection_tests.cpp
-	tests/unit/leshper_highlight_tests.cpp
-	tests/unit/leshper_autosuggest_tests.cpp
+	tests/unit/ui_highlight_tests.cpp
+	tests/unit/ui_autosuggest_tests.cpp
 	tests/unit/leshper_tests.cpp
 	tests/unit/leshper_paste_tests.cpp
-	tests/unit/leshper_pty_tests.cpp
+	tests/unit/ui_pty_tests.cpp
 	tests/unit/ui_session_tests.cpp
 	tests/unit/leshper_replay_tests.cpp
 	tests/unit/log_tests.cpp
@@ -359,12 +374,12 @@ add_executable(lesh_tests
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
 	tests/unit/history_store_tests.cpp
-	tests/unit/leshper_history_search_tests.cpp
+	tests/unit/ui_history_search_tests.cpp
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/leshper_vi_tests.cpp
-	tests/unit/leshper_knowledge_tests.cpp
+	tests/unit/ui_command_kind_tests.cpp
 	tests/unit/ui_knowledge_tests.cpp
-	tests/unit/leshper_complete_tests.cpp
+	tests/unit/ui_completion_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp

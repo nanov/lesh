@@ -1,4 +1,4 @@
-#include "leshper/complete.h"
+#include "ui/completion.h"
 
 #include "substrate/assert.h"
 #include "syntax/lexer.h"
@@ -17,15 +17,18 @@
 // LOOK AT THE INCLUDES, the way builtin_reactors.cpp asks you to.
 //
 // `syntax/` and `substrate/` and the POSIX headers the directory walk needs -
-// and NO `runtime/` header. The expander lives in `lesh_runtime`, which
-// `lesh_leshper` does not link (CMakeLists, spec 4.4), so an include that
-// reached for it would not link. That is what makes "$VAR in a completion prefix
-// is never expanded" (spec 6.9, #11) a property of the build graph rather than
-// of anyone's care - and `LeshperCompleteIncludeDiscipline` in the unit tests
-// reads this file and says so out loud, so the rule is also visible to someone
-// who is only reading the tests.
+// and NO `runtime/` header. THAT USED TO BE A LINK PROPERTY AND IS NOT ANY MORE
+// (#168 Phase B): while this file was `src/leshper/complete.cpp`, the expander
+// lived in `lesh_runtime` and `lesh_leshper` did not link it, so an include that
+// reached for it would not have LINKED. This file is `lesh_ui`'s now, the one
+// library that links both halves, and the link can no longer say no. The rule is
+// unchanged - "$VAR in a completion prefix is never expanded" (spec 6.9, #11) -
+// so what is left keeping it is `UiCompleteIncludeDiscipline` in the unit tests,
+// which reads this file's include lines and fails on a `runtime/` among them.
+// Keep the include list above short and the rule is easy to see; add to it
+// carelessly and the test is the only thing that will notice.
 
-namespace lesh::leshper {
+namespace lesh::ui {
 namespace {
 
 using syntax::lexer;
@@ -158,7 +161,7 @@ private:
 // real name and the fact that it is about to become buffer bytes. `text` is
 // therefore what the pager shows AND what it inserts, which is pager.h's own
 // one-spelling rule honoured rather than worked around.
-void add_candidate(std::string_view name, pager_kind kind, std::vector<candidate>& into) {
+void add_candidate(std::string_view name, leshper::pager_kind kind, std::vector<candidate>& into) {
 	candidate one;
 	one.kind = kind;
 	if (needs_quoting(name))
@@ -453,7 +456,7 @@ void shell_completer::complete(const completion_query& query, completion_result&
 		case completion_source::variable:
 			// A variable is a WORD: no `ls -F` marker exists for one, and what
 			// follows `$HOME` on the line is another word.
-			gather_names(name_domain::variable, pager_kind::word, typed, into.candidates,
+			gather_names(name_domain::variable, leshper::pager_kind::word, typed, into.candidates,
 			             names);
 			break;
 		case completion_source::path:
@@ -466,7 +469,7 @@ void shell_completer::complete(const completion_query& query, completion_result&
 	tidy(into.candidates);
 }
 
-void shell_completer::gather_names(name_domain which, pager_kind kind,
+void shell_completer::gather_names(name_domain which, leshper::pager_kind kind,
                                    std::string_view typed, std::vector<candidate>& out,
                                    std::vector<std::string>& scratch) const {
 	if (_knowledge == nullptr)
@@ -490,9 +493,9 @@ void shell_completer::gather_commands(std::string_view typed, std::vector<candid
 	// highlighter's job over text the user has committed to - a candidate list is
 	// not that. Adding three markers would be adding a description vocabulary the
 	// pager does not have.
-	gather_names(name_domain::builtin, pager_kind::word, typed, out, scratch);
-	gather_names(name_domain::function, pager_kind::word, typed, out, scratch);
-	gather_names(name_domain::alias, pager_kind::word, typed, out, scratch);
+	gather_names(name_domain::builtin, leshper::pager_kind::word, typed, out, scratch);
+	gather_names(name_domain::function, leshper::pager_kind::word, typed, out, scratch);
+	gather_names(name_domain::alias, leshper::pager_kind::word, typed, out, scratch);
 
 	// THE `$PATH` WALK, AND THE SHELL DOES NOT DO IT. See shell_knowledge.h: the
 	// shell hands over the split value and this side does the readdir, which is
@@ -524,7 +527,7 @@ void shell_completer::gather_commands(std::string_view typed, std::vector<candid
 			if (one.name.size() < typed.size()
 			    || std::string_view{one.name}.substr(0, typed.size()) != typed)
 				continue;
-			add_candidate(one.name, pager_kind::executable, out);
+			add_candidate(one.name, leshper::pager_kind::executable, out);
 		}
 	}
 }
@@ -551,12 +554,12 @@ void shell_completer::gather_paths(std::string_view directory, std::string_view 
 			continue;
 		// `word` and not `plain` for an ordinary file: a completed argument is
 		// followed by another word, so it closes with a space (6.9).
-		const pager_kind kind = one.directory ? pager_kind::directory
-			: one.symlink                     ? pager_kind::symlink
-			: one.executable                  ? pager_kind::executable
-			                                  : pager_kind::word;
+		const leshper::pager_kind kind = one.directory ? leshper::pager_kind::directory
+			: one.symlink                     ? leshper::pager_kind::symlink
+			: one.executable                  ? leshper::pager_kind::executable
+			                                  : leshper::pager_kind::word;
 		add_candidate(one.name, kind, out);
 	}
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui
