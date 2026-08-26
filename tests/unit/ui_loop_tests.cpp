@@ -1,9 +1,9 @@
 #include "leshper/history_search.h"
 #include "leshper/keymap.h"
-#include "leshper/loop.h"
-#include "leshper/shell_actor.h"
-#include "leshper/tty.h"
-#include "leshper/workers.h"
+#include "ui/loop.h"
+#include "ui/shell_actor.h"
+#include "ui/tty.h"
+#include "ui/workers.h"
 #include "substrate/fork_guard.h"
 #include "substrate/log.h"
 
@@ -36,6 +36,7 @@
 #endif
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 namespace log = lesh::log;
 
 // THE EVENT LOOP (#129): poll(2), five topics, quiesce.
@@ -189,7 +190,7 @@ bool turn_until(event_loop& loop, Predicate predicate, int budget = 200) {
 // The tty topic
 // ===========================================================================
 
-TEST(LeshperLoopTty, BytesBecomeEditsInOneTurn) {
+TEST(UiLoopTty, BytesBecomeEditsInOneTurn) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -202,7 +203,7 @@ TEST(LeshperLoopTty, BytesBecomeEditsInOneTurn) {
 	EXPECT_TRUE(result.rendered);
 }
 
-TEST(LeshperLoopTty, ReadsAreBatchedWhileTheFdIsStillReadable) {
+TEST(UiLoopTty, ReadsAreBatchedWhileTheFdIsStillReadable) {
 	// #128's trap 4, fish's `read_normal_chars`: a paste is one edit and one
 	// repaint. Two writes land before the turn, and both are consumed by it -
 	// which is what the zero-timeout re-poll buys.
@@ -220,7 +221,7 @@ TEST(LeshperLoopTty, ReadsAreBatchedWhileTheFdIsStillReadable) {
 	EXPECT_TRUE(result.rendered);
 }
 
-TEST(LeshperLoopTty, ABracketedPasteIsOneMutationAndOneGeneration) {
+TEST(UiLoopTty, ABracketedPasteIsOneMutationAndOneGeneration) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -234,7 +235,7 @@ TEST(LeshperLoopTty, ABracketedPasteIsOneMutationAndOneGeneration) {
 	EXPECT_EQ(loop.editor().gen.value(), before + 1);
 }
 
-TEST(LeshperLoopTty, EndOfFileIsAHangupAndNotAKey) {
+TEST(UiLoopTty, EndOfFileIsAHangupAndNotAKey) {
 	// fish `input.cpp`: EOF on the tty is `reader_sighup`, not a keypress.
 	// Ctrl-D at an empty prompt is a BINDING on a real U+0004 and is a different
 	// thing entirely.
@@ -250,7 +251,7 @@ TEST(LeshperLoopTty, EndOfFileIsAHangupAndNotAKey) {
 	EXPECT_EQ(buffer_of(loop), "");
 }
 
-TEST(LeshperLoopTty, AnEscapeResolvesOnItsOwnDeadlineAndNotBefore) {
+TEST(UiLoopTty, AnEscapeResolvesOnItsOwnDeadlineAndNotBefore) {
 	fake_tty tty;
 	loop_options options = pipe_options();
 	options.escape_timeout = std::chrono::milliseconds{15};
@@ -273,7 +274,7 @@ TEST(LeshperLoopTty, AnEscapeResolvesOnItsOwnDeadlineAndNotBefore) {
 // The signal topic
 // ===========================================================================
 
-TEST(LeshperLoopSignals, ResizesAreCountedRatherThanQueued) {
+TEST(UiLoopSignals, ResizesAreCountedRatherThanQueued) {
 	// #128's trap 12: SIGWINCH bumps a counter and the size is read from the
 	// kernel. Queueing resizes would be queueing sizes that were stale when they
 	// were queued.
@@ -290,7 +291,7 @@ TEST(LeshperLoopSignals, ResizesAreCountedRatherThanQueued) {
 	EXPECT_TRUE(pending.empty());
 }
 
-TEST(LeshperLoopSignals, DrainConsumesTheByteAndThePendingSet) {
+TEST(UiLoopSignals, DrainConsumesTheByteAndThePendingSet) {
 	signal_hub hub;
 	hub.deliver(SIGINT);
 	hub.deliver(SIGINT);
@@ -310,7 +311,7 @@ TEST(LeshperLoopSignals, DrainConsumesTheByteAndThePendingSet) {
 	EXPECT_EQ(hub.drain(pending), 0u);
 }
 
-TEST(LeshperLoopSignals, ASignalBecomesAnEventOnTheOrdinaryPath) {
+TEST(UiLoopSignals, ASignalBecomesAnEventOnTheOrdinaryPath) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -324,7 +325,7 @@ TEST(LeshperLoopSignals, ASignalBecomesAnEventOnTheOrdinaryPath) {
 	EXPECT_GE(result.topics_drained, 1u);
 }
 
-TEST(LeshperLoopSignals, AResizeIsDeliveredAsAnEventWithTheQueriedSize) {
+TEST(UiLoopSignals, AResizeIsDeliveredAsAnEventWithTheQueriedSize) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -341,7 +342,7 @@ TEST(LeshperLoopSignals, AResizeIsDeliveredAsAnEventWithTheQueriedSize) {
 	EXPECT_EQ(loop.editor().rows, kFallbackTerminalSize.rows);
 }
 
-TEST(LeshperLoopSignals, ASignalDoesNotTearAMultibyteSequence) {
+TEST(UiLoopSignals, ASignalDoesNotTearAMultibyteSequence) {
 	// #128's trap 2, and fish's never-fixed FIXME: "here signals may break
 	// multibyte sequences." An interrupt injected an event ahead of a half-read
 	// UTF-8 sequence.
@@ -370,7 +371,7 @@ TEST(LeshperLoopSignals, ASignalDoesNotTearAMultibyteSequence) {
 	EXPECT_EQ(buffer_of(loop), "\xC3\xA9") << "the codepoint survived the signal intact";
 }
 
-TEST(LeshperLoopSignals, InstallPutsBackExactlyWhatItReplaced) {
+TEST(UiLoopSignals, InstallPutsBackExactlyWhatItReplaced) {
 	// The one test that touches the process's real dispositions, guarded the way
 	// the shell's own signal tests have been since #37.
 	lesh::testing::saved_disposition interrupt{SIGINT};
@@ -462,7 +463,7 @@ void install_handler(int signo, void (*fn)(int)) {
 
 } // namespace
 
-TEST(LeshperLoopSignals, ReassertOverAForeignHandlerRetargetsTheChain) {
+TEST(UiLoopSignals, ReassertOverAForeignHandlerRetargetsTheChain) {
 	// Rule 4a, and the defect it fixes. `trap 'cmd' CHLD` installs
 	// `record_signal`; the old save-once hub stomped it and went on chaining to
 	// what was there BEFORE the trap existed, so `g_pending[CHLD]` was never set
@@ -489,7 +490,7 @@ TEST(LeshperLoopSignals, ReassertOverAForeignHandlerRetargetsTheChain) {
 	hub.uninstall();
 }
 
-TEST(LeshperLoopSignals, ReassertOverAForeignWinchHandlerRetargetsTheChainToo) {
+TEST(UiLoopSignals, ReassertOverAForeignWinchHandlerRetargetsTheChainToo) {
 	// The same rule on the other caught signal that a `trap` can reach, because
 	// "INT works" was how the CHLD defect stayed invisible: INT escaped only by
 	// the accident that the interactive default had installed `record_signal`
@@ -510,7 +511,7 @@ TEST(LeshperLoopSignals, ReassertOverAForeignWinchHandlerRetargetsTheChainToo) {
 	hub.uninstall();
 }
 
-TEST(LeshperLoopSignals, ReassertLeavesAnIgnoreStanding) {
+TEST(UiLoopSignals, ReassertLeavesAnIgnoreStanding) {
 	// Rule 3. The newest ignore stands, whoever set it - `nohup`'s before exec
 	// or `trap '' CHLD` a moment ago. This is what used to be a SIGHUP-shaped
 	// special case, generalized into the rule that governs every signal.
@@ -529,7 +530,7 @@ TEST(LeshperLoopSignals, ReassertLeavesAnIgnoreStanding) {
 	hub.uninstall();
 }
 
-TEST(LeshperLoopSignals, ReassertLeavesAForeignHandlerOnTheIgnoredSetStanding) {
+TEST(UiLoopSignals, ReassertLeavesAForeignHandlerOnTheIgnoredSetStanding) {
 	// Rule 4b, and the second defect. The hub never CONSUMED SIGTSTP - its
 	// SIG_IGN was only "better than the default action" - so a user's
 	// `trap 'cmd' TSTP` outranks it. The old hub re-ignored unconditionally and
@@ -549,7 +550,7 @@ TEST(LeshperLoopSignals, ReassertLeavesAForeignHandlerOnTheIgnoredSetStanding) {
 	hub.uninstall();
 }
 
-TEST(LeshperLoopSignals, UninstallRestoresTheEntryDispositionAndNotTheNewest) {
+TEST(UiLoopSignals, UninstallRestoresTheEntryDispositionAndNotTheNewest) {
 	// The reason `_saved` and `_chain` are two slots. `_chain` follows the newest
 	// handler so the trap fires; `_saved` must not, or leaving the editor would
 	// hand the process back a disposition it never started with.
@@ -568,7 +569,7 @@ TEST(LeshperLoopSignals, UninstallRestoresTheEntryDispositionAndNotTheNewest) {
 		<< "uninstall put back the trap's handler rather than the entry disposition";
 }
 
-TEST(LeshperLoopSignals, TheLoopNeverWritesADisposition) {
+TEST(UiLoopSignals, TheLoopNeverWritesADisposition) {
 	// #142's second amendment, as an assertion rather than a convention. Taking
 	// the dispositions back used to happen on the LOOP thread, in `enter_read`
 	// and on the unpark - two threads writing one piece of process-wide state,
@@ -601,7 +602,7 @@ TEST(LeshperLoopSignals, TheLoopNeverWritesADisposition) {
 	hub.uninstall();
 }
 
-TEST(LeshperLoopSignals, SighupIsNeverTakenAtAll) {
+TEST(UiLoopSignals, SighupIsNeverTakenAtAll) {
 	// #142 removed SIGHUP from the hub entirely, and this test is the guard on
 	// that decision rather than on the old `nohup` conditional. The editor's
 	// hangup is the tty's POLLHUP, which `drain_tty` synthesizes; a real SIGHUP
@@ -636,7 +637,7 @@ TEST(LeshperLoopSignals, SighupIsNeverTakenAtAll) {
 // The worker topic
 // ===========================================================================
 
-TEST(LeshperLoopWorkers, AReadableFdIsAnsweredWithDrain) {
+TEST(UiLoopWorkers, AReadableFdIsAnsweredWithDrain) {
 	// #126's rule, written in its own header: answer the readable fd with
 	// `drain()`, never by reading it. Reading it would leave the queue armed and
 	// the next wakeup would be lost forever.
@@ -665,7 +666,7 @@ TEST(LeshperLoopWorkers, AReadableFdIsAnsweredWithDrain) {
 	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "counter");
 }
 
-TEST(LeshperLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
+TEST(UiLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	// N-4, and the loop is the only applier, so this is the only place the rule
 	// is decided.
 	fake_tty tty;
@@ -691,7 +692,7 @@ TEST(LeshperLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	EXPECT_TRUE(loop.editor().marks.layers().empty());
 }
 
-TEST(LeshperLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
+TEST(UiLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 	// #154's regression anchor for F-25 on the REAL loop path - the deterministic
 	// in-harness cousin of the pty accept test, with no terminal timing in it.
 	// The autosuggester runs on a HELPER worker; the whole point of the ticket is
@@ -749,7 +750,7 @@ TEST(LeshperLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 // The shell topic (ADR-0009)
 // ===========================================================================
 
-TEST(LeshperLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopic) {
+TEST(UiLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopic) {
 	fake_tty tty;
 	registry reg;
 	fake_shell shell;
@@ -778,7 +779,7 @@ TEST(LeshperLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopi
 	EXPECT_FALSE(actor.replies().armed()) << "drain disarms the shell topic too";
 }
 
-TEST(LeshperLoopShell, ANewerHighlightOverwritesAPendingOne) {
+TEST(UiLoopShell, ANewerHighlightOverwritesAPendingOne) {
 	// ADR-0009: "a newer highlight overwrites a pending one, which is the
 	// cancellation." There is no cancel call in the seam, and that is the point.
 	fake_shell shell;
@@ -801,7 +802,7 @@ TEST(LeshperLoopShell, ANewerHighlightOverwritesAPendingOne) {
 	actor.replies().recycle(inbox);
 }
 
-TEST(LeshperLoopShell, ExecuteOutranksAPendingHighlight) {
+TEST(UiLoopShell, ExecuteOutranksAPendingHighlight) {
 	fake_shell shell;
 	shell_actor actor{shell, nullptr};
 
@@ -814,7 +815,7 @@ TEST(LeshperLoopShell, ExecuteOutranksAPendingHighlight) {
 	EXPECT_EQ(shell.executed, "echo hi") << "priority order: execute, port_call, highlight";
 }
 
-TEST(LeshperLoopShell, MessagesAreRecycledRatherThanReallocated) {
+TEST(UiLoopShell, MessagesAreRecycledRatherThanReallocated) {
 	fake_shell shell;
 	shell_actor actor{shell, nullptr};
 	state target;
@@ -831,7 +832,7 @@ TEST(LeshperLoopShell, MessagesAreRecycledRatherThanReallocated) {
 	EXPECT_EQ(actor.served(), 5u);
 }
 
-TEST(LeshperLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
+TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
 	// #92's contract, unchanged by the thread split: the action blocks, the loop
 	// waits on the `shell` and `signal` topics, and the terminal keeps the
 	// EDITOR's modes throughout (fish #7770).
@@ -858,7 +859,7 @@ TEST(LeshperLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
 // Accept and quiesce
 // ===========================================================================
 
-TEST(LeshperLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
+TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 	// The whole of quiesce, asserted from inside the execution: by the time
 	// `execute` runs on the shell thread, the helpers are parked and the loop is
 	// blocked in its poll. That is the moment a fork is legal.
@@ -897,7 +898,7 @@ TEST(LeshperLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 	EXPECT_FALSE(loop.quiesced());
 }
 
-TEST(LeshperLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
+TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	fake_tty tty;
 	worker_pool helpers{1};
 	event_loop loop{tty.fds(), pipe_options()};
@@ -917,7 +918,7 @@ TEST(LeshperLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	EXPECT_FALSE(helpers.is_quiesced());
 }
 
-TEST(LeshperLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
+TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
 	fake_tty tty;
 	fake_shell shell;
 	shell_actor actor{shell, nullptr};
@@ -945,16 +946,21 @@ TEST(LeshperLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
 // The timer topic
 // ===========================================================================
 
-TEST(LeshperLoopTimers, AnArmedTimerDispatchesItsAction) {
+TEST(UiLoopTimers, AnArmedTimerDispatchesItsAction) {
 	fake_tty tty;
-	registry reg;
+	event_loop loop{tty.fds(), pipe_options()};
+	// THE STATE'S OWN REGISTRY, which is what the session attaches and what a
+	// keystroke reaches (#144). It matters here since #168: an expiry is a
+	// `timer_fired` EVENT and `step` dispatches it through `context_of(state)`, so
+	// a timer armed on some other registry is a timer whose action nothing can
+	// find - which is the same thing a key bound to an unregistered name is.
+	registry& reg = context_of(loop.editor()).actions();
 	ASSERT_EQ(lesh_action_register(&reg, "tick", &counting_action, nullptr), LESH_OK);
 
 	std::uint64_t id = 0;
 	ASSERT_EQ(lesh_timer_start(&reg, 5, "tick", &id), LESH_OK);
 	EXPECT_NE(id, 0u);
 
-	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
 	loop.enter_read();
 
@@ -966,10 +972,10 @@ TEST(LeshperLoopTimers, AnArmedTimerDispatchesItsAction) {
 	EXPECT_EQ(lesh_timer_stop(&reg, id), LESH_ERR_NOTFOUND) << "an id is stopped once";
 }
 
-TEST(LeshperLoopTimers, TheTimeoutIsTheMinimumDeadlineAndMinusOneWhenNothingWaits) {
+TEST(UiLoopTimers, TheTimeoutIsTheMinimumDeadlineAndMinusOneWhenNothingWaits) {
 	fake_tty tty;
-	registry reg;
 	event_loop loop{tty.fds(), pipe_options()};
+	registry& reg = context_of(loop.editor()).actions();
 	loop.attach_registry(reg);
 	loop.enter_read();
 
@@ -978,29 +984,32 @@ TEST(LeshperLoopTimers, TheTimeoutIsTheMinimumDeadlineAndMinusOneWhenNothingWait
 
 	std::uint64_t id = 0;
 	ASSERT_EQ(lesh_timer_start(&reg, 1000, "tick", &id), LESH_OK);
-	loop.turn(0);  // the arm happens on the turn that first sees the table
+	loop.turn(0);  // the arm is an effect, taken at the top of a turn
 	const int timeout = loop.poll_timeout_ms();
 	EXPECT_GT(timeout, 0);
 	EXPECT_LE(timeout, 1001);
 }
 
-TEST(LeshperLoopTimers, ZeroIntervalAndABadNameAreRefused) {
+TEST(UiLoopTimers, ZeroIntervalAndABadNameAreRefused) {
 	registry reg;
 	std::uint64_t id = 0;
 	EXPECT_EQ(lesh_timer_start(&reg, 0, "tick", &id), LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_timer_start(&reg, 5, "NotSnakeCase", &id), LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_timer_start(nullptr, 5, "tick", &id), LESH_ERR_INVAL);
-	EXPECT_TRUE(reg.timers.empty());
+	// Nothing was minted and nothing was queued: a refused arm leaves neither an
+	// id behind nor an `arm_timer` for the host to act on (#168).
+	EXPECT_TRUE(reg.armed_timers.empty());
+	EXPECT_TRUE(reg.pending.empty());
 }
 
-TEST(LeshperLoopTimers, AnActionsExitOutcomeEndsTheLoop) {
+TEST(UiLoopTimers, AnActionsExitOutcomeEndsTheLoop) {
 	fake_tty tty;
-	registry reg;
+	event_loop loop{tty.fds(), pipe_options()};
+	registry& reg = context_of(loop.editor()).actions();
 	ASSERT_EQ(lesh_action_register(&reg, "quit", &exiting_action, nullptr), LESH_OK);
 	std::uint64_t id = 0;
 	ASSERT_EQ(lesh_timer_start(&reg, 1, "quit", &id), LESH_OK);
 
-	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
 	loop.enter_read();
 
@@ -1012,7 +1021,7 @@ TEST(LeshperLoopTimers, AnActionsExitOutcomeEndsTheLoop) {
 // Rendering
 // ===========================================================================
 
-TEST(LeshperLoopRender, TheLoopKeepsThePreviousSurfaceAndDiffsAgainstIt) {
+TEST(UiLoopRender, TheLoopKeepsThePreviousSurfaceAndDiffsAgainstIt) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -1029,7 +1038,7 @@ TEST(LeshperLoopRender, TheLoopKeepsThePreviousSurfaceAndDiffsAgainstIt) {
 	EXPECT_LT(second.size(), first.size());
 }
 
-TEST(LeshperLoopRender, AResizeForcesAFullRepaint) {
+TEST(UiLoopRender, AResizeForcesAFullRepaint) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -1050,7 +1059,7 @@ TEST(LeshperLoopRender, AResizeForcesAFullRepaint) {
 // The thread (#134's two calls)
 // ===========================================================================
 
-TEST(LeshperLoopThread, StopWakesALoopBlockedInPoll) {
+TEST(UiLoopThread, StopWakesALoopBlockedInPoll) {
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 
@@ -1119,7 +1128,7 @@ private:
 
 } // namespace
 
-TEST(LeshperLoopTerminal, AZeroWinsizeFallsBackToEightyByTwentyFour) {
+TEST(UiLoopTerminal, AZeroWinsizeFallsBackToEightyByTwentyFour) {
 	// #128's trap 12: a zero in either axis is "no answer", not a zero-sized
 	// screen, and a layout at zero columns is not a picture.
 	pty_pair pty;
@@ -1139,7 +1148,7 @@ TEST(LeshperLoopTerminal, AZeroWinsizeFallsBackToEightyByTwentyFour) {
 	EXPECT_EQ(query_terminal_size(-1), kFallbackTerminalSize);
 }
 
-TEST(LeshperLoopTerminal, RawModeIsEnteredAndRestoredWithoutEchoInBetween) {
+TEST(UiLoopTerminal, RawModeIsEnteredAndRestoredWithoutEchoInBetween) {
 	pty_pair pty;
 	ASSERT_TRUE(pty.ok());
 
@@ -1170,7 +1179,7 @@ TEST(LeshperLoopTerminal, RawModeIsEnteredAndRestoredWithoutEchoInBetween) {
 	EXPECT_EQ(after.c_lflag & ICANON, before.c_lflag & ICANON);
 }
 
-TEST(LeshperLoopTerminal, EnteringRawKeepsWhateverAChildLeftBehind) {
+TEST(UiLoopTerminal, EnteringRawKeepsWhateverAChildLeftBehind) {
 	// fish's `term_copy_modes`: a `stty` change a user made in one command is
 	// still there for the next one; only the bits the editor needs are forced.
 	pty_pair pty;
@@ -1189,7 +1198,7 @@ TEST(LeshperLoopTerminal, EnteringRawKeepsWhateverAChildLeftBehind) {
 	EXPECT_EQ(during.c_cc[VERASE], 0x08);
 }
 
-TEST(LeshperLoopTerminal, BracketedPasteIsTurnedOnWithRawAndOffWithCooked) {
+TEST(UiLoopTerminal, BracketedPasteIsTurnedOnWithRawAndOffWithCooked) {
 	pty_pair pty;
 	ASSERT_TRUE(pty.ok());
 
@@ -1201,7 +1210,7 @@ TEST(LeshperLoopTerminal, BracketedPasteIsTurnedOnWithRawAndOffWithCooked) {
 	EXPECT_NE(pty.drain().find(kBracketedPasteOff), std::string::npos);
 }
 
-TEST(LeshperLoopTerminal, SetForegroundPgrpOnSomethingThatIsNotATtyAnswersNoTty) {
+TEST(UiLoopTerminal, SetForegroundPgrpOnSomethingThatIsNotATtyAnswersNoTty) {
 	// fish #6573's case: job control without a controlling terminal. Not a
 	// failure - the editor runs, it just has nobody to hand to.
 	int fds[2] = {-1, -1};
@@ -1213,7 +1222,7 @@ TEST(LeshperLoopTerminal, SetForegroundPgrpOnSomethingThatIsNotATtyAnswersNoTty)
 	::close(fds[1]);
 }
 
-TEST(LeshperLoopTerminal, TheExitRestoreDoesNothingWhenTheTerminalIsNotOurs) {
+TEST(UiLoopTerminal, TheExitRestoreDoesNothingWhenTheTerminalIsNotOurs) {
 	// fish `restore_term_mode`: restore only `if (getpgrp() == tcgetpgrp(...))`.
 	// Without the check we steal the terminal from whoever has it (#7060).
 	pty_pair pty;
@@ -1245,7 +1254,7 @@ TEST(LeshperLoopTerminal, TheExitRestoreDoesNothingWhenTheTerminalIsNotOurs) {
 // The fork-child discipline (substrate/fork_guard.h, substrate/log.h)
 // ===========================================================================
 
-TEST(LeshperLoopForkGuard, TheGuardCountsAllocationsBetweenForkAndExec) {
+TEST(UiLoopForkGuard, TheGuardCountsAllocationsBetweenForkAndExec) {
 	lesh::install_fork_child_detection();
 	// The parent is not a forked child, and the flag is consulted only by debug
 	// assertions - never by the signal handler, which compares getpid().
@@ -1265,7 +1274,7 @@ TEST(LeshperLoopForkGuard, TheGuardCountsAllocationsBetweenForkAndExec) {
 	guard.exec_reached();
 }
 
-TEST(LeshperLoopForkGuard, LogSafeFormatsWithoutAllocatingOrCallingVsnprintf) {
+TEST(UiLoopForkGuard, LogSafeFormatsWithoutAllocatingOrCallingVsnprintf) {
 	const lesh::testing::temp_path scratch;
 	const std::string path = scratch.file("log");
 
@@ -1327,7 +1336,7 @@ state replay_through_the_loop(std::string_view bytes, std::size_t chunk) {
 
 } // namespace
 
-TEST(LeshperLoopReplay, ARecordedByteLogReproducesTheSameStateAtEveryReadBoundary) {
+TEST(UiLoopReplay, ARecordedByteLogReproducesTheSameStateAtEveryReadBoundary) {
 	// N-3's property, asked of the LOOP rather than of the editor: the same
 	// bytes produce an EQUAL state - equal by the operator `state` carries over
 	// every field, which exists for exactly this - no matter how the kernel
@@ -1350,7 +1359,7 @@ TEST(LeshperLoopReplay, ARecordedByteLogReproducesTheSameStateAtEveryReadBoundar
 	}
 }
 
-TEST(LeshperLoopReplay, TheEventCategoryRecordsWhatTheLoopDrained) {
+TEST(UiLoopReplay, TheEventCategoryRecordsWhatTheLoopDrained) {
 	// #120's structured sink is the replay file, and #129 owes it every input
 	// the loop drained. The writer is `log_event` at the entrance of `step`, so
 	// what this asserts is that the loop's topics all deliver THROUGH that
@@ -1390,7 +1399,7 @@ TEST(LeshperLoopReplay, TheEventCategoryRecordsWhatTheLoopDrained) {
 	EXPECT_NE(text.find("\"kind\":\"signal\""), std::string::npos);
 }
 
-TEST(LeshperLoopTerminal, FatalRestoreHandlersAreInstalledOnlyOverTheDefault) {
+TEST(UiLoopTerminal, FatalRestoreHandlersAreInstalledOnlyOverTheDefault) {
 	// #98 decision 5's last exit path. The rule that matters is the one about
 	// NOT installing: ASan owns SIGSEGV and SIGBUS under the sanitized gate, and
 	// its report is worth more than a restored terminal after a segfault.

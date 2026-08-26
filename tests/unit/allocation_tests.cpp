@@ -1,6 +1,9 @@
+#include "leshper/abi.h"
 #include "leshper/editor.h"
-#include "leshper/loop.h"
+#include "ui/loop.h"
 #include "leshper/event.h"
+#include "leshper/keymap.h"
+#include "leshper/registry.h"
 #include "leshnici/prompt_modules.h"
 #include "leshper/prompt/prompt.h"
 #include "leshper/state.h"
@@ -321,10 +324,10 @@ public:
 		[&] { ASSERT_EQ(::pipe(_out), 0); }();
 		::fcntl(_in[0], F_SETFL, O_NONBLOCK);
 		::fcntl(_out[0], F_SETFL, O_NONBLOCK);
-		leshper::loop_options options;
+		ui::loop_options options;
 		options.manage_terminal = false;
 		options.prompt = "> ";
-		_loop = std::make_unique<leshper::event_loop>(leshper::loop_fds{_in[0], _out[1]},
+		_loop = std::make_unique<ui::event_loop>(ui::loop_fds{_in[0], _out[1]},
 		                                             std::move(options));
 		_loop->enter_read();
 	}
@@ -337,7 +340,7 @@ public:
 	loop_over_a_pipe(const loop_over_a_pipe&) = delete;
 	loop_over_a_pipe& operator=(const loop_over_a_pipe&) = delete;
 
-	[[nodiscard]] leshper::event_loop& loop() const { return *_loop; }
+	[[nodiscard]] ui::event_loop& loop() const { return *_loop; }
 
 	void drain_output() const {
 		char chunk[4096];
@@ -348,7 +351,7 @@ public:
 private:
 	int _in[2]{-1, -1};
 	int _out[2]{-1, -1};
-	std::unique_ptr<leshper::event_loop> _loop;
+	std::unique_ptr<ui::event_loop> _loop;
 };
 
 } // namespace
@@ -373,6 +376,54 @@ TEST_F(AllocationTest, AWarmIdleLoopTurnCostsNoHeap) {
 			driven.loop().turn(0);
 	});
 	EXPECT_EQ(counted, 0u) << "an idle loop turn reached the heap";
+}
+
+TEST_F(AllocationTest, ATimerExpiryCostsNoHeap) {
+	// N-2 ON THE ONE PATH THAT REPEATS FOREVER (#168). A `{time}` prompt arms a
+	// one-second timer for the life of the session, so every byte the expiry path
+	// allocates is a malloc and a free per second until the shell exits.
+	//
+	// The first shape of the timer effect and event carried the action's NAME as a
+	// `std::string` - one allocation to arm and one on every fire. They carry an
+	// interned handle now (`registry::timer_actions`), and the name is resolved by
+	// an indexed read at dispatch and only there, which is what this counts.
+	//
+	// THE NAME IS DELIBERATELY LONGER THAN A SHORT STRING. libc++ keeps up to 22
+	// bytes inside the object, so a name shorter than that would have passed under
+	// the old `std::string` shape too and this test would have asserted nothing.
+	//
+	// THE ACTION IS DELIBERATELY UNREGISTERED. What is asserted is the CHANNEL -
+	// notice, event, dispatch attempt - and not what an action does once it runs:
+	// a dispatch that reaches a real action allocates for reasons `step` and
+	// `apply_edit` own (see the idle-turn test above), and folding those in here
+	// would measure something else and assert nothing.
+	loop_over_a_pipe driven;
+	leshper::registry& actions = context_of(driven.loop().editor()).actions();
+	driven.loop().attach_registry(actions);
+
+	std::uint64_t id = 0;
+	ASSERT_EQ(lesh_timer_start(&actions, 1, "nobody_registered_this_long_action_name", &id), LESH_OK);
+
+	// Warm: the arm is taken, the first paint happens, and every reused buffer
+	// takes its capacity - including the ones only an expiry touches, which is why
+	// this spins until the timer has actually come due at least twice rather than
+	// turning a fixed number of times (a zero-timeout turn is faster than a
+	// millisecond, so a fixed count would measure a table that never fired).
+	for (int i = 0; i < 200000 && driven.loop().timer_dispatches() < 2u; ++i)
+		driven.loop().turn(0);
+	driven.drain_output();
+	ASSERT_GE(driven.loop().timer_dispatches(), 2u);
+
+	const std::size_t before = driven.loop().timer_dispatches();
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 200000 && driven.loop().timer_dispatches() < before + 3; ++i)
+			driven.loop().turn(0);
+	});
+	EXPECT_GE(driven.loop().timer_dispatches(), before + 3)
+		<< "the timer never came due; the count below would be measuring nothing";
+	EXPECT_EQ(counted, 0u) << "a timer expiry reached the heap";
+
+	EXPECT_EQ(lesh_timer_stop(&actions, id), LESH_OK);
 }
 
 TEST_F(AllocationTest, ALoopRepaintCostsAConstantThatDoesNotGrow) {

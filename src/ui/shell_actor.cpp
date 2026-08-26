@@ -1,4 +1,4 @@
-#include "leshper/shell_actor.h"
+#include "ui/shell_actor.h"
 
 #include "substrate/assert.h"
 #include "substrate/log.h"
@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include <utility>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 namespace {
 
 // The third copy of registry.cpp's thread key, and the comment workers.cpp
@@ -69,7 +69,7 @@ void unring(int fd) noexcept {
 
 void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
                       request_snapshot snapshot, const std::atomic<bool>& superseded,
-                      reactor_batch& into) {
+                      leshper::reactor_batch& into) {
 	LESH_ASSERT(fn != nullptr);
 
 	into.reactor.assign(reactor);
@@ -79,7 +79,7 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	into.texts.clear();
 	into.proposals.clear();
 
-	request_token token;
+	leshper::request_token token;
 	// Moved, not copied: the snapshot was taken on the loop thread and its
 	// buffer has no second reader.
 	token.buffer = std::move(snapshot.buffer);
@@ -107,7 +107,7 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	static thread_local std::uint64_t calls = 0;
 	token.call_token = ++calls;
 
-	LESH_ASSERT(token_is_live(&token));
+	LESH_ASSERT(leshper::token_is_live(&token));
 
 	into.status = fn(&token, userdata);
 
@@ -209,7 +209,7 @@ bool shell_channel::armed() const {
 // shell_actor - the loop thread's side
 // ---------------------------------------------------------------------------
 
-void shell_actor::post_execute(std::string_view line, generation computed_against) {
+void shell_actor::post_execute(std::string_view line, leshper::generation computed_against) {
 	{
 		std::lock_guard lock(_mutex);
 		_execute.line.assign(line);
@@ -222,7 +222,7 @@ void shell_actor::post_execute(std::string_view line, generation computed_agains
 	_work.notify_one();
 }
 
-std::uint64_t shell_actor::post_port_call(std::string_view code, generation computed_against) {
+std::uint64_t shell_actor::post_port_call(std::string_view code, leshper::generation computed_against) {
 	std::uint64_t sequence = 0;
 	{
 		std::lock_guard lock(_mutex);
@@ -351,7 +351,7 @@ void shell_actor::serve_execute(execute_slot& job) {
 		// session's adapter while it runs would be reading a table mid-rewrite,
 		// and the assertion there says so instead of the reader finding out
 		// later.
-		const shell_writing_flag::scope writing{_writing};
+		const leshper::shell_writing_flag::scope writing{_writing};
 		answer.status = _shell->execute(job.line);
 	}
 	answer.sequence = 0;
@@ -368,7 +368,7 @@ void shell_actor::serve_port_call(port_slot& job) {
 	{
 		// The other writer: an action's shell code is arbitrary and may define,
 		// unset or export anything (#92).
-		const shell_writing_flag::scope writing{_writing};
+		const leshper::shell_writing_flag::scope writing{_writing};
 		answer.status = _shell->port_call(job.code);
 	}
 	_replies.post(std::move(answer));
@@ -408,4 +408,4 @@ bool shell_actor::idle() const noexcept {
 	return !_busy && !_execute.filled && !_port.filled && !_highlight.filled;
 }
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

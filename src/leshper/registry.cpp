@@ -730,8 +730,16 @@ int32_t lesh_timer_start(lesh_registry* registry, uint64_t interval_ms, const ch
 	// The name is NOT resolved here. A timer armed before its action is
 	// registered is legal, and re-registering the action replaces what the timer
 	// runs - the same late-binding rule a key follows.
+	//
+	// AND THE SCHEDULE IS NOT KEPT HERE EITHER (#168). What leaves is one
+	// `arm_timer` effect carrying the whole declaration; the host puts a due
+	// instant beside it and owns the table from then on. All this side keeps is
+	// the id, so that stopping the same timer twice can still be told apart from
+	// stopping a live one.
 	const uint64_t id = ++registry->next_timer_id;
-	registry->timers.push_back(lesh_registry::timer_entry{id, interval_ms, std::string{given}});
+	registry->armed_timers.push_back(id);
+	registry->pending.push_back(lesh::leshper::arm_timer{
+		id, interval_ms, lesh::leshper::intern_timer_action(*registry, given)});
 	*id_out = id;
 	return LESH_OK;
 }
@@ -739,10 +747,11 @@ int32_t lesh_timer_start(lesh_registry* registry, uint64_t interval_ms, const ch
 int32_t lesh_timer_stop(lesh_registry* registry, uint64_t id) {
 	if (registry == nullptr)
 		return LESH_ERR_INVAL;
-	for (auto it = registry->timers.begin(); it != registry->timers.end(); ++it) {
-		if (it->id != id)
+	for (auto it = registry->armed_timers.begin(); it != registry->armed_timers.end(); ++it) {
+		if (*it != id)
 			continue;
-		registry->timers.erase(it);
+		registry->armed_timers.erase(it);
+		registry->pending.push_back(lesh::leshper::disarm_timer{id});
 		return LESH_OK;
 	}
 	// Reported rather than silently accepted: stopping a timer twice means the
@@ -1841,12 +1850,28 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	result.outcome = static_cast<loop_outcome>(_handle.outcome);
 	result.exit_status = _handle.exit_status;
-	// Latched for the loop, which is the only caller that can carry an outcome
-	// out. See `take_outcome`: the keystroke path runs through `step`, which
-	// returns effects and not results, so without this a bound `accept_line`
-	// asked for nothing.
-	if (result.outcome != loop_outcome::none)
-		_requested = requested_outcome{result.outcome, result.exit_status};
+	// EMITTED, NOT LATCHED (#168). The outcome an action requested leaves as an
+	// effect, which is the one channel out of a turn: `invoke_action` folds
+	// `produced` into what `step` returns, so a bound `accept_line` reaches the
+	// host down the same path a repaint does, and the host is spared reaching
+	// back into the editor for it. `result.outcome` stays as the answer to "what
+	// did this call ask for", which is what a direct caller of `invoke` reads.
+	switch (result.outcome) {
+		case loop_outcome::none:
+			break;
+		case loop_outcome::accept_line:
+			result.produced.push_back(line_accepted{});
+			break;
+		case loop_outcome::cancel_line:
+			result.produced.push_back(line_cancelled{});
+			break;
+		case loop_outcome::exit:
+			result.produced.push_back(end_of_file{result.exit_status});
+			break;
+		case loop_outcome::recursive_edit:
+			result.produced.push_back(recursive_edit_request{});
+			break;
+	}
 	result.cursor_moved = target.cursor != cursor_before;
 	_handle.target = nullptr;
 	// The handle is dead, and so is what it was pointing an ABI reader at. The
@@ -1896,7 +1921,7 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		token.computed_against = target.gen;
 		token.event_kind = kinds;
 		token.superseded = &_superseded;
-		token.knowledge = _knowledge;
+		token.knowledge = _registry->knowledge;
 		token.spans = &batch.spans;
 		token.texts = &batch.texts;
 		token.proposals = &batch.proposals;
@@ -1912,6 +1937,21 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 }
 
 // The one applier (#144). See the argument in registry.h.
+std::uint32_t intern_timer_action(registry& reg, std::string_view name) {
+	for (std::size_t i = 0; i < reg.timer_actions.size(); ++i) {
+		if (reg.timer_actions[i] == name)
+			return static_cast<std::uint32_t>(i);
+	}
+	reg.timer_actions.emplace_back(name);
+	return static_cast<std::uint32_t>(reg.timer_actions.size() - 1);
+}
+
+std::string_view timer_action_name(const registry& reg, std::uint32_t handle) noexcept {
+	if (handle >= reg.timer_actions.size())
+		return {};
+	return reg.timer_actions[handle];
+}
+
 bool apply_batch(state& target, reactor_batch& batch) {
 	// N-4, and the only place it is decided. There is no other applier and no
 	// other way in, so a stale batch is not rejected here so much as it has

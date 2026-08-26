@@ -1,7 +1,7 @@
 #include "leshper/abi.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
-#include "leshper/workers.h"
+#include "ui/workers.h"
 #include "substrate/arena.h"
 
 #include <gtest/gtest.h>
@@ -21,6 +21,7 @@
 
 using namespace lesh;
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // The worker pool, as tests (#126).
 //
@@ -240,7 +241,7 @@ state state_holding(std::string_view text) {
 // How wide the pool is
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, TheDefaultWidthIsFourOrTheHardwareWhereverItIsNarrower) {
+TEST(UiWorkers, TheDefaultWidthIsFourOrTheHardwareWhereverItIsNarrower) {
 	// Four is the number of independent questions leshper has outstanding at a
 	// keystroke - highlighter, autosuggester, completer, history searcher - each
 	// with one latest-wins slot of depth at most one, so a fifth worker would
@@ -253,7 +254,7 @@ TEST(LeshperWorkers, TheDefaultWidthIsFourOrTheHardwareWhereverItIsNarrower) {
 	EXPECT_LE(worker_pool::default_worker_count(), 4u);
 }
 
-TEST(LeshperWorkers, ThePoolIsAsWideAsItWasAskedToBe) {
+TEST(UiWorkers, ThePoolIsAsWideAsItWasAskedToBe) {
 	worker_pool pool{3};
 	EXPECT_EQ(pool.size(), 3u);
 }
@@ -262,7 +263,7 @@ TEST(LeshperWorkers, ThePoolIsAsWideAsItWasAskedToBe) {
 // A request, from submit to completion
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, AComputationRunsOnAWorkerAndComesBackThroughTheQueue) {
+TEST(UiWorkers, AComputationRunsOnAWorkerAndComesBackThroughTheQueue) {
 	worker_pool pool{2};
 	const state s = state_holding("# TODO: later");
 
@@ -283,7 +284,7 @@ TEST(LeshperWorkers, AComputationRunsOnAWorkerAndComesBackThroughTheQueue) {
 	EXPECT_EQ(batch.spans[0].style_id, todo_style);
 }
 
-TEST(LeshperWorkers, TheTokenIsLiveOnTheWorkerAndCarriesTheSnapshotAndNothingElse) {
+TEST(UiWorkers, TheTokenIsLiveOnTheWorkerAndCarriesTheSnapshotAndNothingElse) {
 	worker_pool pool{1};
 	state s = state_holding("echo hi");
 	s.cursor = position::from_byte_offset(4);
@@ -307,7 +308,7 @@ TEST(LeshperWorkers, TheTokenIsLiveOnTheWorkerAndCarriesTheSnapshotAndNothingEls
 	EXPECT_EQ(seen.selection_active, 0) << "there is no selection model until #96";
 }
 
-TEST(LeshperWorkers, AWorkersAnswerMeetsTheExistingDropRuleUnchanged) {
+TEST(UiWorkers, AWorkersAnswerMeetsTheExistingDropRuleUnchanged) {
 	// The pool computes; the loop still decides. A completion is a reactor_batch,
 	// so it goes into the applier that already exists and meets N-4 there rather
 	// than growing a second staleness rule on this side.
@@ -330,7 +331,7 @@ TEST(LeshperWorkers, AWorkersAnswerMeetsTheExistingDropRuleUnchanged) {
 // Latest-wins
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, TheLatestPendingRequestWinsAndTheOneBetweenIsDropped) {
+TEST(UiWorkers, TheLatestPendingRequestWinsAndTheOneBetweenIsDropped) {
 	// Two workers and one slot, so the "at most one in flight" property is being
 	// asserted too: a second worker must not pick up the same reactor.
 	worker_pool pool{2};
@@ -365,7 +366,7 @@ TEST(LeshperWorkers, TheLatestPendingRequestWinsAndTheOneBetweenIsDropped) {
 	EXPECT_EQ(drained[1].batch().computed_against.value(), s.gen.value());
 }
 
-TEST(LeshperWorkers, DifferentReactorsAreDifferentSlotsAndDoNotDisplaceEachOther) {
+TEST(UiWorkers, DifferentReactorsAreDifferentSlotsAndDoNotDisplaceEachOther) {
 	worker_pool pool{2};
 	held both;
 	const state s = state_holding("x");
@@ -382,7 +383,7 @@ TEST(LeshperWorkers, DifferentReactorsAreDifferentSlotsAndDoNotDisplaceEachOther
 	ASSERT_EQ(pool.completions().wait_and_drain(drained, 2), 2u);
 }
 
-TEST(LeshperWorkers, SubmittingOverAnInFlightRequestSetsItsSupersededPoll) {
+TEST(UiWorkers, SubmittingOverAnInFlightRequestSetsItsSupersededPoll) {
 	worker_pool pool{2};
 	held thinking;
 	state s = state_holding("a");
@@ -404,7 +405,7 @@ TEST(LeshperWorkers, SubmittingOverAnInFlightRequestSetsItsSupersededPoll) {
 	EXPECT_EQ(fresh.runs, 1u);
 }
 
-TEST(LeshperWorkers, SupersedeAllDropsWhatIsPendingAndTellsWhatIsInFlight) {
+TEST(UiWorkers, SupersedeAllDropsWhatIsPendingAndTellsWhatIsInFlight) {
 	// One worker, so the second submission is genuinely waiting rather than
 	// being picked up the instant it lands.
 	worker_pool pool{1};
@@ -435,7 +436,7 @@ TEST(LeshperWorkers, SupersedeAllDropsWhatIsPendingAndTellsWhatIsInFlight) {
 // The seam toward the loop
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, TheWakeupFdIsReadableExactlyWhileSomethingIsWaiting) {
+TEST(UiWorkers, TheWakeupFdIsReadableExactlyWhileSomethingIsWaiting) {
 	worker_pool pool{1};
 	ASSERT_GE(pool.completions().wakeup_fd(), 0);
 	EXPECT_FALSE(pool.completions().armed());
@@ -460,7 +461,7 @@ TEST(LeshperWorkers, TheWakeupFdIsReadableExactlyWhileSomethingIsWaiting) {
 	EXPECT_EQ(::poll(&watch, 1, 0), 0) << "drain must disarm the wakeup";
 }
 
-TEST(LeshperWorkers, ABurstOfResultsCostsOneWakeupAndNotOnePerResult) {
+TEST(UiWorkers, ABurstOfResultsCostsOneWakeupAndNotOnePerResult) {
 	// The queue on its own, with no workers anywhere near it - it is a
 	// loop-agnostic object and this is what that means.
 	//
@@ -494,7 +495,7 @@ TEST(LeshperWorkers, ABurstOfResultsCostsOneWakeupAndNotOnePerResult) {
 	queue.drain(drained);
 }
 
-TEST(LeshperWorkers, MessagesAreDrawnFromAPoolRatherThanAllocatedPerRequest) {
+TEST(UiWorkers, MessagesAreDrawnFromAPoolRatherThanAllocatedPerRequest) {
 	worker_pool pool{1};
 	state s = state_holding("x");
 	run_counter counter;
@@ -516,7 +517,7 @@ TEST(LeshperWorkers, MessagesAreDrawnFromAPoolRatherThanAllocatedPerRequest) {
 // The arena (#90)
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, TheArenaIsResetAtRequestEndSoNothingOutlivesItsRequest) {
+TEST(UiWorkers, TheArenaIsResetAtRequestEndSoNothingOutlivesItsRequest) {
 	worker_pool pool{1};
 	state s = state_holding("x");
 	arena_report report;
@@ -539,7 +540,7 @@ TEST(LeshperWorkers, TheArenaIsResetAtRequestEndSoNothingOutlivesItsRequest) {
 	EXPECT_EQ(report.arenas[0], report.arenas[3]) << "one worker, one arena";
 }
 
-TEST(LeshperWorkers, EachWorkerOwnsAnArenaOfItsOwn) {
+TEST(UiWorkers, EachWorkerOwnsAnArenaOfItsOwn) {
 	worker_pool pool{4};
 	arena_report report;
 	const state s = state_holding("x");
@@ -562,13 +563,13 @@ TEST(LeshperWorkers, EachWorkerOwnsAnArenaOfItsOwn) {
 		<< "two workers shared an arena, which is the race #90 exists to remove";
 }
 
-TEST(LeshperWorkers, TheArenaIsAWorkersOwnAndNobodyElsesToFind) {
+TEST(UiWorkers, TheArenaIsAWorkersOwnAndNobodyElsesToFind) {
 	worker_pool pool{1};
 	ASSERT_EQ(pool.size(), 1u);
 	EXPECT_EQ(current_worker_arena(), nullptr) << "the loop thread has no worker arena";
 }
 
-TEST(LeshperWorkers, TheAllocationGateCountsPerThreadSoAWorkerCannotPolluteIt) {
+TEST(UiWorkers, TheAllocationGateCountsPerThreadSoAWorkerCannotPolluteIt) {
 	// #90's third decision. The gate in tests/unit/allocation_tests.cpp asserts
 	// the COMMAND PATH's allocation counts; a worker parsing a snapshot at the
 	// same instant used to land in the same number, which would have made the
@@ -597,7 +598,7 @@ TEST(LeshperWorkers, TheAllocationGateCountsPerThreadSoAWorkerCannotPolluteIt) {
 // Quiesce (#91)
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, AnIdlePoolParksAndResumes) {
+TEST(UiWorkers, AnIdlePoolParksAndResumes) {
 	worker_pool pool{3};
 	EXPECT_FALSE(pool.is_quiesced());
 	pool.park_all();
@@ -607,7 +608,7 @@ TEST(LeshperWorkers, AnIdlePoolParksAndResumes) {
 	EXPECT_FALSE(pool.is_quiesced());
 }
 
-TEST(LeshperWorkers, ParkAllReachesALongComputeThroughTheSupersededPoll) {
+TEST(UiWorkers, ParkAllReachesALongComputeThroughTheSupersededPoll) {
 	// #115's finding, as a test: quiesce cost is task granularity, so the lever
 	// is how finely a compute checks in. The reactor below runs forever and
 	// nothing in this test ever releases it. What ends it is that PARKING
@@ -635,7 +636,7 @@ TEST(LeshperWorkers, ParkAllReachesALongComputeThroughTheSupersededPoll) {
 	EXPECT_FALSE(pool.is_quiesced());
 }
 
-TEST(LeshperWorkers, ParkAllWaitsForAComputeThatNeverPolls) {
+TEST(UiWorkers, ParkAllWaitsForAComputeThatNeverPolls) {
 	// Not polling is safe - the ABI says so - it just costs the wait. The
 	// release comes from another thread because this one is about to block, and
 	// either order works: park_all returns only once the worker has checked in.
@@ -655,7 +656,7 @@ TEST(LeshperWorkers, ParkAllWaitsForAComputeThatNeverPolls) {
 	pool.resume();
 }
 
-TEST(LeshperWorkers, AParkedPoolAcceptsWorkAndRunsNoneOfItUntilResume) {
+TEST(UiWorkers, AParkedPoolAcceptsWorkAndRunsNoneOfItUntilResume) {
 	worker_pool pool{2};
 	pool.park_all();
 	ASSERT_TRUE(pool.is_quiesced());
@@ -676,7 +677,7 @@ TEST(LeshperWorkers, AParkedPoolAcceptsWorkAndRunsNoneOfItUntilResume) {
 	EXPECT_EQ(counter.runs, 2u);
 }
 
-TEST(LeshperWorkers, ParkingNestsSoAForkSiteInsideAParkedScopeIsNotADeadlock) {
+TEST(UiWorkers, ParkingNestsSoAForkSiteInsideAParkedScopeIsNotADeadlock) {
 	worker_pool pool{3};
 	{
 		parked_scope outer(pool);
@@ -691,7 +692,7 @@ TEST(LeshperWorkers, ParkingNestsSoAForkSiteInsideAParkedScopeIsNotADeadlock) {
 	EXPECT_FALSE(pool.is_quiesced());
 }
 
-TEST(LeshperWorkers, AParkedPoolIsSafeToForkThrough) {
+TEST(UiWorkers, AParkedPoolIsSafeToForkThrough) {
 	// #91's requirement, executed rather than argued: a parked worker is blocked
 	// in condition_variable::wait, which holds no mutex, so the child of a fork
 	// taken here inherits every lock in this file unlocked. If a worker held one
@@ -726,7 +727,7 @@ TEST(LeshperWorkers, AParkedPoolIsSafeToForkThrough) {
 // Shutdown (ADR-0007)
 // ---------------------------------------------------------------------------
 
-TEST(LeshperWorkers, ShutdownJoinsEveryWorkerAndFreesEveryMessage) {
+TEST(UiWorkers, ShutdownJoinsEveryWorkerAndFreesEveryMessage) {
 	// Torn down mid-flight with results undrained and tasks still pending. The
 	// assertion is the sanitized gate: ADR-0007 says the expected leak count is
 	// exactly zero, with no suppression and no baseline.
@@ -743,7 +744,7 @@ TEST(LeshperWorkers, ShutdownJoinsEveryWorkerAndFreesEveryMessage) {
 	SUCCEED();
 }
 
-TEST(LeshperWorkers, APoolTornDownWhileParkedStillLetsItsWorkersOut) {
+TEST(UiWorkers, APoolTornDownWhileParkedStillLetsItsWorkersOut) {
 	state s = state_holding("x");
 	run_counter counter;
 	{

@@ -1,13 +1,9 @@
 #include "leshper/abi.h"
 #include "leshper/registry.h"
-#include "leshper/shell_actor.h"
 #include "leshper/shell_knowledge.h"
 #include "leshper/state.h"
-#include "leshper/workers.h"
-#include "runtime/shell_state.h"
 #include "substrate/arena.h"
 #include "syntax/parser.h"
-#include "ui/shell_state_knowledge.h"
 
 #include "temp_path.h"
 
@@ -26,23 +22,17 @@
 #include <vector>
 
 using namespace lesh::leshper;
-using namespace lesh::ui;
 
 // What the shell knows, on the request token (#135; #130's verb, ADR-0009's
-// thread model).
+// thread model) - the EDITOR's half of it.
 //
-// THREE LAYERS, and each is tested against the layer below rather than against a
+// TWO LAYERS, and each is tested against the layer below rather than against a
 // mock of it:
 //
 //   `lesh_request_command_kind` - the ABI verb. Driven through a probe reactor,
-//   because a token cannot be minted any other way: the loop mints it, hands it
+//   because a token cannot be minted any other way: the host mints it, hands it
 //   to a reactor, and it dies when the compute returns (ADR-0008). A test that
 //   built one by hand would be testing a different object.
-//
-//   `shell_state_knowledge` - the ui layer's adapter, over a REAL `shell_state`
-//   with real aliases, real functions and a real `PATH` variable. It is the only
-//   thing standing between the highlighter and the shell, and faking it here
-//   would leave the one join nobody had checked.
 //
 //   The highlighter's classes - `command.alias`, `command.function`,
 //   `command.builtin`, `command.path`, `command.unknown` - read back through
@@ -50,17 +40,16 @@ using namespace lesh::ui;
 //   which integer it interned as (F-21; the theme is the other half and is not
 //   this ticket's).
 //
+// THE OTHER TWO LAYERS ARE `ui_knowledge_tests.cpp` (#168): `shell_state_knowledge`
+// over a real `shell_state`, and the `shell_actor` that stamps the tables on the
+// token it serves. Both are the HOST's - a shell, a thread, an adapter - and
+// nothing here includes `ui/`, which is what makes this file's suite the one that
+// runs with no shell and no thread.
+//
 // There is no copy-on-write test and no race test in this file, and their
 // absence is the ticket's content rather than an omission: ADR-0009 gave shell
 // state exactly one owner thread, so #130's definitions version was deleted and
 // there is no concurrency here to test.
-//
-// TWO MORE LAYERS ARRIVED WITH #151, at the bottom of the file. `shell_actor`
-// is now the thing that puts the knowledge on a token - it was the loop, and the
-// token build on the far side dropped the field, which is why `exit` and `bind`
-// painted red in a real shell while every test here passed. And
-// `shell_writing_flag` turns ADR-0009's rule into an assertion that can fire,
-// with a death test that fires it.
 
 namespace {
 
@@ -150,7 +139,7 @@ struct verb_fixture {
 		EXPECT_EQ(lesh_reactor_register(&reg, "probe", LESH_EVENT_BUFFER_CHANGED,
 		                                probe_reactor, &asked),
 		          LESH_OK);
-		loop.set_shell_knowledge(&shell);
+		reg.knowledge = &shell;
 	}
 
 	// One request, asking about every name in order. Returns what came back.
@@ -421,7 +410,7 @@ TEST(LeshperKnowledge, WithNoShellAttachedThePathIsTheProcessEnvironments) {
 	make_executable(scratch.file("tool"));
 	const scoped_env_path path{scratch.dir().c_str()};
 	verb_fixture fixture;
-	fixture.loop.set_shell_knowledge(nullptr);
+	fixture.reg.knowledge = nullptr;
 	EXPECT_EQ(fixture.kind_of("tool"), LESH_COMMAND_EXTERNAL);
 	EXPECT_EQ(fixture.kind_of("nosuchtool"), LESH_COMMAND_UNKNOWN);
 	EXPECT_TRUE(fixture.shell.asked.empty());
@@ -434,86 +423,6 @@ TEST(LeshperKnowledge, TheEnvironmentFallbackKnowsNoTables) {
 	const scoped_env_path set{"/nonexistent"};
 	EXPECT_TRUE(environment.path(path));
 	EXPECT_EQ(path, "/nonexistent");
-}
-
-// ---------------------------------------------------------------------------
-// The adapter, over a real shell_state.
-// ---------------------------------------------------------------------------
-
-namespace {
-
-struct adapter_fixture {
-	lesh::runtime::shell_state shell;
-	shell_state_knowledge knowledge{shell};
-};
-
-} // namespace
-
-TEST(LeshperKnowledge, TheAdapterReadsTheRealAliasTable) {
-	adapter_fixture fixture;
-	EXPECT_EQ(fixture.knowledge.classify("ll"), command_kind::unknown);
-	fixture.shell.set_alias("ll", "ls -l");
-	EXPECT_EQ(fixture.knowledge.classify("ll"), command_kind::alias);
-	EXPECT_TRUE(fixture.shell.unset_alias("ll"));
-	EXPECT_EQ(fixture.knowledge.classify("ll"), command_kind::unknown);
-}
-
-TEST(LeshperKnowledge, TheAdapterReadsTheRealFunctionTable) {
-	adapter_fixture fixture;
-	lesh::buffer_pool pool{BUFFER_POOL_SIZE};
-	const lesh::syntax::tree body = lesh::syntax::parse(pool, "true");
-	EXPECT_EQ(fixture.knowledge.classify("deploy"), command_kind::unknown);
-	fixture.shell.define_function("deploy", body, 0);
-	EXPECT_EQ(fixture.knowledge.classify("deploy"), command_kind::function);
-	fixture.shell.unset_function("deploy");
-	EXPECT_EQ(fixture.knowledge.classify("deploy"), command_kind::unknown);
-}
-
-TEST(LeshperKnowledge, TheAdapterKnowsTheStaticBuiltinTable) {
-	// The one table that is not shell state: builtins.h's registry, the same one
-	// the executor's command search reads. A highlighter that disagreed with it
-	// about what `cd` is would be C-5's bug class wearing a colour.
-	adapter_fixture fixture;
-	EXPECT_EQ(fixture.knowledge.classify("cd"), command_kind::builtin);
-	EXPECT_EQ(fixture.knowledge.classify(":"), command_kind::builtin);
-	EXPECT_EQ(fixture.knowledge.classify("["), command_kind::builtin);
-	EXPECT_EQ(fixture.knowledge.classify("definitelynotabuiltin"), command_kind::unknown);
-}
-
-TEST(LeshperKnowledge, TheAdapterReadsTheShellsPathAndNotTheProcessEnvironments) {
-	// The half of #124 that `getenv` got wrong: the two agree until the shell
-	// assigns to PATH, and the line being typed is exactly where that happens.
-	const scoped_env_path environment{"/nonexistent-environment"};
-	adapter_fixture fixture;
-	std::string_view path;
-	ASSERT_TRUE(fixture.shell.set("PATH", "/shell/only"));
-	EXPECT_TRUE(fixture.knowledge.path(path));
-	EXPECT_EQ(path, "/shell/only");
-}
-
-TEST(LeshperKnowledge, TheAdapterAnswersAnUnsetPathAsUnset) {
-	adapter_fixture fixture;
-	ASSERT_TRUE(fixture.shell.set("PATH", "/somewhere"));
-	ASSERT_TRUE(fixture.shell.unset("PATH"));
-	std::string_view path;
-	EXPECT_FALSE(fixture.knowledge.path(path));
-}
-
-TEST(LeshperKnowledge, TheAdapterAnswersTheVerbEndToEnd) {
-	// Adapter and verb together, over a real state - the join a fake on either
-	// side would have left unchecked.
-	lesh::testing::temp_path scratch;
-	make_executable(scratch.file("mytool"));
-	verb_fixture fixture;
-	lesh::runtime::shell_state shell;
-	shell.set_alias("ll", "ls -l");
-	ASSERT_TRUE(shell.set("PATH", scratch.dir()));
-	const shell_state_knowledge knowledge{shell};
-	fixture.loop.set_shell_knowledge(&knowledge);
-	EXPECT_EQ(fixture.kind_of("ll"), LESH_COMMAND_ALIAS);
-	EXPECT_EQ(fixture.kind_of("cd"), LESH_COMMAND_BUILTIN);
-	EXPECT_EQ(fixture.kind_of("mytool"), LESH_COMMAND_EXTERNAL);
-	EXPECT_EQ(fixture.kind_of("nosuchtool"), LESH_COMMAND_UNKNOWN);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +439,7 @@ struct paint_fixture {
 
 	paint_fixture() {
 		register_builtin_reactors(reg, self.get());
-		loop.set_shell_knowledge(&shell);
+		reg.knowledge = &shell;
 	}
 
 	[[nodiscard]] std::string style_name(std::uint32_t id) {
@@ -636,174 +545,3 @@ TEST(LeshperKnowledge, TheTablesAreNotConsultedForAWordThatIsNotACommandName) {
 	EXPECT_EQ(fixture.shell.asked, (std::vector<std::string>{"echo"}));
 }
 
-// ---------------------------------------------------------------------------
-// The actor's stamp (#151).
-// ---------------------------------------------------------------------------
-
-namespace {
-
-// A `shell_side` with nothing behind it. These tests are about the token the
-// actor MINTS, not about anything it runs.
-class idle_shell final : public shell_side {
-public:
-	std::int32_t execute(std::string_view) override { return 0; }
-	std::int32_t port_call(std::string_view) override { return 0; }
-};
-
-// A shell that breaks ADR-0009 deliberately: it reads the tables from inside
-// `execute`, which is the one moment the rule forbids. Nothing in the tree does
-// this; it exists so that the tripwire has something to trip on.
-class reading_shell final : public shell_side {
-public:
-	explicit reading_shell(const shell_knowledge& knowledge) noexcept
-		: _knowledge(&knowledge) {}
-
-	std::int32_t execute(std::string_view) override {
-		std::string_view ignored;
-		(void)_knowledge->path(ignored);
-		return 0;
-	}
-
-	std::int32_t port_call(std::string_view) override { return 0; }
-
-private:
-	const shell_knowledge* _knowledge;
-};
-
-// Runs one reactor through the actor's `highlight` slot and answers the probe.
-void serve_one_highlight(shell_actor& actor, probe& asked) {
-	lesh::leshper::state s;
-	s.gen.bump();
-	request_snapshot asking = snapshot_of(s, LESH_EVENT_BUFFER_CHANGED);
-	// THE LOOP DOES NOT FILL THIS IN, and that is the whole change: what the
-	// shell knows is not something the loop knows about the shell.
-	EXPECT_EQ(asking.knowledge, nullptr);
-	actor.post_highlight("probe", &probe_reactor, &asked, std::move(asking));
-	ASSERT_TRUE(actor.serve_one());
-	std::vector<shell_message> inbox;
-	EXPECT_EQ(actor.replies().drain(inbox), 1u);
-	actor.replies().recycle(inbox);
-}
-
-} // namespace
-
-TEST(LeshperKnowledge, TheActorStampsItsShellsTablesOnTheTokenItServes) {
-	// #151's defect, at the seam it lived in. The shell-thread reactor's token was
-	// built from a snapshot that carried the pointer, and the build copied every
-	// field except that one - so `lesh_request_command_kind` saw a null adapter,
-	// fell back to `environment_knowledge`, and every name that is ONLY a builtin,
-	// a function or an alias resolved unknown. `cd` passed anyway, because macOS
-	// ships `/usr/bin/cd`; `exit` is the case with no binary behind it.
-	idle_shell nothing;
-	fake_knowledge shell;
-	shell.define("exit", command_kind::builtin);
-	shell_actor actor{nothing, &shell};
-
-	probe asked;
-	asked.ask = {"exit"};
-	serve_one_highlight(actor, asked);
-
-	ASSERT_EQ(asked.kinds.size(), 1u);
-	EXPECT_EQ(asked.kinds.front(), LESH_COMMAND_BUILTIN);
-	EXPECT_EQ(shell.asked, (std::vector<std::string>{"exit"}));
-}
-
-TEST(LeshperKnowledge, AnActorWithNoTablesLeavesTheTokenOnTheEnvironmentFallback) {
-	// The null the constructor still accepts, and what it means: no shell
-	// attached, empty tables, `getenv("PATH")` - a leshper embedded in something
-	// that is not this shell.
-	lesh::testing::temp_path scratch;
-	make_executable(scratch.file("tool"));
-	const scoped_env_path path{scratch.dir().c_str()};
-
-	idle_shell nothing;
-	shell_actor actor{nothing, nullptr};
-
-	probe asked;
-	asked.ask = {"tool", "nosuchtool"};
-	serve_one_highlight(actor, asked);
-
-	ASSERT_EQ(asked.kinds.size(), 2u);
-	EXPECT_EQ(asked.kinds[0], LESH_COMMAND_EXTERNAL);
-	EXPECT_EQ(asked.kinds[1], LESH_COMMAND_UNKNOWN);
-}
-
-// ---------------------------------------------------------------------------
-// ADR-0009's rule, as a tripwire (#151).
-// ---------------------------------------------------------------------------
-
-TEST(LeshperKnowledge, TheWritingFlagIsDownExceptInsideTheTwoWriters) {
-	// The positive half, which is the half that runs on every build: the flag the
-	// adapter asserts on is raised around `execute` and `port_call` and around
-	// nothing else - not around a highlight, which is a READER and shares the
-	// shell thread with them.
-	lesh::runtime::shell_state state;
-	shell_writing_flag writing;
-	const shell_state_knowledge knowledge{state, &writing};
-
-	bool up_during_execute = false;
-	bool up_during_port_call = false;
-	class watching_shell final : public shell_side {
-	public:
-		watching_shell(const shell_writing_flag& flag, bool& in_execute, bool& in_port)
-			: _flag(&flag), _in_execute(&in_execute), _in_port(&in_port) {}
-
-		std::int32_t execute(std::string_view) override {
-			*_in_execute = _flag->writing();
-			return 0;
-		}
-
-		std::int32_t port_call(std::string_view) override {
-			*_in_port = _flag->writing();
-			return 0;
-		}
-
-	private:
-		const shell_writing_flag* _flag;
-		bool* _in_execute;
-		bool* _in_port;
-	};
-
-	watching_shell shell{writing, up_during_execute, up_during_port_call};
-	shell_actor actor{shell, &knowledge, &writing};
-
-	lesh::leshper::state s;
-	EXPECT_FALSE(writing.writing());
-	actor.post_execute("anything", s.gen);
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_TRUE(up_during_execute);
-	EXPECT_FALSE(writing.writing()) << "the scope puts it down again";
-
-	(void)actor.post_port_call("anything", s.gen);
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_TRUE(up_during_port_call);
-	EXPECT_FALSE(writing.writing());
-
-	// And a read is legal now, which is the state every reader in the tree runs
-	// in: between slots on the shell thread, or on the loop thread while the loop
-	// is not blocked on one of the two writers.
-	std::string_view ignored;
-	(void)knowledge.path(ignored);
-}
-
-#ifdef LESH_ENABLE_ASSERTS
-TEST(LeshperKnowledgeDeathTest, AReadWhileTheShellIsWritingTripsTheAssertion) {
-	// The negative half, and the reason #151 asked for a flag rather than a
-	// comment: a reader that reaches the adapter while `execute` is running dies
-	// where it did the wrong thing, instead of returning a `string_view` into a
-	// table that is being rewritten and being found out later, somewhere else.
-	//
-	// GUARDED ON THE ASSERT BUILD, because `LESH_ASSERT` compiles out in release
-	// and a death test for a statement that is not there would fail honestly.
-	::testing::GTEST_FLAG(death_test_style) = "threadsafe";
-	lesh::runtime::shell_state state;
-	shell_writing_flag writing;
-	const shell_state_knowledge knowledge{state, &writing};
-	reading_shell wrong{knowledge};
-	shell_actor actor{wrong, &knowledge, &writing};
-
-	lesh::leshper::state s;
-	actor.post_execute("anything", s.gen);
-	EXPECT_DEATH((void)actor.serve_one(), "assertion failed");
-}
-#endif
