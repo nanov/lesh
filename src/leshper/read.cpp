@@ -188,6 +188,42 @@ private:
 // gives real bodies - the operand grammar the builtin hands over is the language,
 // and the parse happens on this side of the boundary because only this side has
 // the registry to resolve a module name against.
+
+// One accumulated ELEMENT, owning its own bytes - `add_module`'s name and
+// argument, or `add_literal`'s bytes, or (`is_group`) a whole closed group's
+// children. Never a style: nothing below gives the console a style verb.
+struct pending_element {
+	bool is_group = false;
+	std::string module;               // "literal" for `add_literal`
+	std::string type;                 // `add_module`'s argument
+	std::string prefix;               // `add_literal`'s bytes
+	std::vector<pending_element> children;   // valid when `is_group`; never nested -
+	                                          // groups do not nest in v1 (below)
+};
+
+// `leshper_prompt_console`'S COMPATIBILITY SHIM (#157, owner's ruling): the
+// engine's only configuration verb left is `set_placements`, whole-surface and
+// atomic, but `runtime::prompt_console` still declares six assembly verbs -
+// `add_module`, `add_literal`, `open_group`, `close_group` chief among them -
+// because builtins.h is not part of this ticket. So this side ACCUMULATES what
+// the builtin hands over, element by element, and REBUILDS THE WHOLE SURFACE
+// from the accumulation on every verb that changes it - "the console's
+// fine-grained verbs are a compatibility shim over the whole-surface verb",
+// literally, until builtins.h is next opened and can say `set_placements`
+// itself.
+//
+// GROUPS STILL DO NOT NEST HERE, matching `prompt_console::open_group`'s own
+// documented contract - a second open is `unbalanced_group` - even though
+// `set_placements` itself would happily build an arbitrarily nested tree. The
+// nesting limit is this shim's, not the engine's.
+//
+// A GROUP IS INVISIBLE TO THE ENGINE UNTIL IT CLOSES - `add_module`/
+// `add_literal` inside an open group accumulate into it but rebuild only the
+// TOP-LEVEL items already committed, never a still-open group's partial
+// content; `close_group` is what folds the accumulated children in and
+// rebuilds. Closing an empty group simply drops it, the same as never having
+// opened one - `set_placements` would refuse a childless group anyway, since
+// it could never have voted.
 class leshper_prompt_console final : public runtime::prompt_console {
 public:
 	explicit leshper_prompt_console(prompt::engine& engine) noexcept : _engine(&engine) {}
@@ -197,37 +233,53 @@ public:
 	}
 
 	outcome clear(surface which) override {
+		reset(which);
 		_engine->clear(surface_of(which));
 		return outcome::ok;
 	}
 
 	outcome use_default(surface which) override {
+		reset(which);
 		_engine->use_default(surface_of(which));
 		return outcome::ok;
 	}
 
 	outcome add_module(surface which, std::string_view name, std::string_view arg) override {
-		// The engine's one failure, and it is a miss rather than a fault: nothing
-		// is registered under that name.
-		return _engine->add_module(surface_of(which), name, arg) ? outcome::ok
-		                                                         : outcome::no_such_module;
+		pending_element element;
+		element.module.assign(name);
+		element.type.assign(arg);
+		return append(which, std::move(element));
 	}
 
 	outcome add_literal(surface which, std::string_view bytes) override {
-		_engine->add_literal(surface_of(which), bytes);
-		return outcome::ok;
+		pending_element element;
+		element.module.assign(prompt::kLiteralPlacement);
+		element.prefix.assign(bytes);
+		return append(which, std::move(element));
 	}
 
 	outcome open_group(surface which) override {
-		// False means one is already open, which in v1 is a caller that lost track
-		// of its own nesting - groups do not nest until the template language.
-		return _engine->open_group(surface_of(which)) ? outcome::ok
-		                                             : outcome::unbalanced_group;
+		state& target = at(which);
+		if (target.group_open)
+			return outcome::unbalanced_group;
+		target.group_open = true;
+		target.open_children.clear();
+		return outcome::ok;
 	}
 
 	outcome close_group(surface which) override {
-		return _engine->close_group(surface_of(which)) ? outcome::ok
-		                                              : outcome::unbalanced_group;
+		state& target = at(which);
+		if (!target.group_open)
+			return outcome::unbalanced_group;
+		target.group_open = false;
+		if (target.open_children.empty())
+			return outcome::ok;
+
+		pending_element group;
+		group.is_group = true;
+		group.children = std::move(target.open_children);
+		target.top.push_back(std::move(group));
+		return commit(which);
 	}
 
 	// The parse-and-swap, one call over. The atomicity the runtime's declaration
@@ -235,6 +287,7 @@ public:
 	// surface exactly as it was, and what comes back here is only the sentence to
 	// print.
 	outcome set(surface which, std::string_view template_text, std::string& error_out) override {
+		reset(which);
 		return _engine->set_template(surface_of(which), template_text, error_out)
 			? outcome::ok
 			: outcome::bad_template;
@@ -256,7 +309,96 @@ private:
 		                                      : prompt::surface_id::left;
 	}
 
+	// One accumulator per surface - `left` and `continuation` are configured
+	// independently, and a verb on one must not disturb the other's progress.
+	struct state {
+		std::vector<pending_element> top;
+		std::vector<pending_element> open_children;
+		bool group_open = false;
+	};
+
+	[[nodiscard]] state& at(surface which) noexcept {
+		return which == surface::continuation ? _continuation : _left;
+	}
+
+	void reset(surface which) noexcept {
+		state& target = at(which);
+		target.top.clear();
+		target.open_children.clear();
+		target.group_open = false;
+	}
+
+	outcome append(surface which, pending_element&& element) {
+		state& target = at(which);
+		(target.group_open ? target.open_children : target.top).push_back(std::move(element));
+		return commit(which);
+	}
+
+	// ONE ELEMENT OF `lesh_prompt_placement`, pointing INTO `element`'s own
+	// strings - valid exactly as long as `element` is, which `commit` below
+	// guarantees lasts through the `set_placements` call this feeds.
+	[[nodiscard]] static lesh_prompt_placement view_of(const pending_element& element,
+	                                                   const lesh_prompt_placement* children,
+	                                                   std::size_t child_count) noexcept {
+		lesh_prompt_placement item{};
+		if (element.is_group) {
+			item.children = children;
+			item.child_count = child_count;
+			return item;
+		}
+		item.module = element.module.c_str();
+		item.options.type = element.type.empty() ? nullptr : element.type.c_str();
+		item.options.prefix = element.prefix.empty() ? nullptr : element.prefix.c_str();
+		return item;
+	}
+
+	// Rebuilds the surface from `at(which)`'s current accumulation and swaps it
+	// in through the engine's own whole-surface verb - the compatibility shim's
+	// entire mechanism. `no_such_module` is this console's one failure outcome
+	// for either of `set_placements`'s two domain refusals - the original
+	// `add_module` already conflated "unknown module" and "refused type" the
+	// same way, so this is not a new loss of precision.
+	outcome commit(surface which) {
+		const state& target = at(which);
+
+		// Groups here are never nested (this shim's own rule, above), so a
+		// group's children are always leaves - one level of storage is enough.
+		// RESERVED TO ITS FINAL SIZE BEFORE A SINGLE POINTER INTO IT IS TAKEN:
+		// `items` below holds `group_storage.data() + offset` for every group,
+		// and a `push_back` past capacity would reallocate and dangle every one
+		// already handed out.
+		std::size_t total_children = 0;
+		for (const pending_element& element : target.top)
+			if (element.is_group)
+				total_children += element.children.size();
+		std::vector<lesh_prompt_placement> group_storage;
+		group_storage.reserve(total_children);
+
+		std::vector<lesh_prompt_placement> items;
+		items.reserve(target.top.size());
+		for (const pending_element& element : target.top) {
+			if (!element.is_group) {
+				items.push_back(view_of(element, nullptr, 0));
+				continue;
+			}
+			const std::size_t at_offset = group_storage.size();
+			for (const pending_element& child : element.children)
+				group_storage.push_back(view_of(child, nullptr, 0));
+			items.push_back(view_of(element, group_storage.data() + at_offset,
+			                        element.children.size()));
+		}
+
+		const std::int32_t answered =
+			_engine->set_placements(surface_of(which), items.data(), items.size());
+		switch (answered) {
+			case LESH_OK: return outcome::ok;
+			default:      return outcome::no_such_module;
+		}
+	}
+
 	prompt::engine* _engine;
+	state _left;
+	state _continuation;
 };
 
 // ---------------------------------------------------------------------------

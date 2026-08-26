@@ -773,13 +773,10 @@ TEST(LeshperPromptAbi, EveryVerbNeedsAnEngineOnTheRegistry) {
 	EXPECT_EQ(lesh_prompt_module_exists(&bare, "x", &exists), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_clear(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_use_default(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_place(&bare, LESH_PROMPT_LEFT, "path", nullptr, nullptr, nullptr,
-	                            nullptr),
+	const lesh_prompt_placement one[] = { { .module = "path" } };
+	EXPECT_EQ(lesh_prompt_set_placements(&bare, LESH_PROMPT_LEFT, one, 1), LESH_ERR_NOTFOUND);
+	EXPECT_EQ(lesh_prompt_module_register_with(&bare, "x", &abi_module, nullptr, {}),
 	          LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_module_register_checked(&bare, "x", &abi_module, nullptr, nullptr),
-	          LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_group_open(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_group_close(&bare, LESH_PROMPT_LEFT), LESH_ERR_NOTFOUND);
 
 	// A null registry is a malformed argument, which is a different answer.
 	EXPECT_EQ(lesh_prompt_clear(nullptr, LESH_PROMPT_LEFT), LESH_ERR_INVAL);
@@ -790,44 +787,102 @@ TEST(LeshperPromptAbi, RejectsBadSurfacesAndBadNames) {
 	lesh_registry registry;
 	registry.prompt_engine = &which;
 
+	const lesh_prompt_placement path[] = { { .module = "path" } };
 	EXPECT_EQ(lesh_prompt_clear(&registry, 7u), LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_place(&registry, 7u, "path", nullptr, nullptr, nullptr, nullptr),
-	          LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "weather", nullptr, nullptr, nullptr,
-	                            nullptr),
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, 7u, path, 1), LESH_ERR_INVAL);
+
+	const lesh_prompt_placement weather[] = { { .module = "weather" } };
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, weather, 1),
 	          LESH_ERR_NOTFOUND);
+
 	EXPECT_EQ(lesh_prompt_module_register(&registry, "Bad-Name", &abi_module, nullptr),
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_module_register(&registry, "ok_name", nullptr, nullptr),
 	          LESH_ERR_INVAL);
 
-	// A NULL NAME IS A LITERAL, not a malformed call: the one verb says both
-	// things, and "no module" is a legitimate placement rather than an omission.
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "x",
-	                            nullptr),
+	// AN ITEM WITH NEITHER `module` NOR `children` (#157, owner's ruling) is a
+	// structural error in the tree, LESH_ERR_INVAL - it is not a placement and
+	// not a group. NULL and "" answer alike.
+	const lesh_prompt_placement neither[] = { {} };
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, neither, 1),
+	          LESH_ERR_INVAL);
+	const lesh_prompt_placement empty_module[] = { { .module = "" } };
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, empty_module, 1),
+	          LESH_ERR_INVAL);
+
+	// AN ITEM WITH BOTH is the other structural error - a caller that meant one
+	// and wrote both.
+	const lesh_prompt_placement leaf[] = { { .module = "path" } };
+	const lesh_prompt_placement both[] = {
+		{ .module = "path", .children = leaf, .child_count = 1 },
+	};
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, both, 1), LESH_ERR_INVAL);
+
+	// A GROUP WITH NO CHILDREN is the third: a zero `child_count` answers exactly
+	// as a NULL `children` does, whether or not the pointer is set.
+	const lesh_prompt_placement empty_group[] = { { .children = leaf, .child_count = 0 } };
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, empty_group, 1),
+	          LESH_ERR_INVAL);
+
+	// "no module" IS SPELLED "literal", exactly as the template spells it - a
+	// literal is a placement, not an omission, and the keyword is how this verb
+	// says so. It needs bytes to paint, the same refusal `{literal}` gets from the
+	// template parser - and the array verb has ONE status, 1, for every
+	// style/type/literal refusal (abi.h says why).
+	const lesh_prompt_placement bare_literal[] = { { .module = "literal" } };
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, bare_literal, 1), 1);
+	const lesh_prompt_placement painted_literal[] = {
+		{ .module = "literal", .options = { .prefix = "x" } },
+	};
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, painted_literal, 1),
 	          LESH_OK);
+
+	// And it has no type slot, the same refusal `{literal::x}` gets - text alone
+	// does not excuse a type.
+	const lesh_prompt_placement typed_literal[] = {
+		{ .module = "literal", .options = { .type = "x", .prefix = "hi" } },
+	};
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, typed_literal, 1), 1);
 }
 
-// THE ONE PLACEMENT VERB, ROUND TRIP. Five arguments in, the same five parts a
-// template spells, and the same bytes out - which is what makes the ABI and the
-// string one configuration language rather than two.
-TEST(LeshperPromptAbi, PlaceSpellsExactlyWhatATemplateDoes) {
+TEST(LeshperPromptAbi, CountZeroIsTheEmptySurfaceAndItemsGoesUnread) {
 	engine which;
 	lesh_registry registry;
 	registry.prompt_engine = &which;
 
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
+	const lesh_prompt_placement items[] = { { .module = "path" } };
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
+	which.render_full(quiet());
+	ASSERT_FALSE(which.output(surface_id::left).empty());
 
-	// `{path:cyan:s}` then `{status:red::[:]}` then a literal `> `.
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "cyan", "s", nullptr,
-	                            nullptr),
+	// `count == 0` clears the surface - `items` unread, so even a dangling or
+	// nonsensical pointer is harmless.
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT,
+	                                     reinterpret_cast<const lesh_prompt_placement*>(1), 0),
 	          LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "status", "red", nullptr, "[", "]"),
-	          LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "> ",
-	                            nullptr),
-	          LESH_OK);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "");
+
+	// Otherwise a NULL `items` is a malformed call.
+	EXPECT_EQ(lesh_prompt_set_placements(&registry, LESH_PROMPT_LEFT, nullptr, 1), LESH_ERR_INVAL);
+}
+
+// THE WHOLE-SURFACE VERB, ROUND TRIP. The template's items, as a tree, build
+// the identical program - which is what "one builder, two front doors" (#157,
+// owner's ruling) buys: the ABI and the string are one configuration language
+// with two spellings.
+TEST(LeshperPromptAbi, SetPlacementsSpellsExactlyWhatATemplateDoes) {
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	// `{path:cyan:s}{status:red::[:]}> `.
+	const lesh_prompt_placement items[] = {
+		{ .module = "path", .options = { .style = "cyan", .type = "s" } },
+		{ .module = "status", .options = { .style = "red", .prefix = "[", .postfix = "]" } },
+		{ .module = "literal", .options = { .prefix = "> " } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 
 	prompt::state failed = quiet();
 	failed.status = 2;
@@ -848,25 +903,70 @@ TEST(LeshperPromptAbi, PlaceSpellsExactlyWhatATemplateDoes) {
 		spelled.render_full(against);
 		which.render_full(against);
 		EXPECT_EQ(spelled.output(surface_id::left), which.output(surface_id::left))
-			<< "the verb stream and the template disagree";
+			<< "the tree and the template disagree";
 	}
 
-	// THE TWO DOMAIN REFUSALS, told apart. A style that will not parse and a type
-	// the module will not take are different mistakes and answer differently -
-	// and both place nothing.
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "blod", nullptr, nullptr,
-	                            nullptr),
-	          1);
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", nullptr, "medum", nullptr,
-	                            nullptr),
-	          2);
-	// A literal has no type slot either, the same refusal `{literal::x}` gets.
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, "x", "hi",
-	                            nullptr),
-	          2);
-
+	// ATOMICITY: a bad item anywhere in the tree leaves the previous surface
+	// exactly as it was, before and after render identical - the whole point of
+	// validating everything before applying anything.
+	const lesh_prompt_placement bad_style[] = {
+		{ .module = "path" },
+		{ .module = "status", .options = { .style = "blod" } },
+	};
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, bad_style), 1);
 	which.render_full(failed);
 	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m\x1b[31m[2]\x1b[0m> ");
+
+	const lesh_prompt_placement bad_type[] = {
+		{ .module = "path", .options = { .type = "medum" } },
+	};
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, bad_type), 1);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m> ");
+
+	// AND THE FIRST OFFENDER IS THE WHOLE ANSWER: an unknown module past a good
+	// item still leaves everything standing, unbuilt.
+	const lesh_prompt_placement unknown[] = {
+		{ .module = "path" },
+		{ .module = "weather" },
+	};
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, unknown), LESH_ERR_NOTFOUND);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "\x1b[36msrc\x1b[0m> ");
+}
+
+// NESTING, WHICH THE OLD VERB STREAM COULD NOT SAY (#157): a group inside a
+// group, built directly as a tree rather than refused as a second `open`.
+TEST(LeshperPromptAbi, GroupsNestToAnyDepthAsATree) {
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	// `(a(b{status}))` - the inner group votes with `status`, and the outer
+	// group votes because the inner one does. Two levels of `.children`, which
+	// the old verb stream had no way to say at all.
+	const lesh_prompt_placement inner[] = {
+		{ .module = "literal", .options = { .prefix = "b" } },
+		{ .module = "status" },
+	};
+	const lesh_prompt_placement outer_children[] = {
+		{ .module = "literal", .options = { .prefix = "a" } },
+		{ .children = inner, .child_count = 2 },
+	};
+	const lesh_prompt_placement items[] = {
+		{ .children = outer_children, .child_count = 2 },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
+
+	prompt::state failed = quiet();
+	failed.status = 5;
+	which.render_full(failed);
+	EXPECT_EQ(which.output(surface_id::left), "ab5");
+
+	// `status` never votes at `$? == 0` (its own render rule), so both groups
+	// vanish together.
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "");
 }
 
 TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
@@ -884,9 +984,11 @@ TEST(LeshperPromptAbi, ARegisteredModuleWritesReadsItsArgAndAsksForAWake) {
 	ASSERT_EQ(lesh_prompt_module_exists(&registry, "weather", &exists), LESH_OK);
 	EXPECT_EQ(exists, 0);
 
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
 	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "probe", nullptr, "hello", nullptr, nullptr), LESH_OK);
+	const lesh_prompt_placement items[] = {
+		{ .module = "probe", .options = { .type = "hello" } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 
 	prompt::state facts = quiet();
 	facts.tick = 42;
@@ -918,13 +1020,69 @@ TEST(LeshperPromptAbi, ARegisteredModuleIsReplacedNotStacked) {
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &first), LESH_OK);
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "probe", &abi_module, &second), LESH_OK);
 
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "probe", nullptr, "x", nullptr, nullptr), LESH_OK);
+	const lesh_prompt_placement items[] = { { .module = "probe", .options = { .type = "x" } } };
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 	which.render_full(quiet());
 
 	EXPECT_EQ(first.calls, 0);
 	EXPECT_EQ(second.calls, 1);
+}
+
+// A type-slot validator: accepts one spelling, refuses everything else, and
+// names why through the same `error_out`/`capacity`/`length_out` copy-out
+// convention every reader in this ABI uses.
+std::int32_t only_ok_validate(const char* type, std::size_t length, void*, char* error_out,
+                              std::size_t capacity, std::size_t* length_out) {
+	if (std::string_view{type == nullptr ? "" : type, length} == "ok")
+		return 0;
+
+	static constexpr std::string_view kMessage = "must be 'ok'";
+	*length_out = kMessage.size();
+	if (error_out != nullptr)
+		std::copy_n(kMessage.data(), std::min(capacity, kMessage.size()), error_out);
+	return 1;
+}
+
+TEST(LeshperPromptAbi, RegisterWithNoValidatorAcceptsAnyType) {
+	abi_probe probe;
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	// `options.validate` left at its zero default is exactly the plain verb: no
+	// grammar to check, so any type slot reaches the module as written.
+	ASSERT_EQ(lesh_prompt_module_register_with(&registry, "any", &abi_module, &probe, {}),
+	          LESH_OK);
+	const lesh_prompt_placement items[] = { { .module = "any", .options = { .type = "whatever" } } };
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
+	which.render_full(quiet());
+	EXPECT_EQ(probe.arg, "whatever");
+}
+
+TEST(LeshperPromptAbi, RegisterWithAValidatorRefusesAndNamesWhy) {
+	abi_probe probe;
+	engine which;
+	lesh_registry registry;
+	registry.prompt_engine = &which;
+
+	ASSERT_EQ(lesh_prompt_module_register_with(&registry, "checked", &abi_module, &probe,
+	                                           { .validate = &only_ok_validate }),
+	          LESH_OK);
+
+	// WHAT THE VALIDATOR ACCEPTS REACHES THE MODULE; what it refuses places
+	// nothing at all, and answers the array verb's one refusal status, 1 - the
+	// same status a bad style or `literal` misuse gets, because there is no
+	// message channel here to tell them apart with.
+	const lesh_prompt_placement ok[] = { { .module = "checked", .options = { .type = "ok" } } };
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, ok), LESH_OK);
+	const lesh_prompt_placement nope[] = { { .module = "checked", .options = { .type = "nope" } } };
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, nope), 1);
+
+	// AND THE WORDS TRAVEL THROUGH THE TEMPLATE, where there is a message
+	// channel - `lesh_prompt_set_placements` has none, by design (abi.h says why).
+	std::string error;
+	EXPECT_FALSE(which.set_template(surface_id::left, "{checked::nope}", error));
+	EXPECT_EQ(error, "checked: must be 'ok' at byte 10");
 }
 
 TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
@@ -932,20 +1090,16 @@ TEST(LeshperPromptAbi, AGroupVanishesWithItsModule) {
 	lesh_registry registry;
 	registry.prompt_engine = &which;
 
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-
-	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	// A second open while one is open is refused rather than nested: groups do
-	// not nest in v1 across this surface.
-	EXPECT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_ERR_REFUSED);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, " [", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "status", nullptr, nullptr, nullptr, nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "]", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	EXPECT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_ERR_REFUSED);
-
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "$ ", nullptr), LESH_OK);
+	const lesh_prompt_placement group[] = {
+		{ .module = "literal", .options = { .prefix = " [" } },
+		{ .module = "status" },
+		{ .module = "literal", .options = { .prefix = "]" } },
+	};
+	const lesh_prompt_placement items[] = {
+		{ .children = group, .child_count = 3 },
+		{ .module = "literal", .options = { .prefix = "$ " } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 
 	// The module omitted, so the brackets went with it - and the top-level
 	// literal did not, because binding is explicit grouping.
@@ -966,12 +1120,12 @@ TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 	registry.prompt_engine = &which;
 
 	// A module that never says anything, so the group can never be shown.
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "on ", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "git", nullptr, nullptr, nullptr, nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	const lesh_prompt_placement group_git[] = {
+		{ .module = "literal", .options = { .prefix = "on " } },
+		{ .module = "git" },
+	};
+	const lesh_prompt_placement items_git[] = { { .children = group_git, .child_count = 2 } };
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items_git), LESH_OK);
 
 	which.render_full(quiet());
 	EXPECT_EQ(which.output(surface_id::left), "");
@@ -979,11 +1133,12 @@ TEST(LeshperPromptAbi, AGroupsDecorationsDoNotRunWhenTheVoteFails) {
 	// The same shape with a module that DOES say something: the literal runs
 	// now, and in declared order before the module's bytes.
 	ASSERT_EQ(which.register_module("shout", &inner), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "on ", nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "shout", nullptr, nullptr, nullptr, nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
+	const lesh_prompt_placement group_shout[] = {
+		{ .module = "literal", .options = { .prefix = "on " } },
+		{ .module = "shout" },
+	};
+	const lesh_prompt_placement items_shout[] = { { .children = group_shout, .child_count = 2 } };
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items_shout), LESH_OK);
 
 	which.render_full(quiet());
 	EXPECT_EQ(inner.calls, 1);
@@ -1029,9 +1184,10 @@ TEST(LeshperPromptAbi, ArgFollowsTheCopyOutConvention) {
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "measure", &measuring_module, &probe),
 	          LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "measure", nullptr, "abcdef", nullptr, nullptr), LESH_OK);
+	const lesh_prompt_placement items[] = {
+		{ .module = "measure", .options = { .type = "abcdef" } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 
 	which.render_full(quiet());
 	EXPECT_EQ(probe.calls, 1);
@@ -1054,10 +1210,11 @@ TEST(LeshperPromptAbi, ANegativeStatusReadsAsOmitted) {
 
 	ASSERT_EQ(lesh_prompt_module_register(&registry, "broken", &failing_module, nullptr),
 	          LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_CONTINUATION), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "broken", nullptr, nullptr, nullptr, nullptr), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, nullptr, nullptr, nullptr, "$ ", nullptr), LESH_OK);
+	const lesh_prompt_placement items[] = {
+		{ .module = "broken" },
+		{ .module = "literal", .options = { .prefix = "$ " } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, items), LESH_OK);
 
 	which.render_full(quiet());
 
@@ -2103,6 +2260,51 @@ TEST(LeshperPromptTemplate, TheDefaultTableAndItsTemplateAgree) {
 	EXPECT_EQ(table_side.template_text(surface_id::continuation), "> ");
 }
 
+TEST(LeshperPromptTemplate, TheDefaultAlsoAgreesWithItsOwnArrayForm) {
+	// A THIRD SPELLING OF THE SAME PROMPT (#157): `{path}> ` as `lesh_prompt_
+	// set_placements` items, proving "one builder, two front doors" on the one
+	// prompt every fresh shell actually shows.
+	engine array_side;
+	lesh_registry registry;
+	registry.prompt_engine = &array_side;
+
+	const lesh_prompt_placement left[] = {
+		{ .module = "path" },
+		{ .module = "literal", .options = { .prefix = "> " } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, left), LESH_OK);
+	const lesh_prompt_placement continuation[] = {
+		{ .module = "literal", .options = { .prefix = "> " } },
+	};
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_CONTINUATION, continuation), LESH_OK);
+
+	engine template_side;
+	std::string error;
+	ASSERT_TRUE(template_side.set_template(surface_id::left, prompt::kDefaultLeftTemplate, error));
+	ASSERT_TRUE(template_side.set_template(surface_id::continuation,
+	                                       prompt::kDefaultContinuationTemplate, error));
+
+	prompt::state elsewhere = quiet();
+	elsewhere.pwd = "/etc";
+	elsewhere.status = 130;
+
+	for (const prompt::state& facts : {quiet(), elsewhere}) {
+		array_side.render_full(facts);
+		template_side.render_full(facts);
+		EXPECT_EQ(array_side.output(surface_id::left), template_side.output(surface_id::left));
+		EXPECT_EQ(array_side.output(surface_id::continuation),
+		          template_side.output(surface_id::continuation));
+	}
+
+	// AN ARRAY-BUILT SURFACE HAS NO TEMPLATE STRING - the same rule the old
+	// assembly verbs always followed.
+	char buffer[64];
+	std::size_t length = 0;
+	ASSERT_EQ(lesh_prompt_text(&registry, LESH_PROMPT_LEFT, buffer, sizeof buffer, &length),
+	          LESH_OK);
+	EXPECT_EQ(length, 0u);
+}
+
 TEST(LeshperPromptTemplate, TheRememberedTextIsTheSourceOrNothingAtAll) {
 	engine which;
 
@@ -2254,21 +2456,19 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_OK);
 	EXPECT_EQ(std::string(buffer, out_length), kTemplate);
 
-	// A styled placement inside a group, over the verbs, and the domain status for
-	// a spec that will not parse.
-	ASSERT_EQ(lesh_prompt_clear(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_open(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	ASSERT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "cyan", nullptr, nullptr,
-	                            nullptr),
-	          LESH_OK);
-	ASSERT_EQ(lesh_prompt_group_close(&registry, LESH_PROMPT_LEFT), LESH_OK);
-	EXPECT_EQ(lesh_prompt_place(&registry, LESH_PROMPT_LEFT, "path", "blod", nullptr, nullptr,
-	                            nullptr),
-	          1);
+	// A styled placement inside a group, built as a tree, and the domain status
+	// for a spec that will not parse.
+	const lesh_prompt_placement cyan_group[] = {
+		{ .module = "path", .options = { .style = "cyan" } },
+	};
+	const lesh_prompt_placement cyan_items[] = { { .children = cyan_group, .child_count = 1 } };
+	ASSERT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, cyan_items), LESH_OK);
+	const lesh_prompt_placement blod[] = { { .module = "path", .options = { .style = "blod" } } };
+	EXPECT_EQ(prompt::set_placements(&registry, LESH_PROMPT_LEFT, blod), 1);
 	which.render_full(quiet());
 	EXPECT_EQ(which.output(surface_id::left), "\x1b[36m~/src\x1b[0m");
 
-	// A surface assembled verb by verb has no template string.
+	// A surface built from a tree has no template string.
 	ASSERT_EQ(lesh_prompt_text(&registry, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
 	          LESH_OK);
 	EXPECT_EQ(out_length, 0u);
@@ -2281,8 +2481,7 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_text(&bare, LESH_PROMPT_LEFT, buffer, sizeof buffer, &out_length),
 	          LESH_ERR_NOTFOUND);
-	EXPECT_EQ(lesh_prompt_place(&bare, LESH_PROMPT_LEFT, "path", "cyan", nullptr, nullptr, nullptr),
-	          LESH_ERR_NOTFOUND);
+	EXPECT_EQ(prompt::set_placements(&bare, LESH_PROMPT_LEFT, cyan_items), LESH_ERR_NOTFOUND);
 	EXPECT_EQ(lesh_prompt_set(nullptr, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, &needed),
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_set(&registry, 7u, "x", 1, nullptr, 0, &needed), LESH_ERR_INVAL);
@@ -2290,11 +2489,8 @@ TEST(LeshperPromptAbi, TheTemplateVerbsTravelAndTheMessageFollowsTheCopyOutConve
 	          LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_set(&registry, LESH_PROMPT_LEFT, "x", 1, nullptr, 0, nullptr),
 	          LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_place(&registry, 7u, "path", "cyan", nullptr, nullptr, nullptr),
-	          LESH_ERR_INVAL);
-	EXPECT_EQ(lesh_prompt_place(nullptr, LESH_PROMPT_LEFT, "path", nullptr, nullptr, nullptr,
-	                            nullptr),
-	          LESH_ERR_INVAL);
+	EXPECT_EQ(prompt::set_placements(&registry, 7u, cyan_items), LESH_ERR_INVAL);
+	EXPECT_EQ(lesh_prompt_set_placements(nullptr, LESH_PROMPT_LEFT, cyan_items, 1), LESH_ERR_INVAL);
 	EXPECT_EQ(lesh_prompt_text(&registry, 7u, buffer, sizeof buffer, &out_length), LESH_ERR_INVAL);
 }
 

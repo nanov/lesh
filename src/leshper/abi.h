@@ -33,6 +33,29 @@
  * token (deliberately absent in v1 - the only clients are native and call the
  * syntax layer directly), and provider access (#94).
  *
+ * REQUIRED ARGUMENTS ARE POSITIONAL; OPTIONAL ONES TRAVEL IN A STRUCT, passed BY
+ * VALUE, when a verb has more than one - `lesh_prompt_module_register_with
+ * (registry, name, fn, userdata, options)` is the pattern: `name` and `fn`
+ * cannot be forgotten because they have no default and no field to leave unset,
+ * and `options` zero-initialized (`{0}` in C, `{}` in C++) means every optional
+ * at its default, so a call reads as the configuration it stands for rather
+ * than a run of positional NULLs. Each such struct is FROZEN AT BIRTH, the same
+ * rule as above applied to structs rather than functions: a field is never
+ * appended, because growth already has its one mechanism - a new verb taking a
+ * new struct - and a second one, a `sizeof`-tagged version an old caller's
+ * struct might be too small for, would tax every call for a case the first
+ * already covers for free. This is not the copy-out convention below
+ * (`char* out, size_t capacity, size_t* length_out`), which is a different
+ * contract for a different problem and is untouched by it.
+ *
+ * LISTS ARE A POINTER AND A COUNT, NEVER `...`. `lesh_prompt_set_placements
+ * (registry, surface, items, count)` is C's variadic - the only one this file
+ * uses, because a real one is not `printf`-portable across a binding and would
+ * put the calling convention back in the caller's hands. `count == 0` is the
+ * empty list, and `items` is unread when it is; otherwise a NULL `items` is
+ * LESH_ERR_INVAL, the same rule a required struct pointer would get if this
+ * file had one.
+ *
  * THREADING, and it is not advisory. Registration, lookup, and every action run
  * on the loop thread. A reactor's compute call and its token live on a worker.
  * Handles are valid only for the duration of the call that received them;
@@ -983,26 +1006,38 @@ typedef int32_t (*lesh_prompt_validate_fn)(const char* type, size_t length, void
  *
  * A module registered this way ACCEPTS ANY TYPE SLOT: it has no grammar this side
  * can check, so nothing is refused at set time and the bytes arrive at
- * `lesh_prompt_arg` as written. Use the checked form below to own a grammar.
+ * `lesh_prompt_arg` as written. Use `lesh_prompt_module_register_with` below to
+ * own a grammar.
  *
- * Registering does not place anything. `lesh_prompt_place` does that, and may do
- * it more than once. */
+ * KEPT AS FOUR PLAIN ARGUMENTS, deliberately, alongside the options-taking form
+ * below: this is the common case, every one of its arguments is required, and an
+ * options value for zero optionals is ceremony a caller should not have to
+ * write. Registering does not place anything. `lesh_prompt_set_placements` does
+ * that, and may place the same module more than once. */
 int32_t lesh_prompt_module_register(lesh_registry* registry,
                                     const char* name,
                                     lesh_prompt_module_fn fn,
                                     void* userdata);
 
-/* The same registration, with a type-slot validator. ADDITIVE: the verb above is
- * unchanged and still means "accepts any type", so nothing written against it has
- * to move.
+/* The same registration, its one optional in a struct passed BY VALUE - the
+ * required-positional/optional-struct convention the top of this file records,
+ * applied here: `registry`, `name`, `fn` and `userdata` are required and stay
+ * positional; `validate` is the only optional, so it alone moves into
+ * `lesh_prompt_module_options`, frozen the same way every such struct is - see
+ * the top block for why there is no size field and none is coming.
  *
- * `validate` may be NULL, which makes this exactly the unchecked form. Both
- * functions receive the same `userdata`. */
-int32_t lesh_prompt_module_register_checked(lesh_registry* registry,
-                                            const char* name,
-                                            lesh_prompt_module_fn fn,
-                                            lesh_prompt_validate_fn validate,
-                                            void* userdata);
+ * `options.validate` may be NULL, which makes this exactly the plain form above -
+ * it exists for the validator and for whatever optional the future adds as a new
+ * verb rather than a new field. */
+typedef struct lesh_prompt_module_options {
+	lesh_prompt_validate_fn validate;   /* NULL = accepts any type slot */
+} lesh_prompt_module_options;
+
+int32_t lesh_prompt_module_register_with(lesh_registry* registry,
+                                         const char* name,
+                                         lesh_prompt_module_fn fn,
+                                         void* userdata,
+                                         lesh_prompt_module_options options);
 
 /* True (1) when a module of that name is registered, built-in ones included. */
 int32_t lesh_prompt_module_exists(lesh_registry* registry, const char* name, int32_t* out);
@@ -1052,40 +1087,117 @@ int32_t lesh_prompt_clear(lesh_registry* registry, uint32_t surface);
 /* Puts a surface back on the built-in default table. */
 int32_t lesh_prompt_use_default(lesh_registry* registry, uint32_t surface);
 
-/* Appends ONE PLACEMENT - the template's five parts, as five arguments. Every
- * argument is a NUL-terminated string and NULL means empty.
+/* AN OPTIONS STRUCT, per `lesh_prompt_module_options` above: frozen, by value,
+ * every field optional. NULL or "" on any field means its default - unstyled,
+ * the module's own type, no affix. */
+typedef struct lesh_prompt_options {
+	const char* style;    /* NULL or "" = unstyled */
+	const char* type;     /* NULL or "" = the module's default */
+	const char* prefix;   /* NULL or "" = none */
+	const char* postfix;  /* NULL or "" = none */
+} lesh_prompt_options;
+
+/* ONE ELEMENT OF A SURFACE - a module placement or a group, the same two
+ * shapes `(…)` and `{…}` are in a template, chosen by which of `module` and
+ * `children` is set. NULL and "" answer alike for `module`, the convention
+ * every optional string field in this ABI already keeps:
  *
- * ONE VERB, BECAUSE THERE IS ONE ELEMENT (6.10). This replaces the three that
- * were here - a module verb, a literal verb and a style verb - and the reason is
- * not tidiness: three verbs let a caller say things the template language cannot
- * (a style with no span to close it) while not letting it say things the language
- * can (a module with a prefix that vanishes with it). One `place` call is exactly
- * `{name:style:type:prefix:postfix}` and exactly nothing else, so the ABI and the
- * string are the same configuration language with two spellings.
+ *   MODULE  no `children` (NULL, or a zero `child_count`), `module` set - a
+ *           placement. `module` is the module's name, or the keyword "literal"
+ *           for a standalone styled literal - see `lesh_prompt_set_placements`
+ *           below for its rules.
+ *   GROUP   no `module` (NULL or ""), `children` set to a non-empty array -
+ *           everything in it is this group's child, shown only when one of
+ *           them is (`lesh_prompt_set`'s `(…)`, exactly). Groups NEST to any
+ *           depth: a child's own `children` makes it a group in turn.
+ *   NEITHER OR BOTH set is LESH_ERR_INVAL - see `lesh_prompt_set_placements`.
  *
- *   `name`    the module. NULL or "" places a LITERAL: no module, the affix bytes
- *             painted unconditionally, taking no part in a group's vote.
- *   `style`   the string grammar - `"cyan.bold"`, `"#89dceb"`, `"red+#222"`.
- *   `type`    the module's own slot, handed to it as written and parsed by IT.
- *   `prefix`  bytes before the module's, painted only if it said something.
- *   `postfix` bytes after, on the same condition.
+ * `options` is unused on a group - a group paints nothing of its own, only its
+ * children do, the same as `(…)` in a template. */
+typedef struct lesh_prompt_placement {
+	const char* module;
+	lesh_prompt_options options;
+	const struct lesh_prompt_placement* children;
+	size_t child_count;
+} lesh_prompt_placement;
+
+/* THE WHOLE SURFACE, IN ONE CALL - atomic, like `lesh_prompt_set`, and built
+ * from the same items the template's elements are: this replaces the single
+ * placement verb and the two group verbs that used to stand here. A verb
+ * stream could not say which group a close belonged to and so could not nest;
+ * a TREE says it directly, which is why groups here nest to any depth where
+ * the old `_group_open`/`_group_close` pair refused a second one.
  *
- * The placement lands INSIDE the open group when there is one, and at top level
- * otherwise. Every byte is copied.
+ *   lesh_prompt_placement branch[] = {
+ *       { "literal", { .style = "magenta", .prefix = " on " } },
+ *       { "git",     { .style = "magenta" } },
+ *   };
+ *   lesh_prompt_placement left[] = {
+ *       { "path",    { .style = "cyan", .type = "s" } },
+ *       { .children = branch, .child_count = 2 },
+ *       { "literal", { .prefix = "> " } },
+ *   };
+ *   lesh_prompt_set_placements(reg, LESH_PROMPT_LEFT, left, 3);   // C++
+ *
+ *   lesh_prompt_set_placements(reg, LESH_PROMPT_LEFT,
+ *       (lesh_prompt_placement[]){
+ *           { .module = "path", .options = { .style = "cyan", .type = "s" } },
+ *       }, 1);   // C99 compound literal
+ *
+ * builds `{path:cyan:s}( on {git:magenta})> ` without a byte of template text
+ * ever existing - `lesh_prompt_text` on a surface built this way answers "",
+ * the same rule a `place`-built surface always followed.
+ *
+ * A Lua binding (LuaJIT FFI) needs nothing this header does not already say:
+ *
+ *     ffi.cdef[[ ...the four typedefs/declarations above, verbatim... ]]
+ *     local branch = ffi.new("lesh_prompt_placement[2]", {
+ *       { "literal", { style = "magenta", prefix = " on " } },
+ *       { "git",     { style = "magenta" } },
+ *     })
+ *     local left = ffi.new("lesh_prompt_placement[3]", {
+ *       { "path",    { style = "cyan", type = "s" } },
+ *       { children = branch, child_count = 2 },
+ *       { "literal", { prefix = "> " } },
+ *     })
+ *     assert(ffi.C.lesh_prompt_set_placements(reg, LESH_PROMPT_LEFT, left, 3) == 0)
+ *
+ * builds `{path:cyan:s}( on {git:magenta})> `. Everything is copied during the
+ * call, so no Lua string or cdata has to outlive it (the copy-in rule above) -
+ * NG-4's promise kept without one binding-specific entry point.
+ *
+ * `module` RESOLVES THROUGH THE IDENTICAL RULE THE TEMPLATE PARSER USES for a
+ * placement's name - "literal" checked, and shadowing a registered module of
+ * that name, before the module table; a non-empty `type` on it refused; refused
+ * again with neither affix set. ONE BUILDER, TWO FRONT DOORS: this verb and
+ * `lesh_prompt_set` both finish by resolving a name, a style and a type and
+ * handing them to the identical engine builder `lesh_prompt_set` uses, so a
+ * tree that says what a template says builds the identical program.
+ *
+ * EVERYTHING IS VALIDATED BEFORE ANYTHING IS APPLIED, recursively, depth first:
+ * every module resolves, every style and every type parses, every group has at
+ * least one child and no item has both a module and children. The first item
+ * that fails is the whole answer; nothing built past it is kept, and the
+ * surface that was standing is still standing - `lesh_prompt_set`'s promise,
+ * scaled up from one string to a tree.
+ *
+ * `count == 0` clears the surface, `items` unread - the same surface
+ * `lesh_prompt_clear` leaves. Otherwise `items == NULL` is LESH_ERR_INVAL.
  *
  * FOUR ANSWERS:
- *   LESH_OK            - placed.
- *   LESH_ERR_NOTFOUND  - no module of that name (and no engine on the registry).
- *   1                  - the STYLE spec would not parse.
- *   2                  - the module REFUSED the type slot.
- * The two positive ones are domain statuses, not LESH_ERR_INVAL: the arguments
- * were well formed and their CONTENT was wrong, which is the caller's own text.
- * There is no message channel here because there is nothing to say that the
- * caller, holding the string, could not say better; `lesh_prompt_set`, whose text
- * a human typed, has one. */
-int32_t lesh_prompt_place(lesh_registry* registry, uint32_t surface,
-                          const char* name, const char* style,
-                          const char* type, const char* prefix, const char* postfix);
+ *   LESH_OK            - set.
+ *   LESH_ERR_INVAL     - a malformed call, or a structural error in the tree:
+ *                        an item with neither `module` nor `children`, an item
+ *                        with BOTH, or a group with a zero `child_count`.
+ *   LESH_ERR_NOTFOUND  - the first unresolved module name (and no engine on the
+ *                        registry).
+ *   1                  - the first style, type or "literal" refusal - one
+ *                        status for all three, because the caller already knows
+ *                        which item it passed and what was in it; there is no
+ *                        message channel here, unlike `lesh_prompt_set`, whose
+ *                        text a human typed and needs one. */
+int32_t lesh_prompt_set_placements(lesh_registry* registry, uint32_t surface,
+                                   const lesh_prompt_placement* items, size_t count);
 
 /* Sets a surface from a TEMPLATE - `{module:style:type:prefix:postfix}`, `(…)`
  * groups, `\:`-family escapes - replacing everything on it.
@@ -1117,26 +1229,11 @@ int32_t lesh_prompt_set(lesh_registry* registry, uint32_t surface,
  * spelling.
  *
  * A surface on the shipped default answers the default's own template; one built
- * out of `lesh_prompt_place` calls answers zero bytes, because a prompt assembled
- * placement by placement has no template string and inventing one would put the
- * element vocabulary on the caller's side of this boundary. */
+ * by `lesh_prompt_set_placements` answers zero bytes, because a prompt assembled
+ * from a tree has no template string and inventing one would put the element
+ * vocabulary on the caller's side of this boundary. */
 int32_t lesh_prompt_text(lesh_registry* registry, uint32_t surface,
                          char* out, size_t capacity, size_t* length_out);
-
-/* Opens a group - the ONLY combinator (6.10). Everything placed until the
- * matching close is its child, and the group is shown only when a child inside it
- * is ready; a literal child never votes.
- *
- * LESH_ERR_REFUSED when one is already open. Groups do not nest across THIS
- * surface, and refusing is the honest answer - a caller that lost track of its
- * own nesting should hear so rather than have the verbs guess. Nesting is the
- * template language's (`lesh_prompt_set`, and the engine's node tree holds it):
- * a verb stream is linear and has no way to say which group a close belongs to,
- * which is exactly what a bracketed grammar does say. */
-int32_t lesh_prompt_group_open(lesh_registry* registry, uint32_t surface);
-
-/* Closes it. LESH_ERR_REFUSED when none is open. */
-int32_t lesh_prompt_group_close(lesh_registry* registry, uint32_t surface);
 
 #ifdef __cplusplus
 } /* extern "C" */

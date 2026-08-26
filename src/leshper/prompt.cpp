@@ -679,6 +679,107 @@ std::string_view engine::template_text(surface_id which) const {
 	return at(which).text;
 }
 
+// THE ARRAY VERB'S FRONT DOOR onto `set_template`'s builder (#157, owner's
+// ruling: "one builder, two front doors"). Where `scan_template` walks bytes
+// and calls `build.resolve`/`on_placement`/`on_open_group`/`on_close_group` as
+// it finds `{…}` and `(…)`, this walks a `lesh_prompt_placement` tree and calls
+// the SAME four hooks on the SAME builder - so a tree that says what a template
+// says builds the identical program, and the module/style/type/`literal` rules
+// are one rule read twice rather than two rules that happen to agree today.
+//
+// RECURSIVE, DEPTH FIRST, AND IT STOPS AT THE FIRST FAILURE - exactly
+// `scan_template`'s own promise: nothing built past the failing item survives,
+// because the caller (`engine::set_placements`) never adopts `build`'s storage
+// unless this returns `none`.
+engine::placements_error engine::build_placements(builder& build,
+                                                   const lesh_prompt_placement* items,
+                                                   std::size_t count) {
+	for (std::size_t i = 0; i < count; ++i) {
+		const lesh_prompt_placement& item = items[i];
+		const bool has_children = item.children != nullptr && item.child_count != 0;
+		// NULL OR "" ANSWER ALIKE, the convention every optional string field in
+		// this ABI already keeps - `module` is the one field on this struct that
+		// is not optional, but "unset" is still one spelling, not two.
+		const bool has_module = item.module != nullptr && item.module[0] != '\0';
+
+		if (!has_module) {
+			// NO MODULE, NO CHILDREN: neither a placement nor a group.
+			if (!has_children)
+				return placements_error::invalid;
+			build.on_open_group();
+			const placements_error nested = build_placements(build, item.children, item.child_count);
+			if (nested != placements_error::none)
+				return nested;
+			build.on_close_group();
+			continue;
+		}
+		// BOTH SET: a caller that meant one and wrote both.
+		if (item.children != nullptr)
+			return placements_error::invalid;
+
+		const std::string_view name{item.module};
+		const bool literal_keyword = name == kLiteralPlacement;
+		const module* core = nullptr;
+		if (!literal_keyword) {
+			core = build.resolve(name);
+			if (core == nullptr)
+				return placements_error::unknown_module;
+		}
+
+		style pen{};
+		const std::string_view style_spec = text_of(item.options.style);
+		if (!style_spec.empty()) {
+			const style_parse parsed = parse_style(style_spec);
+			if (!parsed.ok)
+				return placements_error::refused;
+			pen = parsed.value;
+		}
+
+		const std::string_view type = text_of(item.options.type);
+		params_blob params;
+		if (core != nullptr) {
+			parse_error why;
+			if (!core->parse(type, params, why))
+				return placements_error::refused;
+		} else if (!type.empty()) {
+			// `literal` HAS NO TYPE SLOT, the same refusal `{literal::x}` gets.
+			return placements_error::refused;
+		}
+
+		const std::string_view prefix = text_of(item.options.prefix);
+		const std::string_view postfix = text_of(item.options.postfix);
+		if (literal_keyword && prefix.empty() && postfix.empty())
+			// `literal` NEEDS BYTES TO PAINT, the same refusal `{literal}` gets.
+			return placements_error::refused;
+
+		build.on_placement(core, params, pen, prefix, postfix);
+	}
+	return placements_error::none;
+}
+
+std::int32_t engine::set_placements(surface_id which, const lesh_prompt_placement* items,
+                                    std::size_t count) {
+	builder build;
+	build.owner = this;
+	build.program.reserve(count);
+
+	const placements_error failed = build_placements(build, items, count);
+	switch (failed) {
+		case placements_error::none:           break;
+		case placements_error::invalid:        return LESH_ERR_INVAL;
+		case placements_error::unknown_module: return LESH_ERR_NOTFOUND;
+		case placements_error::refused:        return 1;
+	}
+
+	surface& target = at(which);
+	adopt(target, std::move(build.program), std::move(build.arena));
+	// AN ARRAY-BUILT SURFACE HAS NO TEMPLATE STRING, the same rule `place` and
+	// `add_literal`/`add_module` always followed - see `template_text`.
+	target.text.clear();
+	_configured = true;
+	return LESH_OK;
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -828,15 +929,16 @@ extern "C" {
 
 std::int32_t lesh_prompt_module_register(lesh_registry* registry, const char* name,
                                          lesh_prompt_module_fn fn, void* userdata) {
-	// THE UNCHECKED FORM IS THE CHECKED ONE WITH NO VALIDATOR, which is what makes
-	// the addition additive rather than a second path that could answer differently.
-	return lesh_prompt_module_register_checked(registry, name, fn, nullptr, userdata);
+	// THE PLAIN FORM IS THE OPTIONS FORM WITH A ZERO-INIT OPTIONS VALUE, which is
+	// what makes the addition additive rather than a second path that could
+	// answer differently.
+	return lesh_prompt_module_register_with(registry, name, fn, userdata,
+	                                        lesh_prompt_module_options{});
 }
 
-std::int32_t lesh_prompt_module_register_checked(lesh_registry* registry, const char* name,
-                                                 lesh_prompt_module_fn fn,
-                                                 lesh_prompt_validate_fn validate,
-                                                 void* userdata) {
+std::int32_t lesh_prompt_module_register_with(lesh_registry* registry, const char* name,
+                                              lesh_prompt_module_fn fn, void* userdata,
+                                              lesh_prompt_module_options options) {
 	if (registry == nullptr)
 		return LESH_ERR_INVAL;
 	engine* which = engine_of(registry);
@@ -844,7 +946,7 @@ std::int32_t lesh_prompt_module_register_checked(lesh_registry* registry, const 
 		return LESH_ERR_NOTFOUND;
 	if (name == nullptr || fn == nullptr)
 		return LESH_ERR_INVAL;
-	return which->register_abi_module(std::string_view{name}, fn, validate, userdata);
+	return which->register_abi_module(std::string_view{name}, fn, options.validate, userdata);
 }
 
 std::int32_t lesh_prompt_module_exists(lesh_registry* registry, const char* name,
@@ -937,9 +1039,8 @@ std::int32_t lesh_prompt_use_default(lesh_registry* registry, std::uint32_t surf
 	return LESH_OK;
 }
 
-std::int32_t lesh_prompt_place(lesh_registry* registry, std::uint32_t surface, const char* name,
-                               const char* style, const char* type, const char* prefix,
-                               const char* postfix) {
+std::int32_t lesh_prompt_set_placements(lesh_registry* registry, std::uint32_t surface,
+                                        const lesh_prompt_placement* items, std::size_t count) {
 	if (registry == nullptr)
 		return LESH_ERR_INVAL;
 	engine* which = engine_of(registry);
@@ -949,14 +1050,16 @@ std::int32_t lesh_prompt_place(lesh_registry* registry, std::uint32_t surface, c
 	if (!surface_of(surface, target))
 		return LESH_ERR_INVAL;
 
-	switch (which->place(target, text_of(name), text_of(style), text_of(type), text_of(prefix),
-	                     text_of(postfix))) {
-		case place_result::ok:             return LESH_OK;
-		case place_result::unknown_module: return LESH_ERR_NOTFOUND;
-		case place_result::bad_style:      return 1;
-		case place_result::bad_type:       return 2;
+	// `count == 0` IS THE EMPTY SURFACE, `items` unread - the same rule
+	// `lesh_prompt_clear` gives directly, and cheaper: nothing to validate.
+	if (count == 0) {
+		which->clear(target);
+		return LESH_OK;
 	}
-	return LESH_ERR_INVAL;
+	if (items == nullptr)
+		return LESH_ERR_INVAL;
+
+	return which->set_placements(target, items, count);
 }
 
 std::int32_t lesh_prompt_set(lesh_registry* registry, std::uint32_t surface, const char* text,
@@ -1005,30 +1108,6 @@ std::int32_t lesh_prompt_text(lesh_registry* registry, std::uint32_t surface, ch
 	if (!surface_of(surface, target))
 		return LESH_ERR_INVAL;
 	return copy_out(which->template_text(target), out, capacity, length_out);
-}
-
-std::int32_t lesh_prompt_group_open(lesh_registry* registry, std::uint32_t surface) {
-	if (registry == nullptr)
-		return LESH_ERR_INVAL;
-	engine* which = engine_of(registry);
-	if (which == nullptr)
-		return LESH_ERR_NOTFOUND;
-	surface_id target = surface_id::left;
-	if (!surface_of(surface, target))
-		return LESH_ERR_INVAL;
-	return which->open_group(target) ? LESH_OK : LESH_ERR_REFUSED;
-}
-
-std::int32_t lesh_prompt_group_close(lesh_registry* registry, std::uint32_t surface) {
-	if (registry == nullptr)
-		return LESH_ERR_INVAL;
-	engine* which = engine_of(registry);
-	if (which == nullptr)
-		return LESH_ERR_NOTFOUND;
-	surface_id target = surface_id::left;
-	if (!surface_of(surface, target))
-		return LESH_ERR_INVAL;
-	return which->close_group(target) ? LESH_OK : LESH_ERR_REFUSED;
 }
 
 } // extern "C"
