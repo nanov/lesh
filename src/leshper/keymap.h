@@ -197,6 +197,10 @@ public:
 	static constexpr std::string_view vi_visual = "vi_visual";
 	static constexpr std::string_view vi_find_char = "vi_find_char";
 	static constexpr std::string_view vi_replace_char = "vi_replace_char";
+	// The pager's sub-mode (#138). Named here for the same reason the seven
+	// above are: registry.cpp's ABI doors push and pop it through THIS constant,
+	// so the map the pager opens and the map that closes it cannot drift.
+	static constexpr std::string_view pager = "pager";
 
 	// Creates (or replaces) `name`, optionally as a copy of `copy_from`. Null
 	// `copy_from` makes an empty one; a non-null name that does not exist is a

@@ -766,6 +766,50 @@ void keymap_registry::install_defaults() {
 	keymap* replace_map = create("vi_replace_char");
 	replace_map->opaque = true;
 	replace_map->default_action = "vi_replace_char_with";
+
+	// --- pager: the map #117 was shaped for (#138, F-28 to F-30) -------------
+	//
+	// OPAQUE WITH A DEFAULT ACTION, which is the whole of the pager's dispatch.
+	// #117 decision 4 promised "the pager needs zero special dispatch" and this
+	// is what cashes it: opaque stops the lookup AND takes the `self_insert`
+	// floor with it, so a printable typed over an open pager cannot reach the
+	// buffer; the default action then routes it to the filter, which is F-29.
+	// editor.cpp has no branch for any of it.
+	//
+	// NO INDICATOR, deliberately. F-40's indicator reads the topmost keymap that
+	// declares one, and a pager is a thing you can SEE - it is on the screen
+	// under the line. Declaring one would blank VISUAL while a pager was open
+	// over visual mode, which is the case keymap.h's note about this map names.
+	keymap* pager_map = create(pager);
+	pager_map->opaque = true;
+	pager_map->default_action = "pager_filter_key";
+	// Tab cycles, which is what Tab has meant in a menu since tcsh. `<S-Tab>`
+	// parses today and the decoder does not read CSI Z yet (keymap.h says so);
+	// binding it is the notation and the decoder growing into each other.
+	bind_notation(*pager_map, "<Tab>", "pager_next");
+	bind_notation(*pager_map, "<S-Tab>", "pager_previous");
+	// Left and Right walk the row, Up and Down walk the column. The grid is
+	// row-major - candidates fill across then down - so a row step is the grid's
+	// width, which is a question about the terminal that `lesh_pager_move`'s
+	// axis argument asks the editor rather than guessing here.
+	bind_notation(*pager_map, "<Right>", "pager_next");
+	bind_notation(*pager_map, "<Left>", "pager_previous");
+	bind_notation(*pager_map, "<Down>", "pager_next_row");
+	bind_notation(*pager_map, "<Up>", "pager_previous_row");
+	// Enter accepts, and BOTH spellings of it, for the reason read.cpp's
+	// `bind_line_keys` gives: the key sends U+000D and a raw-mode terminal may
+	// hand back either. This is not F-35's question - there is no line to decide
+	// about, only a candidate to take - so binding it here answers nothing
+	// quietly.
+	bind_notation(*pager_map, "<C-m>", "pager_accept");
+	bind_notation(*pager_map, "<C-j>", "pager_accept");
+	bind_notation(*pager_map, "<Esc>", "pager_close");
+	bind_notation(*pager_map, "<C-g>", "pager_close");
+	// Three spellings of Backspace, the same three every other default table
+	// carries.
+	bind_notation(*pager_map, "<BS>", "pager_filter_backspace");
+	bind_notation(*pager_map, "<C-h>", "pager_filter_backspace");
+	bind_notation(*pager_map, "<BSKey>", "pager_filter_backspace");
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +822,10 @@ editing_context::editing_context() {
 	// (#119). Its context is a member above, which is what gives the userdata
 	// pointer in every one of those registrations an owner (ADR-0007).
 	register_vi_actions(_actions, _vi.get());
+	// The pager's actions (#138), through the same ABI and by the same rule.
+	// Registered with a null context because they have none to need: everything
+	// the pager remembers is editor state, which the handle reaches.
+	register_pager_actions(_actions);
 	_keymaps.install_defaults();
 }
 

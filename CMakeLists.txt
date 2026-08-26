@@ -199,6 +199,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/layout.h
 	src/leshper/pager.cpp
 	src/leshper/pager.h
+	src/leshper/pager_actions.cpp
 	src/leshper/sgr.h
 	src/leshper/loop.cpp
 	src/leshper/loop.h

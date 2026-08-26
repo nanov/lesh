@@ -1,12 +1,15 @@
 #include "leshper/registry.h"
 
 #include "leshper/editor.h"
+#include "leshper/keymap.h"
+#include "leshper/pager.h"
 #include "substrate/assert.h"
 #include "substrate/grapheme.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -513,6 +516,78 @@ void memo_store(command_kind_memo& memo, std::string_view name, std::uint32_t ki
 	++memo.used;
 }
 
+// --- The pager (#138), the parts that are not the doors themselves --------
+
+using lesh::leshper::pager_candidate;
+using lesh::leshper::pager_decision;
+using lesh::leshper::pager_grid;
+using lesh::leshper::pager_kind;
+using lesh::leshper::pager_state;
+
+// The C numbers and the C++ enumerators are one space, and this is what keeps
+// them one - the same guard `command_kind` gets above, for the same reason.
+static_assert(static_cast<std::uint32_t>(pager_kind::plain) == LESH_PAGER_PLAIN);
+static_assert(static_cast<std::uint32_t>(pager_kind::word) == LESH_PAGER_WORD);
+static_assert(static_cast<std::uint32_t>(pager_kind::directory) == LESH_PAGER_DIRECTORY);
+static_assert(static_cast<std::uint32_t>(pager_kind::executable) == LESH_PAGER_EXECUTABLE);
+static_assert(static_cast<std::uint32_t>(pager_kind::symlink) == LESH_PAGER_SYMLINK);
+
+// The keymap `commit` pushes and `close` pops, by the ONE name that is its
+// identity (#117 decision 3). Reached through keymap.h rather than spelled again
+// here: a name written in two places is a name that will be misspelled in one,
+// and this is the pair where the misspelling would be a pager that opened
+// without a keymap and could not be closed.
+constexpr std::string_view pager_keymap_name = lesh::leshper::keymap_registry::pager;
+
+bool kind_is_known(std::uint32_t kind) noexcept {
+	return kind <= LESH_PAGER_SYMLINK;
+}
+
+// The grid the CURRENT terminal size implies. The row question a binding cannot
+// answer for itself, which is why `lesh_pager_move` takes an axis rather than a
+// candidate count.
+//
+// THE DEFAULT WIDTH POLICY, and the one place that is a compromise: #108's
+// policy lives in the LOOP's options, not in `state`, so the ABI cannot reach
+// the one the renderer will use. The two agree for every candidate that has no
+// ambiguous-width character in it, which is every command name and every
+// pathname on a POSIX system; where they could differ, the cost is a row step
+// that moves by a column too many or too few, and the renderer still puts the
+// selection on screen. Making them agree means putting the policy on `state`,
+// which is a change to what a state IS and belongs with the ticket that gives
+// the policy a configuration surface (#101).
+pager_grid grid_of(const lesh_editor* editor) noexcept {
+	const lesh::leshper::state& target = *editor->target;
+	return lesh::leshper::measure_pager(target.pager, target.columns,
+	                                    lesh::leshper::pager_row_budget(target.rows));
+}
+
+// The one place a candidate becomes buffer text. Staged, cursor after it.
+void stage_insertion(lesh_editor* editor, std::string_view with) {
+	const std::string_view text{editor->staged};
+	const pager_state& pager = editor->target->pager;
+	std::size_t begin = clamp_into(text, pager.replace_from.byte_offset());
+	std::size_t end = clamp_into(text, pager.replace_to.byte_offset());
+	if (end < begin)
+		std::swap(begin, end);
+	begin = snap_back(text, begin);
+	end = snap_forward(text, end);
+	editor->staged.replace(begin, end - begin, with.data(), with.size());
+	editor->buffer_written = true;
+	editor->staged_cursor = begin + with.size();
+	editor->cursor_written = true;
+}
+
+// Drops the pager AND the layer it pushed. Popping only when the top layer is
+// the pager's is what keeps a client that closed the pager from popping a mode
+// somebody else had pushed above it.
+void close_pager(lesh_editor* editor) {
+	lesh::leshper::state& target = *editor->target;
+	if (target.pager.open && !target.keymaps.layers.empty()
+	    && target.keymaps.layers.back() == pager_keymap_name)
+		target.keymaps.pop();
+	target.pager.clear();
+}
 } // namespace
 
 // ===========================================================================
@@ -1333,6 +1408,187 @@ int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind) {
 	// changes its mind leaves the screen as it found it.
 	editor->dismissed_kind = kind;
 	editor->dismiss_requested = true;
+	return LESH_OK;
+}
+
+// --- The pager (#138, F-28 to F-30, spec §6.9) ------------------------------
+//
+// WRITTEN THROUGH TO THE STATE, like the mode and the keymap stack, and for the
+// same two reasons: the pager is not in the undo history, and dispatch reads the
+// keymap stack back the instant the action returns. The one exception is the one
+// thing that touches the buffer - the insertion below - which stages exactly as
+// `lesh_buffer_replace` stages, so A-12's "through the accepting action, as one
+// undo entry" holds without the pager being privileged.
+
+int32_t lesh_pager_open(lesh_editor* editor, size_t from, size_t to) {
+	LESH_EDITOR_HANDLE(editor);
+	close_pager(editor);
+
+	const std::string_view text{editor->staged};
+	std::size_t begin = clamp_into(text, from);
+	std::size_t end = clamp_into(text, to);
+	if (end < begin)
+		std::swap(begin, end);
+	pager_state& pager = editor->target->pager;
+	pager.replace_from = position::from_byte_offset(snap_back(text, begin));
+	pager.replace_to = position::from_byte_offset(snap_forward(text, end));
+	return LESH_OK;
+}
+
+int32_t lesh_pager_add(lesh_editor* editor, const char* bytes, size_t length,
+                       uint32_t kind) {
+	LESH_EDITOR_HANDLE(editor);
+	if (bytes == nullptr && length != 0)
+		return LESH_ERR_INVAL;
+	if (!kind_is_known(kind))
+		return LESH_ERR_INVAL;
+	pager_candidate one;
+	one.text.assign(bytes == nullptr ? "" : bytes, length);
+	one.kind = static_cast<pager_kind>(kind);
+	editor->target->pager.candidates.push_back(std::move(one));
+	return LESH_OK;
+}
+
+int32_t lesh_pager_commit(lesh_editor* editor, uint32_t* outcome_out) {
+	LESH_EDITOR_HANDLE(editor);
+	pager_state& pager = editor->target->pager;
+	lesh::leshper::pager_refilter(pager);
+
+	// What the user has typed of the span, read from the STAGED bytes: an action
+	// that edited before committing is completing what it wrote.
+	const std::string_view text{editor->staged};
+	const std::size_t begin = clamp_into(text, pager.replace_from.byte_offset());
+	const std::size_t end = clamp_into(text, pager.replace_to.byte_offset());
+	const std::string_view typed =
+		end > begin ? text.substr(begin, end - begin) : std::string_view{};
+
+	const pager_decision decided = lesh::leshper::decide_pager(pager, typed);
+	std::uint32_t outcome = LESH_PAGER_NOTHING;
+	switch (decided.what) {
+		case pager_decision::kind::nothing:
+			close_pager(editor);
+			break;
+		case pager_decision::kind::insert:
+			// F-30: the pager never opens. The insertion is staged, so the
+			// common prefix and the accepted candidate reach the buffer down the
+			// identical path.
+			stage_insertion(editor, decided.text);
+			close_pager(editor);
+			outcome = LESH_PAGER_INSERTED;
+			break;
+		case pager_decision::kind::open:
+			pager.open = true;
+			pager.selected = 0;
+			pager.scroll_row = 0;
+			editor->target->keymaps.push(pager_keymap_name);
+			outcome = LESH_PAGER_OPENED;
+			break;
+	}
+	if (outcome_out != nullptr)
+		*outcome_out = outcome;
+	return LESH_OK;
+}
+
+int32_t lesh_pager_accept(lesh_editor* editor) {
+	LESH_EDITOR_HANDLE(editor);
+	const pager_candidate* one = lesh::leshper::pager_selected(editor->target->pager);
+	if (one == nullptr)
+		return LESH_ERR_NOTFOUND;
+	std::string with;
+	lesh::leshper::pager_insertion(*one, with);
+	stage_insertion(editor, with);
+	close_pager(editor);
+	return LESH_OK;
+}
+
+int32_t lesh_pager_close(lesh_editor* editor) {
+	LESH_EDITOR_HANDLE(editor);
+	close_pager(editor);
+	return LESH_OK;
+}
+
+int32_t lesh_pager_status(lesh_editor* editor, int32_t* open_out, size_t* count_out,
+                          size_t* selected_out) {
+	LESH_EDITOR_HANDLE(editor);
+	const pager_state& pager = editor->target->pager;
+	if (open_out != nullptr)
+		*open_out = pager.showing() ? 1 : 0;
+	if (count_out != nullptr)
+		*count_out = pager.matching.size();
+	if (selected_out != nullptr)
+		*selected_out = pager.selected;
+	return LESH_OK;
+}
+
+int32_t lesh_pager_range(lesh_editor* editor, size_t* from_out, size_t* to_out) {
+	LESH_EDITOR_HANDLE(editor);
+	const pager_state& pager = editor->target->pager;
+	if (!pager.open)
+		return LESH_ERR_NOTFOUND;
+	if (from_out != nullptr)
+		*from_out = pager.replace_from.byte_offset();
+	if (to_out != nullptr)
+		*to_out = pager.replace_to.byte_offset();
+	return LESH_OK;
+}
+
+int32_t lesh_pager_selected(lesh_editor* editor, char* out, size_t capacity,
+                            size_t* length_out, uint32_t* kind_out) {
+	LESH_EDITOR_HANDLE(editor);
+	const pager_candidate* one = lesh::leshper::pager_selected(editor->target->pager);
+	if (one == nullptr) {
+		if (length_out != nullptr)
+			*length_out = 0;
+		return LESH_ERR_NOTFOUND;
+	}
+	if (kind_out != nullptr)
+		*kind_out = static_cast<std::uint32_t>(one->kind);
+	return copy_out(one->text, out, capacity, length_out);
+}
+
+int32_t lesh_pager_move(lesh_editor* editor, int64_t by, uint32_t axis) {
+	LESH_EDITOR_HANDLE(editor);
+	pager_state& pager = editor->target->pager;
+	if (!pager.showing())
+		return LESH_ERR_NOTFOUND;
+	if (axis != LESH_PAGER_BY_CANDIDATE && axis != LESH_PAGER_BY_ROW)
+		return LESH_ERR_INVAL;
+
+	const pager_grid grid = grid_of(editor);
+	// A row is as wide as the grid is, which is a question about the terminal
+	// the binding is not holding. One column - the answer at an unknown size -
+	// makes a row move a candidate move, which is the honest degradation.
+	const std::int64_t step = axis == LESH_PAGER_BY_ROW
+	                              ? static_cast<std::int64_t>(std::max<std::uint16_t>(1, grid.columns))
+	                              : 1;
+	lesh::leshper::pager_move(pager, by * step);
+	lesh::leshper::pager_reveal(pager, grid);
+	return LESH_OK;
+}
+
+int32_t lesh_pager_filter_push(lesh_editor* editor, const char* bytes, size_t length) {
+	LESH_EDITOR_HANDLE(editor);
+	if (bytes == nullptr && length != 0)
+		return LESH_ERR_INVAL;
+	pager_state& pager = editor->target->pager;
+	if (!pager.open)
+		return LESH_ERR_NOTFOUND;
+	if (length == 0)
+		return LESH_OK;
+	pager.filter.append(bytes, length);
+	lesh::leshper::pager_refilter(pager);
+	lesh::leshper::pager_reveal(pager, grid_of(editor));
+	return LESH_OK;
+}
+
+int32_t lesh_pager_filter_pop(lesh_editor* editor) {
+	LESH_EDITOR_HANDLE(editor);
+	pager_state& pager = editor->target->pager;
+	if (!pager.open)
+		return LESH_ERR_NOTFOUND;
+	if (!lesh::leshper::pager_filter_pop(pager))
+		return LESH_ERR_NOTFOUND;
+	lesh::leshper::pager_reveal(pager, grid_of(editor));
 	return LESH_OK;
 }
 
