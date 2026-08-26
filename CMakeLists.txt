@@ -191,6 +191,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/blit.h
 	src/leshper/abi.h
 	src/leshper/builtin_actions.cpp
+	src/leshper/complete.cpp
+	src/leshper/complete.h
 	src/leshper/builtin_reactors.cpp
 	src/leshper/editor.cpp
 	src/leshper/editor.h
