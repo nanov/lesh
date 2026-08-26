@@ -43,6 +43,8 @@ enum class builtin_kind {
 // Declared in runtime/builtins.h; only POINTED AT here, so shell_state can hold
 // the `bind` seam (#134) without this header depending on the builtin table.
 class binding_console;
+// The prompt's, on the same terms (#157). Two consoles, one rule.
+class prompt_console;
 
 class shell_state final : public parameter_source,
                           public arithmetic_variables,
@@ -519,6 +521,21 @@ public:
 	}
 	[[nodiscard]] binding_console* console() const noexcept { return _binding_console; }
 
+	// The prompt registry a configuration builtin will reach, or null when there
+	// is no line editor (#157, §6.10). Installed and taken away by the same owner
+	// on the same terms as the binding console above - non-owning, per-shell,
+	// alive for exactly as long as the session that lent it, and null in every
+	// non-interactive shell.
+	//
+	// NOT THE PROMPT PROVIDER, which is leshper's own `prompt_source` and reads
+	// `$PS1`. That one answers "what bytes is the prompt"; this one answers "what
+	// is the prompt MADE OF", and §6.10 has the second superseding the first
+	// rather than either growing into the other.
+	void set_prompt_console(prompt_console* console) noexcept {
+		_prompt_console = console;
+	}
+	[[nodiscard]] prompt_console* prompts() const noexcept { return _prompt_console; }
+
 private:
 	struct variable {
 		std::string value;
@@ -573,6 +590,10 @@ private:
 	// Non-owning; see set_binding_console. Null in every non-interactive shell,
 	// which is what makes `bind` say "no line editor" rather than pretend.
 	binding_console* _binding_console = nullptr;
+	// Non-owning; see set_prompt_console. Null in every non-interactive shell,
+	// which is what a prompt-configuration builtin will answer "no line editor"
+	// from, exactly as `bind` does today.
+	prompt_console* _prompt_console = nullptr;
 	// Backing store for option_flags(). Rebuilt on demand and mutable because
 	// parameter_source::option_flags() is const, for the same reason
 	// environment_block() owns its strings: the returned view must outlive the call.

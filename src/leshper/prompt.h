@@ -883,7 +883,12 @@ enum class surface_id : std::uint8_t {
 // re-read - a slot that is not due is memcpy'd, not recomputed. A changed `$?`
 // or a changed `$PWD` is a NEW PROMPT and goes through `render_full`.
 //
-// LOOP-THREAD ONLY, like every other registry here (#93). No locking anywhere.
+// LOOP-THREAD ONLY, like every other registry here (#93). No locking anywhere,
+// and the rule is really "one thread at a time": #157's wiring calls
+// `render_full` from the SHELL thread, in the window ADR-0009 gives it while the
+// loop is blocked in `wait_on_shell` - the same window `loop_options::prompt` has
+// been written in since #129. `render_tick` is the loop's own. See
+// `session::refresh_prompt` in read.cpp, where the argument is made in full.
 class engine {
 public:
 	engine();
@@ -939,6 +944,26 @@ public:
 
 	// False when none is open.
 	bool close_group(surface_id which);
+
+	// Whether anything has configured this engine - false until the first of the
+	// six verbs above has run, from C++ or across the ABI, and true from then on.
+	//
+	// THIS IS WHAT LETS `$PS1` STAY THE DEFAULT WITHOUT BEING THE FUTURE. §6.10
+	// makes `PS1`/`PS2` a transitional stub, rendered as literal bytes "as it does
+	// today", superseded by the native prompt rather than grown into a POSIX
+	// expansion vocabulary. Supersession is a trajectory, and in v1 - with the
+	// configuration builtin still a follow-up and the ABI the only way in - a
+	// shell nobody has configured must still print the `PS1` its user set, or the
+	// stub would have been removed rather than kept. So the wiring site asks this
+	// one question: an untouched engine leaves the prompt to `PS1`, and the moment
+	// anything configures one the native engine owns it, for the rest of the
+	// session.
+	//
+	// NOT REGAINED. There is no un-configure: `clear` and `use_default` are
+	// themselves configuration, and `use_default` in particular is how a user asks
+	// for the shipped prompt back - which is a native prompt and emphatically not
+	// a request to be handed `$PS1` again.
+	[[nodiscard]] bool configured() const noexcept { return _configured; }
 
 	// --- Rendering ---
 
@@ -1069,7 +1094,49 @@ private:
 	// makes it possible.
 	std::vector<sink> _scratch;
 	sink _top;
+
+	// See `configured()`. The constructor's own seeding of the default table
+	// deliberately does not set it - that is the engine arriving with something to
+	// render, not a user asking for it.
+	bool _configured = false;
 };
+
+// ---------------------------------------------------------------------------
+// The tick timer's interval
+// ---------------------------------------------------------------------------
+
+// What to arm the loop's prompt timer with, given the engine's `next_wake()` and
+// the tick the render was computed at. Milliseconds, because `lesh_timer_start`
+// counts in them and the wheel counts in ticks; zero means NO TIMER, which is
+// `next_wake()`'s own zero carried through - a static prompt causes zero idle
+// wakeups (§6.10) and that has to survive this conversion.
+//
+// PURE, and in the header, because the wiring that arms the timer runs on the
+// loop thread inside a session and the arithmetic is the part worth testing on
+// its own. A wiring site is hard to reach from a test; a function is not.
+//
+// PAST-DUE CLAMPS TO ONE TICK rather than to zero: a deadline that has already
+// gone by means the loop was busy, and the answer is "fire at the next
+// opportunity", not "fire never" (which zero means here) and not "fire with a
+// zero interval" (which `lesh_timer_start` refuses). The same floor catches a
+// sub-tick request, so nothing this returns is ever below the 10 ms grid.
+[[nodiscard]] constexpr std::uint64_t timer_interval_ms(std::uint64_t next_wake_tick,
+                                                        std::uint64_t now_tick) noexcept {
+	if (next_wake_tick == 0)
+		return 0;
+	if (next_wake_tick <= now_tick)
+		return 10;
+	return (next_wake_tick - now_tick) * 10;
+}
+
+static_assert(timer_interval_ms(0, 0) == 0);
+static_assert(timer_interval_ms(0, 12345) == 0);
+// One tick out is one tick of milliseconds; ten is a hundred.
+static_assert(timer_interval_ms(101, 100) == 10);
+static_assert(timer_interval_ms(110, 100) == 100);
+// Due now, and overdue by a parked minute: the floor, not zero and not a burst.
+static_assert(timer_interval_ms(100, 100) == 10);
+static_assert(timer_interval_ms(100, 6100) == 10);
 
 // ---------------------------------------------------------------------------
 // Compile-time selftests

@@ -157,6 +157,14 @@ engine::engine() {
 
 	use_default(surface_id::left);
 	use_default(surface_id::continuation);
+
+	// AND UNSET AGAIN, last thing. The two calls above are the engine arriving
+	// with something to render - `render_full` on a fresh engine has to answer
+	// bytes - and not a user asking for the native prompt. `configured()` is the
+	// wiring site's question about INTENT (see its comment), so the constructor
+	// must not answer it on the user's behalf; the same `use_default` typed by a
+	// user does.
+	_configured = false;
 }
 
 engine::~engine() = default;
@@ -248,6 +256,12 @@ void engine::module_names(std::vector<std::string>& out) const {
 // ---------------------------------------------------------------------------
 
 void engine::clear(surface_id which) {
+	// THE FLAG IS SET BY THE VERBS AND BY NOTHING ELSE, and here rather than in
+	// six places because `use_default` goes through this one. The other four set
+	// it where they succeed - a verb that changed nothing configured nothing, so
+	// an `add_module` for a name nobody registered leaves `$PS1` in charge.
+	_configured = true;
+
 	surface& target = at(which);
 	target.nodes.clear();
 	target.bytes.clear();
@@ -306,6 +320,7 @@ bool engine::add_module(surface_id which, std::string_view name, std::string_vie
 	made->data = &made->bound;
 
 	place(at(which), std::move(made));
+	_configured = true;
 	return true;
 }
 
@@ -318,6 +333,7 @@ void engine::add_literal(surface_id which, std::string_view bytes) {
 	made->data = &made->bound;
 
 	place(at(which), std::move(made));
+	_configured = true;
 }
 
 bool engine::open_group(surface_id which) {
@@ -332,6 +348,7 @@ bool engine::open_group(surface_id which) {
 	// Top level only: `place` would have put it inside the open group, and there
 	// is no open group here by the check above.
 	target.open = &place(target, std::move(made));
+	_configured = true;
 	return true;
 }
 
@@ -340,6 +357,7 @@ bool engine::close_group(surface_id which) {
 	if (target.open == nullptr)
 		return false;
 	target.open = nullptr;
+	_configured = true;
 	return true;
 }
 

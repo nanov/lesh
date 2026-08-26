@@ -2512,6 +2512,14 @@ static_assert(registry_agrees_with_handlers(),
 // registry itself is reached from `state` and is owned there (spec §6.4).
 binding_console::~binding_console() = default;
 
+// And the prompt's, on the same terms (#157, §6.10). The vtable needs a key
+// function in one translation unit whether or not anything calls the class, and
+// in v1 nothing in this file does: the configuration builtin is the recorded
+// follow-up, and the ABI verbs reach the engine through the registry rather than
+// through here. So this line is the whole of the runtime side's prompt code,
+// which is what a seam that is only a seam ought to weigh.
+prompt_console::~prompt_console() = default;
+
 int report_bad_number(std::string_view builtin, std::string_view operand,
                       numeric_parse why) {
 	// Worded the way lesh's other builtins word an operand they refuse -

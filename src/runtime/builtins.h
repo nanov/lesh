@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -271,6 +272,98 @@ protected:
 // off file scope the moment there was a loop to own it, exactly as the note that
 // stood here said it would - so two shells in one process (a test's, and the
 // one under it) can no longer be handed each other's keymaps.
+
+// ---------------------------------------------------------------------------
+// The prompt, and the same link boundary again (#157, spec §6.10).
+// ---------------------------------------------------------------------------
+//
+// THE SAME PROBLEM AND THEREFORE THE SAME SHAPE - §6.10 says so in as many
+// words: "`prompt_console` beside `binding_console`". The prompt registry, the
+// composer and the tick wheel live in leshper (`src/leshper/prompt.h`), and
+// `lesh_runtime` does not link `lesh_leshper`; a builtin in this file cannot
+// call `engine::add_module` any more than it can call a keymap function. So the
+// runtime declares what a configuration builtin needs to SAY, and the wiring
+// site - `src/leshper/read.cpp`, the one translation unit that links both
+// halves - hands it a leshper-backed implementation for the life of a session.
+//
+// NOTHING IN THIS FILE CALLS IT IN v1, and that is deliberate rather than
+// unfinished. §6.10 scopes v1 to "the registry, the composer, the tick wheel, a
+// `constexpr` default prompt table, and configuration through the ABI"; the
+// `bind`-shaped builtin and the `{module:style:type}` template language are the
+// recorded follow-up, because the builtin's operand grammar is the template
+// language's grammar and inventing half of it now would be inventing the half
+// that has to be kept. What v1 needs from this class is that the seam exist and
+// be installed the day the session starts, so the builtin, when it is written,
+// finds a console rather than a reason to re-open this argument.
+//
+// The C ABI verbs (`lesh_prompt_add_module` and friends) are the other caller,
+// and the language-neutral one NG-4 says the Lua binding reuses unchanged. They
+// reach the engine through the registry, not through here: this is the in-tree
+// C++ door, and the two are deliberately not layered on one another.
+class prompt_console {
+public:
+	virtual ~prompt_console();
+
+	prompt_console(const prompt_console&) = delete;
+	prompt_console& operator=(const prompt_console&) = delete;
+
+	// Which prompt is being configured. §6.10's two v1 surfaces; the right and
+	// transient prompts are #156's and arrive as new enumerators. It mirrors
+	// leshper's own `surface_id` and is deliberately a SECOND enum rather than a
+	// shared one - a shared one would be a header of leshper's included here,
+	// which is the link the whole arrangement exists to avoid.
+	enum class surface : std::uint8_t {
+		left,
+		continuation,
+	};
+
+	// How an operation ended, one space for all six verbs - `binding_console`'s
+	// reasoning, and it applies unchanged: the caller's job is to turn each into
+	// a message and a status, and a per-verb enum would make that six switches
+	// that drift.
+	enum class outcome {
+		ok,
+		no_such_module,
+		unbalanced_group,
+	};
+
+	// Every registered module's name, sorted. The listing verb, `bind -l`'s
+	// opposite number.
+	virtual void module_names(std::vector<std::string>& into) const = 0;
+
+	// Empties a surface. A prompt configured from nothing starts here.
+	virtual outcome clear(surface which) = 0;
+
+	// Puts the shipped default table back, which is also how a user undoes a
+	// configuration without restarting the shell.
+	virtual outcome use_default(surface which) = 0;
+
+	// Places a registered module, with its bound argument (`env` takes a variable
+	// name, `path` a style). `no_such_module` when nothing is registered under
+	// that name - a placement is not a registration (§6.10: modules are singletons
+	// with free placement, so the same name may be placed more than once).
+	virtual outcome add_module(surface which, std::string_view name,
+	                           std::string_view arg) = 0;
+
+	// Places literal bytes - the grammar between the modules.
+	virtual outcome add_literal(surface which, std::string_view bytes) = 0;
+
+	// Opens and closes a group: the thing that shows iff a module inside it is
+	// ready, taking its literals and styles with it when it does not. Groups do
+	// not nest in v1, so a second open answers `unbalanced_group`, as does a close
+	// with nothing open.
+	virtual outcome open_group(surface which) = 0;
+	virtual outcome close_group(surface which) = 0;
+
+protected:
+	prompt_console() = default;
+};
+
+// Installed the same way and in the same place: `state.set_prompt_console(&c)`,
+// read back through `state.prompts()`. Null in every non-interactive shell, for
+// the same reason `console()` is - a `lesh -c` has no line editor and therefore
+// no prompt engine, and the honest answer to configuring one is that there is
+// none.
 
 // Where a utility's OPERANDS begin, having discarded a leading `--`.
 //

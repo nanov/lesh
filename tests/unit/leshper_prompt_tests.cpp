@@ -12,6 +12,11 @@
 #include "leshper/prompt.h"
 #include "leshper/registry.h"
 #include "leshper/git_head.h"
+// The runtime's half of the seam (#157): `prompt_console` is declared there and
+// installed on `shell_state`, and this file is one of the places both halves are
+// linked - the same standing `leshper_keymap_tests.cpp` has for `bind`.
+#include "runtime/builtins.h"
+#include "runtime/shell_state.h"
 #include "temp_path.h"
 
 #include <gtest/gtest.h>
@@ -19,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -1250,6 +1256,288 @@ TEST_F(LeshperPromptGit, AHungFallbackIsKilledAndTheProbeReturns) {
 	// Generous: the bound that matters is "well under the stub's five seconds",
 	// and a loaded machine under three sanitizers is not a stopwatch.
 	EXPECT_LT(elapsed, 1500) << "the probe waited " << elapsed << "ms";
+}
+
+// ---------------------------------------------------------------------------
+// --- git through the composer, and the gate it guards (#157) ---
+// ---------------------------------------------------------------------------
+//
+// The reader has its own cases above; these two are about what the COMPOSER
+// does with it, which is a different question and the one §6.10's performance
+// floor rests on.
+
+TEST_F(LeshperPromptGit, TheDefaultTableRendersTheBranchItIsStandingIn) {
+	const std::string repo = make_repo("composed", "ref: refs/heads/topic\n");
+	write_text(repo + "/.git/refs/heads/topic", sha40('d') + "\n");
+
+	// The shipped table, unconfigured, against a real repository - so this is the
+	// whole path a user gets on a fresh shell: `seg<magenta, " on ", git>` votes
+	// ready, brings its literal with it, and the branch appears.
+	engine which;
+	prompt::state facts = quiet();
+	facts.pwd = repo;
+	facts.home = std::string_view{};
+	// The one fact that lets a budgeted module touch the disk at all.
+	facts.fs_allowed = true;
+	which.render_full(facts);
+
+	const std::string_view left = which.output(surface_id::left);
+	EXPECT_NE(left.find(" on topic"), std::string_view::npos) << left;
+
+	// And the same table outside a repository says nothing at all about git - the
+	// seg's literal vanishing with the module, which the compile-time selftests
+	// check against synthetic facts and this checks against a real filesystem.
+	const std::string bare = at("not_a_repo");
+	make_dirs(bare);
+	prompt::state elsewhere = facts;
+	elsewhere.pwd = bare;
+	which.render_full(elsewhere);
+	EXPECT_EQ(which.output(surface_id::left).find(" on "), std::string_view::npos)
+		<< which.output(surface_id::left);
+}
+
+// THE GATE #157 NAMES, and the one that would be expensive to get wrong: a
+// spinner ticking beside `git` must not drag `git` along with it. §6.10 is
+// explicit - "a tick that animates a spinner re-invokes the spinner alone and
+// `git`'s slot is memcpy'd" - and the cost of the defect is a `.git/HEAD` read,
+// possibly on an NFS mount, ten times a second.
+//
+// The assertion is made against the FILESYSTEM rather than against a call
+// counter, because a counter would only prove the engine did not call the
+// function this test registered. Moving the branch on disk under the running
+// prompt proves the bytes came from the slot: had the tick re-read anything, it
+// would have read `two`.
+TEST_F(LeshperPromptGit, ATickSplicesGitsSlotAndOnlyANewPromptRereadsIt) {
+	const std::string repo = make_repo("ticking", "ref: refs/heads/one\n");
+	write_text(repo + "/.git/refs/heads/one", sha40('e') + "\n");
+	write_text(repo + "/.git/refs/heads/two", sha40('f') + "\n");
+
+	counter spinner;
+	spinner.label = "|";
+	spinner.wake = 3;
+
+	engine which;
+	which.register_module("spinner", &counting_module, &spinner);
+	which.clear(surface_id::left);
+	which.add_module(surface_id::left, "git", "");
+	which.add_literal(surface_id::left, " ");
+	which.add_module(surface_id::left, "spinner", "");
+
+	prompt::state facts = quiet();
+	facts.pwd = repo;
+	facts.fs_allowed = true;
+	facts.tick = 0;
+	which.render_full(facts);
+	EXPECT_EQ(which.output(surface_id::left), "one |1");
+	EXPECT_EQ(which.next_wake(), 3u);
+
+	// The branch moves, under a prompt that is already on screen.
+	write_text(repo + "/.git/HEAD", "ref: refs/heads/two\n");
+
+	facts.tick = 3;
+	EXPECT_TRUE(which.render_tick(facts));
+	// The spinner advanced; `git` did not. Its slot was spliced whole.
+	EXPECT_EQ(which.output(surface_id::left), "one |2");
+
+	// A NEW PROMPT is the cause that re-reads it - the only one that does
+	// (§6.10's three reasons, and `git` answers exactly one of them).
+	facts.tick = 4;
+	which.render_full(facts);
+	EXPECT_EQ(which.output(surface_id::left), "two |3");
+}
+
+// ---------------------------------------------------------------------------
+// --- the runtime seam (#157, §6.10) ---
+// ---------------------------------------------------------------------------
+//
+// WHERE `timer_interval_ms`'S COVERAGE IS: in prompt.h, as `static_assert`s
+// beside the function. It is a pure integer expression with four cases and the
+// compiler checks all four in every translation unit that includes the header,
+// which is a stronger statement than a test that runs on this binary only - and
+// the same discipline the composer's omission rules already follow.
+//
+// WHERE `leshper_prompt_console`'S IS NOT: it stays anonymous in read.cpp,
+// unreachable from here, and that is `binding_console`'s precedent exactly -
+// that adapter is tested through `bind`, and v1 has no prompt builtin to test
+// this one through. Contorting the design to make an untestable-by-necessity
+// class reachable would be paying for the follow-up ticket's test in this
+// ticket's code. What IS asserted here is the seam's own contract: the interface
+// is implementable over the real engine, the six verbs reach it, the two
+// surfaces map, and the install point round-trips - which is everything the
+// builtin will stand on when it is written.
+
+// The same twenty lines read.cpp's adapter has, over a real engine. It exists to
+// prove they are enough, which is what `leshper_keymap_tests.cpp`'s copy did for
+// `bind` before there was a loop to hold the real one.
+class test_prompt_console final : public lesh::runtime::prompt_console {
+public:
+	explicit test_prompt_console(engine& which) noexcept : _engine(&which) {}
+
+	void module_names(std::vector<std::string>& into) const override {
+		_engine->module_names(into);
+	}
+
+	outcome clear(surface which) override {
+		_engine->clear(surface_of(which));
+		return outcome::ok;
+	}
+
+	outcome use_default(surface which) override {
+		_engine->use_default(surface_of(which));
+		return outcome::ok;
+	}
+
+	outcome add_module(surface which, std::string_view name, std::string_view arg) override {
+		return _engine->add_module(surface_of(which), name, arg) ? outcome::ok
+		                                                         : outcome::no_such_module;
+	}
+
+	outcome add_literal(surface which, std::string_view bytes) override {
+		_engine->add_literal(surface_of(which), bytes);
+		return outcome::ok;
+	}
+
+	outcome open_group(surface which) override {
+		return _engine->open_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
+	}
+
+	outcome close_group(surface which) override {
+		return _engine->close_group(surface_of(which)) ? outcome::ok : outcome::unbalanced_group;
+	}
+
+private:
+	[[nodiscard]] static surface_id surface_of(surface which) noexcept {
+		return which == surface::continuation ? surface_id::continuation : surface_id::left;
+	}
+
+	engine* _engine;
+};
+
+using console_surface = lesh::runtime::prompt_console::surface;
+using console_outcome = lesh::runtime::prompt_console::outcome;
+
+TEST(LeshperPromptWiring, TheConsoleRoundTripsOnTheShellState) {
+	lesh::runtime::shell_state shell;
+	// A non-interactive shell has no prompt engine and says so rather than
+	// pretending - `bind`'s "no line editor", one seam over.
+	EXPECT_EQ(shell.prompts(), nullptr);
+
+	engine which;
+	test_prompt_console console{which};
+	shell.set_prompt_console(&console);
+	ASSERT_EQ(shell.prompts(), &console);
+
+	// And the owner takes the view away as it takes the object (ADR-0007), which
+	// is what `session::~session` does one line below its `bind` counterpart.
+	shell.set_prompt_console(nullptr);
+	EXPECT_EQ(shell.prompts(), nullptr);
+}
+
+TEST(LeshperPromptWiring, TheConsoleVerbsReachTheEngineAndBothSurfaces) {
+	engine which;
+	test_prompt_console console{which};
+	lesh::runtime::prompt_console& seam = console;
+
+	std::vector<std::string> names;
+	seam.module_names(names);
+	EXPECT_NE(std::find(names.begin(), names.end(), "git"), names.end());
+	EXPECT_NE(std::find(names.begin(), names.end(), "path"), names.end());
+
+	// The two surfaces are configured apart, and what this asserts is the
+	// translation between the runtime's `surface` and leshper's `surface_id`:
+	// bytes put on one must not appear on the other.
+	EXPECT_EQ(seam.clear(console_surface::left), console_outcome::ok);
+	EXPECT_EQ(seam.clear(console_surface::continuation), console_outcome::ok);
+	EXPECT_EQ(seam.add_literal(console_surface::left, "L"), console_outcome::ok);
+	EXPECT_EQ(seam.add_literal(console_surface::continuation, "C"), console_outcome::ok);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left), "L");
+	EXPECT_EQ(which.output(surface_id::continuation), "C");
+
+	// The one miss a placement has, and it is a miss rather than a fault.
+	EXPECT_EQ(seam.add_module(console_surface::left, "path", ""), console_outcome::ok);
+	EXPECT_EQ(seam.add_module(console_surface::left, "no_such_thing", ""),
+	          console_outcome::no_such_module);
+
+	// Groups do not nest in v1, and neither half of the imbalance is silent.
+	EXPECT_EQ(seam.open_group(console_surface::left), console_outcome::ok);
+	EXPECT_EQ(seam.open_group(console_surface::left), console_outcome::unbalanced_group);
+	EXPECT_EQ(seam.close_group(console_surface::left), console_outcome::ok);
+	EXPECT_EQ(seam.close_group(console_surface::left), console_outcome::unbalanced_group);
+
+	// And the shipped table comes back, which is how a user undoes all of it.
+	EXPECT_EQ(seam.use_default(console_surface::left), console_outcome::ok);
+	which.render_full(quiet());
+	EXPECT_EQ(which.output(surface_id::left).find('L'), std::string_view::npos);
+}
+
+// ---------------------------------------------------------------------------
+// --- the precedence rule's one bit (#157, §6.10) ---
+// ---------------------------------------------------------------------------
+
+// `configured()` is what lets `$PS1` stay the default prompt while the native
+// engine supersedes it the moment anybody configures one. The wiring asks it
+// once per prompt (`session::refresh_prompt`), so what it answers on a shell
+// nobody has touched is the whole of whether today's prompts still work.
+TEST(LeshperPromptEngine, ConfiguredIsFalseUntilAVerbRunsAndIsNeverRegained) {
+	{
+		engine fresh;
+		EXPECT_FALSE(fresh.configured());
+		// A RENDER IS NOT A CONFIGURATION. The engine arrives holding the default
+		// table - it has to, or `render_full` on a fresh one would answer nothing -
+		// and rendering it does not make it the user's choice.
+		fresh.render_full(quiet());
+		EXPECT_FALSE(fresh.configured());
+		EXPECT_FALSE(fresh.output(surface_id::left).empty());
+	}
+	{
+		engine one;
+		one.clear(surface_id::left);
+		EXPECT_TRUE(one.configured());
+	}
+	{
+		engine one;
+		// The verb that puts the shipped table back is STILL a configuration: a
+		// user asking for the native default is not asking for `$PS1`.
+		one.use_default(surface_id::left);
+		EXPECT_TRUE(one.configured());
+	}
+	{
+		engine one;
+		one.add_literal(surface_id::left, "x");
+		EXPECT_TRUE(one.configured());
+	}
+	{
+		engine one;
+		EXPECT_TRUE(one.add_module(surface_id::left, "path", ""));
+		EXPECT_TRUE(one.configured());
+	}
+	{
+		engine one;
+		EXPECT_TRUE(one.open_group(surface_id::left));
+		EXPECT_TRUE(one.configured());
+		EXPECT_TRUE(one.close_group(surface_id::left));
+		EXPECT_TRUE(one.configured());
+	}
+	{
+		// A VERB THAT FAILED CONFIGURED NOTHING. An `add_module` for a name nobody
+		// registered changed no placement, so the prompt is still the one the user
+		// had - and that is `$PS1`.
+		engine one;
+		EXPECT_FALSE(one.add_module(surface_id::left, "nobody_registered_this", ""));
+		EXPECT_FALSE(one.configured());
+		EXPECT_FALSE(one.close_group(surface_id::left));
+		EXPECT_FALSE(one.configured());
+	}
+	{
+		// NEVER REGAINED. There is no un-configure, on any path.
+		engine one;
+		one.add_literal(surface_id::left, "x");
+		one.clear(surface_id::left);
+		one.use_default(surface_id::left);
+		one.clear(surface_id::continuation);
+		EXPECT_TRUE(one.configured());
+	}
 }
 
 } // namespace
