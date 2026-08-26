@@ -269,6 +269,13 @@ volatile sig_atomic_t g_previous_ran = 0;
 
 void previous_handler(int) { g_previous_ran = 1; }
 
+// The one a `trap` typed mid-session installs, standing in for
+// `runtime/signals.cpp`'s `record_signal` - which is the only foreign handler
+// that ever appears in a real lesh process.
+volatile sig_atomic_t g_newer_ran = 0;
+
+void newer_handler(int) { g_newer_ran = 1; }
+
 } // namespace
 
 TEST(LeshperReadSignals, TheHubCallsTheHandlerItReplaced) {
@@ -331,12 +338,19 @@ TEST(LeshperReadSignals, InstallingChainsAndUninstallingPutsItBack) {
 	}
 }
 
-TEST(LeshperReadSignals, ReassertingTakesItBackAndKeepsTheOriginalChainTarget) {
-	// The hazard this exists for: a user types `trap ... WINCH` at the prompt,
-	// the shell's own `sigaction` replaces ours, and Ctrl-C stops reaching the
-	// editor. Re-asserting at every read entry takes the disposition back - and
-	// keeps what it saved the FIRST time, so the chain still reaches a real
-	// handler rather than our own (which would never return).
+TEST(LeshperReadSignals, ReassertingTakesItBackAndRetargetsTheChain) {
+	// REWRITTEN BY #142, and the rewrite is the point. This test used to steal
+	// SIGWINCH with SIG_IGN and assert that `reassert` stomped it and went on
+	// chaining to the FIRST-saved handler. Both halves of that are now wrong:
+	// an ignore is left standing (rule 3, tested next door), and a foreign
+	// handler is taken but the chain is RETARGETED to it (rule 4a) - because
+	// chaining to what was there before the user's `trap` existed is precisely
+	// how `trap 'cmd' CHLD` was silently dead.
+	//
+	// The hazard the test exists for is unchanged: the user types
+	// `trap ... WINCH` at the prompt, the shell's own `sigaction` replaces ours,
+	// and the resize stops reaching the editor. Re-asserting at every read entry
+	// takes the disposition back, and now takes the trap's handler with it.
 	const lesh::testing::saved_disposition saved{SIGWINCH};
 	struct sigaction previous{};
 	previous.sa_handler = previous_handler;
@@ -346,25 +360,29 @@ TEST(LeshperReadSignals, ReassertingTakesItBackAndKeepsTheOriginalChainTarget) {
 	signal_hub hub;
 	ASSERT_TRUE(hub.install());
 
-	// The shell, taking it away.
+	// The shell, taking it away - what `trap 'cmd' WINCH` does.
 	struct sigaction stolen{};
-	stolen.sa_handler = SIG_IGN;
+	stolen.sa_handler = newer_handler;
 	sigemptyset(&stolen.sa_mask);
 	ASSERT_EQ(::sigaction(SIGWINCH, &stolen, nullptr), 0);
 
 	EXPECT_TRUE(hub.reassert());
 	struct sigaction now{};
 	ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
-	EXPECT_NE(now.sa_handler, SIG_IGN);
+	EXPECT_NE(now.sa_handler, newer_handler);
 	EXPECT_NE(now.sa_handler, previous_handler);
 
 	g_previous_ran = 0;
+	g_newer_ran = 0;
 	hub.deliver(SIGWINCH);
-	EXPECT_EQ(g_previous_ran, 1) << "reassert lost the original chain target";
+	EXPECT_EQ(g_newer_ran, 1) << "reassert did not retarget the chain to the newest handler";
+	EXPECT_EQ(g_previous_ran, 0) << "reassert chained to the stale entry-time handler";
 
+	// And `_saved` still holds the ENTRY-time disposition, which is the whole
+	// reason the two slots are separate.
 	hub.uninstall();
 	ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
-	EXPECT_EQ(now.sa_handler, previous_handler);
+	EXPECT_EQ(now.sa_handler, previous_handler) << "uninstall put back the newest, not the entry";
 }
 
 TEST(LeshperReadSignals, AHubThatNeverInstalledDoesNotWriteDispositions) {
