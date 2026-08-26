@@ -96,12 +96,13 @@ struct region {
 // ---------------------------------------------------------------------------
 // The keymap stack, and what is still a placeholder beside it.
 //
-// The two below that are still placeholders are NAMED types with no behaviour,
-// so that A-1's state struct already has the field the spec says it has and its
-// ticket fills a type in rather than threading a new member through every
-// signature. Each says which ticket fills it. Nothing reads them, and the editor
-// does not get to grow a use for one before its ticket lands. The keymap stack
-// was the third and is one no longer (#118).
+// ONE below is still a placeholder: a NAMED type with no behaviour, so that
+// A-1's state struct already has the field the spec says it has and its ticket
+// fills a type in rather than threading a new member through every signature.
+// It says which ticket fills it. Nothing reads it, and the editor does not get
+// to grow a use for it before its ticket lands. The keymap stack was one of
+// three and stopped being a placeholder with #118; the pager was the second and
+// stopped being one with #138.
 // ---------------------------------------------------------------------------
 
 // The stack of keymaps dispatch runs against (A-8, F-8 to F-12, spec §6.4).
@@ -313,13 +314,111 @@ struct decorations {
 	}
 };
 
-// The completion pager's state (F-28 to F-31). Fills when the completion engine
-// is charted: map #82 carries it as fog, waiting on the provider interfaces
-// (#94).
+// ---------------------------------------------------------------------------
+// The pager (#138, F-28 to F-30, spec §6.9). NOT a placeholder any more.
+//
+// ONE PAGER, THREE CLIENTS (#137's resolution): tab completion, history search
+// (F-32) and the autosuggestion candidate view are the same surface with the
+// same keymap over the same list. Nothing below names any of the three, which
+// is what makes that true rather than aspirational - a client fills the list,
+// says which span of the buffer an accepted candidate replaces, and commits.
+// ---------------------------------------------------------------------------
+
+// What a candidate IS, in `ls -F`'s vocabulary, and the whole of v1's
+// description (#137 decision 3: "a kind marker as the only description").
+//
+// The kind decides two things and only two: the one-character marker drawn
+// after the candidate, and what an accepted candidate is followed by. A richer
+// description column is recorded as later work and arrives as a FIELD on the
+// candidate, not as a change here.
+//
+// `plain` and `word` are both marker-less and differ only in the second
+// question. A history line is `plain` - it replaces the buffer and nothing
+// trails it; a command name or a plain file is `word`, and a space follows,
+// because the next thing the user types is an argument. That distinction is
+// the reason the enum is not simply the file-type set.
+//
+// Numbered explicitly and appended to, never reordered: the ABI's
+// LESH_PAGER_* constants are these numbers (registry.cpp static_asserts it).
+enum class pager_kind : std::uint32_t {
+	plain = 0,       // no marker, nothing trails it
+	word = 1,        // no marker, a space trails it
+	directory = 2,   // `/`, and a `/` trails it
+	executable = 3,  // `*`, a space trails it
+	symlink = 4,     // `@`, a space trails it
+};
+
+struct pager_candidate {
+	// What is SHOWN and what is inserted, before the kind's trailing byte. The
+	// bare name: the completer hands `bin`, not `bin/`, and the kind says the
+	// rest. Two spellings of the same candidate would otherwise disagree the
+	// first time one of them was filtered.
+	std::string text;
+	pager_kind kind = pager_kind::plain;
+
+	friend bool operator==(const pager_candidate&, const pager_candidate&) noexcept = default;
+};
+
+// The pager's whole state (F-28: candidates, selection, scroll; F-29: filter).
+//
+// IN THE REPLAY COMPARE, CANDIDATES INCLUDED, and that is the deliberate answer
+// N-3 asks for. `decorations` is compared-always-equal because a reactor's
+// output arrives asynchronously and the loop applies it whenever it lands;
+// this list does not. §6.9 decision 2 makes v1 completion SYNCHRONOUS on the
+// loop thread - the list is written by an action, inside the turn the key
+// started, exactly like a buffer edit - and everything a turn of the machine
+// writes is what a replay compares. A replayed session that offered a different
+// list offered a different pager, and the one component the comparison could
+// not see would be the newest one.
 struct pager_state {
-	friend constexpr bool operator==(const pager_state&, const pager_state&) noexcept {
-		return true;
+	// Everything the client offered, in the order it offered it.
+	std::vector<pager_candidate> candidates;
+
+	// Indices into `candidates` that match `filter`, recomputed whenever either
+	// changes (F-29). Materialized rather than re-derived per read so that
+	// `selected` indexes ONE list and the renderer and the movement actions
+	// cannot disagree about which one.
+	std::vector<std::uint32_t> matching;
+
+	// What the user has typed since the pager opened (F-29). NOT in the buffer:
+	// the pager's own keymap routes unbound printables here through its default
+	// action, so filtering never edits the line it is completing.
+	std::string filter;
+
+	// Into `matching`, never into `candidates`.
+	std::size_t selected = 0;
+
+	// The first grid row shown. A HINT rather than the answer: the renderer
+	// clamps it and overrides it when the selection would fall outside, which is
+	// what makes a resize need no reflow here (#123's argument, kept). It is
+	// still stored, because it is where an explicit page-scroll writes and
+	// because what a key did to the pager belongs in the replay compare.
+	std::uint16_t scroll_row = 0;
+
+	// Whether the pager is SHOWING. False while a client is filling it, and
+	// false after F-30 inserted a common prefix instead of opening.
+	bool open = false;
+
+	// The span an accepted candidate replaces. The client's, set at open: the
+	// token under the cursor for completion, the whole buffer for history
+	// search, `[cursor, cursor)` for a suggestion.
+	position replace_from;
+	position replace_to;
+
+	[[nodiscard]] bool showing() const noexcept { return open && !matching.empty(); }
+
+	void clear() {
+		candidates.clear();
+		matching.clear();
+		filter.clear();
+		selected = 0;
+		scroll_row = 0;
+		open = false;
+		replace_from = position{};
+		replace_to = position{};
 	}
+
+	friend bool operator==(const pager_state&, const pager_state&) noexcept = default;
 };
 
 // Input delivered but not yet consumed (A-1, F-7).
@@ -359,7 +458,7 @@ struct state {
 	keymap_stack keymaps;
 	decorations marks; // #93
 	pending_input pending;
-	pager_state pager; // #94
+	pager_state pager; // #138
 	generation gen;
 	undo_history undo;
 
