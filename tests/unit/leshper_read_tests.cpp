@@ -1,0 +1,384 @@
+#include "leshper/read.h"
+
+#include "leshper/keymap.h"
+#include "leshper/loop.h"
+#include "leshper/registry.h"
+#include "leshper/state.h"
+#include "runtime/builtins.h"
+#include "runtime/history_store.h"
+#include "runtime/shell_state.h"
+
+#include "interactive_signal_guard.h"
+#include "temp_path.h"
+
+#include <gtest/gtest.h>
+
+#include <csignal>
+#include <string>
+#include <vector>
+
+using namespace lesh::leshper;
+
+// THE WIRING SITE (#134), tested where it can be: the four providers, the floor
+// refusal, the outcome latch, and the signal chain.
+//
+// WHAT IS NOT HERE is the session itself - it spawns a thread, takes the
+// process's dispositions and owns a terminal, which is a pty and a fork rather
+// than a unit test. That is `leshper_pty_tests.cpp`, and it drives the real
+// binary's path end to end.
+
+// ===========================================================================
+// The syntax layer (#94, sealed; F-35)
+// ===========================================================================
+
+TEST(LeshperReadSyntax, EnterRunsACompleteLine) {
+	const shell_syntax_layer syntax;
+	EXPECT_TRUE(syntax.line_is_complete("echo hi"));
+	EXPECT_TRUE(syntax.line_is_complete(""));
+	EXPECT_TRUE(syntax.line_is_complete("for i in a b; do echo $i; done"));
+}
+
+TEST(LeshperReadSyntax, EnterContinuesAnIncompleteOne) {
+	const shell_syntax_layer syntax;
+	// C-2's incompleteness list, which is already load-bearing in parser_tests.
+	EXPECT_FALSE(syntax.line_is_complete("echo \"x"));
+	EXPECT_FALSE(syntax.line_is_complete("if true; then"));
+	EXPECT_FALSE(syntax.line_is_complete("f() { echo x"));
+	EXPECT_FALSE(syntax.line_is_complete("case a in"));
+}
+
+TEST(LeshperReadSyntax, AMalformedLineAcceptsRatherThanTrappingTheUser) {
+	// `incomplete()` wins over a defect while more input could come, and a defect
+	// with nothing left to come is COMPLETE for F-35: the shell runs it and
+	// reports the error. Answering "incomplete" here would hold the user in a
+	// continuation prompt no keystroke could escape.
+	const shell_syntax_layer syntax;
+	EXPECT_TRUE(syntax.line_is_complete("echo ;;"));
+}
+
+TEST(LeshperReadSyntax, VaredsLayerAcceptsEverything) {
+	// F-17: `vared` edits a variable, where a newline is a newline. F-35
+	// degenerates rather than being special-cased away, which is #94's own
+	// acceptance test for A-5.
+	const trivially_complete_syntax syntax;
+	EXPECT_TRUE(syntax.line_is_complete("echo \"x"));
+	EXPECT_TRUE(syntax.line_is_complete("if true; then"));
+}
+
+// ===========================================================================
+// The prompt provider (#94: bytes out, no expansion)
+// ===========================================================================
+
+TEST(LeshperReadPrompt, TheDefaultsArePosixAndComeFromTheShell) {
+	const lesh::runtime::shell_state state;
+	const shell_prompt_source prompt{state};
+	std::string text;
+	prompt.left(text);
+	EXPECT_EQ(text, "$ ");
+	prompt.continuation(text);
+	EXPECT_EQ(text, "> ");
+}
+
+TEST(LeshperReadPrompt, ThePromptIsLiteralBytesAndNothingIsExpanded) {
+	// The decision, pinned: expansion is lesh-side and BEHIND this interface
+	// (#94), so until it lands the bytes come out exactly as the variable holds
+	// them. A half-implemented `\w` here would be a vocabulary the real
+	// expansion would then have to keep.
+	lesh::runtime::shell_state state;
+	ASSERT_TRUE(state.set("PS1", "\\w \\u$ "));
+	ASSERT_TRUE(state.set("PS2", "$PWD> "));
+	const shell_prompt_source prompt{state};
+	std::string text;
+	prompt.left(text);
+	EXPECT_EQ(text, "\\w \\u$ ");
+	prompt.continuation(text);
+	EXPECT_EQ(text, "$PWD> ");
+}
+
+TEST(LeshperReadPrompt, AFixedSourceIsWhatVaredAndTheTestsPass) {
+	const fixed_prompt_source prompt{"name: ", "..."};
+	std::string text;
+	prompt.left(text);
+	EXPECT_EQ(text, "name: ");
+	prompt.continuation(text);
+	EXPECT_EQ(text, "...");
+}
+
+// ===========================================================================
+// The history adapter (#113 store onto #125's shape)
+// ===========================================================================
+
+TEST(LeshperReadHistory, TheStoreWalksNewestFirstThroughTheAdapter) {
+	const lesh::testing::temp_path scratch;
+	lesh::runtime::history_store store{scratch.file("history")};
+	EXPECT_TRUE(store.append("one"));
+	EXPECT_TRUE(store.append("two"));
+	EXPECT_TRUE(store.append("three"));
+
+	const history_store_source source{store};
+	std::vector<std::string> seen;
+	source.for_each_newest_first([&](std::string_view entry) {
+		seen.emplace_back(entry);
+		return true;
+	});
+	ASSERT_EQ(seen.size(), 3u);
+	EXPECT_EQ(seen[0], "three");
+	EXPECT_EQ(seen[1], "two");
+	EXPECT_EQ(seen[2], "one");
+}
+
+TEST(LeshperReadHistory, AWalkThatStopsSeesNothingAfterTheStop) {
+	// #125's note made real: the store's callback answers void, so the rest of
+	// the walk still happens and this adapter simply stops SHOWING entries. What
+	// matters to the searcher's supersede poll is that `fn` is not called again,
+	// and that is what this asserts.
+	const lesh::testing::temp_path scratch;
+	lesh::runtime::history_store store{scratch.file("history")};
+	EXPECT_TRUE(store.append("one"));
+	EXPECT_TRUE(store.append("two"));
+	EXPECT_TRUE(store.append("three"));
+
+	const history_store_source source{store};
+	std::vector<std::string> seen;
+	source.for_each_newest_first([&](std::string_view entry) {
+		seen.emplace_back(entry);
+		return false;
+	});
+	ASSERT_EQ(seen.size(), 1u);
+	EXPECT_EQ(seen[0], "three");
+}
+
+TEST(LeshperReadHistory, AMissingFileIsAnEmptyHistoryAndNotAnError) {
+	const lesh::testing::temp_path scratch;
+	const lesh::runtime::history_store store{scratch.file("never-written")};
+	const history_store_source source{store};
+	std::size_t seen = 0;
+	source.for_each_newest_first([&](std::string_view) {
+		++seen;
+		return true;
+	});
+	EXPECT_EQ(seen, 0u);
+}
+
+// ===========================================================================
+// #97 decision 3: the floor
+// ===========================================================================
+
+TEST(LeshperReadFloor, ATerminalThatSaidItIsNotOneIsBelowTheFloor) {
+	EXPECT_FALSE(terminal_meets_floor(nullptr));
+	EXPECT_FALSE(terminal_meets_floor(""));
+	EXPECT_FALSE(terminal_meets_floor("dumb"));
+}
+
+TEST(LeshperReadFloor, EverythingElseIsAssumedCapable) {
+	// #97 decision 2, "assume first": the trivial environment read and nothing
+	// else. Never terminfo, never a startup query - so an unknown name passes.
+	EXPECT_TRUE(terminal_meets_floor("xterm-256color"));
+	EXPECT_TRUE(terminal_meets_floor("screen"));
+	EXPECT_TRUE(terminal_meets_floor("something-nobody-has-heard-of"));
+}
+
+TEST(LeshperReadFloor, NoColorIsAUsersChoiceAndNotABelowFloorTerminal) {
+	// The two questions are different: `from_env` answers what the terminal can
+	// DO, and a monochrome xterm is a terminal leshper drives perfectly well.
+	// Refusing to start on `NO_COLOR=1` would be refusing a preference.
+	EXPECT_TRUE(terminal_meets_floor("xterm-256color"));
+	const terminal_capabilities caps =
+		terminal_capabilities::from_env("xterm-256color", nullptr, "1");
+	EXPECT_EQ(caps.colors, color_depth::monochrome);
+}
+
+// ===========================================================================
+// `bind` reaches the keymaps through shell_state (#118, #134)
+// ===========================================================================
+
+TEST(LeshperReadConsole, AShellWithNoEditorHasNoConsole) {
+	// The seam moved off file scope, so two shells in one process can no longer
+	// be handed each other's keymaps - and a fresh one has nothing installed,
+	// which is what makes `bind` in a script say "no line editor".
+	const lesh::runtime::shell_state state;
+	EXPECT_EQ(state.console(), nullptr);
+}
+
+// ===========================================================================
+// The outcome latch (#134): what an action asked for reaches the loop
+// ===========================================================================
+
+namespace {
+
+std::int32_t ask_to_accept(lesh_editor* editor, const lesh_invocation*, void*) {
+	return lesh_accept_line(editor);
+}
+
+std::int32_t ask_to_exit(lesh_editor* editor, const lesh_invocation*, void*) {
+	return lesh_exit(editor, 7);
+}
+
+std::int32_t ask_for_nothing(lesh_editor*, const lesh_invocation*, void*) { return LESH_OK; }
+
+} // namespace
+
+TEST(LeshperReadOutcome, TheHarnessLatchesWhatAnActionRequested) {
+	// Before this existed, an `accept_line` bound to a KEY went nowhere: the
+	// keystroke path runs through `step`, which returns effects and not results,
+	// and only the timer path ever read `invoke`'s outcome.
+	state s;
+	editing_context& context = context_of(s);
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", ask_to_accept, nullptr),
+	          LESH_OK);
+
+	EXPECT_EQ(context.loop().take_outcome().what, loop_outcome::none);
+	context.loop().invoke(s, "ask_accept", invocation{});
+	EXPECT_EQ(context.loop().take_outcome().what, loop_outcome::accept_line);
+	// Taken means taken: the next turn starts with nothing pending.
+	EXPECT_EQ(context.loop().take_outcome().what, loop_outcome::none);
+}
+
+TEST(LeshperReadOutcome, AnExitCarriesItsStatus) {
+	state s;
+	editing_context& context = context_of(s);
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_exit", ask_to_exit, nullptr),
+	          LESH_OK);
+	context.loop().invoke(s, "ask_exit", invocation{});
+	const loop_harness::requested_outcome asked = context.loop().take_outcome();
+	EXPECT_EQ(asked.what, loop_outcome::exit);
+	EXPECT_EQ(asked.exit_status, 7);
+}
+
+TEST(LeshperReadOutcome, AnActionThatAskedForNothingLeavesNothingLatched) {
+	state s;
+	editing_context& context = context_of(s);
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_nothing", ask_for_nothing, nullptr),
+	          LESH_OK);
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", ask_to_accept, nullptr),
+	          LESH_OK);
+	context.loop().invoke(s, "ask_accept", invocation{});
+	context.loop().invoke(s, "ask_nothing", invocation{});
+	// LAST WINS is about actions that ASK. One that asked for nothing does not
+	// erase the request of the one before it within the same turn.
+	EXPECT_EQ(context.loop().take_outcome().what, loop_outcome::accept_line);
+}
+
+// ===========================================================================
+// The signal chain (#134's resolution of the ownership question #129 returned)
+// ===========================================================================
+
+namespace {
+
+volatile sig_atomic_t g_previous_ran = 0;
+
+void previous_handler(int) { g_previous_ran = 1; }
+
+} // namespace
+
+TEST(LeshperReadSignals, TheHubCallsTheHandlerItReplaced) {
+	// THE RESOLUTION, as a test. The shell's `g_pending` is set by a handler
+	// `runtime/signals.cpp` installs; while the hub owns the disposition, only
+	// chaining keeps that handler running - and it has to keep running not just
+	// during editing but during EXECUTION, when the shell thread is busy in a
+	// command and drains no slots at all.
+	const lesh::testing::saved_disposition saved{SIGUSR1};
+	struct sigaction previous{};
+	previous.sa_handler = previous_handler;
+	sigemptyset(&previous.sa_mask);
+	ASSERT_EQ(::sigaction(SIGUSR1, &previous, nullptr), 0);
+
+	signal_hub hub;
+	// `deliver` is the handler's whole body, and driving it directly is what
+	// keeps this test from touching the binary's real dispositions for a signal
+	// the hub actually installs.
+	struct sigaction now{};
+	ASSERT_EQ(::sigaction(SIGUSR1, nullptr, &now), 0);
+	EXPECT_EQ(now.sa_handler, previous_handler);
+
+	g_previous_ran = 0;
+	hub.deliver(SIGUSR1);
+	// Nothing was SAVED for SIGUSR1 - this hub never installed - so nothing is
+	// chained, and the wakeup is still ours.
+	EXPECT_EQ(g_previous_ran, 0);
+	std::vector<int> pending;
+	EXPECT_EQ(hub.drain(pending), 1u);
+	ASSERT_EQ(pending.size(), 1u);
+	EXPECT_EQ(pending[0], SIGUSR1);
+}
+
+TEST(LeshperReadSignals, InstallingChainsAndUninstallingPutsItBack) {
+	// SIGWINCH, because it is one the hub really takes and because nothing else
+	// in this binary cares what happens to it.
+	const lesh::testing::saved_disposition saved{SIGWINCH};
+	struct sigaction previous{};
+	previous.sa_handler = previous_handler;
+	sigemptyset(&previous.sa_mask);
+	ASSERT_EQ(::sigaction(SIGWINCH, &previous, nullptr), 0);
+
+	{
+		signal_hub hub;
+		ASSERT_TRUE(hub.install());
+		// Ours now, and the shell's is what we saved.
+		struct sigaction now{};
+		ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
+		EXPECT_NE(now.sa_handler, previous_handler);
+
+		g_previous_ran = 0;
+		hub.deliver(SIGWINCH);
+		EXPECT_EQ(g_previous_ran, 1) << "the saved handler was not chained";
+		// And our own work happened too: SIGWINCH is a counter, not a queue.
+		EXPECT_EQ(hub.resize_count(), 1u);
+
+		hub.uninstall();
+		ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
+		EXPECT_EQ(now.sa_handler, previous_handler);
+	}
+}
+
+TEST(LeshperReadSignals, ReassertingTakesItBackAndKeepsTheOriginalChainTarget) {
+	// The hazard this exists for: a user types `trap ... WINCH` at the prompt,
+	// the shell's own `sigaction` replaces ours, and Ctrl-C stops reaching the
+	// editor. Re-asserting at every read entry takes the disposition back - and
+	// keeps what it saved the FIRST time, so the chain still reaches a real
+	// handler rather than our own (which would never return).
+	const lesh::testing::saved_disposition saved{SIGWINCH};
+	struct sigaction previous{};
+	previous.sa_handler = previous_handler;
+	sigemptyset(&previous.sa_mask);
+	ASSERT_EQ(::sigaction(SIGWINCH, &previous, nullptr), 0);
+
+	signal_hub hub;
+	ASSERT_TRUE(hub.install());
+
+	// The shell, taking it away.
+	struct sigaction stolen{};
+	stolen.sa_handler = SIG_IGN;
+	sigemptyset(&stolen.sa_mask);
+	ASSERT_EQ(::sigaction(SIGWINCH, &stolen, nullptr), 0);
+
+	EXPECT_TRUE(hub.reassert());
+	struct sigaction now{};
+	ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
+	EXPECT_NE(now.sa_handler, SIG_IGN);
+	EXPECT_NE(now.sa_handler, previous_handler);
+
+	g_previous_ran = 0;
+	hub.deliver(SIGWINCH);
+	EXPECT_EQ(g_previous_ran, 1) << "reassert lost the original chain target";
+
+	hub.uninstall();
+	ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
+	EXPECT_EQ(now.sa_handler, previous_handler);
+}
+
+TEST(LeshperReadSignals, AHubThatNeverInstalledDoesNotWriteDispositions) {
+	// A test's hub is driven by `deliver` alone and must not start taking the
+	// binary's dispositions when somebody calls `reassert` on it.
+	const lesh::testing::saved_disposition saved{SIGWINCH};
+	struct sigaction previous{};
+	previous.sa_handler = previous_handler;
+	sigemptyset(&previous.sa_mask);
+	ASSERT_EQ(::sigaction(SIGWINCH, &previous, nullptr), 0);
+
+	signal_hub hub;
+	EXPECT_FALSE(hub.reassert());
+	struct sigaction now{};
+	ASSERT_EQ(::sigaction(SIGWINCH, nullptr, &now), 0);
+	EXPECT_EQ(now.sa_handler, previous_handler);
+}
