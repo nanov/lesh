@@ -35,6 +35,15 @@
 
 namespace {
 
+// The longest text these actions will copy through a stack buffer. A stack
+// buffer, because an action runs on the keystroke path and the alternative is a
+// heap allocation per keypress; a command line past 4 KiB is a paste, and a
+// paste is not something anyone is autosuggesting or killing a word out of.
+// Past it a read answers LESH_ERR_TOOSMALL, which is the honest "the bytes are
+// there and they did not fit" rather than a truncation that would mean
+// something else.
+constexpr size_t kCandidateBytes = 4096;
+
 // Every action here is: read the cursor, ask the editor a geometry question,
 // stage one write. Two accessor calls and a motion, per keystroke, which is the
 // friction the ADR priced.
@@ -85,8 +94,30 @@ int32_t delete_backward_char(lesh_editor* editor, const lesh_invocation*, void*)
 	return delete_back_to(editor, LESH_MOTION_PREV_CLUSTER);
 }
 
+// emacs's `backward-kill-word`, and the word KILL is the operative half: #99
+// answer 3 says every kill feeds the one store, and this is the emacs side's
+// only killing built-in. `delete_backward_char` deliberately does not - emacs's
+// backspace does not kill either, and a store that filled up with single
+// characters would make `C-y` useless.
 int32_t delete_backward_word(lesh_editor* editor, const lesh_invocation*, void*) {
-	return delete_back_to(editor, LESH_MOTION_PREV_WORD);
+	size_t cursor = 0;
+	int32_t status = lesh_cursor_get(editor, &cursor);
+	if (status != LESH_OK)
+		return status;
+	size_t from = 0;
+	status = lesh_position_move(editor, cursor, LESH_MOTION_PREV_WORD, &from);
+	if (status != LESH_OK)
+		return status;
+	if (from >= cursor)
+		return LESH_OK;
+	// A word longer than the scratch is deleted and not stored, rather than
+	// stored truncated: half a word in the register is worse than none, and a
+	// `C-w` over 4 KiB of one word is a paste being unpicked, not editing.
+	char killed[kCandidateBytes];
+	size_t length = 0;
+	if (lesh_buffer_read(editor, from, cursor, killed, sizeof(killed), &length) == LESH_OK)
+		lesh_kill_set(editor, nullptr, killed, length, LESH_KILL_CHARWISE);
+	return lesh_buffer_replace(editor, from, cursor, nullptr, 0);
 }
 
 int32_t backward_char(lesh_editor* editor, const lesh_invocation*, void*) {
@@ -116,14 +147,6 @@ int32_t end_of_line(lesh_editor* editor, const lesh_invocation*, void*) {
 // Nothing here knows what a history is. `lesh_proposal_read` answers with bytes
 // under a kind; whether they came from history (#125), from a completer, or
 // from a plugin nobody has written yet is the proposing reactor's business.
-
-// The longest candidate these will accept. A stack buffer, because an action
-// runs on the keystroke path and the alternative is a heap allocation per
-// keypress; a command line past 4 KiB is a paste, and a paste is not something
-// anyone is autosuggesting. Past it the read answers LESH_ERR_TOOSMALL, which
-// is the honest "the bytes are there and they did not fit" rather than a
-// truncated line that would run as a different command.
-constexpr size_t kCandidateBytes = 4096;
 
 // Reads the suggestion currently on screen. `*length` is its full length.
 //
