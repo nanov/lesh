@@ -259,7 +259,44 @@ typedef enum lesh_motion {
 	LESH_MOTION_PREV_WORD = 4,
 	LESH_MOTION_NEXT_WORD = 5,
 	LESH_MOTION_BUFFER_START = 6,
-	LESH_MOTION_BUFFER_END = 7
+	LESH_MOTION_BUFFER_END = 7,
+
+	/* --- Appended by #119, never reordered --------------------------------
+	 *
+	 * The vi repertoire needed geometry the first eight do not have, and every
+	 * one of them is a question about TEXT rather than about vi, so they are
+	 * spelled in neither paradigm's vocabulary and helix mode will reuse them
+	 * unchanged. A binding asks; it does not reimplement - the same rule that
+	 * put cluster stepping here in the first place.
+	 *
+	 * The two WORD FAMILIES are the one thing worth naming carefully.
+	 * LESH_MOTION_*_WORD_* (4, 5) are blank-separated, which is what emacs's
+	 * word motions and vi's `W B E` both mean. The `WORD_*` family below is
+	 * CLASS-AWARE: a word is a run of identifier bytes or a run of punctuation,
+	 * which is what vi's `w b e` mean and what a shell user wants when a path
+	 * and its slashes are one blank-separated blob. C-6 makes the lexer
+	 * independently callable and both families become token-wise without this
+	 * enum noticing. */
+
+	/* The first non-blank byte on the line `from` is on (vi's `^`). */
+	LESH_MOTION_LINE_FIRST_NONBLANK = 8,
+
+	/* The same byte column on the previous / next line, clamped to that line's
+	 * end. The 2D buffer (F-2) is what makes these mean anything at a prompt. */
+	LESH_MOTION_LINE_UP = 9,
+	LESH_MOTION_LINE_DOWN = 10,
+
+	/* Class-aware word geometry (vi's `w`, `b`, `e`). */
+	LESH_MOTION_WORD_START_NEXT = 11,
+	LESH_MOTION_WORD_START_PREV = 12,
+	LESH_MOTION_WORD_END_NEXT = 13,
+
+	/* Blank-separated word geometry (vi's `W`, `B`, `E`). START_NEXT is not
+	 * LESH_MOTION_NEXT_WORD: that one lands past the END of the word, which is
+	 * what emacs's `forward-word` means and is a different place. */
+	LESH_MOTION_BLANK_WORD_START_NEXT = 14,
+	LESH_MOTION_BLANK_WORD_START_PREV = 15,
+	LESH_MOTION_BLANK_WORD_END_NEXT = 16
 } lesh_motion;
 
 int32_t lesh_position_move(lesh_editor* editor, size_t from, lesh_motion motion, size_t* out);
@@ -519,6 +556,181 @@ int32_t lesh_proposal_read(lesh_editor* editor, uint32_t kind, size_t index,
  * the drawn half is the virtual text. The reactor is free to propose again on
  * the next event - dismissal is about what is showing, not a mute. */
 int32_t lesh_proposal_dismiss(lesh_editor* editor, uint32_t kind);
+
+/* ------------------------------------------------------------------------- */
+/* Modes and the keymap stack (#117 decision 5, #119)                         */
+/*                                                                            */
+/* THE DECISION #118 LEFT OPEN, and it is decided here. The actions that enter */
+/* and leave insert, command, visual and operator-pending modes could have     */
+/* been native C++ over `state` - `set_mode`, `push` and `pop` are already     */
+/* there, one call each. They are not, and the reason is ADR-0008's first      */
+/* sentence: there is no native side door. An `i` implemented in C++ over the  */
+/* state would be a capability the built-in vi mode has and the Lua binding    */
+/* cannot have, and NG-4 says the second binding needs NO ABI change - which   */
+/* it would need, on the day someone writes a plugin that enters a mode. Mode  */
+/* entry is the single most-bound behaviour in a modal editor; a surface that  */
+/* cannot express it is not the surface a binding writes against.              */
+/*                                                                            */
+/* So the ABI grows, additively, by the six functions below - exactly the      */
+/* growth the ADR sanctions ("new capability functions"). src/leshper/vi.cpp   */
+/* includes abi.h and nothing else from leshper, the same as                   */
+/* builtin_actions.cpp, and so is held to this surface by the compiler.        */
+/*                                                                            */
+/* WRITTEN THROUGH, NOT STAGED, and that is deliberate. Staging exists so an   */
+/* action's buffer writes commit as one undo entry; a mode is not in the undo  */
+/* history and never was (zle's `i` is not undoable either), and dispatch has  */
+/* to READ the stack back the instant the action returns to decide whether an  */
+/* operator is now pending. A staged mode would be a mode dispatch could not   */
+/* see.                                                                        */
+/* ------------------------------------------------------------------------- */
+
+/* The name of the keymap at the BASE of the stack - the mode. Copy-out, like
+ * every other reader. */
+int32_t lesh_mode_get(lesh_editor* editor, char* out, size_t capacity, size_t* length_out);
+
+/* A full mode switch: the base is replaced and every sub-mode pushed above it
+ * goes with it (state.h gives the argument). LESH_ERR_INVAL for a null or empty
+ * name; a name no keymap has is accepted, because `bind` may create it later
+ * and a mode naming a table that does not exist yet dispatches to nothing
+ * rather than crashing. */
+int32_t lesh_mode_set(lesh_editor* editor, const char* name);
+
+/* A sub-mode arrives: visual, operator-pending, the pager, history search. */
+int32_t lesh_keymap_push(lesh_editor* editor, const char* name);
+
+/* Pops the topmost sub-mode. LESH_ERR_REFUSED at the base: a mode is not
+ * something one can pop out of, only something one swaps. */
+int32_t lesh_keymap_pop(lesh_editor* editor);
+
+/* zle's `viopp` slot (#117 decision 6): the action name the verb parked here,
+ * empty when none. Dispatch consumes it after the next motion or text object,
+ * runs it on the selection region, and clears it - so an action setting this
+ * is asking dispatch for the NEXT key's span, not performing anything.
+ *
+ * Not vi's alone by construction: helix mode never sets it, because its verbs
+ * read the always-present selection, and nothing here knows the difference. */
+int32_t lesh_pending_operator_get(lesh_editor* editor, char* out, size_t capacity,
+                                  size_t* length_out);
+
+/* Sets it; NULL or "" clears it, which is how an operator aborts itself. */
+int32_t lesh_pending_operator_set(lesh_editor* editor, const char* action);
+
+/* ------------------------------------------------------------------------- */
+/* The numeric argument, pending (#99: counts that multiply)                  */
+/*                                                                            */
+/* `lesh_invocation::numeric_argument` is what an action RECEIVES. This is how */
+/* an action leaves one for the NEXT dispatch, which is the half a digit key   */
+/* needs and the half that did not exist. vi's `3dd` and emacs's `M-3 C-f` are */
+/* the same mechanism; the name is neither one's.                              */
+/*                                                                            */
+/* Dispatch reads the pending argument into the invocation and clears it        */
+/* BEFORE calling, so an action that sets one is always setting the next key's  */
+/* and never re-reading its own.                                               */
+/* ------------------------------------------------------------------------- */
+
+int32_t lesh_numeric_argument_set(lesh_editor* editor, int64_t value);
+int32_t lesh_numeric_argument_clear(lesh_editor* editor);
+
+/* ------------------------------------------------------------------------- */
+/* The kill store (#99 answer 3, spec §6.5)                                   */
+/*                                                                            */
+/* One keyed store, the unnamed key as default: F-1's kill ring and vi's       */
+/* unnamed register are the same object under two paradigms' names. Named      */
+/* registers and a clipboard-backed key are both OUT of v1 and both arrive as  */
+/* new KEYS rather than as new functions, which is the whole reason the door   */
+/* takes a key at all.                                                         */
+/*                                                                            */
+/* `key` may be NULL, which is the unnamed key - so an action that has never   */
+/* heard of registers passes NULL and reaches the one entry v1 has.            */
+/* ------------------------------------------------------------------------- */
+
+/* How the text was taken, because `p` has to put it back the same way. A mask,
+ * reserved for additive growth: blockwise is a bit, not a third enumerator. */
+#define LESH_KILL_CHARWISE 0x0u
+#define LESH_KILL_LINEWISE 0x1u
+
+int32_t lesh_kill_set(lesh_editor* editor, const char* key,
+                      const char* bytes, size_t length, uint32_t flags);
+
+/* LESH_ERR_NOTFOUND when nothing has ever been put under `key` - which is what
+ * `p` with an empty register reads, and is not an error. `flags_out` may be
+ * NULL. Copy-out otherwise: `*length_out` is the full length whether or not it
+ * fit, and `out` may be NULL with capacity zero to ask the length first. */
+int32_t lesh_kill_get(lesh_editor* editor, const char* key,
+                      char* out, size_t capacity, size_t* length_out, uint32_t* flags_out);
+
+/* ------------------------------------------------------------------------- */
+/* Matching a delimiter pair (#99 answer 2: ONE helper, in neither paradigm's  */
+/* idiom)                                                                     */
+/*                                                                            */
+/* The innermost pair of `open`/`close` that ENCLOSES `at`, as the offsets of  */
+/* the opener and one past the closer. Nesting counts when the two differ;     */
+/* when they are equal - a quote - the run is paired in order along the line,  */
+/* because `'` has no nesting and pretending it does finds the wrong pair.     */
+/*                                                                            */
+/* `at` sitting ON a delimiter counts as inside its own pair, which is what    */
+/* makes `di(` work with the cursor on either parenthesis.                     */
+/*                                                                            */
+/* LESH_ERR_NOTFOUND when `at` is not enclosed. Both codepoints must be ASCII  */
+/* delimiters; anything else is LESH_ERR_INVAL, because a multi-byte pair is a */
+/* question nobody has asked and guessing at it would fix the answer.          */
+/*                                                                            */
+/* Written for vi's `i(`/`a(` and consumed unchanged by helix's `mi(` later -  */
+/* which is why it is a geometry question on the editor rather than a piece of */
+/* either mode.                                                                */
+/* ------------------------------------------------------------------------- */
+int32_t lesh_match_pair(lesh_editor* editor, size_t at, uint32_t open, uint32_t close,
+                        size_t* start_out, size_t* end_out);
+
+/* ------------------------------------------------------------------------- */
+/* The run at a position (#119)                                              */
+/*                                                                            */
+/* The other half of what a text object needs, and the half a MOTION cannot   */
+/* answer: `iw` is not "move somewhere", it is "what is the extent of the     */
+/* thing under the cursor". Asked of the editor for the same reason cluster   */
+/* stepping is - a binding that worked it out itself would be a second        */
+/* word-boundary rule, and the second one is always the one that is wrong.    */
+/*                                                                            */
+/* The two spans are the two word families the motions already distinguish.   */
+/* A run of BLANKS is a run like any other, which is what makes `iw` on a     */
+/* space select the whitespace, exactly as vim does, with no special case.    */
+/*                                                                            */
+/* `[start, end)`, on cluster boundaries, both equal to the buffer's length    */
+/* when `at` is past the end. Additive: a new span is a new enumerator.        */
+/* ------------------------------------------------------------------------- */
+typedef enum lesh_span {
+	/* Class-aware: identifier bytes, punctuation, or blanks (vi's `iw`). */
+	LESH_SPAN_WORD = 0,
+	/* Blank-separated (vi's `iW`). */
+	LESH_SPAN_BLANK_WORD = 1
+} lesh_span;
+
+int32_t lesh_span_at(lesh_editor* editor, size_t at, lesh_span which,
+                     size_t* start_out, size_t* end_out);
+
+/* ------------------------------------------------------------------------- */
+/* The last change, for `.` (#99 answer 4)                                    */
+/*                                                                            */
+/* Dispatch records every buffer change as the KEY SEQUENCE that made it, plus */
+/* the mode it was made in and whether it left that mode. See state.h's        */
+/* `change_replay` for why the record is keys rather than (action, count) -    */
+/* the short version is that `dw` is three dispatches and has no single action */
+/* name, and that F-7's `lesh_push_input` already replays keys.                */
+/*                                                                            */
+/* An action reads the two below and pushes the keys back. Nothing about that  */
+/* is vi's: helix's `.` is the same two calls.                                 */
+/* ------------------------------------------------------------------------- */
+
+/* The typed text of the last change's key sequence. LESH_ERR_NOTFOUND when
+ * nothing has changed the buffer yet. */
+int32_t lesh_last_change_keys(lesh_editor* editor, char* out, size_t capacity,
+                              size_t* length_out);
+
+/* Whether replaying that sequence HERE would mean what it meant THERE: it was
+ * made in the mode the editor is in now, it did not leave that mode, and every
+ * key in it is text a push-back can re-type. `*out` is 0 or 1; a 0 is the
+ * answer, not an error - pressing `.` after `ciwfoo` is the documented no-op. */
+int32_t lesh_last_change_replayable(lesh_editor* editor, int32_t* out);
 
 #ifdef __cplusplus
 } /* extern "C" */

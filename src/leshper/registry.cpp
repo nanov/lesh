@@ -173,6 +173,205 @@ std::size_t next_word_of(std::string_view text, std::size_t offset) noexcept {
 	return offset;
 }
 
+// --- Word geometry, two families (#119) -------------------------------------
+//
+// One implementation, a flag apart, because the only difference between vi's
+// `w` and vi's `W` is whether punctuation is its own class. Writing them twice
+// would be writing the boundary rule twice, and the boundary rule is the part
+// that is easy to get subtly wrong.
+//
+// Everything >= 0x80 is an identifier byte. That is deliberately coarse: it
+// keeps a run of non-ASCII text one word, keeps a class run from ever splitting
+// a cluster (so the cluster stepping below can be trusted), and asks Unicode no
+// question about word breaking that UAX #29's word rules would answer
+// differently on a shell prompt than a user expects.
+
+enum class char_class : std::uint8_t { blank, ident, punct };
+
+char_class class_of(char byte, bool blank_separated) noexcept {
+	const unsigned char c = static_cast<unsigned char>(byte);
+	if (c == ' ' || c == '\t' || c == '\n')
+		return char_class::blank;
+	if (blank_separated)
+		return char_class::ident;   // `W B E`: two classes, blank and not
+	if (c >= 0x80)
+		return char_class::ident;
+	const bool word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+	               || (c >= '0' && c <= '9') || c == '_';
+	return word ? char_class::ident : char_class::punct;
+}
+
+// Where the NEXT word begins (vi's `w` / `W`).
+std::size_t word_start_next(std::string_view text, std::size_t at, bool big) noexcept {
+	const std::size_t size = text.size();
+	std::size_t p = snap_back(text, at);
+	if (p >= size)
+		return size;
+	const char_class here = class_of(text[p], big);
+	if (here != char_class::blank) {
+		while (p < size && class_of(text[p], big) == here)
+			p = lesh::grapheme::next_boundary(text, p);
+	}
+	while (p < size && class_of(text[p], big) == char_class::blank)
+		p = lesh::grapheme::next_boundary(text, p);
+	return p;
+}
+
+// Where the word at or before `at` begins (vi's `b` / `B`).
+std::size_t word_start_prev(std::string_view text, std::size_t at, bool big) noexcept {
+	std::size_t p = snap_back(text, at);
+	if (p == 0)
+		return 0;
+	p = lesh::grapheme::prev_boundary(text, p);
+	while (p > 0 && class_of(text[p], big) == char_class::blank)
+		p = lesh::grapheme::prev_boundary(text, p);
+	if (class_of(text[p], big) == char_class::blank)
+		return 0;
+	const char_class here = class_of(text[p], big);
+	for (;;) {
+		if (p == 0)
+			return 0;
+		const std::size_t back = lesh::grapheme::prev_boundary(text, p);
+		if (class_of(text[back], big) != here)
+			return p;
+		p = back;
+	}
+}
+
+// The LAST cluster of the next word (vi's `e` / `E`), which is a place the
+// cursor rests on rather than one past it - vi's `e` is inclusive and this is
+// where that inclusiveness comes from.
+std::size_t word_end_next(std::string_view text, std::size_t at, bool big) noexcept {
+	const std::size_t size = text.size();
+	std::size_t p = snap_back(text, at);
+	if (p >= size)
+		return size;
+	p = lesh::grapheme::next_boundary(text, p);
+	while (p < size && class_of(text[p], big) == char_class::blank)
+		p = lesh::grapheme::next_boundary(text, p);
+	if (p >= size)
+		return size;
+	const char_class here = class_of(text[p], big);
+	while (p < size && class_of(text[p], big) == here)
+		p = lesh::grapheme::next_boundary(text, p);
+	return lesh::grapheme::prev_boundary(text, p);
+}
+
+// --- Line geometry the 2D buffer makes real (F-2) ---------------------------
+
+std::size_t first_nonblank_of(std::string_view text, std::size_t at) noexcept {
+	std::size_t p = line_start_of(text, at);
+	const std::size_t end = line_end_of(text, at);
+	while (p < end && (text[p] == ' ' || text[p] == '\t'))
+		++p;
+	return p;
+}
+
+// The same byte column on the line above / below, clamped to that line's end.
+//
+// BYTE column, not display column, and that is the honest v1: #123's width
+// tables know what a column is on screen and the editor does not consult them
+// here. A `j` through a line of CJK lands somewhere defensible rather than
+// somewhere correct, and the fix is a call into the layout, which is a ticket
+// and not a line.
+std::size_t line_up_of(std::string_view text, std::size_t at) noexcept {
+	const std::size_t start = line_start_of(text, at);
+	if (start == 0)
+		return at;   // no line above: vi does nothing rather than going to 0
+	const std::size_t above_end = start - 1;
+	const std::size_t above_start = line_start_of(text, above_end);
+	const std::size_t column = at - start;
+	const std::size_t target = above_start + column;
+	return snap_back(text, target > above_end ? above_end : target);
+}
+
+std::size_t line_down_of(std::string_view text, std::size_t at) noexcept {
+	const std::size_t end = line_end_of(text, at);
+	if (end >= text.size())
+		return at;
+	const std::size_t below_start = end + 1;
+	const std::size_t below_end = line_end_of(text, below_start);
+	const std::size_t column = at - line_start_of(text, at);
+	const std::size_t target = below_start + column;
+	return snap_back(text, target > below_end ? below_end : target);
+}
+
+// --- The one delimiter-matching helper (#99 answer 2) -----------------------
+//
+// In neither paradigm's idiom on purpose: vi's `i(`/`a(` is its first caller and
+// helix's `mi(` is its second, and the difference between them is which slice of
+// the answer they take, not how the answer is found.
+
+bool match_pair_in(std::string_view text, std::size_t at, char open, char close,
+                   std::size_t& start_out, std::size_t& end_out) noexcept {
+	const std::size_t size = text.size();
+	if (size == 0)
+		return false;
+	if (at > size)
+		at = size;
+
+	if (open == close) {
+		// A quote does not nest, so depth counting finds the wrong pair. Pair the
+		// run in order along the LINE - which is also what stops an unbalanced
+		// quote three lines up from swallowing everything after it.
+		const std::size_t line_begin = line_start_of(text, at);
+		const std::size_t line_finish = line_end_of(text, at);
+		std::size_t opener = std::string_view::npos;
+		for (std::size_t i = line_begin; i < line_finish; ++i) {
+			if (text[i] != open)
+				continue;
+			if (opener == std::string_view::npos) {
+				opener = i;
+				continue;
+			}
+			if (at >= opener && at <= i) {
+				start_out = opener;
+				end_out = i + 1;
+				return true;
+			}
+			opener = std::string_view::npos;
+		}
+		return false;
+	}
+
+	std::size_t opener = 0;
+	if (at < size && text[at] == open) {
+		opener = at;   // the cursor ON the opener is inside its own pair
+	} else {
+		std::size_t depth = 0;
+		bool found = false;
+		for (std::size_t i = at; i-- > 0;) {
+			if (text[i] == close) {
+				++depth;
+			} else if (text[i] == open) {
+				if (depth == 0) {
+					opener = i;
+					found = true;
+					break;
+				}
+				--depth;
+			}
+		}
+		if (!found)
+			return false;
+	}
+
+	std::size_t depth = 0;
+	for (std::size_t i = opener + 1; i < size; ++i) {
+		if (text[i] == open) {
+			++depth;
+		} else if (text[i] == close) {
+			if (depth == 0) {
+				start_out = opener;
+				end_out = i + 1;
+				return true;
+			}
+			--depth;
+		}
+	}
+	return false;   // an opener with no closer is not a pair
+}
+
 // ---------------------------------------------------------------------------
 // Copy-out, the one shape every reading accessor has.
 //
@@ -653,8 +852,96 @@ int32_t lesh_position_move(lesh_editor* editor, size_t from, lesh_motion motion,
 	case LESH_MOTION_BUFFER_END:
 		*out = text.size();
 		return LESH_OK;
+	case LESH_MOTION_LINE_FIRST_NONBLANK:
+		*out = first_nonblank_of(text, at);
+		return LESH_OK;
+	case LESH_MOTION_LINE_UP:
+		*out = line_up_of(text, at);
+		return LESH_OK;
+	case LESH_MOTION_LINE_DOWN:
+		*out = line_down_of(text, at);
+		return LESH_OK;
+	case LESH_MOTION_WORD_START_NEXT:
+		*out = word_start_next(text, at, false);
+		return LESH_OK;
+	case LESH_MOTION_WORD_START_PREV:
+		*out = word_start_prev(text, at, false);
+		return LESH_OK;
+	case LESH_MOTION_WORD_END_NEXT:
+		*out = word_end_next(text, at, false);
+		return LESH_OK;
+	case LESH_MOTION_BLANK_WORD_START_NEXT:
+		*out = word_start_next(text, at, true);
+		return LESH_OK;
+	case LESH_MOTION_BLANK_WORD_START_PREV:
+		*out = word_start_prev(text, at, true);
+		return LESH_OK;
+	case LESH_MOTION_BLANK_WORD_END_NEXT:
+		*out = word_end_next(text, at, true);
+		return LESH_OK;
 	}
 	return LESH_ERR_INVAL;  // an enumerator from a newer header than this build
+}
+
+// --- The delimiter pair (#99 answer 2), over the staged text ----------------
+
+int32_t lesh_match_pair(lesh_editor* editor, size_t at, uint32_t open, uint32_t close,
+                        size_t* start_out, size_t* end_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (start_out == nullptr || end_out == nullptr)
+		return LESH_ERR_INVAL;
+	// ASCII only, and refused rather than guessed at: a multi-byte pair - the
+	// typographic quotes, the CJK brackets - is a question no consumer has asked,
+	// and answering it wrongly now would fix the wrong answer in place.
+	if (open == 0 || open > 0x7F || close == 0 || close > 0x7F)
+		return LESH_ERR_INVAL;
+	std::size_t begin = 0;
+	std::size_t end = 0;
+	if (!match_pair_in(editor->staged, at, static_cast<char>(open), static_cast<char>(close),
+	                   begin, end))
+		return LESH_ERR_NOTFOUND;
+	*start_out = begin;
+	*end_out = end;
+	return LESH_OK;
+}
+
+int32_t lesh_span_at(lesh_editor* editor, size_t at, lesh_span which,
+                     size_t* start_out, size_t* end_out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (start_out == nullptr || end_out == nullptr)
+		return LESH_ERR_INVAL;
+	bool big = false;
+	switch (which) {
+	case LESH_SPAN_WORD:
+		big = false;
+		break;
+	case LESH_SPAN_BLANK_WORD:
+		big = true;
+		break;
+	default:
+		return LESH_ERR_INVAL;   // an enumerator from a newer header than this build
+	}
+	const std::string_view text{editor->staged};
+	std::size_t p = snap_back(text, at);
+	if (p >= text.size()) {
+		*start_out = text.size();
+		*end_out = text.size();
+		return LESH_OK;
+	}
+	const char_class here = class_of(text[p], big);
+	std::size_t begin = p;
+	while (begin > 0) {
+		const std::size_t back = lesh::grapheme::prev_boundary(text, begin);
+		if (class_of(text[back], big) != here)
+			break;
+		begin = back;
+	}
+	std::size_t end = p;
+	while (end < text.size() && class_of(text[end], big) == here)
+		end = lesh::grapheme::next_boundary(text, end);
+	*start_out = begin;
+	*end_out = end;
+	return LESH_OK;
 }
 
 // --- Loop outcomes ---------------------------------------------------------
@@ -734,6 +1021,132 @@ int32_t lesh_push_input(lesh_editor* editor, const char* bytes, size_t length) {
 	if (bytes == nullptr && length != 0)
 		return LESH_ERR_INVAL;
 	editor->pushed_input.append(bytes == nullptr ? "" : bytes, length);
+	return LESH_OK;
+}
+
+// --- Modes, the keymap stack, and the operator slot (#119) ------------------
+//
+// WRITTEN THROUGH TO THE STATE, not staged. See the note in abi.h: a mode is
+// not in the undo history, and dispatch has to be able to read the stack back
+// the instant the action returns to decide whether an operator is now pending.
+
+int32_t lesh_mode_get(lesh_editor* editor, char* out, size_t capacity, size_t* length_out) {
+	LESH_EDITOR_HANDLE(editor);
+	return copy_out(editor->target->keymaps.mode(), out, capacity, length_out);
+}
+
+int32_t lesh_mode_set(lesh_editor* editor, const char* name) {
+	LESH_EDITOR_HANDLE(editor);
+	if (name == nullptr || *name == '\0')
+		return LESH_ERR_INVAL;
+	// A name no keymap has is ACCEPTED. `bind` may create it later, and a mode
+	// naming a table that does not exist dispatches to nothing - which
+	// resolve_keys already survives, skipping the layer rather than failing.
+	editor->target->keymaps.set_mode(std::string_view{name});
+	return LESH_OK;
+}
+
+int32_t lesh_keymap_push(lesh_editor* editor, const char* name) {
+	LESH_EDITOR_HANDLE(editor);
+	if (name == nullptr || *name == '\0')
+		return LESH_ERR_INVAL;
+	editor->target->keymaps.push(std::string_view{name});
+	return LESH_OK;
+}
+
+int32_t lesh_keymap_pop(lesh_editor* editor) {
+	LESH_EDITOR_HANDLE(editor);
+	// Refused rather than silently ignored at the base: a mode is not something
+	// one can pop out of, and an action that thinks it popped one has lost track
+	// of its own pushes.
+	return editor->target->keymaps.pop() ? LESH_OK : LESH_ERR_REFUSED;
+}
+
+int32_t lesh_pending_operator_get(lesh_editor* editor, char* out, size_t capacity,
+                                  size_t* length_out) {
+	LESH_EDITOR_HANDLE(editor);
+	return copy_out(editor->target->keymaps.pending_operator, out, capacity, length_out);
+}
+
+int32_t lesh_pending_operator_set(lesh_editor* editor, const char* action) {
+	LESH_EDITOR_HANDLE(editor);
+	if (action == nullptr || *action == '\0') {
+		editor->target->keymaps.pending_operator.clear();
+		return LESH_OK;
+	}
+	if (!is_snake_case(std::string_view{action}))
+		return LESH_ERR_INVAL;
+	editor->target->keymaps.pending_operator.assign(action);
+	return LESH_OK;
+}
+
+// --- The pending numeric argument (#119) ------------------------------------
+
+int32_t lesh_numeric_argument_set(lesh_editor* editor, int64_t value) {
+	LESH_EDITOR_HANDLE(editor);
+	editor->target->keymaps.pending_count = value;
+	editor->target->keymaps.has_pending_count = true;
+	return LESH_OK;
+}
+
+int32_t lesh_numeric_argument_clear(lesh_editor* editor) {
+	LESH_EDITOR_HANDLE(editor);
+	editor->target->keymaps.clear_count();
+	return LESH_OK;
+}
+
+// --- The kill store (#99 answer 3) ------------------------------------------
+//
+// Straight to the state, like the mode and for a related reason: a kill is not
+// a buffer write and has no diff to commit. The DELETION that accompanies it is
+// an ordinary staged write and commits with everything else, so `dw` is still
+// one undo entry - undoing it puts the text back in the buffer and deliberately
+// leaves the register holding it, which is what every editor with a register
+// does and what makes `u` then `p` a way to duplicate a word.
+
+int32_t lesh_kill_set(lesh_editor* editor, const char* key, const char* bytes,
+                      size_t length, uint32_t flags) {
+	LESH_EDITOR_HANDLE(editor);
+	if (bytes == nullptr && length != 0)
+		return LESH_ERR_INVAL;
+	constexpr std::uint32_t known = LESH_KILL_LINEWISE;
+	if ((flags & ~known) != 0)
+		return LESH_ERR_INVAL;
+	editor->target->kills.put(key == nullptr ? lesh::leshper::kill_store::unnamed
+	                                         : std::string_view{key},
+	                          std::string_view{bytes == nullptr ? "" : bytes, length}, flags);
+	return LESH_OK;
+}
+
+int32_t lesh_kill_get(lesh_editor* editor, const char* key, char* out, size_t capacity,
+                      size_t* length_out, uint32_t* flags_out) {
+	LESH_EDITOR_HANDLE(editor);
+	const auto* entry = editor->target->kills.get(
+		key == nullptr ? lesh::leshper::kill_store::unnamed : std::string_view{key});
+	if (entry == nullptr)
+		return LESH_ERR_NOTFOUND;
+	if (flags_out != nullptr)
+		*flags_out = entry->flags;
+	return copy_out(entry->text, out, capacity, length_out);
+}
+
+// --- The last change, for `.` (#99 answer 4) --------------------------------
+
+int32_t lesh_last_change_keys(lesh_editor* editor, char* out, size_t capacity,
+                              size_t* length_out) {
+	LESH_EDITOR_HANDLE(editor);
+	const lesh::leshper::change_replay& record = editor->target->repeat;
+	if (!record.recorded())
+		return LESH_ERR_NOTFOUND;
+	return copy_out(record.keys, out, capacity, length_out);
+}
+
+int32_t lesh_last_change_replayable(lesh_editor* editor, int32_t* out) {
+	LESH_EDITOR_HANDLE(editor);
+	if (out == nullptr)
+		return LESH_ERR_INVAL;
+	const lesh::leshper::state& target = *editor->target;
+	*out = target.repeat.replayable(target.keymaps.mode()) ? 1 : 0;
 	return LESH_OK;
 }
 

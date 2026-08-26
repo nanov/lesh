@@ -103,6 +103,7 @@ enum class numeric_site : uint8_t {
 	redirection_word_fd,          // `3>file`               parser.cpp/lexer.cpp
 	positional_parameter_index,   // `${12}`                        expander.cpp
 	csi_parameter,                // `ESC [ 1 ; 5 C`                  decode.cpp
+	editor_repeat_count,          // `3dd` at the prompt                  vi.cpp
 	count_,                       // must stay last
 };
 
@@ -165,6 +166,11 @@ inline constexpr numeric_policy kNumericPolicies[] = {
 	// A CSI parameter is held in an `unsigned`. That no key at the terminal floor
 	// sends one above 201 is the decoder's knowledge, not this table's.
 	{numeric_site::csi_parameter,              0,              kNumericUnsignedMax, false, numeric_blanks::none},
+	// A repeat count is typed one digit at a time and lands in an int64 numeric
+	// argument. What a sane count IS - the ceiling past which `dd` stops being a
+	// command and starts being a hang - is the editor's knowledge, not this
+	// table's, exactly as the CSI row above says of key codes.
+	{numeric_site::editor_repeat_count,        0,              kNumericIntMax, false, numeric_blanks::none},
 };
 
 // The registry guard, in #35's shape. The first catches a site added to the enum

@@ -38,6 +38,7 @@
 #include "leshper/event.h"
 #include "leshper/registry.h"
 #include "leshper/state.h"
+#include "leshper/vi.h"
 
 #include <chrono>
 #include <cstddef>
@@ -103,6 +104,15 @@ void encode_key(const key_event& key, std::string& into);
 // Codepoints only: a named key is not text and contributes nothing, which is
 // what makes `self_insert` bound to `<Up>` insert nothing rather than garbage.
 void encoded_keys_as_text(std::string_view encoded, std::string& into);
+
+// True when EVERY key in the sequence contributes text - which is the same as
+// saying that pushing `encoded_keys_as_text` of it back through F-7's input
+// stack would re-type the sequence exactly.
+//
+// The question `.` asks (#119): a change made with `<Up>` or `<A-f>` in it
+// cannot be replayed through a door that carries bytes, and is marked
+// unreplayable rather than replayed with the untypable keys silently missing.
+[[nodiscard]] bool encoded_keys_are_text(std::string_view encoded) noexcept;
 
 // ---------------------------------------------------------------------------
 // The keymap.
@@ -180,6 +190,13 @@ public:
 	static constexpr std::string_view emacs = "emacs";
 	static constexpr std::string_view vi_insert = "vi_insert";
 	static constexpr std::string_view vi_command = "vi_command";
+	// The three sub-modes vi pushes above its base (#119). Named here for the
+	// same reason the three above are: a keymap's identity is its name, and a
+	// name spelled in two places is a name that will be misspelled in one.
+	static constexpr std::string_view vi_operator_pending = "vi_operator_pending";
+	static constexpr std::string_view vi_visual = "vi_visual";
+	static constexpr std::string_view vi_find_char = "vi_find_char";
+	static constexpr std::string_view vi_replace_char = "vi_replace_char";
 
 	// Creates (or replaces) `name`, optionally as a copy of `copy_from`. Null
 	// `copy_from` makes an empty one; a non-null name that does not exist is a
@@ -196,13 +213,13 @@ public:
 
 	[[nodiscard]] std::size_t size() const noexcept { return _maps.size(); }
 
-	// `emacs`, `vi_insert` and `vi_command`, as data.
+	// The default tables, as data.
 	//
 	// The emacs table is the hardcoded switch that used to live in editor.cpp,
-	// moved rather than rewritten. The two vi tables are SKELETONS: enough that
-	// the stack has something to swap its base to and that the opaque/indicator
-	// machinery is exercised by a real map, and no more - vi's repertoire is
-	// #119's, and writing it here would be writing that ticket badly.
+	// moved rather than rewritten. The vi tables carry #99's repertoire in full
+	// (#119): `vi_command` and `vi_insert` as modes, and `vi_operator_pending`,
+	// `vi_visual`, `vi_find_char` and `vi_replace_char` as the four sub-modes
+	// pushed above them.
 	void install_defaults();
 
 private:
@@ -246,6 +263,11 @@ public:
 
 private:
 	registry _actions;
+	// The vi mode's registration-time context (#119): what `;` repeats and which
+	// one-shot key is armed. Owned here, so ADR-0007's "everything has an owner
+	// that frees it" holds with no wiring - the context outlives the registry
+	// entries that point at it because it is declared before them.
+	owned_vi_context _vi;
 	keymap_registry _keymaps;
 	loop_harness _loop{_actions};
 };

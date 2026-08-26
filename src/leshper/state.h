@@ -1,5 +1,6 @@
 #pragma once
 
+#include "leshper/kill_store.h"
 #include "leshper/text.h"
 #include "leshper/undo.h"
 #include "substrate/assert.h"
@@ -148,6 +149,21 @@ struct keymap_stack {
 	// Helix mode never sets it - its verbs read the always-present selection.
 	std::string pending_operator;
 
+	// The COUNT a digit action has accumulated and dispatch has not yet handed
+	// to anything (#99: counts that multiply, `d2w` and `3dd`).
+	//
+	// Here rather than in the vi module for the same reason `pending_operator`
+	// is here: it is dispatch state, read and cleared by the loop's own turn,
+	// and a mode swap has to be able to drop it. It is also not vi's alone -
+	// emacs's `universal-argument` is the identical mechanism under another
+	// name, which is why the ABI door onto it (`lesh_numeric_argument_set`) is
+	// spelled in neither paradigm's vocabulary.
+	//
+	// An integer pair rather than an accumulating string, because this is the
+	// keystroke path and a digit must not allocate.
+	std::int64_t pending_count = 0;
+	bool has_pending_count = false;
+
 	// The mode every state starts in.
 	static constexpr std::string_view default_mode = "emacs";
 
@@ -167,6 +183,7 @@ struct keymap_stack {
 		layers.assign(1, std::string(name));
 		clear_hold();
 		pending_operator.clear();
+		clear_count();
 	}
 
 	// A sub-mode arrives (visual, operator-pending, the pager, history search).
@@ -192,7 +209,98 @@ struct keymap_stack {
 		hold_deadline.reset();
 	}
 
+	void clear_count() noexcept {
+		pending_count = 0;
+		has_pending_count = false;
+	}
+
 	friend bool operator==(const keymap_stack&, const keymap_stack&) noexcept = default;
+};
+
+// ---------------------------------------------------------------------------
+// What `.` repeats (#99 answer 4, spec §6.5): the last change, recorded as the
+// keys that made it.
+//
+// THE DEPARTURE, AND THE ARGUMENT. #99 writes the record as "(action name,
+// count)". That is not enough for the four things #99's own resolution names as
+// having to repeat: `dw`, `x`, `dd`, `diw`. Three of those four are TWO OR THREE
+// dispatches - an operator that pushes, a count, a motion or a text object, and
+// then the operator run by dispatch on the region - so there is no single
+// (action, count) that is the change. What there is, is the KEY SEQUENCE, which
+// is one thing for all four, and which F-7 already has a door for: a replay is
+// `lesh_push_input` of what was typed, read back through the keymap exactly as
+// though the user had typed it again. vim's `.` is literally this.
+//
+// So the record is the typed text of the sequence, plus the two questions that
+// decide whether replaying it HERE would mean what it meant THERE:
+//
+//   `mode_changed` - the change also left the mode it was made in. That is what
+//   an insert-carrying change looks like from dispatch's side: `ciw` deletes and
+//   lands in insert mode, and replaying the keys alone would delete and then sit
+//   waiting for text nobody is about to type. #99's "an insert-carrying last
+//   change makes `.` a no-op" is this bit, and dispatch can see it without
+//   knowing what an insert mode is.
+//
+//   `mode` - the mode base the sequence began in. This is what keeps the letters
+//   of an insert-mode word out of the record's way: typing `foo` in insert mode
+//   IS three buffer changes, and each is recorded, but each is recorded as having
+//   been made in `vi_insert`, so `.` pressed in `vi_command` declines them.
+//
+// `typable` is the honest limit of the mechanism: F-7's door carries BYTES, so a
+// sequence containing a key that types nothing - `<Up>`, `<C-w>` - cannot be
+// pushed back through it. Such a change is recorded and marked unreplayable
+// rather than half-replayed.
+//
+// Paradigm-neutral by construction: nothing here names vi, and helix's `.` -
+// when helix mode arrives - reads the same record.
+struct change_replay {
+	// --- The sequence being typed now ------------------------------------
+	std::string in_progress;
+	std::string started_in;
+	bool in_progress_typable = true;
+	// The stack depth the sequence began at. What makes "is the machine still
+	// mid-command" answerable without dispatch knowing what a mode is: a layer
+	// pushed DURING the sequence (`f` waiting for its target character) is the
+	// command asking for more input, where a layer that was already there
+	// (visual mode, which one sits in) is not.
+	std::size_t in_progress_depth = 1;
+
+	// --- The last completed change ---------------------------------------
+	bool present = false;
+	std::string keys;
+	std::string mode;
+	bool mode_changed = false;
+	bool typable = false;
+
+	[[nodiscard]] bool recorded() const noexcept { return present; }
+
+	// Whether replaying the record in `current_mode` would mean what it meant.
+	[[nodiscard]] bool replayable(std::string_view current_mode) const noexcept {
+		return present && typable && !mode_changed && mode == current_mode;
+	}
+
+	// A new sequence begins. `clear()` rather than assignment on the accumulator
+	// keeps the capacity it grew to, so a steady state of `x x x` allocates once.
+	void begin(std::string_view in_mode, std::size_t depth) {
+		in_progress.clear();
+		started_in.assign(in_mode);
+		in_progress_typable = true;
+		in_progress_depth = depth;
+	}
+
+	// The sequence is over and was not a change. Everything the accumulator held
+	// goes back to its default, not just the keys: two states that are both
+	// between commands must COMPARE equal (N-3), and a leftover "the last
+	// sequence started in emacs" would make a state that had pressed a key
+	// differ from one that had not.
+	void abandon() {
+		in_progress.clear();
+		started_in.clear();
+		in_progress_typable = true;
+		in_progress_depth = 1;
+	}
+
+	friend bool operator==(const change_replay&, const change_replay&) noexcept = default;
 };
 
 // Namespaced annotations anchored to buffer positions (A-7). Fills with #93,
@@ -254,6 +362,23 @@ struct state {
 	pager_state pager; // #94
 	generation gen;
 	undo_history undo;
+
+	// The one kill store (#99 answer 3, spec §6.5): emacs's kill ring and vi's
+	// unnamed register, keyed, with the unnamed key as the default.
+	//
+	// EDITOR STATE, not environment, and that is the decision. It goes here
+	// beside the undo history rather than into `editing_context` because it is
+	// something a TURN of the machine writes - `dw` puts text in it - and because
+	// N-3's replay compares states: a recorded session that killed and then put
+	// must reproduce what was put, and a store living in the shared environment
+	// would be invisible to that comparison. It outlives a line for the same
+	// reason the loop's state does: the loop clears the buffer at accept and
+	// keeps the state, so `dd` on one line and `p` on the next reach the same
+	// entry.
+	kill_store kills;
+
+	// What `.` repeats, and the in-progress half dispatch accumulates into.
+	change_replay repeat;
 
 	// The terminal size the last resize event reported. Here rather than in the
 	// renderer because A-3 delivers resize as an event on the ordinary input path
@@ -362,6 +487,7 @@ struct state {
 		return a.buffer == b.buffer && a.cursor == b.cursor && a._selected == b._selected
 		    && a.keymaps == b.keymaps && a.marks == b.marks && a.pending == b.pending
 		    && a.pager == b.pager && a.gen == b.gen && a.undo == b.undo
+		    && a.kills == b.kills && a.repeat == b.repeat
 		    && a.columns == b.columns && a.rows == b.rows;
 	}
 
