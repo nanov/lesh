@@ -200,9 +200,9 @@ add_library(lesh_leshper STATIC
 	src/leshper/decoration.h
 	src/leshper/editor.cpp
 	src/leshper/editor.h
+	src/leshper/effect.h
 	src/leshper/git_head.cpp
 	src/leshper/git_head.h
-	src/leshper/effect.h
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/pager.cpp
