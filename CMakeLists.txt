@@ -272,6 +272,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/leshper_vi_tests.cpp
 	tests/unit/leshper_knowledge_tests.cpp
+	tests/unit/leshper_complete_tests.cpp
 	tests/unit/invocation_tests.cpp
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp
