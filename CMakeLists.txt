@@ -266,6 +266,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_decoration_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
+	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/leshper_loop_tests.cpp
 	tests/unit/leshper_workers_tests.cpp
 	tests/unit/executor_tests.cpp
