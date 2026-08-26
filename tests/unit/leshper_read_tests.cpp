@@ -1,5 +1,3 @@
-#include "leshper/read.h"
-
 #include "leshper/keymap.h"
 #include "leshper/loop.h"
 #include "leshper/registry.h"
@@ -7,6 +5,7 @@
 #include "runtime/builtins.h"
 #include "runtime/history_store.h"
 #include "runtime/shell_state.h"
+#include "ui/session.h"
 
 #include "interactive_signal_guard.h"
 #include "temp_path.h"
@@ -18,9 +17,10 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
-// THE WIRING SITE (#134), tested where it can be: the four providers, the floor
-// refusal, the outcome latch, and the signal chain.
+// THE UI LAYER (#134, moved to `src/ui/` by #164), tested where it can be: the
+// four providers, the floor refusal, the outcome latch, and the signal chain.
 //
 // WHAT IS NOT HERE is the session itself - it spawns a thread, takes the
 // process's dispositions and owns a terminal, which is a pty and a fork rather

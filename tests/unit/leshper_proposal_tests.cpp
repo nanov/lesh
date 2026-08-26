@@ -151,7 +151,7 @@ int32_t probing_action(lesh_editor* editor, const lesh_invocation*, void* userda
 // A loop, its helpers, and the editing context they all share.
 //
 // THE CONTEXT IS THE LOOP'S EDITOR'S, which is the wiring #134 does in
-// `read.cpp` and the only wiring that works: `editor.cpp` dispatches a key
+// `ui/session.cpp` and the only wiring that works: `editor.cpp` dispatches a key
 // through `context_of(state)`, so the registry the loop attaches has to be that
 // context's or a bound key reaches a different table than the reactors do.
 struct looped {

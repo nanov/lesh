@@ -7,10 +7,10 @@
 // a function and `ls` a thing on `$PATH` (F-21). All four answers live in
 // `shell_state`, and `lesh_leshper` does not link `lesh_runtime` - that is the
 // CMake rule spec §4.4 made enforceable rather than reviewable. So the shape of
-// the question is declared here and the answer is supplied at the wiring site,
+// the question is declared here and the answer is supplied in the ui layer,
 // which is exactly the A-5 arrangement `history_source` already has: leshper
-// depends on a shape, `src/leshper/shell_state_knowledge.h` implements it over
-// the real state, and a test fakes it with a map.
+// depends on a shape, `src/ui/shell_state_knowledge.h` implements it over the
+// real state, and a test fakes it with a map.
 //
 // ONE OWNER, NO VERSION. #130 resolved this over a copy-on-write definitions
 // version held by the request token, because the highlighter then ran on a

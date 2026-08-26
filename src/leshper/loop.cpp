@@ -474,7 +474,7 @@ void event_loop::enter_read() {
 	// THE COUNTER ONLY, AND NO `sigaction` (#142). Re-asserting the dispositions
 	// used to happen here, and it was the loop thread writing process-wide state
 	// that the shell thread's `trap` builtin writes too. It moved to the shell
-	// side of the wiring site (`read.cpp`), which leaves one writer; this thread
+	// side of the ui layer (`ui/session.cpp`), which leaves one writer; this thread
 	// only ever READS the hub.
 	if (_signals != nullptr)
 		_resizes_seen = _signals->resize_count();

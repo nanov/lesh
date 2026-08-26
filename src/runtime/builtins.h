@@ -288,9 +288,9 @@ protected:
 // composer and the tick wheel live in leshper (`src/leshper/prompt/prompt.h`), and
 // `lesh_runtime` does not link `lesh_leshper`; a builtin in this file cannot
 // call `engine::add_module` any more than it can call a keymap function. So the
-// runtime declares what a configuration builtin needs to SAY, and the wiring
-// site - `src/leshper/read.cpp`, the one translation unit that links both
-// halves - hands it a leshper-backed implementation for the life of a session.
+// runtime declares what a configuration builtin needs to SAY, and the ui layer
+// - `src/ui/session.cpp`, in the one target that links both halves - hands it a
+// leshper-backed implementation for the life of a session.
 //
 // `builtin_prompt` IS THE CALLER, and it arrived after the seam rather than with
 // it. §6.10 scoped v1 to "the registry, the composer, the tick wheel, a

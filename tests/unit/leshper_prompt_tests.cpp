@@ -1229,21 +1229,21 @@ TEST(LeshperPromptAbi, ANegativeStatusReadsAsOmitted) {
 // which is a stronger statement than a test that runs on this binary only - and
 // the same discipline the composer's omission rules already follow.
 //
-// WHERE `leshper_prompt_console`'S IS NOT: it stays anonymous in read.cpp,
-// unreachable from here, and that is `binding_console`'s precedent exactly -
-// that adapter is tested through `bind`, and this one through `prompt`, whose
-// own tests drive a fake console rather than reaching into read.cpp
-// (tests/unit/prompt_builtin_tests.cpp). Contorting the design to make an
-// untestable-by-necessity
-// class reachable would be paying for the follow-up ticket's test in this
-// ticket's code. What IS asserted here is the seam's own contract: the interface
-// is implementable over the real engine, the six verbs reach it, the two
-// surfaces map, and the install point round-trips - which is everything the
-// builtin will stand on when it is written.
+// WHERE `leshper_prompt_console`'S IS NOT: it stays anonymous in
+// `ui/session.cpp`, unreachable from here, and that is `binding_console`'s
+// precedent exactly - that adapter is tested through `bind`, and this one
+// through `prompt`, whose own tests drive a fake console rather than reaching
+// into `ui/session.cpp` (tests/unit/prompt_builtin_tests.cpp). Contorting the
+// design to make an untestable-by-necessity class reachable would be paying for
+// the follow-up ticket's test in this ticket's code. What IS asserted here is
+// the seam's own contract: the interface is implementable over the real engine,
+// the six verbs reach it, the two surfaces map, and the install point
+// round-trips - which is everything the builtin will stand on when it is
+// written.
 
-// The same twenty lines read.cpp's adapter has, over a real engine. It exists to
-// prove they are enough, which is what `leshper_keymap_tests.cpp`'s copy did for
-// `bind` before there was a loop to hold the real one.
+// The same twenty lines `ui/session.cpp`'s adapter has, over a real engine. It
+// exists to prove they are enough, which is what `leshper_keymap_tests.cpp`'s
+// copy did for `bind` before there was a loop to hold the real one.
 class test_prompt_console final : public lesh::runtime::prompt_console {
 public:
 	explicit test_prompt_console(engine& which) noexcept : _engine(&which) {}
@@ -1262,8 +1262,9 @@ public:
 		return outcome::ok;
 	}
 
-	// The same two bodies read.cpp's adapter has, now that there is a language to
-	// read a template in: one parse-and-swap, and the source string it remembered.
+	// The same two bodies `ui/session.cpp`'s adapter has, now that there is a
+	// language to read a template in: one parse-and-swap, and the source string
+	// it remembered.
 	outcome set(surface which, std::string_view template_text, std::string& error_out) override {
 		return _engine->set_template(surface_of(which), template_text, error_out)
 			? outcome::ok

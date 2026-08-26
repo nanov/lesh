@@ -838,7 +838,7 @@ void keymap_registry::install_defaults() {
 	bind_notation(*pager_map, "<Left>", "pager_previous");
 	bind_notation(*pager_map, "<Down>", "pager_next_row");
 	bind_notation(*pager_map, "<Up>", "pager_previous_row");
-	// Enter accepts, and BOTH spellings of it, for the reason read.cpp's
+	// Enter accepts, and BOTH spellings of it, for the reason `ui/session.cpp`'s
 	// `bind_line_keys` gives: the key sends U+000D and a raw-mode terminal may
 	// hand back either. This is not F-35's question - there is no line to decide
 	// about, only a candidate to take - so binding it here answers nothing

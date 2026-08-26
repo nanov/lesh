@@ -3,10 +3,10 @@
 #include "leshper/pager.h"
 #include "leshper/registry.h"
 #include "leshper/shell_knowledge.h"
-#include "leshper/shell_state_knowledge.h"
 #include "leshper/state.h"
 #include "runtime/shell_state.h"
 #include "substrate/arena.h"
+#include "ui/shell_state_knowledge.h"
 
 #include <gtest/gtest.h>
 
@@ -22,6 +22,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // The v1 completer (#139, #137, spec §6.9): three sources, synchronously, on the
 // loop thread.
@@ -41,7 +42,7 @@ using namespace lesh::leshper;
 //   against a real directory, because that is the only place `d_type` and
 //   `stat` can disagree.
 //
-//   `shell_state_knowledge::enumerate` - the wiring-site adapter, over a REAL
+//   `shell_state_knowledge::enumerate` - the ui layer's adapter, over a REAL
 //   `shell_state` with real aliases, functions and a real `PATH`. It is the one
 //   join between the completer and the shell and faking it here would leave it
 //   unchecked.

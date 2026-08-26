@@ -152,6 +152,20 @@ A redirection whose input is taken from the lines following the command.
 
 ## The implementation
 
+**Layering** _[lesh]_:
+One directory, one namespace, one target: `src/X/Y.cpp` holds `lesh::X::Y` and is
+compiled into `lesh_X`. `src/substrate/` is the one flat exception — it is
+`lesh::` with no second component, because it is what everything else is built
+out of. The order is
+`substrate ← syntax ← {runtime, leshper} ← ui ← leshnici ← lesh`, and each target
+names every dependency it uses rather than inheriting one: a layer violation is a
+link failure, not a review comment. Two rules are load-bearing and worth saying
+out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
+shapes; the ui layer fills them in over shell state), and `lesh_ui` is the ONE
+library that links both halves.
+_Avoid_: reaching for a symbol across a link the target does not declare; adding
+a dependency by relying on transitivity.
+
 **Substrate** _[lesh]_:
 The allocation and container layer everything else is built on: the arena and the
 stack-first hybrid containers. Depends on nothing.
@@ -211,8 +225,14 @@ a second language would someday be added.
 _Avoid_: front end, dialect.
 
 **UI** _[lesh]_:
-The interactive layer as a whole: leshper, prompts, rendering — what
-`src/ui/` holds. The shell proper is everything else.
+Two senses, and both are in use. The layer as a whole is everything an
+interactive shell has that `lesh -c` does not — leshper, prompts, rendering.
+`src/ui/` is the narrower thing: the GLUE. The session that runs an interactive
+shell to its end, and the shell-side adapters that answer the shapes leshper
+declares — `shell_state_knowledge` over shell state, `history_store_source` over
+the history file, the prompt and binding consoles in the other direction.
+leshper is the editor BENEATH it; leshnici the extension set ABOVE it. The shell
+proper is everything else.
 
 **Front end** _[retired]_:
 A word that carried three meanings at once and now carries none. What it
@@ -265,16 +285,20 @@ incomplete with a continuation prompt; an executor holding the whole input has
 nothing to continue and answers the defect with a diagnostic.
 
 **leshper** _[lesh]_:
-lesh Prompt Editing & Reading — the shell's own line editor, the largest
-resident of the UI. Integrated: compiled into the lesh binary, not a library.
-_Avoid_: LLE, the retired earlier name; the reader; readline.
+lesh Prompt Editing & Reading — the shell's own line editor, the largest piece
+of the interactive layer and the one BENEATH `src/ui/`. Integrated: linked into
+the lesh binary, not shipped as a library anyone else builds against, and it
+never sees the shell — `lesh_leshper` does not link `lesh_runtime`, so it
+declares shapes that `src/ui/` fills in.
+_Avoid_: LLE, the retired earlier name; the reader; readline; calling the
+session or its adapters "leshper" — those are `src/ui/`.
 
 **leshnici** _[lesh]_:
 The shipped extension set: what lesh ships on top of leshper but does not owe
 it — prompt modules now, builtins later. A layer ABOVE leshper (`lesh_leshnici`
 links `lesh_leshper`, never the other way), and it arrives on an engine by being
-installed: the wiring site calls `install_prompt_modules`, so an engine built
-anywhere else is the bare built-in one. `git` is its first resident, and it is
+installed: `src/main.cpp` hands `install_prompt_modules` to the session as its
+extension hook, so an engine built anywhere else is the bare built-in one. `git` is its first resident, and it is
 there rather than among the built-ins because it reads a filesystem where every
 built-in is a pure function of the facts struct.
 _Avoid_: calling a leshnici module a built-in; a template naming one on an

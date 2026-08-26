@@ -1023,7 +1023,8 @@ enum class place_result : std::uint8_t {
 // `render_full` from the SHELL thread, in the window ADR-0009 gives it while the
 // loop is blocked in `wait_on_shell` - the same window `loop_options::prompt` has
 // been written in since #129. `render_tick` is the loop's own. See
-// `session::refresh_prompt` in read.cpp, where the argument is made in full.
+// `session::refresh_prompt` in `ui/session.cpp`, where the argument is made in
+// full.
 class engine {
 public:
 	engine();
@@ -1156,9 +1157,9 @@ public:
 	// two disagree: a user who set `$PS1` gets the stub UNTIL something configures
 	// the engine, and from that moment the native composer owns both surfaces for
 	// the rest of the session. The rest of the rule - "an untouched `$PS1` is not a
-	// preference" - is a question about the shell's variables and is asked at the
-	// wiring site, which is the only side that can see them. See
-	// `session::refresh_prompt` in read.cpp.
+	// preference" - is a question about the shell's variables and is asked in the
+	// ui layer, which is the only side that can see them. See
+	// `session::refresh_prompt` in `ui/session.cpp`.
 	//
 	// NOT REGAINED. There is no un-configure: `clear` and `use_default` are
 	// themselves configuration, and `use_default` in particular is how a user asks

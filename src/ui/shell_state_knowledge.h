@@ -1,23 +1,21 @@
 #pragma once
 
-// The wiring site: `shell_knowledge`, answered by the real `shell_state` (#135).
+// The ui layer: `shell_knowledge`, answered by the real `shell_state` (#135).
 //
-// THIS HEADER IS IN NO LIBRARY TARGET, and that is the point. `lesh_leshper`
-// does not link `lesh_runtime` - CMakeLists.txt says so and spec §4.4 is why -
-// so this file is not in `lesh_leshper`'s source list. It is compiled by the
-// header self-containment target, which links both, and by `lesh_tests`, which
-// links both; the switch-on ticket (#134) adopts it into `src/leshper/read.*`,
-// the place where lesh-side and leshper-side types are allowed to meet. If some
-// file inside `lesh_leshper` ever includes it, the link fails - which is the
-// rule enforcing itself rather than being remembered.
+// THIS HEADER IS IN `lesh_ui` AND IN NO OTHER LIBRARY, and that is the point.
+// `lesh_leshper` does not link `lesh_runtime` - CMakeLists.txt says so and spec
+// §4.4 is why - so a header that reads `shell_state` through leshper's own shape
+// can only live in the one target that links both halves. `session.cpp` is its
+// user (#164 moved both here from `src/leshper/read.*`). If some file inside
+// `lesh_leshper` ever includes it, the link fails - which is the rule enforcing
+// itself rather than being remembered.
 //
 // It is the same arrangement `history_search.h` describes for `history_source`
 // and #113's store: leshper depends on a shape, the shape is filled in where
 // both halves are already linked, and the tests fake it.
 //
 // HEADER-ONLY because there is nothing to hide: four lookups, each one line, and
-// no state but a pointer. A .cpp would need a target of its own to live in, and
-// the target it would need is the one #134 is about to create.
+// no state but a pointer.
 
 #include "leshper/shell_knowledge.h"
 #include "runtime/builtins.h"
@@ -29,7 +27,7 @@
 #include <string_view>
 #include <vector>
 
-namespace lesh::leshper {
+namespace lesh::ui {
 
 // `shell_state`, read through the one window leshper is allowed.
 //
@@ -50,14 +48,14 @@ namespace lesh::leshper {
 // the REAL state: a fake over a map has nothing a running command could change,
 // and a check it could never fail is a check nobody would trust. Debug-only:
 // `LESH_ASSERT` compiles out in release.
-class shell_state_knowledge final : public shell_knowledge {
+class shell_state_knowledge final : public leshper::shell_knowledge {
 public:
 	// `writing` is the flag `shell_actor` raises around the two writers. Null -
 	// the default - means "unchecked", which is what every adapter built over a
 	// state that no actor is serving gets, and what the tests that own their own
 	// `shell_state` want.
 	explicit shell_state_knowledge(const runtime::shell_state& state,
-	                               const shell_writing_flag* writing = nullptr) noexcept
+	                               const leshper::shell_writing_flag* writing = nullptr) noexcept
 		: _state(&state), _writing(writing) {}
 
 	// Alias, function, builtin - the executor's own order, and the reason it is
@@ -68,16 +66,16 @@ public:
 	// `external` is never answered: it costs a stat, and the token is the side
 	// that memoizes those. `unknown` from here means "not in the three tables",
 	// and the token walks `$PATH` next.
-	[[nodiscard]] command_kind classify(std::string_view name) const override {
+	[[nodiscard]] leshper::command_kind classify(std::string_view name) const override {
 		assert_readable();
 		std::string_view ignored;
 		if (_state->lookup_alias(name, ignored))
-			return command_kind::alias;
+			return leshper::command_kind::alias;
 		if (_state->has_function(name))
-			return command_kind::function;
+			return leshper::command_kind::function;
 		if (runtime::classify_builtin(name) != runtime::builtin_kind::none)
-			return command_kind::builtin;
-		return command_kind::unknown;
+			return leshper::command_kind::builtin;
+		return leshper::command_kind::unknown;
 	}
 
 	// The SHELL's `$PATH` - the variable, not the environment. They part company
@@ -95,22 +93,22 @@ public:
 	// decides its marker. Builtins come from the same `kBuiltinRegistry`
 	// `classify_builtin` reads, so the completer cannot offer a builtin the
 	// classifier would then call unknown. Nothing here touches the filesystem.
-	void enumerate(name_domain which, std::vector<std::string>& into) const override {
+	void enumerate(leshper::name_domain which, std::vector<std::string>& into) const override {
 		assert_readable();
 		switch (which) {
-			case name_domain::builtin:
+			case leshper::name_domain::builtin:
 				for (const runtime::builtin_descriptor& one : runtime::kBuiltinRegistry)
 					into.emplace_back(one.name);
 				break;
-			case name_domain::function:
+			case leshper::name_domain::function:
 				for (std::string_view name : _state->function_names())
 					into.emplace_back(name);
 				break;
-			case name_domain::alias:
+			case leshper::name_domain::alias:
 				for (const runtime::shell_state::alias_row& row : _state->aliases())
 					into.emplace_back(row.name);
 				break;
-			case name_domain::variable:
+			case leshper::name_domain::variable:
 				for (const runtime::shell_state::variable_row& row : _state->variables()) {
 					// A name that was marked (`export x`) but never assigned is
 					// still a name the user can complete to: `$x` expands to
@@ -120,7 +118,7 @@ public:
 					into.emplace_back(row.name);
 				}
 				break;
-			case name_domain::path_directory:
+			case leshper::name_domain::path_directory:
 				split_path(into);
 				break;
 		}
@@ -165,7 +163,7 @@ private:
 	}
 
 	const runtime::shell_state* _state;
-	const shell_writing_flag* _writing;
+	const leshper::shell_writing_flag* _writing;
 };
 
-} // namespace lesh::leshper
+} // namespace lesh::ui

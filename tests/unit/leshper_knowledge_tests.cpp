@@ -2,12 +2,12 @@
 #include "leshper/registry.h"
 #include "leshper/shell_actor.h"
 #include "leshper/shell_knowledge.h"
-#include "leshper/shell_state_knowledge.h"
 #include "leshper/state.h"
 #include "leshper/workers.h"
 #include "runtime/shell_state.h"
 #include "substrate/arena.h"
 #include "syntax/parser.h"
+#include "ui/shell_state_knowledge.h"
 
 #include "temp_path.h"
 
@@ -26,6 +26,7 @@
 #include <vector>
 
 using namespace lesh::leshper;
+using namespace lesh::ui;
 
 // What the shell knows, on the request token (#135; #130's verb, ADR-0009's
 // thread model).
@@ -38,7 +39,7 @@ using namespace lesh::leshper;
 //   to a reactor, and it dies when the compute returns (ADR-0008). A test that
 //   built one by hand would be testing a different object.
 //
-//   `shell_state_knowledge` - the wiring-site adapter, over a REAL `shell_state`
+//   `shell_state_knowledge` - the ui layer's adapter, over a REAL `shell_state`
 //   with real aliases, real functions and a real `PATH` variable. It is the only
 //   thing standing between the highlighter and the shell, and faking it here
 //   would leave the one join nobody had checked.

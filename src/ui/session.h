@@ -1,6 +1,7 @@
 #pragma once
 
-// THE WIRING SITE (#134): the one place lesh-side and leshper-side types meet.
+// THE UI LAYER (#134, moved here by #164): the one place lesh-side and
+// leshper-side types meet.
 //
 // Everything below this line in the dependency graph is arranged so that the
 // editor and the shell never see each other. `lesh_leshper` does not link
@@ -10,10 +11,11 @@
 // executor, and `binding_console` in the other direction, declared by the
 // runtime for `bind` and implemented here over the keymap registry.
 //
-// THIS FILE IS NOT IN `lesh_leshper`. It is compiled into the `lesh` binary and
-// into `lesh_tests`, both of which link both halves. If it ever ended up in the
-// editor's own target the link would fail, which is the rule enforcing itself -
-// exactly what `shell_state_knowledge.h` was built to be adopted by.
+// THIS FILE IS NOT IN `lesh_leshper`. `lesh_ui` is the ONE library that links
+// both `lesh_leshper` and `lesh_runtime`, and this is what it is for. If any of
+// it ever ended up in the editor's own target the link would fail, which is the
+// rule enforcing itself - exactly what `shell_state_knowledge.h` was built to
+// be adopted by.
 //
 // WHAT HAPPENED TO `read(providers) -> line`. #94 fixed leshper's entry as
 // `read(providers) -> line`: a call that takes a provider bundle and answers one
@@ -46,7 +48,22 @@ class history_store;
 class shell_state;
 }
 
+namespace lesh::leshper::prompt {
+class engine;
+}
+
 namespace lesh::leshper {
+// The `Completer` override point (#94), DEFINED IN `complete.h` since #139.
+//
+// Forward-declared here rather than included, because this header hands a
+// pointer through and never touches one - the same arrangement `history_source`
+// has. `provider_bundle::completion` below keeps its meaning and gains a
+// default: null now means "the session builds its own trio" rather than "there
+// is no completer".
+class completer;
+}
+
+namespace lesh::ui {
 
 // ---------------------------------------------------------------------------
 // The four providers (#94, A-5).
@@ -127,7 +144,7 @@ inline constexpr std::string_view kPosixContinuation = "> ";
 // owner's ruling on #157 is that the supersession has arrived: a fresh shell
 // paints the native prompt, and this class is what a user who set `$PS1` to
 // something of their own keeps getting. The precedence rule itself lives at the
-// wiring site (`session::refresh_prompt` in read.cpp), which is the only side
+// ui layer (`session::refresh_prompt` in session.cpp), which is the only side
 // that can see both the engine and the variables.
 //
 // NO EXPANSION, and it is a decision rather than an omission. #94 put "PS1
@@ -165,14 +182,6 @@ private:
 	std::string _continuation;
 };
 
-// The `Completer` override point (#94), DEFINED IN `complete.h` since #139.
-//
-// Forward-declared here rather than included, because this header hands a
-// pointer through and never touches one - the same arrangement `history_source`
-// has. The bundle field below keeps its meaning and gains a default: null now
-// means "the session builds its own trio" rather than "there is no completer".
-class completer;
-
 // #113's store, adapted onto #125's shape.
 //
 // The one difference between the two is that the searcher's callback can STOP -
@@ -181,7 +190,7 @@ class completer;
 // store's walk on the floor rather than truly stopping it: the v1 store reads
 // the whole file before it calls anybody, so what that costs is a loop over
 // spans already in memory and no further I/O at all (#125's note).
-class history_store_source final : public history_source {
+class history_store_source final : public leshper::history_source {
 public:
 	explicit history_store_source(const runtime::history_store& store) noexcept
 		: _store(&store) {}
@@ -200,13 +209,13 @@ private:
 // providers for at least as long as the read.
 struct provider_bundle {
 	const syntax_layer* syntax = nullptr;
-	const history_source* history = nullptr;
+	const leshper::history_source* history = nullptr;
 	const prompt_source* prompt = nullptr;
 	// Null means the session builds the default `shell_completer` (#139): the
 	// three sources of spec 6.9 over the shell's own tables. A caller that
 	// supplies one replaces the whole trio, which is #94's override point, at one
 	// indirect call per Tab.
-	const completer* completion = nullptr;
+	const leshper::completer* completion = nullptr;
 
 	// The OTHER half of #94's `HistoryStore`, and the only non-const member here.
 	// `history_source` above is the read side, which is all the searcher and the
@@ -259,8 +268,20 @@ struct provider_bundle {
 // semantics: a missing file is silence, a syntax error abandons the rest and the
 // shell still comes up. Empty means no rc, which is what `vared` and the tests
 // pass.
+//
+// `install_extensions` is the hook the SHIPPED EXTENSION SET arrives through
+// (#163, moved out of the session by #164). `lesh_ui` links `lesh_leshper` and
+// `lesh_runtime` and NOT `lesh_leshnici` - leshnici sits above this layer, not
+// beside it - so the session cannot name `install_prompt_modules` itself. It
+// calls this instead, on the engine it has just built and before anything can
+// name a module: `main.cpp` passes `&leshnici::install_prompt_modules`, and null
+// - what every unit test passes - means the bare seven-module engine, on which
+// `{git}` is an unknown module refused at `set`.
+using prompt_extension_installer = void (*)(leshper::prompt::engine&);
+
 [[nodiscard]] int run_interactive_shell(runtime::shell_state& state, buffer_pool& pool,
                                         const provider_bundle& providers, int in, int out,
-                                        std::string_view rc_path = {});
+                                        std::string_view rc_path = {},
+                                        prompt_extension_installer install_extensions = nullptr);
 
-} // namespace lesh::leshper
+} // namespace lesh::ui
