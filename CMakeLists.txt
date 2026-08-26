@@ -200,6 +200,7 @@ add_library(lesh_leshper STATIC
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/sgr.h
+	src/leshper/theme.h
 	src/leshper/loop.cpp
 	src/leshper/loop.h
 	src/leshper/shell_actor.cpp
