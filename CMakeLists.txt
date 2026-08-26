@@ -273,6 +273,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/leshper_loop_tests.cpp
 	tests/unit/leshper_workers_tests.cpp
+	tests/unit/args_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
 	tests/unit/grapheme_tests.cpp
