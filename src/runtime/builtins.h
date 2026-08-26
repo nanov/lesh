@@ -291,6 +291,25 @@ protected:
 // return-p.tst, exit-p.tst and eval-p.tst for it. Divergence from the reference
 // shell recorded rather than copied, exactly as for `exec --`: dash is behind the
 // standard here.
+//
+// A ZERO-ROW SPEC DOES NOT REPLACE THIS, which #148 phase 2 assumed it would and
+// measurement refuted. A spec with no rows gives `--` and the lone `-` for free,
+// but it also REFUSES every other option word - `-1` is a well-formed option
+// group whose letter no row matches - and that is precisely what these utilities
+// must not do. POSIX XCU 1.4 gives a utility with no options exactly one rule
+// about a leading hyphen, and it is this one; everything else is an operand.
+// Measured at 634e4c8, with what a zero-row spec would have answered:
+//
+//     exit -1        lesh 255   bash 255   zsh 255   (dash refuses)   -> would be
+//                    `exit: Illegal option -1`, breaking three shells' agreement
+//     return -1      lesh -1    bash 255   zsh -1    (dash refuses)   -> the same
+//     eval -x echo   lesh/dash/zsh run it and report `-x: not found`  -> the same
+//
+// So `exit`, `return`, `break`, `continue`, `shift`, `eval`, `.`, `wait` and
+// `alias` keep this reading, and it is the RIGHT one for them rather than a
+// leftover. zsh spells the same exemption as BINF_SKIPINVALID on its table row;
+// growing the parser a flag for it would be bending the grammar to fit nine
+// utilities that POSIX says have no grammar to fit.
 [[nodiscard]] constexpr size_t first_operand(char* const* argv) noexcept {
 	return argv[1] != nullptr && std::string_view{argv[1]} == "--" ? 2 : 1;
 }

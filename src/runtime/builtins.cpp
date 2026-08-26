@@ -50,6 +50,21 @@ builtin_result builtin_echo(shell_state&, char** argv) {
 	// the widely-portable behaviour, and what dash does, is to honour -n and
 	// interpret escapes. Matching dash matters because dash is the differential
 	// reference for the floor.
+	//
+	// `echo` GETS NO SPEC (#148), and the reasoning was re-read against the corpus
+	// rather than carried over. POSIX gives `echo` no OPTIONS section at all, so a
+	// word in option position that is not `-n` is an ARGUMENT and has to be
+	// printed. A table cannot say that: a spec with an `n` row refuses `-Z`, and a
+	// spec with no rows refuses it too. Measured at 634e4c8:
+	//
+	//     lesh   echo -Z    -Z      dash   echo -Z    -Z
+	//     bash   echo -Z    -Z      zsh    echo -Z    -Z
+	//
+	// zsh spells the same exemption as a flag on its table row (BINF_SKIPINVALID:
+	// "a word containing any unknown char is an operand"), which this parser does
+	// not have and should not grow for one utility. Six lines of special case are
+	// less code than the row that would replace them, and `--` stays absent here
+	// for the same reason - `echo --` prints `--`, as it does in dash.
 	size_t first = 1;
 	bool newline = true;
 	if (argv[1] != nullptr && std::strcmp(argv[1], "-n") == 0) {
