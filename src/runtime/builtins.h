@@ -332,11 +332,6 @@ protected:
 // no arguments blocks on standard input and `cd` would move the test process.
 [[nodiscard]] bool builtin_has_handler(std::string_view name) noexcept;
 
-// True when `unset`'s options select FUNCTIONS rather than variables. Exposed
-// rather than file-local because it is the one reading of `-fv` the builtin makes,
-// and a second reading anywhere would be free to disagree with it.
-[[nodiscard]] bool unset_selects_functions(char** argv) noexcept;
-
 // Where the registry says this name is implemented. `builtin_home::table` for a
 // name that is not a builtin at all - the caller has classify_builtin for that
 // question, and this one only says "not the executor's".

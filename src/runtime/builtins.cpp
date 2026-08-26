@@ -924,54 +924,58 @@ builtin_result builtin_readonly(shell_state& state, char** argv) {
 	return run_declaration(state, argv, /*make_readonly=*/true);
 }
 
-// `unset -f name...` removes FUNCTIONS. It used to live in the executor, because
-// the function table did; #106 moved the table to shell state, and try_run_builtin
-// is handed shell state, so the interception the executor kept for this one form
-// has nothing left to do.
+// WHICH TABLE `unset` REACHES, as ONE field with two letters writing it - which
+// is `cd`'s -L/-P shape, and gives last-one-wins for free: `unset -fv x` unsets a
+// variable and `unset -vf x` a function, for the same reason `x = 1; x = 2` is 2.
 //
-// POSIX: unsetting a name that is not a function is NOT an error, which is why
-// there is no diagnostic and no status but zero. The operands are deliberately NOT
-// validated as names either - `unset -f 1bad` succeeds silently in dash.
-builtin_result unset_functions(shell_state& state, char** argv) {
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			for (; argv[i] != nullptr; ++i)
-				state.unset_function(argv[i]);
-			break;
-		}
-		if (arg.size() >= 2 && arg[0] == '-')
-			continue;  // an option word; unset_selects_functions has read them
-		state.unset_function(arg);
-	}
-	return {0};
-}
+// THIS FIELD IS THE WHOLE OF #150. The tree read `unset`'s command line TWICE by
+// two different rules: this builtin's own loop, which rejected any option but
+// `-v`, and `unset_selects_functions`, which asked `arg.find('f') != npos` - a
+// SUBSTRING SEARCH over the whole word, with no notion of which letters `unset`
+// actually has. So `unset -qf f` selected the function table by the rule that had
+// never heard of `-q`, and the rule that would have rejected `-q` was never
+// consulted, because the first one had already returned. Two readings of one
+// command line, free to disagree, and they did: dash, bash and zsh all refuse
+// `-q` and lesh silently removed the function at status 0.
+//
+// There is one reading now and it is this table, so the disagreement has nowhere
+// to live. That is the same argument the registry `static_assert` (#35) makes one
+// layer up.
+enum class unset_target : std::uint8_t {
+	variables,  // -v, and the default
+	functions,  // -f
+};
+
+struct unset_opts {
+	unset_target target = unset_target::variables;
+};
+
+constexpr auto kUnset = args::spec<unset_opts>(
+	args::option{'f', args::field<&unset_opts::target>, unset_target::functions}
+		.help("unset functions rather than variables"),
+	args::option{'v', args::field<&unset_opts::target>, unset_target::variables}
+		.help("unset variables, which is the default"));
 
 builtin_result builtin_unset(shell_state& state, char** argv) {
-	// The two forms share a name and nothing else: `-f` reaches the function table,
-	// takes any word as an operand, and cannot fail. One option reading for both,
-	// so `-fv` cannot mean one thing here and another there.
-	if (unset_selects_functions(argv))
-		return unset_functions(state, argv);
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		// `-v` is the default and selects variables. `-f` never reaches here: the
-		// function form returned above, before a single operand was read.
-		if (arg == "-v")
-			continue;
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("unset: Illegal option %.*s",
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
+	const auto parsed = args::parse(kUnset, argv);
+	if (parsed.err)
+		return {report_option_error("unset", parsed.err)};
+	size_t i = static_cast<size_t>(parsed.rest - argv);
+
+	// `unset -f name...` removes FUNCTIONS. It used to live in the executor, because
+	// the function table did; #106 moved the table to shell state, and try_run_builtin
+	// is handed shell state, so the interception the executor kept for this one form
+	// has nothing left to do.
+	//
+	// POSIX: unsetting a name that is not a function is NOT an error, which is why
+	// there is no diagnostic and no status but zero. The operands are deliberately NOT
+	// validated as names either - `unset -f 1bad` succeeds silently in dash.
+	if (parsed.opts.target == unset_target::functions) {
+		for (; argv[i] != nullptr; ++i)
+			state.unset_function(argv[i]);
+		return {0};
 	}
+
 	int status = 0;
 	for (; argv[i] != nullptr; ++i) {
 		// AN OPERAND THAT IS NOT A NAME, refused before anything is unset (#73).
@@ -987,7 +991,7 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 		// Sharing the predicate is the whole of the fix; a second spelling of "is
 		// this a name" is what #63 was opened to end.
 		//
-		// The `-f` form never reaches here - unset_functions took it - and it is
+		// The `-f` form never reaches here - it returned above - and it is
 		// deliberately NOT validated: `unset -f 1bad` succeeds silently in dash, so
 		// a check on every operand of every form would have been a fix past the bug.
 		if (!is_name(argv[i])) {
@@ -2428,19 +2432,6 @@ builtin_report builtin_report_of(std::string_view name) noexcept {
 		if (d.name == name)
 			return d.report;
 	return builtin_report::name;
-}
-
-bool unset_selects_functions(char** argv) noexcept {
-	if (argv == nullptr || argv[0] == nullptr)
-		return false;
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--" || arg.size() < 2 || arg[0] != '-')
-			return false;
-		if (arg.find('f') != std::string_view::npos)
-			return true;
-	}
-	return false;
 }
 
 bool try_run_builtin(shell_state& state, char** argv, builtin_result& out,

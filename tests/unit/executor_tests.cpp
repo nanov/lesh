@@ -1263,6 +1263,39 @@ TEST_F(ExecutorTest, UnsetMinusFRemovesTheFunctionFromShellState) {
 	EXPECT_TRUE(state.has_function("g"));
 }
 
+TEST_F(ExecutorTest, UnsetRejectsAnUnknownOptionInsteadOfSelectingTheFunctionTable) {
+	// #150, and the reason #148 exists. `unset` used to read its command line TWICE
+	// by two different rules: `unset_selects_functions` asked whether the word
+	// CONTAINED an `f` - a substring search that had never heard of `-q` - and the
+	// builtin's own loop, which WOULD have rejected `-q`, was never reached because
+	// the first reading had already routed the call to the function table. So
+	// `unset -qf f` removed the function and reported success, where dash, bash and
+	// zsh all refuse the option and leave the function alone.
+	//
+	// There is one reading now - kUnset - so the two rules have nowhere to disagree.
+	EXPECT_EQ(run("f() { echo hi; }"), 0);
+	ASSERT_TRUE(state.has_function("f"));
+	EXPECT_EQ(run("unset -qf f 2>/dev/null"), 2) << "an option `unset` does not have is refused";
+	EXPECT_TRUE(state.has_function("f")) << "and nothing was unset on the way to refusing it";
+
+	// The same word without the unknown letter still selects the function table, so
+	// the fix is a refusal and not a disabling.
+	EXPECT_EQ(run("unset -f f"), 0);
+	EXPECT_FALSE(state.has_function("f"));
+}
+
+TEST_F(ExecutorTest, UnsetsTwoLettersAreOneFieldSoTheLastOneWins) {
+	// `-f` and `-v` name one thing - WHICH TABLE - so they are one field with two
+	// letters writing it, and the tie-break is the second store rather than any
+	// bookkeeping. Inside a cluster as well as across words, which is the case a
+	// hand-rolled loop gets wrong (cd-p.tst:354 makes the same assertion of `cd`).
+	EXPECT_EQ(run("h() { echo h; }; hv=set"), 0);
+	EXPECT_EQ(run("unset -fv h"), 0) << "-v is last, so a VARIABLE was named";
+	EXPECT_TRUE(state.has_function("h")) << "and the function is untouched";
+	EXPECT_EQ(run("unset -vf h"), 0) << "-f is last, so the FUNCTION was named";
+	EXPECT_FALSE(state.has_function("h"));
+}
+
 // --- break and continue outside a loop ---------------------------------------
 
 TEST_F(ExecutorTest, ABreakWithNoEnclosingLoopDoesNothing) {
