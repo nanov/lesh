@@ -201,6 +201,8 @@ add_library(lesh_leshper STATIC
 	src/leshper/editor.cpp
 	src/leshper/editor.h
 	src/leshper/effect.h
+	src/leshper/git_head.cpp
+	src/leshper/git_head.h
 	src/leshper/layout.cpp
 	src/leshper/layout.h
 	src/leshper/pager.cpp
@@ -270,6 +272,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_decoration_tests.cpp
 	tests/unit/leshper_layout_tests.cpp
 	tests/unit/leshper_pager_tests.cpp
+	tests/unit/leshper_prompt_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/leshper_loop_tests.cpp
 	tests/unit/leshper_workers_tests.cpp
