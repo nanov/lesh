@@ -1,5 +1,17 @@
 #include "substrate/args.h"
 
+// THE REAL TABLES, not stand-ins. The allocation count below is the number the
+// whole design exists for, and measuring it against a spec written for the test
+// would leave `set`'s twelve rows and the shell's own fourteen unmeasured - the
+// two biggest in the tree, and the only two driven one option word at a time.
+// `parse_invocation` is the production path for the second and reachable from a
+// test; runtime/option_word.h is the driver both of them use.
+//
+// The malloc hook is installed ONCE FOR THE WHOLE FILE (see below), which is why
+// these live here rather than beside the code they exercise.
+#include "runtime/invocation.h"
+#include "runtime/option_word.h"
+
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -442,6 +454,93 @@ TEST(Args, TenThousandParsesAllocateNothing) {
 	});
 	EXPECT_EQ(counted, 0u) << "the parse fell back to the heap";
 	EXPECT_EQ(verbosity, 30'000);
+}
+
+// `set`'s table, transcribed - the same eleven toggles bound to bool fields and
+// the same `-o NAME` with both sigils. The real one binds shell_state::options
+// and is file-local to builtins.cpp; what is measured here is the SHAPE that
+// costs: twelve rows, a store_view among them, driven one word at a time.
+struct set_shape {
+	bool a = false, b = false, c = false, e = false, f = false, h = false;
+	bool m = false, n = false, u = false, v = false, x = false;
+	std::string_view name{};
+};
+
+constexpr auto kSetShape = lesh::args::spec<set_shape>(
+	lesh::args::option{'a', lesh::args::field<&set_shape::a>, lesh::args::toggle},
+	lesh::args::option{'b', lesh::args::field<&set_shape::b>, lesh::args::toggle},
+	lesh::args::option{'C', lesh::args::field<&set_shape::c>, lesh::args::toggle},
+	lesh::args::option{'e', lesh::args::field<&set_shape::e>, lesh::args::toggle},
+	lesh::args::option{'f', lesh::args::field<&set_shape::f>, lesh::args::toggle},
+	lesh::args::option{'h', lesh::args::field<&set_shape::h>, lesh::args::toggle},
+	lesh::args::option{'m', lesh::args::field<&set_shape::m>, lesh::args::toggle},
+	lesh::args::option{'n', lesh::args::field<&set_shape::n>, lesh::args::toggle},
+	lesh::args::option{'u', lesh::args::field<&set_shape::u>, lesh::args::toggle},
+	lesh::args::option{'v', lesh::args::field<&set_shape::v>, lesh::args::toggle},
+	lesh::args::option{'x', lesh::args::field<&set_shape::x>, lesh::args::toggle},
+	lesh::args::option{'o', lesh::args::field<&set_shape::name>,
+	                   lesh::args::value("NAME")}.plus_sigil());
+
+TEST(Args, TenThousandSetStyleWordAtATimeScansAllocateNothing) {
+	// `set -o allexport +o noglob -x -- a b`, stepped the way builtin_set steps it:
+	// one option word at a time, so each `-o` is applied as it arrives. The driver
+	// widens its window to two words for the separate-form name and re-parses the
+	// first word inside it, which is the one place this design does extra WORK -
+	// the point of the measurement is that it is not extra MEMORY.
+	words w{{"set", "-o", "allexport", "+o", "noglob", "-x", "--", "a", "b"}};
+	char** const argv = w.argv();
+
+	int names = 0;
+	const size_t counted = mallocs_during([argv, &names] {
+		for (int i = 0; i < 10'000; ++i) {
+			set_shape o;
+			char** cur = argv;
+			for (;;) {
+				o.name = {};
+				const lesh::runtime::option_word step =
+					lesh::runtime::next_option_word(kSetShape, cur, o);
+				if (step.err)
+					break;
+				if (o.name.data() != nullptr)
+					names += static_cast<int>(o.name.size());
+				cur += step.consumed;
+				if (step.done)
+					break;
+			}
+		}
+	});
+	EXPECT_EQ(counted, 0u) << "the word-at-a-time scan fell back to the heap";
+	// allexport (9) + noglob (6), ten thousand times: both names arrived, and the
+	// second did not overwrite the first unseen.
+	EXPECT_EQ(names, 150'000);
+}
+
+TEST(Args, TenThousandCommandLineParsesAllocateNothing) {
+	// THE PRODUCTION TABLE, fourteen rows: the eleven shell-option toggles, `-c`,
+	// `-i`, `-s` and `-o NAME` with both sigils - stepped twice per word, because
+	// `-i` is a tri-state that needs two seeds. If anything in the new machinery
+	// reached the heap, the shell would touch it before it ran a single command.
+	words w{{"sh", "-eux", "-o", "allexport", "+o", "noglob", "+i", "-c", "echo hi",
+	         "name", "arg"}};
+	char** const argv = w.argv();
+
+	int reached = 0;
+	const size_t counted = mallocs_during([argv, &reached] {
+		for (int i = 0; i < 10'000; ++i) {
+			const lesh::runtime::invocation inv = lesh::runtime::parse_invocation(11, argv);
+			reached += (inv.error == nullptr) + (inv.command_string != nullptr);
+		}
+	});
+	EXPECT_EQ(counted, 0u) << "parsing the shell's own command line fell back to the heap";
+	EXPECT_EQ(reached, 20'000);
+
+	// And it parsed what it was given, so the loop above measured a real parse.
+	const lesh::runtime::invocation inv = lesh::runtime::parse_invocation(11, argv);
+	EXPECT_STREQ(inv.command_string, "echo hi");
+	EXPECT_TRUE(inv.options.all_export) << "the FIRST -o survived the second";
+	EXPECT_FALSE(inv.options.no_glob) << "and +o cleared rather than set";
+	ASSERT_TRUE(inv.interactive.has_value());
+	EXPECT_FALSE(*inv.interactive) << "+i is a written false, not an absent one";
 }
 
 TEST(Args, TheUsageWriterIsHeapFreeToo) {

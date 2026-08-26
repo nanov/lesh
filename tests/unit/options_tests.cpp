@@ -155,6 +155,65 @@ TEST_F(OptionsTest, SetPlusOPrintsCommandsThatRestoreTheSettings) {
 	EXPECT_FALSE(state.opts().no_glob) << "the saved listing must turn -f back off";
 }
 
+TEST_F(OptionsTest, EveryLetterInTheOptionTableIsARowOfSetsSpec) {
+	// THE GUARD ON THE ONE THING kSet DUPLICATES. `set`'s rows name the option
+	// fields directly, so the letters live in builtins.cpp while the `-o` names and
+	// the `$-` order live in shell_state::option_table(). A letter added to the
+	// table and forgotten in the spec would be `Illegal option`, and one added to
+	// the spec and forgotten in the table would have no name and no `$-` - which is
+	// exactly the drift the registry static_assert (#35) exists to catch one layer
+	// up. option_table() is not a constant expression, so this is a test rather
+	// than a static_assert; it is otherwise the same guard.
+	for (const auto& row : shell_state::option_table()) {
+		if (row.letter == '\0')
+			continue;  // pipefail, vi, nolog, ignoreeof: an `-o` name and no letter
+		if (row.letter == 'n')
+			continue;  // noexec would stop this shell running the rest of the loop;
+			           // NoExecReadsWithoutRunning is where that letter is asserted
+		const std::string on = std::string{"set -"} + row.letter;
+		const std::string off = std::string{"set +"} + row.letter;
+		EXPECT_EQ(run(on + " 2>/dev/null"), 0) << "set -" << row.letter << " is a row";
+		EXPECT_TRUE(state.opts().*row.field) << "and -" << row.letter << " turns it on";
+		EXPECT_EQ(run(off + " 2>/dev/null"), 0) << "set +" << row.letter << " is a row";
+		EXPECT_FALSE(state.opts().*row.field) << "and +" << row.letter << " turns it off";
+	}
+}
+
+TEST_F(OptionsTest, EverySubOptionIsAppliedAsItArrivesRatherThanOnlyTheLast) {
+	// `-o NAME` binds a string_view, and a string_view holds ONE name. `set` is
+	// therefore driven one option word at a time (next_option_word), so each
+	// occurrence is applied with its own sigil as it arrives. dash applies both of
+	// these too; taking only the last would silently drop allexport.
+	EXPECT_EQ(run("set -o allexport -o noglob"), 0);
+	EXPECT_TRUE(state.opts().all_export) << "the FIRST -o is not lost to the second";
+	EXPECT_TRUE(state.opts().no_glob);
+
+	// The sigil is per occurrence, not per command.
+	EXPECT_EQ(run("set -o errexit +o allexport -o nounset"), 0);
+	EXPECT_TRUE(state.opts().exit_on_error);
+	EXPECT_FALSE(state.opts().all_export) << "+o clears where -o in the same word sets";
+	EXPECT_TRUE(state.opts().error_on_unset);
+}
+
+TEST_F(OptionsTest, TheSubOptionTakesItsNameAttachedAsWellAsSeparate) {
+	// DELIBERATE DIVERGENCE, recorded per ADR-0001. `set -oerrexit` used to LIST the
+	// options and discard the attached name entirely - dash and bash do the same,
+	// zsh sets errexit. Routing the scan through the table takes XBD 12.2
+	// Guideline 7 with it, which gives a row no say in which of the two spellings it
+	// accepts, so the attached form now means what it says. A silent discard is the
+	// stub-that-succeeds shape this project keeps paying for; no corpus case covers
+	// either answer.
+	EXPECT_EQ(run("set -oerrexit"), 0);
+	EXPECT_TRUE(state.opts().exit_on_error);
+	EXPECT_EQ(run("set +oerrexit"), 0);
+	EXPECT_FALSE(state.opts().exit_on_error);
+
+	// A BARE `-o` still lists, which is what set-p.tst's round trip needs. The
+	// parser reports a missing argument only when argv really holds no next word,
+	// so the two cases stay apart.
+	EXPECT_NE(capture("set +o").find("set +o errexit\n"), std::string::npos);
+}
+
 TEST_F(OptionsTest, AnUnknownOptionIsAnErrorThatExitsANonInteractiveShell) {
 	// The return value of apply_option_letter was discarded with a `(void)`, so
 	// `set -Z` succeeded silently. `set` is a special builtin, so dash reports

@@ -1,6 +1,7 @@
 #include "runtime/builtins.h"
 
 #include "runtime/diagnostic.h"
+#include "runtime/option_word.h"
 #include "substrate/args.h"
 #include "substrate/numeric.h"
 
@@ -49,6 +50,21 @@ builtin_result builtin_echo(shell_state&, char** argv) {
 	// the widely-portable behaviour, and what dash does, is to honour -n and
 	// interpret escapes. Matching dash matters because dash is the differential
 	// reference for the floor.
+	//
+	// `echo` GETS NO SPEC (#148), and the reasoning was re-read against the corpus
+	// rather than carried over. POSIX gives `echo` no OPTIONS section at all, so a
+	// word in option position that is not `-n` is an ARGUMENT and has to be
+	// printed. A table cannot say that: a spec with an `n` row refuses `-Z`, and a
+	// spec with no rows refuses it too. Measured at 634e4c8:
+	//
+	//     lesh   echo -Z    -Z      dash   echo -Z    -Z
+	//     bash   echo -Z    -Z      zsh    echo -Z    -Z
+	//
+	// zsh spells the same exemption as a flag on its table row (BINF_SKIPINVALID:
+	// "a word containing any unknown char is an operand"), which this parser does
+	// not have and should not grow for one utility. Six lines of special case are
+	// less code than the row that would replace them, and `--` stays absent here
+	// for the same reason - `echo --` prints `--`, as it does in dash.
 	size_t first = 1;
 	bool newline = true;
 	if (argv[1] != nullptr && std::strcmp(argv[1], "-n") == 0) {
@@ -848,30 +864,33 @@ void print_declaration(std::string_view keyword, const shell_state::variable_row
 // `export` and `readonly` differ in one flag and one predicate, so they share a
 // body: writing them twice is how the two would come to disagree about `--`, about
 // a bad name, or about what a refused assignment costs.
+// The one option `export` and `readonly` have between them (#148). POSIX gives
+// both utilities the same `-p` and nothing else, so they share a table for the
+// same reason they share a body: two of them would be two chances to disagree.
+//
+// CLUSTERING COMES WITH THE TABLE, and it is a fix rather than a side effect.
+// The loop this replaces compared the WHOLE WORD with `-p`, so `export -pp` was
+// `Illegal option -pp` here while dash, bash and zsh all read it as `-p` given
+// twice. Harmless today because there is one letter; a live bug the day there
+// are two.
+struct declaration_opts {
+	bool print_only = false;  // -p
+};
+
+constexpr auto kDeclaration = args::spec<declaration_opts>(
+	args::option{'p', args::field<&declaration_opts::print_only>}
+		.help("write the declarations in a form that can be re-input"));
+
 builtin_result run_declaration(shell_state& state, char** argv, bool make_readonly) {
 	const std::string_view keyword{argv[0]};
-	size_t i = 1;
-	bool print_only = false;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		// `--` ends the options: readonly-p.tst's 'separator preceding operand' is
-		// `readonly -- a=foo`, which without this assigned to a name of `--`.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg == "-p") {
-			print_only = true;
-			continue;
-		}
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("%.*s: Illegal option %.*s",
-			       static_cast<int>(keyword.size()), keyword.data(),
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
-	}
+	// `--` ends the options: readonly-p.tst's 'separator preceding operand' is
+	// `readonly -- a=foo`, which without it assigned to a name of `--`. The table
+	// answers that once, for every utility, rather than once per loop.
+	const auto parsed = args::parse(kDeclaration, argv);
+	if (parsed.err)
+		return {report_option_error(keyword, parsed.err)};
+	const bool print_only = parsed.opts.print_only;
+	size_t i = static_cast<size_t>(parsed.rest - argv);
 
 	// `-p` PRINTS and ignores any operands, which is dash's behaviour: `readonly -p
 	// x` there neither lists x nor makes it readonly.
@@ -924,54 +943,58 @@ builtin_result builtin_readonly(shell_state& state, char** argv) {
 	return run_declaration(state, argv, /*make_readonly=*/true);
 }
 
-// `unset -f name...` removes FUNCTIONS. It used to live in the executor, because
-// the function table did; #106 moved the table to shell state, and try_run_builtin
-// is handed shell state, so the interception the executor kept for this one form
-// has nothing left to do.
+// WHICH TABLE `unset` REACHES, as ONE field with two letters writing it - which
+// is `cd`'s -L/-P shape, and gives last-one-wins for free: `unset -fv x` unsets a
+// variable and `unset -vf x` a function, for the same reason `x = 1; x = 2` is 2.
 //
-// POSIX: unsetting a name that is not a function is NOT an error, which is why
-// there is no diagnostic and no status but zero. The operands are deliberately NOT
-// validated as names either - `unset -f 1bad` succeeds silently in dash.
-builtin_result unset_functions(shell_state& state, char** argv) {
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			for (; argv[i] != nullptr; ++i)
-				state.unset_function(argv[i]);
-			break;
-		}
-		if (arg.size() >= 2 && arg[0] == '-')
-			continue;  // an option word; unset_selects_functions has read them
-		state.unset_function(arg);
-	}
-	return {0};
-}
+// THIS FIELD IS THE WHOLE OF #150. The tree read `unset`'s command line TWICE by
+// two different rules: this builtin's own loop, which rejected any option but
+// `-v`, and `unset_selects_functions`, which asked `arg.find('f') != npos` - a
+// SUBSTRING SEARCH over the whole word, with no notion of which letters `unset`
+// actually has. So `unset -qf f` selected the function table by the rule that had
+// never heard of `-q`, and the rule that would have rejected `-q` was never
+// consulted, because the first one had already returned. Two readings of one
+// command line, free to disagree, and they did: dash, bash and zsh all refuse
+// `-q` and lesh silently removed the function at status 0.
+//
+// There is one reading now and it is this table, so the disagreement has nowhere
+// to live. That is the same argument the registry `static_assert` (#35) makes one
+// layer up.
+enum class unset_target : std::uint8_t {
+	variables,  // -v, and the default
+	functions,  // -f
+};
+
+struct unset_opts {
+	unset_target target = unset_target::variables;
+};
+
+constexpr auto kUnset = args::spec<unset_opts>(
+	args::option{'f', args::field<&unset_opts::target>, unset_target::functions}
+		.help("unset functions rather than variables"),
+	args::option{'v', args::field<&unset_opts::target>, unset_target::variables}
+		.help("unset variables, which is the default"));
 
 builtin_result builtin_unset(shell_state& state, char** argv) {
-	// The two forms share a name and nothing else: `-f` reaches the function table,
-	// takes any word as an operand, and cannot fail. One option reading for both,
-	// so `-fv` cannot mean one thing here and another there.
-	if (unset_selects_functions(argv))
-		return unset_functions(state, argv);
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		// `-v` is the default and selects variables. `-f` never reaches here: the
-		// function form returned above, before a single operand was read.
-		if (arg == "-v")
-			continue;
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("unset: Illegal option %.*s",
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
+	const auto parsed = args::parse(kUnset, argv);
+	if (parsed.err)
+		return {report_option_error("unset", parsed.err)};
+	size_t i = static_cast<size_t>(parsed.rest - argv);
+
+	// `unset -f name...` removes FUNCTIONS. It used to live in the executor, because
+	// the function table did; #106 moved the table to shell state, and try_run_builtin
+	// is handed shell state, so the interception the executor kept for this one form
+	// has nothing left to do.
+	//
+	// POSIX: unsetting a name that is not a function is NOT an error, which is why
+	// there is no diagnostic and no status but zero. The operands are deliberately NOT
+	// validated as names either - `unset -f 1bad` succeeds silently in dash.
+	if (parsed.opts.target == unset_target::functions) {
+		for (; argv[i] != nullptr; ++i)
+			state.unset_function(argv[i]);
+		return {0};
 	}
+
 	int status = 0;
 	for (; argv[i] != nullptr; ++i) {
 		// AN OPERAND THAT IS NOT A NAME, refused before anything is unset (#73).
@@ -987,7 +1010,7 @@ builtin_result builtin_unset(shell_state& state, char** argv) {
 		// Sharing the predicate is the whole of the fix; a second spelling of "is
 		// this a name" is what #63 was opened to end.
 		//
-		// The `-f` form never reaches here - unset_functions took it - and it is
+		// The `-f` form never reaches here - it returned above - and it is
 		// deliberately NOT validated: `unset -f 1bad` succeeds silently in dash, so
 		// a check on every operand of every form would have been a fix past the bug.
 		if (!is_name(argv[i])) {
@@ -1039,57 +1062,133 @@ void print_options_reinputtable(const shell_state::options& o) {
 	}
 }
 
+// `set`'s table, and the hardest one in the tree (#148).
+//
+// THE ROWS BIND THE OPTION STATE ITSELF. Every POSIX shell option is already a
+// `bool` field of `shell_state::options`, which is exactly what a `toggle` row
+// binds - so `set -x` and `set +x` are one row writing one field, and the deviant
+// the research note kept setting aside (`+x` is not an option word anywhere else)
+// becomes the most ordinary thing in the table.
+//
+// A scan struct DERIVES from the option state rather than copying it field by
+// field: `-o NAME` needs somewhere to put the name, a spec requires every row to
+// bind one struct, and eleven hand-written copies in and eleven out would be
+// eleven chances to forget the twelfth. Seeding is then one assignment and
+// writing back is one assignment.
+//
+// `set -h` HAS NO `-o` SPELLING and `pipefail`, `vi`, `nolog` and `ignoreeof`
+// have no letter; shell_state::option_table() is where that asymmetry lives, and
+// `apply_option_name` is still what reads it. The letters are the rows.
+struct set_scan : shell_state::options {
+	// `-o NAME` / `+o NAME`. A default-constructed view has a NULL data pointer and
+	// `set -o ''` gives an empty one that is not null, so the two stay apart - and
+	// `set -o ''` keeps reaching `apply_option_name`, which refuses it.
+	std::string_view name{};
+};
+
+// `shell_option<&shell_state::options::trace>` - one row's binding.
+//
+// `&shell_state::options::trace` has type `bool options::*` however it is spelled,
+// including through the derived struct ([expr.unary.op]/4), and a spec requires
+// every row to bind ONE struct. The base-to-derived conversion is the language's
+// own way of saying "the same field, seen from here", and it is a constant
+// expression, so the row is still built at compile time.
+template <bool shell_state::options::*Member>
+inline constexpr auto shell_option = args::field<static_cast<bool set_scan::*>(Member)>;
+
+constexpr auto kSet = args::spec<set_scan>(
+	args::option{'a', shell_option<&shell_state::options::all_export>, args::toggle}
+		.help("export every name that is assigned"),
+	args::option{'b', shell_option<&shell_state::options::notify>, args::toggle}
+		.help("report terminated background jobs at once (recorded, inert)"),
+	args::option{'C', shell_option<&shell_state::options::no_clobber>, args::toggle}
+		.help("refuse to truncate an existing file with >"),
+	args::option{'e', shell_option<&shell_state::options::exit_on_error>, args::toggle}
+		.help("exit when a command fails"),
+	args::option{'f', shell_option<&shell_state::options::no_glob>, args::toggle}
+		.help("disable pathname expansion"),
+	args::option{'h', shell_option<&shell_state::options::hash_all>, args::toggle}
+		.help("hash commands as functions are defined (recorded, inert)"),
+	args::option{'m', shell_option<&shell_state::options::monitor>, args::toggle}
+		.help("job control (recorded, inert)"),
+	args::option{'n', shell_option<&shell_state::options::no_exec>, args::toggle}
+		.help("read commands without executing them"),
+	args::option{'u', shell_option<&shell_state::options::error_on_unset>, args::toggle}
+		.help("treat an unset parameter as an error"),
+	args::option{'v', shell_option<&shell_state::options::verbose>, args::toggle}
+		.help("echo input lines as they are read"),
+	args::option{'x', shell_option<&shell_state::options::trace>, args::toggle}
+		.help("trace commands as they are executed"),
+	args::option{'o', args::field<&set_scan::name>, args::value("NAME")}
+		.plus_sigil()
+		.help("set the option NAME names; with no NAME, list the options"));
+
 builtin_result builtin_set(shell_state& state, char** argv) {
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
+	// The scan IS the option state, seeded from it. A word that is refused half way
+	// therefore leaves the letters it had already applied applied - `set -x -Z`
+	// turns on xtrace and then reports - which is what the loop this replaces did,
+	// and what dash does.
+	set_scan scan;
+	static_cast<shell_state::options&>(scan) = state.opts();
 
-		// `--` ends the options and replaces the positional parameters with
-		// whatever follows - including nothing, which clears them.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg.size() < 2 || (arg[0] != '-' && arg[0] != '+'))
-			break;  // a plain operand also ends the options and sets $1..
-
-		const bool enable = arg[0] == '-';
-		// One option table, shared with command-line parsing (runtime/invocation.h),
-		// so `set -m` and `sh -m` cannot disagree about which letters exist.
-		for (const char c : arg.substr(1)) {
-			if (c == 'o') {
-				// A bare `set -o` LISTS; `set -o name` sets. dash prints the verbose
-				// form for `-o` and the re-inputtable form for `+o`.
-				if (argv[i + 1] == nullptr) {
-					if (enable)
-						print_options_verbose(state.opts());
-					else
-						print_options_reinputtable(state.opts());
-					break;
-				}
-				if (!shell_state::apply_option_name(state.opts(), argv[++i], enable)) {
-					// An unknown option is an ERROR, not something to shrug at. This
-					// return value was discarded with a `(void)`, so `set -o bogus`
-					// succeeded silently - and `set` is a special builtin, so dash both
-					// reports and exits a non-interactive shell. Status 2 and the
-					// wording are dash's.
-					report("set: Illegal option %co %s",
-					       arg[0], argv[i]);
-					return {2};
-				}
+	// ONE OPTION WORD AT A TIME, because `-o NAME` is applied AS IT ARRIVES. A
+	// string_view field holds one name and `set -o allexport -o noglob` gives it
+	// two - dash applies both, and so does this. The sigil is per occurrence for
+	// the same reason: `set -o errexit +o xtrace` turns one on and the other off,
+	// and a stored view cannot remember which sigil it arrived under.
+	char** cur = argv;
+	bool separator = false;
+	for (;;) {
+		scan.name = {};
+		const option_word step = next_option_word(kSet, cur, scan);
+		state.opts() = scan;
+		if (step.err) {
+			if (step.err.kind == args::error_kind::missing_argument &&
+			    step.err.letter == 'o') {
+				// A BARE `set -o` LISTS. `next_option_word` widens its window only
+				// when argv really does hold a next word, so a missing argument to
+				// `-o` can only mean there is none - which is exactly the condition
+				// the loop tested as `argv[i + 1] == nullptr`. dash prints the verbose
+				// form for `-o` and the re-inputtable form for `+o`, and set-p.tst's
+				// round trip depends on the second.
+				if (cur[1][0] == '-')
+					print_options_verbose(state.opts());
+				else
+					print_options_reinputtable(state.opts());
+				cur += 1;
 				break;
 			}
-			if (!shell_state::apply_option_letter(state.opts(), c, enable)) {
-				report("set: Illegal option %c%c", arg[0], c);
+			return {report_option_error("set", step.err)};
+		}
+		if (scan.name.data() != nullptr) {
+			// One option table, shared with command-line parsing
+			// (runtime/invocation.h), so `set -o monitor` and `sh -o monitor` cannot
+			// disagree about which names exist.
+			//
+			// An unknown name is an ERROR, not something to shrug at. The return
+			// value was once discarded with a `(void)`, so `set -o bogus` succeeded
+			// silently - and `set` is a special builtin, so dash both reports and
+			// exits a non-interactive shell. Status 2 and the wording are dash's.
+			if (!shell_state::apply_option_name(scan, scan.name, cur[1][0] == '-')) {
+				report("set: Illegal option %co %.*s", cur[1][0],
+				       static_cast<int>(scan.name.size()), scan.name.data());
 				return {2};
 			}
+			state.opts() = scan;
+		}
+		cur += step.consumed;
+		if (step.done) {
+			separator = step.separator;
+			break;
 		}
 	}
 
 	// Only replace the positional parameters when operands were actually given -
 	// bare `set -e` must not clear them, which is why this is conditional rather
-	// than unconditional.
-	if (argv[i] != nullptr || (i > 1 && std::string_view{argv[i - 1]} == "--")) {
+	// than unconditional. A bare `set --` DOES clear them, which is why the
+	// separator is a fact the driver hands back rather than one re-read from argv.
+	size_t i = static_cast<size_t>(cur + 1 - argv);
+	if (argv[i] != nullptr || separator) {
 		std::vector<std::string> positional;
 		for (; argv[i] != nullptr; ++i)
 			positional.emplace_back(argv[i]);
@@ -1202,43 +1301,38 @@ bool is_unsigned_integer(std::string_view text) {
 	return {status, control_flow::normal, 1, failure_kind::operational};
 }
 
+// `trap`'s one option. The OPERAND grammar after it - a lone `-` for reset, a
+// numeric first operand making every operand a condition - is untouched and stays
+// below; only the option scan moved into the table.
+struct trap_opts {
+	bool print_defaults = false;  // -p
+};
+
+constexpr auto kTrap = args::spec<trap_opts>(
+	args::option{'p', args::field<&trap_opts::print_defaults>}
+		.help("include conditions left at their default disposition"));
+
 builtin_result builtin_trap(shell_state& state, char** argv) {
 	signal_state& sigs = state.signals();
 
 	// Options first. `-p` prints defaults too; `--` ends the options, which is what
 	// lets `trap -- '- trapped' USR1` set a command that starts with a hyphen.
-	size_t i = 1;
-	bool include_default = false;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg == "-p") {
-			include_default = true;
-			continue;
-		}
-		// AN OPTION `trap` DOES NOT HAVE (#73). The loop used to break here, so `-Z`
-		// silently became the ACTION STRING and `trap -Z x INT` went on to read `x`
-		// as a condition and report `x: bad signal` at status 1 - a diagnostic about
-		// the wrong operand, and not fatal. dash and yash both report a usage error.
-		//
-		// POSIX XCU 2.8.1 makes that a UTILITY SYNTAX ERROR, which in a SPECIAL
-		// builtin exits a non-interactive shell; `failure_kind` defaults to `usage`,
-		// so returning 2 is the whole of it. Same wording and same status as the
-		// `unset` and `export` loops, which is the shape this one was missing.
-		//
-		// `arg.size() >= 2` is what keeps a BARE HYPHEN out of it: `-` is `trap`'s
-		// reset ACTION, not an option, and every `trap - SIG` in both test suites
-		// depends on it. Anything after `--` never reaches here at all.
-		if (arg.size() >= 2 && arg[0] == '-') {
-			report("trap: Illegal option %.*s",
-			       static_cast<int>(arg.size()), arg.data());
-			return {2};
-		}
-		break;
-	}
+	//
+	// AN OPTION `trap` DOES NOT HAVE is a usage error (#73), and the table is now
+	// what says so: the loop this replaces broke out here, so `-Z` silently became
+	// the ACTION STRING and `trap -Z x INT` went on to read `x` as a condition and
+	// report `x: bad signal` at status 1 - a diagnostic about the wrong operand,
+	// and not fatal. POSIX XCU 2.8.1 makes it a UTILITY SYNTAX ERROR, which in a
+	// SPECIAL builtin exits a non-interactive shell.
+	//
+	// A BARE HYPHEN is `trap`'s reset ACTION and not an option, and every
+	// `trap - SIG` in both test suites depends on it - the parser knows a one-
+	// character word is an operand, so this no longer needs its own guard.
+	const auto parsed = args::parse(kTrap, argv);
+	if (parsed.err)
+		return {report_option_error("trap", parsed.err)};
+	const bool include_default = parsed.opts.print_defaults;
+	size_t i = static_cast<size_t>(parsed.rest - argv);
 
 	// `trap`, `trap -p` and `trap -p SIG...` all PRINT rather than set. Only the
 	// presence of an action operand makes this a setting call, and after `-p` there
@@ -1407,43 +1501,60 @@ static_assert(std::numeric_limits<pid_t>::max() >=
 // the old reading looked at argv[1] and argv[2] by hand and had no notion of
 // where the OPERANDS began, which is why `kill -s` took the `s` for a signal name
 // and `kill -s TERM --` sent SIGTERM to the shell's process group.
+// `kill`'s two real options. `-SIGNAME` and `-9` are NOT among them: they are
+// signals standing in option position, which is why yash and zsh both refuse to
+// route `kill` through their shared parsers at all (research S4.1, S4.2).
+//
+// THIS TREE ROUTES IT, and the fall-through is explicit rather than a hole in a
+// loop: the table owns `-l`, `-s NAME` in both attachment forms, `--` and the
+// operand boundary, and a word the table REFUSES is re-read as the signal. That
+// is a per-utility policy on ONE error kind - unknown_option - and `kill` is the
+// only utility in the tree that has it. Everything else the table refuses (a
+// missing argument to `-s`) is still a usage error.
+struct kill_opts {
+	bool list = false;            // -l
+	std::string_view signal{};    // -s NAME, attached or separate
+};
+
+constexpr auto kKill = args::spec<kill_opts>(
+	args::option{'l', args::field<&kill_opts::list>}
+		.help("write the signal names rather than send one"),
+	args::option{'s', args::field<&kill_opts::signal>, args::value("SIGNAL")}
+		.help("the signal to send, by name or by number"));
+
 builtin_result builtin_kill(shell_state&, char** argv) {
 	const char* signal_operand = nullptr;
 	bool list = false;
-	size_t i = 1;
-	for (; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		// POSIX XCU 1.4: `--` ends the options. first_operand cannot serve here -
-		// it answers for a utility whose `--` can only be argv[1], and `kill`'s
-		// comes after the signal option.
-		if (arg == "--") {
-			++i;
-			break;
-		}
-		if (arg.size() < 2 || arg.front() != '-')
-			break;  // the operands start here
-		if (arg == "-l") {
-			list = true;
-			continue;
-		}
-		if (arg == "-s") {
+	// POSIX XCU 1.4: `--` ends the options. `first_operand` cannot serve here - it
+	// answers for a utility whose `--` can only be argv[1], and `kill`'s comes
+	// after the signal option - which is why this walks the words.
+	char** cur = argv;
+	for (;;) {
+		kill_opts o;
+		const option_word step = next_option_word(kKill, cur, o);
+		if (step.err) {
+			if (step.err.kind == args::error_kind::unknown_option) {
+				// `-TERM`, `-15`, and also `kill -x 1` or `kill -n 9 $$`: the word is
+				// taken as a signal and VALIDATED below, so an option this tree does
+				// not have is refused by name rather than silently taken for a pid.
+				signal_operand = cur[1] + 1;
+				cur += 1;
+				continue;
+			}
 			// `kill -s` with nothing after it names no signal. It used to fall
-			// through to the `-NAME` reading below, which took the `s` for the name
-			// and reported `s: bad signal` - a diagnostic about the wrong thing.
-			if (argv[i + 1] == nullptr)
-				return kill_usage();
-			signal_operand = argv[++i];
-			continue;
+			// through to the `-NAME` reading, which took the `s` for the name and
+			// reported `s: bad signal` - a diagnostic about the wrong thing.
+			return kill_usage();
 		}
-		if (arg.substr(0, 2) == "-s") {
-			signal_operand = argv[i] + 2;  // `kill -sTERM`, which dash accepts too
-			continue;
-		}
-		// `-TERM`, `-15`. Validated below, so an option this reading does not know -
-		// `kill -x 1`, `kill -n 9 $$` - is refused by name rather than silently
-		// taken for a pid.
-		signal_operand = argv[i] + 1;
+		if (o.list)
+			list = true;
+		if (!o.signal.empty())
+			signal_operand = o.signal.data();  // a view into argv, nul-terminated
+		cur += step.consumed;
+		if (step.done)
+			break;
 	}
+	size_t i = static_cast<size_t>(cur + 1 - argv);
 
 	if (list) {
 		// dash reads only the first operand and ignores the rest.
@@ -1607,48 +1718,38 @@ std::vector<line_field> split_line(const input_line& line, std::string_view ifs)
 	return fields;
 }
 
+// `read`'s options. `-d` is POSIX Issue 8 and the reason read-p.tst scores 32
+// rather than 31 on a shell that has it: dash predates the addition and fails
+// that one case. The divergence is deliberate and recorded, per ADR-0001.
+//
+// The delimiter is a VIEW rather than a char, because that is what the table can
+// store; `read` takes its first byte. A default of `\n` cannot live in the view -
+// an absent `-d` and `-d ''` have to stay distinguishable, and the second means
+// NUL - so the view starts unset and the newline is applied where it is read.
+struct read_opts {
+	bool raw = false;                 // -r
+	std::string_view delimiter{"\n"}; // -d
+};
+
+constexpr auto kRead = args::spec<read_opts>(
+	args::option{'r', args::field<&read_opts::raw>}
+		.help("do not treat a backslash as an escape"),
+	args::option{'d', args::field<&read_opts::delimiter>, args::value("DELIM")}
+		.help("read up to DELIM's first byte rather than to a newline"));
+
 builtin_result builtin_read(shell_state& state, char** argv) {
 	// POSIX: reads ONE line, splits it on IFS, and assigns to the named variables
 	// with the LAST one receiving everything that remains - which is what makes
 	// `read first rest` work.
-	bool raw = false;
-	// `-d` is POSIX Issue 8 and the reason read-p.tst scores 32 rather than 31 on a
-	// shell that has it: dash predates the addition and fails that one case. The
-	// divergence is deliberate and recorded, per ADR-0001.
-	char delimiter = '\n';
-	size_t first = 1;
-	for (; argv[first] != nullptr && argv[first][0] == '-' && argv[first][1] != '\0';
-	     ++first) {
-		if (std::strcmp(argv[first], "--") == 0) {
-			++first;
-			break;
-		}
-		const char* opt = argv[first] + 1;
-		while (*opt != '\0') {
-			if (*opt == 'r') {
-				raw = true;
-				++opt;
-				continue;
-			}
-			if (*opt != 'd') {
-				report("read: illegal option -%c", *opt);
-				return {2};
-			}
-			// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`).
-			// An empty one means NUL, as it does in bash.
-			++opt;
-			if (*opt == '\0') {
-				if (argv[first + 1] == nullptr) {
-					report("read: -d: missing delimiter");
-					return {2};
-				}
-				++first;
-				opt = argv[first];
-			}
-			delimiter = *opt;
-			break;
-		}
-	}
+	const auto parsed = args::parse(kRead, argv);
+	if (parsed.err)
+		return {report_option_error("read", parsed.err)};
+	const bool raw = parsed.opts.raw;
+	// The delimiter is the rest of the word (`-d:`) or the next one (`-d :`) - the
+	// table takes both, as XBD 12.2 Guideline 7 requires and as this loop already
+	// did. An EMPTY one means NUL, as it does in bash.
+	const char delimiter = parsed.opts.delimiter.empty() ? '\0' : parsed.opts.delimiter.front();
+	size_t first = static_cast<size_t>(parsed.rest - argv);
 
 	const input_line line = read_input_line(delimiter, raw);
 
@@ -2039,40 +2140,41 @@ int report_bind_outcome(binding_console::outcome what, std::string_view subject)
 	return 1;
 }
 
+// `bind`'s table. It is leshper's builtin rather than POSIX's, and the third
+// consumer the substrate placement of lesh::args was argued from (#148).
+struct bind_opts {
+	bool list_keymaps = false;   // -l
+	std::string_view keymap{};   // -m KEYMAP
+	std::string_view create{};   // -N NAME
+};
+
+constexpr auto kBind = args::spec<bind_opts>(
+	args::option{'l', args::field<&bind_opts::list_keymaps>}
+		.help("write the keymap names"),
+	args::option{'m', args::field<&bind_opts::keymap>, args::value("KEYMAP")}
+		.help("act on KEYMAP rather than the current one"),
+	args::option{'N', args::field<&bind_opts::create>, args::value("NAME")}
+		.help("create keymap NAME, optionally copying an existing one"));
+
 builtin_result builtin_bind(shell_state& state, char** argv) {
 	binding_console* console = state.console();
 
 	// Options first, POSIX-style, and `--` ends them. Read before the console is
 	// consulted so that a malformed command line is a malformed command line in
 	// every shell, interactive or not.
-	std::string_view keymap;
-	bool list_keymaps = false;
-	std::string_view create;
-	size_t at = 1;
-	for (; argv[at] != nullptr; ++at) {
-		const std::string_view arg{argv[at]};
-		if (arg == "--") {
-			++at;
-			break;
-		}
-		if (arg.size() < 2 || arg[0] != '-')
-			break;
-		if (arg == "-l") {
-			list_keymaps = true;
-			continue;
-		}
-		if (arg == "-m" || arg == "-N") {
-			if (argv[at + 1] == nullptr) {
-				report("bind: %.*s: option requires an argument",
-				       static_cast<int>(arg.size()), arg.data());
-				return {2};
-			}
-			(arg == "-m" ? keymap : create) = argv[++at];
-			continue;
-		}
-		report("bind: %.*s: unknown option", static_cast<int>(arg.size()), arg.data());
-		return {2};
-	}
+	//
+	// `bind -memacs` NOW WORKS, and did not before: the loop this replaces compared
+	// whole words, so `-m` took the next word and the attached spelling every other
+	// option-taking utility in the tree accepts was an unknown option. XBD 12.2
+	// Guideline 7 gives a row no say in which spelling it takes, which is half of
+	// what the thirteen loops disagreed about.
+	const auto parsed = args::parse(kBind, argv);
+	if (parsed.err)
+		return {report_option_error("bind", parsed.err)};
+	const std::string_view keymap = parsed.opts.keymap;
+	const bool list_keymaps = parsed.opts.list_keymaps;
+	const std::string_view create = parsed.opts.create;
+	size_t at = static_cast<size_t>(parsed.rest - argv);
 
 	if (list_keymaps && (!create.empty() || argv[at] != nullptr)) {
 		report("bind: -l takes no operands");
@@ -2143,21 +2245,47 @@ builtin_result builtin_bind(shell_state& state, char** argv) {
 	return {report_bind_outcome(what, keys)};
 }
 
+// `unalias -a`, and the one letter POSIX gives it.
+//
+// `unalias -Z` USED TO BE AN OPERAND - an alias named `-Z`, reported as not found
+// at status 1 - because the loop only ever compared argv[1] with `-a`. POSIX gives
+// `unalias` an OPTIONS section, so a word in option position that names no option
+// is a usage error, and dash, bash and zsh all say so. Measured at 634e4c8:
+//
+//     lesh   unalias -Z   unalias: -Z: not found         status 1
+//     dash   unalias -Z   unalias: Illegal option -Z     status 2
+//     bash   unalias -Z   unalias: -Z: invalid option    status 2
+//     zsh    unalias -Z   unalias: bad option: -Z        status 1
+//
+// `alias` is the opposite case and keeps its operand reading: POSIX gives it no
+// options at all ("OPTIONS: None."), so `alias -Z` is a lookup of an alias named
+// `-Z` - which is dash's answer too, and what alias-p.tst:93's re-input round trip
+// needs.
+struct unalias_opts {
+	bool all = false;  // -a
+};
+
+constexpr auto kUnalias = args::spec<unalias_opts>(
+	args::option{'a', args::field<&unalias_opts::all>}.help("remove every alias"));
+
 builtin_result builtin_unalias(shell_state& state, char** argv) {
 	// `-a` removes every alias. It used to be looked up as the NAME `-a`, which
 	// removed nothing and reported nothing - and the case that asserts it passed
 	// anyway, because `alias` printed nothing to compare against. Two silent
 	// failures cancelling out is exactly what #38 found in sigurg5-p.tst.
-	if (argv[1] != nullptr && std::string_view{argv[1]} == "-a") {
+	//
+	// POSIX puts the options first and `--` after them, so `unalias -a` is an
+	// option and `unalias -- -a` removes an alias whose name is `-a`. The table
+	// orders the two without a fast path in front of it.
+	const auto parsed = args::parse(kUnalias, argv);
+	if (parsed.err)
+		return {report_option_error("unalias", parsed.err)};
+	if (parsed.opts.all) {
 		state.clear_aliases();
 		return {0};
 	}
 	int status = 0;
-	// AFTER the `-a` check above and not before it: POSIX puts the options first
-	// and `--` after them, so `unalias -a` is an option and `unalias -- -a` removes
-	// an alias whose name is `-a`. dash, bash, zsh and ksh all discard the
-	// separator here and lesh looked for an alias literally called `--` (#63).
-	for (size_t i = first_operand(argv); argv[i] != nullptr; ++i) {
+	for (size_t i = static_cast<size_t>(parsed.rest - argv); argv[i] != nullptr; ++i) {
 		// POSIX: removing an alias that does not exist is an ERROR. Returning 0 made
 		// `unalias true; unalias true` succeed twice.
 		if (!state.unset_alias(argv[i])) {
@@ -2428,19 +2556,6 @@ builtin_report builtin_report_of(std::string_view name) noexcept {
 		if (d.name == name)
 			return d.report;
 	return builtin_report::name;
-}
-
-bool unset_selects_functions(char** argv) noexcept {
-	if (argv == nullptr || argv[0] == nullptr)
-		return false;
-	for (size_t i = 1; argv[i] != nullptr; ++i) {
-		const std::string_view arg{argv[i]};
-		if (arg == "--" || arg.size() < 2 || arg[0] != '-')
-			return false;
-		if (arg.find('f') != std::string_view::npos)
-			return true;
-	}
-	return false;
 }
 
 bool try_run_builtin(shell_state& state, char** argv, builtin_result& out,

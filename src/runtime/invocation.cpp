@@ -1,8 +1,71 @@
 #include "runtime/invocation.h"
 
+#include "runtime/option_word.h"
+
 #include <string_view>
 
 namespace lesh::runtime {
+
+namespace {
+
+// The shell's own command line, as a table (#148).
+//
+// It reads the SAME option letters `set` does, from the same
+// shell_state::option_table(), because POSIX gives them the same set and two
+// tables would drift - `sh -m` and `set -m` disagreeing about which letters exist
+// is the failure this arrangement exists to prevent. What is here and not in
+// `set` is the three letters that belong to an INVOCATION rather than to a
+// running shell: `-c`, `-i` and `-s`.
+struct invocation_scan : shell_state::options {
+	std::string_view name{};      // -o NAME
+	bool command_string = false;  // -c
+	bool interactive = false;     // -i / +i
+	bool read_stdin = false;      // -s / +s
+};
+
+// `shell_option<&shell_state::options::trace>` - the same trick `set`'s table
+// uses, and for the same reason: a row must bind the struct the spec names, and
+// `&shell_state::options::trace` has type `bool options::*` however it is spelled.
+template <bool shell_state::options::*Member>
+inline constexpr auto shell_option =
+	args::field<static_cast<bool invocation_scan::*>(Member)>;
+
+constexpr auto kInvocation = args::spec<invocation_scan>(
+	args::option{'a', shell_option<&shell_state::options::all_export>, args::toggle}
+		.help("export every name that is assigned"),
+	args::option{'b', shell_option<&shell_state::options::notify>, args::toggle}
+		.help("report terminated background jobs at once (recorded, inert)"),
+	args::option{'C', shell_option<&shell_state::options::no_clobber>, args::toggle}
+		.help("refuse to truncate an existing file with >"),
+	args::option{'e', shell_option<&shell_state::options::exit_on_error>, args::toggle}
+		.help("exit when a command fails"),
+	args::option{'f', shell_option<&shell_state::options::no_glob>, args::toggle}
+		.help("disable pathname expansion"),
+	args::option{'h', shell_option<&shell_state::options::hash_all>, args::toggle}
+		.help("hash commands as functions are defined (recorded, inert)"),
+	args::option{'m', shell_option<&shell_state::options::monitor>, args::toggle}
+		.help("job control (recorded, inert)"),
+	args::option{'n', shell_option<&shell_state::options::no_exec>, args::toggle}
+		.help("read commands without executing them"),
+	args::option{'u', shell_option<&shell_state::options::error_on_unset>, args::toggle}
+		.help("treat an unset parameter as an error"),
+	args::option{'v', shell_option<&shell_state::options::verbose>, args::toggle}
+		.help("echo input lines as they are read"),
+	args::option{'x', shell_option<&shell_state::options::trace>, args::toggle}
+		.help("trace commands as they are executed"),
+	// POSIX spells the command string `-c`; `+c` is not an option at all, so the
+	// row declares no `+` sigil and the parser refuses one.
+	args::option{'c', args::field<&invocation_scan::command_string>}
+		.help("read the commands from the first operand"),
+	args::option{'i', args::field<&invocation_scan::interactive>, args::toggle}
+		.help("run interactively"),
+	args::option{'s', args::field<&invocation_scan::read_stdin>, args::toggle}
+		.help("read the commands from standard input"),
+	args::option{'o', args::field<&invocation_scan::name>, args::value("NAME")}
+		.plus_sigil()
+		.help("set the option NAME names"));
+
+} // namespace
 
 invocation parse_invocation(int argc, char** argv) {
 	invocation inv;
@@ -18,83 +81,91 @@ invocation parse_invocation(int argc, char** argv) {
 	// Reading the next word instead was one bug wearing two faces (issue #44). It
 	// walked ON past the command string, so `-c code -- -x` read `--` as the option
 	// terminator and then took `-x` for $0, losing a positional parameter that dash
-	// and bash both keep; and it ran the hyphen in `-c - code`. Both go away here,
+	// and bash both keep; and it ran the hyphen in `-c - code`. Both stay gone here,
 	// because the option list ends at the first operand by construction and the
 	// command string IS that operand.
-	bool want_command_string = false;
 
-	int i = 1;
-	for (; i < argc; ++i) {
-		const std::string_view arg{argv[i]};
+	// TWO SEEDS, ONE TABLE. `-i` and `+i` need a THIRD answer - "neither was given"
+	// - because POSIX then decides interactiveness from isatty rather than from the
+	// command line, and this parser must not pretend to know. A `toggle` binds a
+	// bool and a bool holds two answers, so the same table is stepped over the same
+	// words into two structs seeded oppositely: a field that comes back the SAME
+	// either way was written, and one that comes back as it was seeded was not.
+	//
+	// This is not #150's bug wearing a new hat. That was two DIFFERENT rules reading
+	// one command line and disagreeing; this is one rule applied twice, which cannot.
+	// It costs a few dozen byte compares, once, at startup.
+	invocation_scan scan;
+	invocation_scan probe;
+	probe.interactive = true;
 
-		// `--` ends the options. A lone `-` or `+` does too, and POSIX's obsolete
-		// `set -` spelling means nothing on the command line, so both are simply
-		// consumed rather than treated as an operand.
-		if (arg == "--" || arg == "-" || arg == "+") {
-			++i;
+	// THE ARRAY IS NULL-TERMINATED, and the parser reads it through that terminator
+	// rather than through `argc`. ISO C 5.1.2.2.1 and POSIX XBD 8 both require
+	// argv[argc] to be a null pointer, so this is the same array every other option
+	// scan in the tree walks; `argc` is still what the operand indices are reported
+	// against.
+	char** cur = argv;
+	for (;;) {
+		const option_word step = next_option_word(kInvocation, cur, scan);
+		(void)next_option_word(kInvocation, cur, probe);
+		if (step.err) {
+			// `-o` is the only row that takes an argument, so a missing one is its.
+			if (step.err.kind == args::error_kind::missing_argument) {
+				inv.error = "-o requires an option name";
+				return inv;
+			}
+			// The whole WORD, which is what this parser has always named - `-xZ` and
+			// `--nosuch` read better than the letter alone on a command line nobody
+			// has run yet.
+			inv.error = "invalid option";
+			inv.error_operand = cur[1];
+			return inv;
+		}
+		if (scan.name.data() != nullptr) {
+			// One option table, shared with the `set` builtin, so `sh -o monitor` and
+			// `set -o monitor` cannot disagree about which names exist. The sigil is
+			// read off the word the stored view points into - `+o` clears.
+			const bool enable = cur[1][0] == '-';
+			if (!shell_state::apply_option_name(scan, scan.name, enable)) {
+				inv.error = "invalid option name";
+				inv.error_operand = scan.name.data();
+				return inv;
+			}
+			// The probe carries the same options; only `interactive` differs.
+			static_cast<shell_state::options&>(probe) =
+				static_cast<const shell_state::options&>(scan);
+			scan.name = {};
+			probe.name = {};
+		}
+		cur += step.consumed;
+		if (step.done) {
+			// A lone `-` or `+` ends the options too, and POSIX's obsolete `set -`
+			// spelling means nothing on a command line, so it is consumed rather than
+			// left to be read as the script's pathname. The parser stops at it - a
+			// one-character word is an operand - and this is the utility saying what
+			// its own first operand means, the way `trap` says a lone `-` is a reset.
+			if (!step.separator && cur[1] != nullptr) {
+				const std::string_view first{cur[1]};
+				if (first == "-" || first == "+")
+					cur += 1;
+			}
 			break;
 		}
-		if (arg.size() < 2 || (arg[0] != '-' && arg[0] != '+'))
-			break;  // an operand; the options are over
-
-		const bool enable = arg[0] == '-';
-		bool group_ended = false;
-		for (size_t c = 1; c < arg.size() && !group_ended; ++c) {
-			switch (arg[c]) {
-				case 'c':
-					// POSIX spells this `-c`; `+c` is not an option at all.
-					if (!enable) {
-						inv.error = "invalid option";
-						inv.error_operand = argv[i];
-						return inv;
-					}
-					// The rest of THIS word is still option letters, and so is the rest
-					// of the command line up to the first operand. Ending the group here
-					// dropped the letters silently: `sh -cn 'for i in $(>f); do :; done'`
-					// ran the substitution and created the file, which is option-p.tst's
-					// 'noexec on: for command is not executed'.
-					want_command_string = true;
-					break;
-				case 'i':
-					inv.interactive = enable;
-					break;
-				case 's':
-					// Read commands from standard input. Already the default when there
-					// is no operand; explicit -s means it holds even when there is one.
-					inv.read_stdin = true;
-					break;
-				case 'o': {
-					// `-o` takes the option's long name. POSIX writes it as a separate
-					// word; a bare `-o` with nothing after it lists the options, which
-					// belongs to `set` (issue #31) and is not an invocation form.
-					if (++i >= argc) {
-						inv.error = "-o requires an option name";
-						return inv;
-					}
-					if (!shell_state::apply_option_name(inv.options, argv[i], enable)) {
-						inv.error = "invalid option name";
-						inv.error_operand = argv[i];
-						return inv;
-					}
-					group_ended = true;
-					break;
-				}
-				default:
-					if (!shell_state::apply_option_letter(inv.options, arg[c], enable)) {
-						inv.error = "invalid option";
-						inv.error_operand = argv[i];
-						return inv;
-					}
-					break;
-			}
-		}
 	}
+
+	inv.options = scan;
+	inv.read_stdin = scan.read_stdin;
+	// Written by either sigil, or by neither - see the two seeds above.
+	if (scan.interactive == probe.interactive)
+		inv.interactive = scan.interactive;
+
+	int i = static_cast<int>(cur + 1 - argv);
 
 	// Operand handling, and the part of POSIX's invocation grammar lesh had wrong:
 	// with -c the first operand is the command string and the SECOND is $0
 	// (command_name), NOT $1. Without -c the first operand is the script to run,
 	// and a script's pathname is its own $0.
-	if (want_command_string) {
+	if (scan.command_string) {
 		if (i >= argc) {
 			inv.error = "-c requires a command string";
 			return inv;

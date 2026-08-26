@@ -285,6 +285,26 @@ struct option {
 		return copy;
 	}
 
+	// `+o NAME` as well as `-o NAME`.
+	//
+	// A TOGGLE gets the `+` sigil from its tag, because polarity is what a toggle
+	// IS. Every other setter has to ask, and exactly one row in the tree does:
+	// POSIX writes `set` as
+	// `set [-abCefhmnuvx] [-o option]... [+abCefhmnuvx] [+o option]...`, so the
+	// sub-option takes both sigils and stores the same name under either. WHICH
+	// sigil it arrived under is the caller's to read - from the word the stored
+	// view points into - because a `store_view` row keeps a name and not a
+	// polarity; the row records only that `+` is legal here.
+	//
+	// This is a DECLARATION form, not a grammar change: `detail::next` has always
+	// admitted `+` per row and refused it where no row declares one. Before this
+	// there was simply no way to say it except by being a toggle.
+	[[nodiscard]] consteval option plus_sigil() const {
+		option copy = *this;
+		copy.plus = true;
+		return copy;
+	}
+
 private:
 	template <class T>
 	using underlying_of = typename std::conditional_t<std::is_enum_v<T>, std::underlying_type<T>,
@@ -604,6 +624,24 @@ template <class T, std::size_t N>
 	return out;
 }
 
+// The same parse, into a struct the CALLER already holds.
+//
+// `parse` default-constructs its result, which is what a utility wants when the
+// member initializers ARE the defaults. Three callers want the other thing:
+//
+//   - `set` and the shell's own command line parse INTO the live option state, so
+//     a word that is refused half way leaves the options it had already applied
+//     applied - which is what the loops they replace did, and what dash does.
+//   - a caller stepping through argv one option word at a time (see
+//     `next_option_word` in runtime/builtins.cpp) accumulates across the steps.
+//
+// It is the same erased core and the same table; only the seed differs. Nothing
+// about the grammar is reachable from here.
+template <class T, std::size_t N>
+[[nodiscard]] scan_result parse_into(const spec_table<T, N>& s, char** argv, T& into) noexcept {
+	return detail::parse_core(s.view(), argv, &into);
+}
+
 // ---------------------------------------------------------------------------
 // Usage
 // ---------------------------------------------------------------------------
@@ -732,6 +770,18 @@ constexpr bool a_plus_word_is_an_option_only_where_a_row_admits_the_sigil() {
 	return !run(argv).err && run(bad).err == error{error_kind::unknown_option, 'L'};
 }
 
+constexpr bool an_argument_taking_row_may_declare_the_plus_sigil() {
+	// `set +o NAME`: both sigils, one stored name. The row is not a toggle, so it
+	// says so with plus_sigil(), and the caller reads the polarity off the word.
+	static constexpr auto kSub = spec<opts>(
+		option{'x', field<&opts::x>, toggle},
+		option{'o', field<&opts::delimiter>, value("NAME")}.plus_sigil());
+	char a0[] = "set", a1[] = "+o", a2[] = "errexit", *argv[] = {a0, a1, a2, nullptr};
+	char b0[] = "set", b1[] = "+d", *bad[] = {b0, b1, nullptr};
+	return !scan(kSub.view(), argv).err && scan(kSub.view(), argv).rest == argv + 3 &&
+	       scan(kSub.view(), bad).err == error{error_kind::unknown_option, 'd'};
+}
+
 constexpr bool a_spec_without_a_toggle_reads_a_plus_word_as_an_operand() {
 	// `cd +1` is a chdir into a directory named `+1`, not an illegal option.
 	static constexpr auto kNoPlus =
@@ -784,6 +834,7 @@ static_assert(an_unknown_letter_inside_a_cluster_is_the_one_reported(), "not the
 static_assert(a_missing_option_argument_is_an_error(), "Guideline 7 with nothing after it");
 static_assert(operands_follow_the_options(), "Guideline 9: no permutation");
 static_assert(a_plus_word_is_an_option_only_where_a_row_admits_the_sigil(), "set's +x");
+static_assert(an_argument_taking_row_may_declare_the_plus_sigil(), "set's +o NAME");
 static_assert(a_spec_without_a_toggle_reads_a_plus_word_as_an_operand(), "and cd's +1 is a path");
 static_assert(no_options_at_all_leaves_the_first_word(), "");
 static_assert(an_empty_argv_tail_is_an_empty_operand_list(), "");
