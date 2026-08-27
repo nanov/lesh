@@ -135,6 +135,13 @@ pointer. Workers never see a mutation, a stale view keeps its old mapping alive,
 and the compute path stays heap-free per `UiAutosuggest`'s zero-heap tests.
 `new_items` is bounded by the vacuum cadence, so the copy is small.
 
+Amended by #196: the walk is a CONCATENATION of the three tiers (own → log →
+blob), each sorted within itself, not a three-way merge sort. `when` may
+therefore rise at a tier boundary (an idle terminal's own items precede a
+sibling's newer vacuumed ones — fish behaves the same) and inside the log tier
+(append order). The property suite asserts exactly that and that it rises
+nowhere else. A true merge would be an ADR change.
+
 Never re-check file identity per read: the watch and the write-path check make
 it redundant, and a `stat` per keystroke is a syscall on the autosuggest path.
 
