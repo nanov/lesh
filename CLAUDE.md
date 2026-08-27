@@ -90,6 +90,19 @@ exemption still leans on:
 `lesh_leshper` links `lesh_substrate` and nothing else, so a `src/leshper/` change
 provably cannot reach syntax, the runtime or a file descriptor.
 
+**`src/fiber/` is exempt, on `lesh_leshper`'s exact argument** (#198). `lesh_fiber`
+links `lesh_substrate` AND NOTHING ELSE - no syntax, no runtime, no ui - so a
+change under `src/fiber/` provably cannot reach the parser, the executor or a
+file descriptor, and as of step 0 no shipped binary even links the target: the
+consumers are `lesh_tests` and `lesh_bench`. Iterate with
+`./build/debug/lesh_tests --gtest_filter='Fiber*'` (tens of milliseconds,
+including two `fork()`ed guard-page cases). Two things the exemption does NOT
+cover. The full sanitized gate still runs at merge - `Fiber*` is where the
+LeakSanitizer control for parked fiber stacks lives, and `ctest --preset debug`
+is the only place it means anything; and the exemption expires the moment step 1
+of #145 puts a scheduler inside `event_loop`, because from then on a
+`src/fiber/` change is reached by `src/ui/`, which is not exempt.
+
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered
 baseline. Four tickets on this map have opened with a headline number that was
