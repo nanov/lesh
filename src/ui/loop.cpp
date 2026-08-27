@@ -146,7 +146,6 @@ const char* name_of(topic which) noexcept {
 		case topic::signal: return "signal";
 		case topic::worker: return "worker";
 		case topic::timer: return "timer";
-		case topic::shell: return "shell";
 		case topic::watch: return "watch";
 		case topic::count_: break;
 	}
@@ -432,7 +431,6 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	_deferred.reserve(8);
 	_signal_numbers.reserve(8);
 	_completions.reserve(8);
-	_inbox.reserve(8);
 	_out.reserve(4096);
 	_accepted.reserve(256);
 
@@ -440,18 +438,23 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 }
 
 event_loop::~event_loop() {
-	stop();
-	// The messages `drain` handed us go back before the actor that owns their
-	// storage does (ADR-0007).
-	if (_shell != nullptr)
-		_shell->replies().recycle(_inbox);
+	// NOTHING TO JOIN AND NOTHING TO GIVE BACK (#201). This used to `stop()` a
+	// thread of its own and then hand the actor's pooled messages back before the
+	// actor that owned their storage died (ADR-0007); there is no thread and no
+	// message pool. `run()` has returned by the time a caller destroys a loop,
+	// because `run()` is a call on the caller's own thread.
 }
 
 void event_loop::attach_helpers(worker_pool& pool) noexcept { _helpers = &pool; }
 
 void event_loop::attach_registry(leshper::registry& reg) noexcept { _registry = &reg; }
 
-void event_loop::attach_shell(shell_actor& shell) noexcept { _shell = &shell; }
+void event_loop::attach_shell(shell_side& shell, const leshper::host* host,
+                             shell_writing_flag* writing) noexcept {
+	_shell = &shell;
+	_shell_host = host;
+	_writing = writing;
+}
 
 void event_loop::attach_signals(signal_hub& hub) noexcept {
 	_signals = &hub;
@@ -598,7 +601,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	}
 
 	int at = 0;
-	int tty_at = -1, signal_at = -1, worker_at = -1, shell_at = -1, watch_at = -1;
+	int tty_at = -1, signal_at = -1, worker_at = -1, watch_at = -1;
 	const auto poll_on = [&](int fd) {
 		_poll[static_cast<std::size_t>(at)].fd = fd;
 		_poll[static_cast<std::size_t>(at)].events = POLLIN;
@@ -611,8 +614,6 @@ turn_result event_loop::turn(int timeout_ms) {
 		signal_at = poll_on(_signals->wakeup_fd());
 	if (_helpers != nullptr)
 		worker_at = poll_on(_helpers->completions().wakeup_fd());
-	if (_shell != nullptr)
-		shell_at = poll_on(_shell->replies().wakeup_fd());
 	if (_watch_fd >= 0)
 		watch_at = poll_on(_watch_fd);
 
@@ -658,8 +659,6 @@ turn_result event_loop::turn(int timeout_ms) {
 	fire_timers(now, result);
 	if (worker_at >= 0 && revents_of(_poll[static_cast<std::size_t>(worker_at)]) != 0)
 		drain_worker_topic(result);
-	if (shell_at >= 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0)
-		drain_shell_topic(result);
 	// LAST, AND IT PRODUCES NO EVENT. Everything above turns a descriptor into
 	// something the editor sees; the watch turns one into a fact about a file the
 	// editor has never heard of. Last because it is the least urgent thing in a
@@ -670,12 +669,13 @@ turn_result event_loop::turn(int timeout_ms) {
 		drain_watch_topic(result);
 
 	// SWAPPED OUT BEFORE THE WALK, the way `drain_registry_effects` does it
-	// (#162). `handle` on an accepted line blocks in `wait_on_shell`, and a shell
-	// message arriving there pushes onto `_events`; a range-for over the vector
-	// being appended to reads freed memory the moment the push reallocates - a
-	// heap-use-after-free ASan catches, and any user with a background job can
-	// hit. The push lands in the emptied `_events` now and the outer pass picks
-	// it up, so nothing is dropped and nothing dangles.
+	// (#162). `handle` PUSHES onto `_events` - the shell reactor's `worker_result`
+	// does it from inside `notify_reactors`, and a shell message drained inside a
+	// blocked `wait_on_shell` was the case that found it - and a range-for over
+	// the vector being appended to reads freed memory the moment the push
+	// reallocates: a heap-use-after-free ASan catches. The push lands in the
+	// emptied `_events` now and the outer pass picks it up, so nothing is dropped
+	// and nothing dangles.
 	while (!_events.empty()) {
 		_carried_events.clear();
 		_carried_events.swap(_events);
@@ -867,19 +867,6 @@ void event_loop::drain_worker_topic(turn_result& result) {
 	_completions.clear();
 }
 
-void event_loop::drain_shell_topic(turn_result& result) {
-	if (_shell == nullptr)
-		return;
-	++result.topics_drained;
-
-	// Same contract as the worker topic: `drain` consumes the byte and empties
-	// the queue under one lock (ADR-0009 point 3, #126's rule).
-	_shell->replies().drain(_inbox);
-	for (shell_message& answer : _inbox)
-		handle_shell_message(answer);
-	_shell->replies().recycle(_inbox);
-}
-
 void event_loop::drain_watch_topic(turn_result& result) {
 	if (_watch_hook == nullptr)
 		return;
@@ -891,32 +878,6 @@ void event_loop::drain_watch_topic(turn_result& result) {
 	// means: an inotify record and a kevent are two different shapes and neither
 	// is the loop's business.
 	_watch_hook(_watch_userdata);
-}
-
-void event_loop::handle_shell_message(shell_message& answer) {
-	switch (answer.which) {
-		case shell_message::kind::highlight_done:
-			LESH_LOG(log::level::debug, log::category::event,
-			         "topic=shell highlight gen=%llu status=%d",
-			         static_cast<unsigned long long>(answer.computed_against.value()),
-			         static_cast<int>(answer.status));
-			take_batch(answer.batch);
-			_events.push_back(leshper::worker_result{answer.computed_against});
-			break;
-		case shell_message::kind::port_call_done:
-			// Nobody is waiting: the action that asked has already given up, or
-			// this is a reply that outlived its `call_port`. Dropped, loudly
-			// enough to find in a log.
-			LESH_LOG(log::level::warn, log::category::event,
-			         "topic=shell unmatched port_call seq=%llu",
-			         static_cast<unsigned long long>(answer.sequence));
-			break;
-		case shell_message::kind::execute_done:
-			LESH_LOG(log::level::info, log::category::event,
-			         "topic=shell execute_done status=%d", static_cast<int>(answer.status));
-			_exit_status = answer.status;
-			break;
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,10 +1054,11 @@ void event_loop::refresh_dispatch_table() {
 		return;
 	}
 	for (const auto& [name, entry] : _registry->reactors) {
-		// ADR-0009: the highlighter runs on the SHELL thread, because it reads
-		// the alias, function and builtin tables and shell state has exactly one
-		// owner. Everything else is state-free - history search, the
-		// autosuggester, path checks - and stays on the stateless helper pool.
+		// ADR-0009: the highlighter runs where SHELL STATE is owned, because it
+		// reads the alias, function and builtin tables and that state has exactly
+		// one owner - which since #201 means in place, on this thread. Everything
+		// else is state-free - history search, the autosuggester, path checks -
+		// and stays on the stateless helper pool.
 		// The comparison is made HERE, once per table change, rather than once
 		// per reactor per keystroke.
 		_dispatch_table.push_back(reactor_dispatch{
@@ -1127,19 +1089,57 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 			continue;
 
 		if (_shell != nullptr && one.on_shell_thread) {
-			// THE SNAPSHOT LEAVES `knowledge` NULL AND THAT IS RIGHT (#151). It
-			// is the SHELL's tables, and the actor - which serves exactly one
-			// shell - stamps them on the token it builds. The loop used to fill
-			// the field in here, which meant the loop telling the shell where the
-			// shell's own state was, and the far side dropped it for a whole
-			// wave. What stays on `request_snapshot` is the helper pool's copy of
-			// the field, where null honestly means "no shell attached".
-			_shell->post_highlight(one.name, one.fn, one.userdata, _state, served);
+			run_shell_reactor_here(one.name, one.fn, one.userdata, served);
 			continue;
 		}
 		if (_helpers != nullptr)
 			_helpers->submit(one.name, _state, served, one.fn, one.userdata);
 	}
+}
+
+void event_loop::run_shell_reactor_here(std::string_view reactor, lesh_reactor_fn fn,
+                                        void* userdata, std::uint32_t kinds) {
+	// SYNCHRONOUSLY, IN PLACE, AND THIS SHAPE IS TEMPORARY (#201, step 1 of #145).
+	// The highlighter reads the alias, function and builtin tables, so it must run
+	// on the thread that owns them - which used to mean posting to the shell
+	// thread's `highlight` slot and waiting for the answer on the `shell` topic,
+	// and now means calling it here, because this thread is that thread. THE NEXT
+	// STEP MAKES IT A FIBER: a reactor that walks `$PATH` holds the keystroke it
+	// was computed for until it returns, and the only thing that gives the walk a
+	// yield point back is a stack of its own. Until then a slow highlight is
+	// latency on the next key, which is the trade #145's architecture review
+	// priced and accepted for one step.
+	//
+	// WHAT IS CORRECT ABOUT IT ANYWAY: the token is minted here, stamped with THIS
+	// shell's host, and reads tables nothing else can be writing - `_writing` is
+	// down, because the two writers are calls this same thread makes from
+	// `accept_current_line` and `call_port`.
+	//
+	// INTO MEMBERS, so the round allocates nothing warm: `take_snapshot` assigns
+	// into the buffer the last keystroke grew, `run_reactor_here` lends it to the
+	// token and hands it back, and the batch's vectors are cleared rather than
+	// freed.
+	take_snapshot(_shell_snapshot, _state, kinds);
+	// THE STAMP (#151). Not the snapshot-taker's and not the reactor's: the loop
+	// serves one shell, and this is that shell's door, on every token it mints.
+	_shell_snapshot.host = _shell_host;
+	run_reactor_here(reactor, fn, userdata, _shell_snapshot, _shell_superseded,
+	                 _shell_batch);
+	LESH_LOG(log::level::debug, log::category::reactor,
+	         "shell reactor %.*s gen=%llu status=%d spans=%zu",
+	         static_cast<int>(reactor.size()), reactor.data(),
+	         static_cast<unsigned long long>(_shell_batch.computed_against.value()),
+	         static_cast<int>(_shell_batch.status), _shell_batch.spans.size());
+	// APPLIED NOW, and the generation rule still decides - it just cannot fail
+	// from here, because the batch was computed against the state it is being
+	// applied to.
+	take_batch(_shell_batch);
+	// AND THE EDITOR HEARS ABOUT THE ARRIVAL, exactly as it does for a helper's
+	// answer: `step` carries the same drop rule, emits the redraw, and the replay
+	// file records it (#109's `event`). The event goes into `_events` while the
+	// walk that led here is in progress, which is what the swap in `turn` is for
+	// (#162).
+	_events.push_back(leshper::worker_result{_shell_batch.computed_against});
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,7 +1307,6 @@ void event_loop::assert_quiesced() const noexcept {
 
 std::optional<std::int32_t> event_loop::accept_current_line() {
 	_accepted.assign(_state.buffer.text());
-	const leshper::generation at = _state.gen;
 
 	// The cursor is left wherever the layout put it; the command's output has to
 	// start on a fresh row below the edit line (F-39 scrolls output above the
@@ -1316,28 +1315,37 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 		write_all(_fds.output, "\r\n");
 	_have_previous = false;
 
-	// PARK, THEN RESTORE, THEN POST. In that order: the fork is the shell
-	// thread's and it happens inside `execute`, so the helpers must be parked
-	// before the message is even visible to it.
+	// PARK, THEN RESTORE, THEN CALL. In that order, and the order is the whole of
+	// quiesce: the fork happens inside `execute`, on this thread, so the helpers
+	// have to be parked and the terminal handed back BEFORE the call is made.
+	// #201 shortened the distance between the park and the fork from a channel to
+	// a stack frame; it did not change what has to be true at it.
 	quiesce();
 	assert_quiesced();
 
 	std::optional<std::int32_t> status;
 	if (_shell != nullptr) {
-		_shell->post_execute(_accepted, at);
-		status = wait_on_shell(shell_message::kind::execute_done, 0);
+		// ADR-0009's one writer, ANNOUNCED (#151), and now trivially true: this
+		// is where a `PATH=` assignment, an `alias`, a function definition or an
+		// `unset` actually happens, and any read through the session's adapter
+		// while it runs would be reading a table mid-rewrite. The flag is kept
+		// because the assertion is what says so out loud - the completer reads
+		// through that adapter from inside an action, and the premise it leans on
+		// is exactly that this scope is not open.
+		const shell_writing_flag::scope writing{_writing};
+		status = _shell->execute(_accepted);
+		_exit_status = *status;
 	}
 
-	// THE LINE THAT JUST RAN MAY HAVE BEEN AN `exit` (#152). Only the shell
-	// thread can know that, and it says so by `request_stop()` BEFORE it posts
-	// the reply this wait returned - so the flag is settled by the time it is
-	// read here, and reading it here is the whole point: one line further down
-	// the loop lays out a fresh prompt for a line nobody will ever type, paints
-	// it, and the process exits out from under it, leaving the user's parent
-	// shell to start its own prompt after `$ `. The unpark still happens - the
-	// park depth is a balance and `leave_read` is owed a terminal to hand back -
-	// but the repaint does not.
-	const bool ending = _stopping.load(std::memory_order_relaxed);
+	// THE LINE THAT JUST RAN MAY HAVE BEEN AN `exit` (#152). Only the shell can
+	// know that, and it says so by `request_stop()` from inside the call above -
+	// so the flag is settled by the time it is read here, and reading it here is
+	// the whole point: one line further down the loop lays out a fresh prompt for
+	// a line nobody will ever type, paints it, and the process exits out from
+	// under it, leaving the user's parent shell to start its own prompt after
+	// `$ `. The unpark still happens - the park depth is a balance and
+	// `leave_read` is owed a terminal to hand back - but the repaint does not.
+	const bool ending = _stopping;
 
 	resume_after_execution();
 
@@ -1372,19 +1380,21 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 void event_loop::finish_cancelled_line() {
 	// #98 decision 3, the zsh way: Ctrl-C at the prompt cancels the line AND
 	// fires the user's INT trap, with `$?` = 130. Both are the shell's, and the
-	// only door to the shell thread is the `execute` slot - so a cancel is posted
-	// as an EMPTY line, which is exactly what it is: nothing to run, at a command
-	// boundary, which is where #33 says a trap body belongs.
+	// only door to the shell is `execute` - so a cancel is delivered as an EMPTY
+	// line, which is exactly what it is: nothing to run, at a command boundary,
+	// which is where #33 says a trap body belongs.
 	//
 	// THE QUIESCE IS NOT CEREMONY. A trap body is arbitrary shell code and may
 	// fork, so the helpers have to be parked and the terminal handed back before
-	// the shell thread touches it, on the identical path an accepted line takes.
+	// the call is made, on the identical path an accepted line takes.
 	if (_shell == nullptr)
 		return;
 	quiesce();
 	assert_quiesced();
-	_shell->post_execute(std::string_view{}, _state.gen);
-	wait_on_shell(shell_message::kind::execute_done, 0);
+	{
+		const shell_writing_flag::scope writing{_writing};
+		(void)_shell->execute(std::string_view{});
+	}
 	resume_after_execution();
 }
 
@@ -1399,84 +1409,18 @@ port_result event_loop::call_port(std::string_view code) {
 	// editor's terminal, because restoring cooked modes around it would race new
 	// input against the restore - and there is deliberately no call in tty.h
 	// that would let this function do otherwise.
-	const std::uint64_t sequence = _shell->post_port_call(code, _state.gen);
-	const std::optional<std::int32_t> status =
-		wait_on_shell(shell_message::kind::port_call_done, sequence);
-	if (status.has_value()) {
-		answer.status = *status;
-		answer.answered = true;
+	//
+	// NO QUIESCE EITHER, and that is not an omission: #92's lane discipline
+	// refuses the forking forms, so an action's shell code does not fork. What is
+	// raised is the writing flag - arbitrary shell code may define, unset or
+	// export anything - and the answer is the call's, so there is nothing left for
+	// a sequence number to match.
+	{
+		const shell_writing_flag::scope writing{_writing};
+		answer.status = _shell->port_call(code);
 	}
+	answer.answered = true;
 	return answer;
-}
-
-std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
-                                                      std::uint64_t sequence) {
-	LESH_ASSERT(_shell != nullptr);
-
-	for (;;) {
-		// TWO TOPICS ONLY: `shell` and `signal`. The tty is not ours while a
-		// command runs, the helpers are parked, and a timer that fired here would
-		// dispatch an action into an editor with no terminal. ADR-0009: "during
-		// execution the loop blocks in that same poll, so SIGWINCH and the
-		// terminal-restore path still flow through it."
-		int at = 0;
-		int signal_at = -1;
-		int shell_at = -1;
-		const auto watch = [&](int fd) {
-			_poll[static_cast<std::size_t>(at)].fd = fd;
-			_poll[static_cast<std::size_t>(at)].events = POLLIN;
-			_poll[static_cast<std::size_t>(at)].revents = 0;
-			return at++;
-		};
-		if (_signals != nullptr)
-			signal_at = watch(_signals->wakeup_fd());
-		shell_at = watch(_shell->replies().wakeup_fd());
-
-		const int ready = ::poll(_poll.data(), static_cast<nfds_t>(at), -1);
-		if (ready < 0 && errno != EINTR) {
-			LESH_LOG(log::level::error, log::category::loop, "poll failed while waiting: %s",
-			         std::strerror(errno));
-			return std::nullopt;
-		}
-
-		if (_signals != nullptr
-		    && (ready < 0 || revents_of(_poll[static_cast<std::size_t>(signal_at)]) != 0)) {
-			_signal_numbers.clear();
-			_signals->drain(_signal_numbers);
-			// The RESIZE IS NOT QUERIED HERE (#98 decision 6: "during a command
-			// it is not tracked at all"). The counter is realigned at the next
-			// read entry, which re-queries unconditionally - which is what makes
-			// a missed resize structurally impossible rather than handled.
-			for (int signo : _signal_numbers)
-				_deferred.push_back(leshper::signal_event{signo});
-		}
-
-		if (ready > 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0) {
-			_shell->replies().drain(_inbox);
-			std::optional<std::int32_t> found;
-			for (shell_message& answer : _inbox) {
-				const bool matched_by_sequence =
-					until == shell_message::kind::port_call_done;
-				if (answer.which == until
-				    && (!matched_by_sequence || answer.sequence == sequence)) {
-					found = answer.status;
-					if (until == shell_message::kind::execute_done)
-						_exit_status = answer.status;
-					continue;
-				}
-				// A highlight computed against the line that is now running, or a
-				// port call nobody is waiting for. The generation rule drops the
-				// first; the second is logged.
-				handle_shell_message(answer);
-			}
-			_shell->replies().recycle(_inbox);
-			if (found.has_value())
-				return found;
-		}
-
-		if (_stopping.load(std::memory_order_relaxed))
-			return std::nullopt;
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,6 +1428,14 @@ std::optional<std::int32_t> event_loop::wait_on_shell(shell_message::kind until,
 // ---------------------------------------------------------------------------
 
 void event_loop::run() {
+	// ON THE CALLER'S THREAD, WHICH IS MAIN (#201). This was the body of a thread
+	// this class spawned, and the first statement of that body was
+	// `block_caught_signals_on_this_thread()`. THAT BLOCK IS DELETED, NOT MOVED,
+	// and it is the one line of this ticket that would have been a bug to carry
+	// over: a signal mask survives `execve`, main is the thread that forks and
+	// execs, and a child born with SIGINT blocked ignores the `kill -INT` meant
+	// for it (#142, #143). Main stays unmasked, the handler runs here as it did
+	// before leshper existed, and the poll below takes the EINTR it always could.
 	enter_read();
 	// THE PROMPT IS PAINTED BEFORE THE FIRST POLL. `enter_read` asks for a
 	// render, but a turn clears that flag before it polls and the first poll
@@ -1491,55 +1443,19 @@ void event_loop::run() {
 	// once the user had typed something, which is the one moment they no longer
 	// need it.
 	render();
-	while (!_exiting && !_stopping.load(std::memory_order_relaxed))
+	while (!_exiting && !_stopping)
 		turn();
 	leave_read();
 }
 
-void event_loop::start() {
-	LESH_ASSERT(!_thread.joinable());
-	_stopping.store(false, std::memory_order_relaxed);
-	_thread = std::thread([this] {
-		// FIRST THING IN THE BODY (#142). A process-directed signal goes to any
-		// one thread that does not block it, so without this a Ctrl-C landed on
-		// the loop thread, on a helper or on main by the kernel's choice. Blocked
-		// here, it lands on main - the shell thread, where the handler ran before
-		// leshper existed, and where the dispositions and `g_pending` are written.
-		// This thread hears about it as the self-pipe byte, which is all it ever
-		// needed: the `poll` wakeup is the byte, never the EINTR.
-		//
-		// Safe here and NOT on main because a mask survives `execve`: main is the
-		// thread that forks (ADR-0009), and a child born with a shell's mask would
-		// ignore the `kill -INT` meant for it.
-		if (!block_caught_signals_on_this_thread())
-			LESH_LOG(log::level::warn, log::category::loop,
-			         "the loop thread could not block the caught signals");
-		run();
-		// THE LOOP THREAD RELEASES THE SHELL THREAD, and nothing else can
-		// (ADR-0009, #134). The shell is the main thread and is parked in
-		// `shell_actor::run` on a condition variable with no descriptor to
-		// watch; when the editor is finished - Ctrl-D, an `exit` action, a
-		// hangup - the only side that knows is this one. `stop()` is documented
-		// as the loop thread's call, and this is the loop thread making it.
-		if (_shell != nullptr)
-			_shell->stop();
-	});
-}
-
 void event_loop::request_stop() noexcept {
-	_stopping.store(true, std::memory_order_relaxed);
-	// The one wakeup that always exists: ring the signal topic's own pipe. No
-	// signal is raised, so nothing else in the process notices.
-	if (_signals != nullptr)
-		_signals->poke();
+	// A FLAG AND NOTHING ELSE (#201). It used to ring the signal topic's pipe as
+	// well, because the caller was the shell thread and the loop was asleep in a
+	// `poll` that had to be woken. Every caller is this thread now - `end_of_file`
+	// and the hangup from inside a turn, an `exit` from inside the `execute` this
+	// loop called - and a poll that is not running needs no wakeup. `run`'s
+	// `while` and `accept_current_line` read it at the next statement either way.
+	_stopping = true;
 }
-
-void event_loop::stop() {
-	request_stop();
-	if (_thread.joinable())
-		_thread.join();
-}
-
-bool event_loop::running() const noexcept { return _thread.joinable(); }
 
 } // namespace lesh::ui

@@ -9,7 +9,7 @@
 #include "ui/loop.h"
 #include "ui/prompt/prompt.h"
 #include "ui/reactors.h"
-#include "ui/shell_actor.h"
+#include "ui/shell_side.h"
 #include "ui/shell_state_knowledge.h"
 #include "ui/tty.h"
 #include "ui/workers.h"
@@ -324,12 +324,19 @@ void fill_wall_clock(prompt_facts& into) noexcept {
 // The session
 // ---------------------------------------------------------------------------
 
-// The shell thread's half of ADR-0009, and the owner of everything an
-// interactive shell has that a non-interactive one does not.
+// The shell's half of ADR-0009, and the owner of everything an interactive
+// shell has that a non-interactive one does not.
+//
+// ONE THREAD SINCE #201. This was the SHELL thread's half, and `run` below
+// spawned the loop's thread and then served its three slots on this one; the
+// loop runs on this thread now and reaches the shell by calling the two methods
+// below. What is left of the split is the two ROLES, which is all it ever bought:
+// the shell owns `shell_state` and the loop owns editor state and the terminal,
+// and they take turns rather than taking locks.
 //
 // ONE OBJECT, so that ADR-0007 is answered by its destructor: the helper pool,
-// the loop, the actor, the two reactor contexts, the signal hub and the four
-// adapters all die together and in the reverse order they were built. Nothing
+// the loop, the two reactor contexts, the signal hub and the four adapters all
+// die together and in the reverse order they were built. Nothing
 // here is a global and nothing is leaked on any exit path, which is what lets
 // the leak gate expect zero.
 class session final : public shell_side {
@@ -344,7 +351,7 @@ public:
 
 	[[nodiscard]] int run(std::string_view rc_path);
 
-	// --- shell_side (A-5), both on THIS thread -------------------------------
+	// --- shell_side (A-5), called by the loop, on this thread ----------------
 
 	std::int32_t execute(std::string_view line) override;
 	std::int32_t port_call(std::string_view code) override;
@@ -353,10 +360,11 @@ public:
 
 	[[nodiscard]] const syntax_layer& syntax() const noexcept { return *_providers.syntax; }
 
-	// Set by the `cancel_line` action, read and cleared by `execute`. The post
-	// that follows it takes the actor's mutex and the shell thread reads under
-	// the same one, so the ordering is the channel's and not this flag's; the
-	// atomic is for the store itself.
+	// Set by the `cancel_line` action, read and cleared by `execute` - which the
+	// loop calls the moment the action returns, on this thread. The atomic is
+	// vestigial now that both sides are one thread; it is kept because a flag that
+	// crossed a channel and now does not is the sort of thing #145's next step
+	// will want to look at once, rather than twice.
 	void note_cancel() noexcept { _cancelled.store(true, std::memory_order_relaxed); }
 
 private:
@@ -398,26 +406,25 @@ private:
 	runtime::shell_state& _state;
 	const provider_bundle& _providers;
 	runtime::tree_walking_executor _executor;
-	// ADR-0009's tripwire (#151), DECLARED BEFORE THE ADAPTER AND THE ACTOR
-	// because both borrow it: the actor raises it around `execute` and
-	// `port_call` below, and the adapter asserts it is down on every read. One
-	// flag, so the two cannot be talking about different windows.
+	// ADR-0009's tripwire (#151), DECLARED BEFORE THE ADAPTER AND THE LOOP
+	// because both borrow it: the loop raises it around the `execute` and
+	// `port_call` calls it makes below, and the adapter asserts it is down on
+	// every read. One flag, so the two cannot be talking about different windows.
 	shell_writing_flag _writing;
 	shell_state_knowledge _knowledge;
 	// --- The completer, and the one door the editor has ----------------------
 
-	// THE SAME ADAPTER THE HIGHLIGHTER'S TOKENS READ THROUGH, called on the LOOP
-	// thread (#139, direct since #151). There is one statement anywhere in this
-	// tree of what the editor may see of `shell_state`, and both readers go
-	// through it.
+	// THE SAME ADAPTER THE HIGHLIGHTER'S TOKENS READ THROUGH (#139, direct since
+	// #151). There is one statement anywhere in this tree of what the editor may
+	// see of `shell_state`, and both readers go through it.
 	//
 	// #139 put a `name_source` and a round trip on the actor between these two
 	// lines; the owner's reading of ADR-0009 removed the need. `complete` is
 	// called from inside an action, dispatched by the loop; the only writers are
-	// `execute` and `port_call`, both of which the loop itself requests and then
-	// blocks on for their whole duration. So while this call runs, nothing is
-	// writing - and `_writing` above is what says so out loud if that ever stops
-	// being true.
+	// `execute` and `port_call`, both of which the loop CALLS and is therefore not
+	// inside while it dispatches. So while this call runs, nothing is writing -
+	// and `_writing` above is what says so out loud if that ever stops being
+	// true.
 	shell_completer _completer;
 
 	// THE ONE DOOR THE EDITOR HAS (#168 Phase B, `leshper/host.h`).
@@ -429,28 +436,27 @@ private:
 	// on the loop.
 	//
 	// DECLARED HERE AND NOT AT THE BOTTOM, which is the same lifetime rule the
-	// actor and the loop are placed by: the actor stamps this on every token it
-	// serves and the registry the loop owns holds a borrowed pointer to it, and
-	// members die in reverse - so it has to outlive both. The two IT borrows are
-	// the two lines above it.
+	// loop is placed by: the loop stamps this on every token it mints for the
+	// shell-state reactor and the registry it owns holds a borrowed pointer to
+	// it, and members die in reverse - so it has to outlive the loop. The two IT
+	// borrows are the two lines above it.
 	editor_host _host;
 
 	owned_highlighter _highlighter;
 	owned_autosuggester _autosuggester;
 	worker_pool _helpers;
 	signal_hub _signals;
-	// DECLARED BEFORE THE LOOP, and for the actor's reason one line down: the
-	// registry the loop owns holds a borrowed pointer to this engine (see the
-	// constructor), and members die in reverse - so the loop, and the registry
-	// with it, has to go first.
+	// DECLARED BEFORE THE LOOP: the registry the loop owns holds a borrowed
+	// pointer to this engine (see the constructor), and members die in reverse -
+	// so the loop, and the registry with it, has to go first.
 	ui::prompt::engine _prompt_engine;
 	prompt_facts _prompt_facts;
-	// THE ACTOR IS DECLARED BEFORE THE LOOP, and it is not a style choice:
-	// `~event_loop` recycles the messages `drain` handed it back into the
-	// channel the ACTOR owns (ADR-0007), so an actor destroyed first would have
-	// the loop locking a mutex whose storage had gone. Members die in reverse,
-	// so declaring it first is how the loop dies first.
-	shell_actor _actor;
+	// AND THE LOOP LAST OF THE BIG THREE (#201). The actor used to be declared on
+	// the line above this one, because `~event_loop` recycled the pooled messages
+	// back into the channel the actor owned; there is no channel and no actor, and
+	// what is left of that rule is what everything above is ordered by - the loop
+	// borrows the host, the engine, the pool and the hub, so it must die first,
+	// which means being declared last.
 	event_loop _loop;
 	std::optional<leshper_binding_console> _console;
 	std::optional<prompt_console_impl> _prompt_console;
@@ -469,12 +475,12 @@ private:
 	// Whether the engine is the surface the loop is showing - the precedence rule's
 	// answer, cached rather than re-asked. `refresh_prompt` is the only writer and
 	// `prompt_tick` the only other reader, which is the SAME serialization every
-	// other option write here has (ADR-0009): the shell thread writes it in the
-	// window where the loop is blocked in `wait_on_shell`, and the loop thread
-	// reads it afterwards, on the far side of the channel mutex that published the
-	// reply. Cached rather than recomputed because recomputing it on the tick path
-	// would mean reading `shell_state` from the loop thread, which is the one thing
-	// ADR-0009 forbids outright.
+	// other option write here has (ADR-0009): the write happens inside the
+	// `execute` the loop called, and the read happens on a later turn. One thread
+	// since #201, so it is a sequence rather than a handshake. Cached rather than
+	// recomputed because recomputing it on the tick path would mean reading
+	// `shell_state` from a timer expiry - legal now, and still the wrong place to
+	// re-decide a question `refresh_prompt` owns.
 	//
 	// TRUE TO BEGIN WITH, and the constructor's `refresh_prompt` settles it before
 	// the loop starts.
@@ -528,7 +534,6 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _host(&_knowledge,
 	        providers.completion != nullptr ? providers.completion : &_completer),
 	  _autosuggester(providers.history),
-	  _actor(*this, &_host, &_writing),
 	  _loop(loop_fds{in, out}, options_for(providers, true)) {
 	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163),
 	// THROUGH A HOOK THIS LAYER CANNOT NAME ITSELF (#164).
@@ -591,7 +596,10 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 
 	_loop.attach_registry(context.actions());
 	_loop.attach_helpers(_helpers);
-	_loop.attach_shell(_actor);
+	// THE SHELL, AND WHAT IT KNOWS, AND THE TRIPWIRE, in one call (#201). All
+	// three used to be `shell_actor`'s constructor arguments; the loop is what
+	// calls `execute` and `port_call` now, so the loop is what holds them.
+	_loop.attach_shell(*this, &_host, &_writing);
 	_loop.attach_signals(_signals);
 	// THE HISTORY'S DIRECTORY WATCH, as the loop's sixth topic (#195, ADR-0010
 	// §Locking and staleness; fish #3565). One `int` and one function pointer:
@@ -612,13 +620,14 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 			},
 			_providers.recorder);
 	}
-	// #135's door is NOT attached to the loop (#151). The actor was given it at
-	// construction and stamps it on every token it serves, so the loop never
-	// holds a pointer to state it does not own; see `event_loop`'s note where
-	// `attach_shell_knowledge` used to be. One object, and this is what says so:
-	// a token minted on the shell thread and a Tab dispatched on the loop reach
+	// #135's door arrives WITH THE SHELL (#151, #201). It is not an attachment of
+	// its own, because it is not something the loop knows - it is the shell's own
+	// tables, handed over with the shell so that a token minted for the
+	// shell-state reactor can find them; see `event_loop`'s note where
+	// `attach_shell_knowledge` used to be. One object, and this is what says so: a
+	// token minted for the highlighter and a Tab dispatched from a keymap reach
 	// the same host.
-	LESH_ASSERT(_actor.host() == &_host);
+	LESH_ASSERT(_loop.shell_host() == &_host);
 	LESH_ASSERT(context.actions().host == &_host);
 
 	// THE FIRST PAINT, and it needs saying here or the first prompt of every
@@ -635,8 +644,8 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// already there. The rc's own `refresh_prompt` still runs after the rc, so a
 	// `PS1=` set in `~/.leshrc` takes the surface back before anything is painted.
 	//
-	// ADR-0009 IS TRIVIALLY SATISFIED HERE: this is the shell thread, and the loop
-	// thread does not exist yet - `_loop.start()` is two calls away, in `run`.
+	// ADR-0009 IS TRIVIALLY SATISFIED HERE: nothing is reading, because the loop
+	// is not running yet - `_loop.run()` is one call away, in `run`.
 	refresh_prompt();
 }
 
@@ -906,10 +915,11 @@ std::int32_t session::execute(std::string_view line) {
 			std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
 	}
 
-	// An `exit` typed at the prompt ends the session, and the shell thread is the
-	// only side that can know. NOT `stop()`: the loop is waiting for the reply
-	// this call is about to post, so joining it from here would be waiting on a
-	// thread that is waiting on us.
+	// An `exit` typed at the prompt ends the session, and the shell is the only
+	// side that can know. A FLAG AND NOT A JOIN, still, for a simpler reason than
+	// the deadlock it used to avoid: this call is a frame inside
+	// `event_loop::accept_current_line`, which reads the flag the statement after
+	// it returns.
 	if (_executor.exit_requested())
 		_loop.request_stop();
 
@@ -920,9 +930,9 @@ std::int32_t session::execute(std::string_view line) {
 	// it in `enter_read` and on the unpark, which made two threads writers of one
 	// piece of process-wide state; now the loop only reads the hub.
 	//
-	// BEFORE THE REPLY IS POSTED, which is what "before the loop resumes" means:
-	// this function's return value IS the reply, so everything above it is
-	// ordered ahead of the loop waking up.
+	// BEFORE THIS RETURNS, which is what "before the loop resumes" means: the
+	// return is the loop's cue to reclaim the terminal, so everything above it is
+	// ordered ahead of the next keystroke.
 	_signals.reassert();
 	return _state.last_status();
 }
@@ -932,7 +942,7 @@ std::int32_t session::port_call(std::string_view code) {
 	// editor has no ABI door that reaches this, so nothing calls it yet. It is
 	// implemented rather than left abstract because A-5 is an interface with two
 	// methods and a session that answered only one of them would be a session
-	// that cannot be handed to `shell_actor`.
+	// that cannot be attached to a loop.
 	//
 	// The three lanes (#92 decision 1) are not enforced here: `run_input` runs
 	// what it is given. The refusal of the forking forms belongs with the door
@@ -1092,25 +1102,25 @@ int session::run(std::string_view rc_path) {
 	// IS the first take - the same disposition rules `reassert` applies, applied
 	// once - so running it after the rc is what lets an rc's `trap 'cmd' CHLD`
 	// be seen by the hub and chained to, rather than stomped by a hub that had
-	// already decided. Before `_loop.start()`, because from there on this thread
-	// is the only writer of dispositions and the loop must find them settled.
+	// already decided. Before `_loop.run()`, because from there on the only writes
+	// are the ones `execute` makes on the way out of a command, and the loop must
+	// find them settled.
 	if (!_signals.install())
 		LESH_LOG(log::level::warn, log::category::loop,
 		         "some signal dispositions could not be installed");
 
-	// ONE THREAD SPAWNED, and this is it (ADR-0009, #136). Everything after this
-	// line is the SHELL thread serving the loop's three slots; the loop thread
-	// owns editor state and the terminal until it is finished, and releases this
-	// one by calling `shell_actor::stop` on its way out.
-	_loop.start();
-	_actor.run();
-	// Joins. The terminal is already restored: `event_loop::run` leaves the read
-	// before it returns, which is the path every exit takes.
-	_loop.stop();
+	// AND THE READ, ON THIS THREAD (#201). This was `_loop.start(); _actor.run();
+	// _loop.stop();` - a thread spawned for the editor and this one turned into
+	// the shell's slot server. There is no thread and no slots: the loop turns
+	// here until Ctrl-D, an `exit` or a hangup, calls `execute` and `port_call`
+	// on this object as it goes, and returns with the terminal already restored -
+	// `event_loop::run` leaves the read before it returns, which is the path
+	// every exit takes.
+	_loop.run();
 
 	// HISTORY, ON THE WAY OUT (ADR-0010 §Vacuum: "`save()` on interactive exit
-	// flushes unwritten items to the log and does not vacuum"). After the join,
-	// so this thread is the only one left and the flush cannot race a walk;
+	// flushes unwritten items to the log and does not vacuum"). After the read,
+	// so the helpers are parked and the flush cannot race a walk;
 	// before the EXIT trap, because the trap's commands are run through the
 	// executor and never reach `execute`, so there is nothing of theirs to wait
 	// for. A failure costs the last few commands their place on disk and is not

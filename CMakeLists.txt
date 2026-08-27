@@ -200,7 +200,7 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # leshper: the line editor's state machine, its events and its effects.
 #
 # THE EDITOR, AND NOTHING THAT DRIVES IT (#168). `loop`, `tty`, `workers` and
-# `shell_actor` were here and are `lesh_ui`'s now: leshper is
+# the shell handoff were here and are `lesh_ui`'s now: leshper is
 # `step(state, event, now) -> effects` with no thread, fd, poll, timer or
 # mailbox in it, and a host sends it events and performs its effects. What is
 # left here has no `<poll.h>`, no `<termios.h>`, and no thread, fd or clock of
@@ -373,8 +373,6 @@ add_library(lesh_ui STATIC
 	src/ui/session.cpp
 	src/ui/session.h
 	src/ui/shell_knowledge.h
-	src/ui/shell_actor.cpp
-	src/ui/shell_actor.h
 	src/ui/shell_side.h
 	src/ui/shell_state_knowledge.h
 	src/ui/tty.cpp
