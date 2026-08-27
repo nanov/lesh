@@ -128,11 +128,12 @@ and is untouched. The walk merges `new_items` (resolved, newest first) then the
 mapped vector, deduplicating across the seam with a per-walk seen-set of `cmd`
 bytes. Same-`cmd` items: the newest wins; on equal `when`, own `session_id` wins.
 
-**Threading (ADR-0009):** `add`/`resolve_pending`/vacuum/reload run on the loop
-thread; the walk runs on stateless helpers. `History` hands each compute an
+**Threading (ADR-0011):** `add`/`resolve_pending`/vacuum/reload are the loop's;
+the walk runs inside a reactor's slice, on the same thread, and yields at every
+entry. `History` hands each compute an
 **immutable snapshot view** — `shared_ptr` to {frozen copy of resolved
 `new_items`, refcounted mmap handle}; mutation builds a new view and swaps the
-pointer. Workers never see a mutation, a stale view keeps its old mapping alive,
+pointer. A walk never sees a mutation, a stale view keeps its old mapping alive,
 and the compute path stays heap-free per `UiAutosuggest`'s zero-heap tests.
 `new_items` is bounded by the vacuum cadence, so the copy is small.
 

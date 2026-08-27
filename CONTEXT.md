@@ -605,7 +605,7 @@ main THREAD serving three latest-wins slots (`execute`, `port_call`,
 serialization is a call stack rather than a channel. Everything else in the
 process is stateless or owns only editor state.
 _Avoid_: reading shell state from another thread; a definitions version or
-concurrent collection for it — one owner makes both unnecessary (ADR-0009). There
+concurrent collection for it — one owner makes both unnecessary (ADR-0011). There
 is no other thread to read from since #202.
 
 **Loop** _[lesh]_:
