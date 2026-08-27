@@ -10,6 +10,7 @@
 
 #include "interactive_signal_guard.h"
 #include "temp_path.h"
+#include "ui_fakes.h"
 
 #include <gtest/gtest.h>
 
@@ -38,6 +39,7 @@
 
 using namespace lesh::leshper;
 using namespace lesh::ui;
+using lesh::testing::fake_tty;
 namespace log = lesh::log;
 
 // THE EVENT LOOP (#129): poll(2), five topics, quiesce.
@@ -55,58 +57,6 @@ namespace log = lesh::log;
 // have used since #37.
 
 namespace {
-
-// A pipe standing in for a terminal. Non-blocking on the read end, because the
-// loop polls before reading and a test that got the poll wrong should fail
-// rather than hang the suite.
-class fake_tty {
-public:
-	fake_tty() {
-		[&] { ASSERT_EQ(::pipe(_in), 0); }();
-		[&] { ASSERT_EQ(::pipe(_out), 0); }();
-		::fcntl(_in[0], F_SETFL, O_NONBLOCK);
-		::fcntl(_out[0], F_SETFL, O_NONBLOCK);
-	}
-	~fake_tty() {
-		for (int fd : {_in[0], _in[1], _out[0], _out[1]})
-			if (fd >= 0)
-				::close(fd);
-	}
-
-	fake_tty(const fake_tty&) = delete;
-	fake_tty& operator=(const fake_tty&) = delete;
-
-	[[nodiscard]] loop_fds fds() const { return loop_fds{_in[0], _out[1]}; }
-
-	void type(std::string_view bytes) const {
-		ASSERT_EQ(::write(_in[1], bytes.data(), bytes.size()),
-		          static_cast<ssize_t>(bytes.size()));
-	}
-
-	void close_input() {
-		if (_in[1] >= 0) {
-			::close(_in[1]);
-			_in[1] = -1;
-		}
-	}
-
-	// Everything the loop has written since the last call.
-	[[nodiscard]] std::string painted() const {
-		std::string all;
-		char chunk[4096];
-		for (;;) {
-			const ssize_t n = ::read(_out[0], chunk, sizeof(chunk));
-			if (n <= 0)
-				break;
-			all.append(chunk, static_cast<std::size_t>(n));
-		}
-		return all;
-	}
-
-private:
-	int _in[2]{-1, -1};
-	int _out[2]{-1, -1};
-};
 
 // A loop over a pipe, with the terminal management off - there is nothing to
 // manage, and leaving it on would put `tcsetpgrp` in the path of every test.
@@ -147,6 +97,10 @@ int32_t counting_action(lesh_editor*, const lesh_invocation*, void*) {
 
 int32_t exiting_action(lesh_editor* editor, const lesh_invocation*, void*) {
 	return lesh_exit(editor, 7);
+}
+
+int32_t accepting_action(lesh_editor* editor, const lesh_invocation*, void*) {
+	return lesh_accept_line(editor);
 }
 
 // --- The shell side (A-5), faked -------------------------------------------
@@ -854,6 +808,67 @@ TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
 	EXPECT_TRUE(answered.answered);
 	EXPECT_EQ(answered.status, 3);
 	EXPECT_EQ(shell.called, "echo from an action");
+}
+
+TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
+	// #162, and it is a heap-use-after-free rather than a tidiness point. The
+	// turn walked `_events` by reference; handling an accept blocks in
+	// `wait_on_shell`, and a shell message arriving there goes to
+	// `handle_shell_message`, which PUSHES onto that same vector. Once the push
+	// reallocates, the walk's iterator points into freed storage.
+	//
+	// The repro is arithmetic, not luck. `enter_read` reserves exactly sixteen
+	// events, so sixteen bytes read in one go fill the queue to its capacity and
+	// the next push is guaranteed to reallocate - and the accept is put in the
+	// MIDDLE of them so that the walk still has elements to dereference
+	// afterwards. Under ASan the old code fails here; a user reaches the same
+	// place by typing a second line before the first one's prompt comes back
+	// while a background job reports in.
+	fake_tty tty;
+	fake_shell shell;
+	shell_actor actor{shell, nullptr};
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_shell(actor);
+	loop.enter_read();
+
+	// Enter is the session's binding, not a default (F-35), so the accepting key
+	// is bound here the way `ui_session_tests.cpp` binds one: Ctrl-A, one byte,
+	// so the byte count and the event count are the same number.
+	editing_context& context = context_of(loop.editor());
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", &accepting_action, nullptr),
+	          LESH_OK);
+	keymap* map = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(map, nullptr);
+	std::string encoded;
+	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
+	map->bind(encoded, "ask_accept");
+
+	// From inside `execute`, on the shell thread: replies the loop is not waiting
+	// for. `wait_on_shell` matches on `execute_done` and hands everything else to
+	// `handle_shell_message`. A default generation is deliberate - the batch is
+	// dropped by the generation rule, and the event is pushed either way.
+	shell.on_execute = [&] {
+		for (int i = 0; i < 4; ++i) {
+			shell_message extra = actor.replies().acquire();
+			extra.which = shell_message::kind::highlight_done;
+			extra.computed_against = generation{};
+			actor.replies().post(std::move(extra));
+		}
+	};
+
+	std::thread shell_thread{[&] { actor.run(); }};
+	tty.type("12345678\x01" "abcdefg");
+	const turn_result result = loop.turn(50);
+	actor.stop();
+	shell_thread.join();
+
+	EXPECT_EQ(shell.executed, "12345678");
+	EXPECT_EQ(buffer_of(loop), "abcdefg")
+		<< "the seven keys typed after the accept still reached the fresh line";
+	EXPECT_EQ(result.events, 20u)
+		<< "sixteen keys plus the four mid-walk arrivals: swapping the batch out "
+		   "must not drop what is pushed while it is being walked";
 }
 
 // ===========================================================================

@@ -51,7 +51,7 @@ void highlighter_destroy(highlighter* self) noexcept;
 
 // Registers the built-in reactors (F-20/F-22) through the ABI and by no other
 // route (A-11). `self` must outlive `reg`. Answers how many were registered.
-std::size_t register_builtin_reactors(::lesh_registry& reg, highlighter& self);
+std::size_t register_reactors(::lesh_registry& reg, highlighter& self);
 
 // The owner ADR-0007 asks for, so no caller has to remember the pair above.
 class owned_highlighter {
@@ -94,7 +94,7 @@ void autosuggester_destroy(autosuggester* self) noexcept;
 // Registers the autosuggester through the ABI and by no other route (A-11).
 // `self` must outlive `reg`. Answers how many were registered.
 //
-// Its own function rather than a second argument to register_builtin_reactors,
+// Its own function rather than a second argument to register_reactors,
 // because that would be a signature change on a call site the loop already
 // makes - the same additive-growth rule the ABI is held to, applied one layer
 // up.

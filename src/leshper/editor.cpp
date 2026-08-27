@@ -184,7 +184,7 @@ void invoke_action(state& current, std::string_view name, std::string_view keys,
 		out = std::move(ran.produced);
 		return;
 	}
-	out.insert(out.end(), std::make_move_iterator(ran.produced.begin()),
+	out.append(std::make_move_iterator(ran.produced.begin()),
 	           std::make_move_iterator(ran.produced.end()));
 }
 

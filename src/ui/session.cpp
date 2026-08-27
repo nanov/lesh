@@ -559,7 +559,7 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	leshper::editing_context& context = context_of(_loop.editor());
 	// The ten built-in actions and the three default keymaps are the context's
 	// constructor's; what is added here is everything that needs a shell.
-	register_builtin_reactors(context.actions(), _highlighter.get());
+	register_reactors(context.actions(), _highlighter.get());
 	register_autosuggester(context.actions(), _autosuggester.get());
 	register_line_actions();
 	bind_line_keys();

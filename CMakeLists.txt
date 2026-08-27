@@ -147,6 +147,7 @@ add_library(lesh_substrate STATIC
 	src/substrate/char_utils.h
 	src/substrate/fork_guard.h
 	src/substrate/grapheme.h
+	src/substrate/inline_vector.h
 	src/substrate/log.cpp
 	src/substrate/log.h
 	src/substrate/measure.h
@@ -198,7 +199,9 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # `shell_actor` were here and are `lesh_ui`'s now: leshper is
 # `step(state, event, now) -> effects` with no thread, fd, poll, timer or
 # mailbox in it, and a host sends it events and performs its effects. What is
-# left here compiles with no `<poll.h>`, no `<thread>` and no `<termios.h>`.
+# left here has no `<poll.h>`, no `<termios.h>`, and no thread, fd or clock of
+# its own - `<thread>` appears once, in `registry.cpp`, to hash a thread id for
+# handle ownership.
 #
 # Links THE SUBSTRATE AND NOTHING ELSE (#168 Phase B). Not lesh_runtime, which
 # is spec §4.4's rule made enforceable the same way every other one here is - a
@@ -399,6 +402,7 @@ add_executable(lesh_tests
 	tests/unit/leshnici_git_tests.cpp
 	tests/unit/ui_prompt_tests.cpp
 	tests/unit/leshper_style_grammar_tests.cpp
+	tests/unit/ui_style_grammar_tests.cpp
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/ui_proposal_tests.cpp
 	tests/unit/ui_loop_tests.cpp
@@ -410,6 +414,7 @@ add_executable(lesh_tests
 	tests/unit/history_store_tests.cpp
 	tests/unit/ui_history_search_tests.cpp
 	tests/unit/leshper_keymap_tests.cpp
+	tests/unit/ui_bind_tests.cpp
 	tests/unit/leshper_vi_tests.cpp
 	tests/unit/ui_command_kind_tests.cpp
 	tests/unit/ui_knowledge_tests.cpp

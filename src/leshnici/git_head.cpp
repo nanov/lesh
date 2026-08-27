@@ -563,7 +563,7 @@ bool run_command(const char* command, char* const argv[], const budget& deadline
 	::posix_spawn_file_actions_adddup2(&actions, devnull, STDIN_FILENO);
 	::posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO);
 	// stderr to /dev/null, not to the terminal: `git` is entitled to complain
-	// about a layout we already decided we did not understand, and leshper owns
+	// about a layout we already decided we did not understand, and the host owns
 	// the screen (#98). Its complaint would land in the middle of a prompt.
 	::posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
 

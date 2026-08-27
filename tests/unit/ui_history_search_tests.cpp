@@ -3,6 +3,8 @@
 #include "leshper/registry.h"
 #include "leshper/state.h"
 
+#include "ui_fakes.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -17,6 +19,7 @@
 
 using namespace lesh::leshper;
 using namespace lesh::ui;
+using lesh::testing::superseding_source;
 
 // The searcher's tests feed VECTORS and never open a file (#125).
 //
@@ -56,30 +59,6 @@ history_search searcher_for(history_search::mode which) {
 	opts.search = which;
 	return history_search{opts};
 }
-
-// A source that supersedes the request part-way through its own walk, so the
-// poll has something to notice. The real trigger is the user typing while a
-// worker is thinking; here it is the second entry.
-class superseding_source final : public history_source {
-public:
-	superseding_source(loop_harness& loop, std::vector<std::string> entries)
-		: _loop(&loop), _entries(std::move(entries)) {}
-
-	void for_each_newest_first(
-		const std::function<bool(std::string_view)>& fn) const override {
-		std::size_t seen = 0;
-		for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
-			if (++seen == 2)
-				_loop->supersede();
-			if (!fn(*it))
-				return;
-		}
-	}
-
-private:
-	loop_harness* _loop;
-	std::vector<std::string> _entries;
-};
 
 state buffer_of(std::string_view text, std::size_t cursor) {
 	state s;

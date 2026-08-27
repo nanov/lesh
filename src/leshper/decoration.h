@@ -81,7 +81,7 @@ struct virtual_text {
 // with a cursor that only ever moves forward.
 //
 // THE NORMALIZATION HAPPENS HERE, at application time, and that is the decision.
-// A highlighter's spans NEST by construction - builtin_reactors.cpp's
+// A highlighter's spans NEST by construction - `src/ui/reactors.cpp`'s
 // `paint_segments` emits a double-quoted segment and then recurses into it for
 // the `$x` inside - so somebody has to decide that the inner span wins. The two
 // places to decide it are once per applied batch and once per cluster per

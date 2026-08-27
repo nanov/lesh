@@ -1,7 +1,5 @@
 #include "ui/tty.h"
 
-#include "substrate/log.h"
-
 #include <cerrno>
 #include <cstdlib>
 #include <csignal>

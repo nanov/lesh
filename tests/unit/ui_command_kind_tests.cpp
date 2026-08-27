@@ -8,6 +8,7 @@
 #include "syntax/parser.h"
 
 #include "temp_path.h"
+#include "ui_fakes.h"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +26,8 @@
 
 using namespace lesh::leshper;
 using namespace lesh::ui;
+using lesh::testing::fake_knowledge;
+using lesh::testing::scoped_env_path;
 
 // What the shell knows, on the request token (#135; #130's verb, ADR-0009's
 // thread model) - the EDITOR's half of it.
@@ -55,46 +58,6 @@ using namespace lesh::ui;
 // there is no concurrency here to test.
 
 namespace {
-
-// A `shell_knowledge` that is a map, which is what a test has.
-//
-// It counts its calls, because the memo's whole claim - a name repeated on one
-// line is walked once - is a claim about how often this gets asked.
-class fake_knowledge final : public shell_knowledge {
-public:
-	void define(std::string name, command_kind kind) {
-		_names.insert_or_assign(std::move(name), kind);
-	}
-
-	void set_path(std::string value) {
-		_path = std::move(value);
-		_has_path = true;
-	}
-	void unset_path() noexcept { _has_path = false; }
-
-	[[nodiscard]] command_kind classify(std::string_view name) const override {
-		asked.push_back(std::string{name});
-		const auto found = _names.find(name);
-		return found == _names.end() ? command_kind::unknown : found->second;
-	}
-
-	[[nodiscard]] bool path(std::string_view& out) const override {
-		++path_reads;
-		if (!_has_path)
-			return false;
-		out = _path;
-		return true;
-	}
-
-	// Every name this was asked about, in order.
-	mutable std::vector<std::string> asked;
-	mutable int path_reads = 0;
-
-private:
-	std::map<std::string, command_kind, std::less<>> _names;
-	std::string _path;
-	bool _has_path = false;
-};
 
 // The reactor a test uses to reach the token.
 //
@@ -178,33 +141,6 @@ void make_plain_file(const std::string& path) {
 	std::fclose(f);
 	ASSERT_EQ(::chmod(path.c_str(), 0644), 0);
 }
-
-// The process environment's PATH, restored on the way out. Only the tests for
-// the no-shell-attached fallback touch it; every other test here goes through a
-// `shell_knowledge` and is indifferent to it.
-class scoped_env_path {
-public:
-	explicit scoped_env_path(const char* value) {
-		if (const char* old = ::getenv("PATH")) {
-			_had = true;
-			_old = old;
-		}
-		::setenv("PATH", value, 1);
-	}
-	~scoped_env_path() {
-		if (_had)
-			::setenv("PATH", _old.c_str(), 1);
-		else
-			::unsetenv("PATH");
-	}
-
-	scoped_env_path(const scoped_env_path&) = delete;
-	scoped_env_path& operator=(const scoped_env_path&) = delete;
-
-private:
-	bool _had = false;
-	std::string _old;
-};
 
 } // namespace
 
@@ -448,7 +384,7 @@ struct paint_fixture {
 	editor_host host{&shell};
 
 	paint_fixture() {
-		register_builtin_reactors(reg, self.get());
+		register_reactors(reg, self.get());
 		reg.host = &host;
 	}
 

@@ -1,7 +1,7 @@
 // leshnici's `git`: the budgeted HEAD reader and the prompt module over it
 // (#157, #163, spec §6.10).
 //
-// WHY THIS FILE EXISTS APART FROM `leshper_prompt_tests.cpp`. `git` is not a
+// WHY THIS FILE EXISTS APART FROM `ui_prompt_tests.cpp`. `git` is not a
 // built-in module. It is the first resident of `src/leshnici/`, the shipped
 // extension set, which sits ABOVE leshper and is installed on an engine by the
 // wiring site; the engine's own suite is about an engine that has never heard
@@ -70,7 +70,7 @@ namespace prompt = lesh::ui::prompt;
 // The handful of doubles these cases share with the engine's own suite,
 // restated here rather than exported: a test double is not an interface, and a
 // header holding them would make one out of a few functions that exist to be
-// read at their use site. `leshper_prompt_tests.cpp` keeps its own copies for
+// read at their use site. `ui_prompt_tests.cpp` keeps its own copies for
 // the same reason.
 
 // A session in `~/src`, no repo, last command succeeded.

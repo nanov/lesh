@@ -3,6 +3,8 @@
 **Status:** Accepted
 **Date:** 2026-08-26
 
+Amended 2026-08-27 (#168 Phase A): the loop is the host's (`src/ui/loop.cpp`); the two-owner rule stands.
+
 ## Context
 
 leshper runs reactors on worker threads while the user types (A-10/A-11), and

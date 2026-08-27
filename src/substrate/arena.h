@@ -32,7 +32,7 @@ struct allocation_counters {
 	void reset() noexcept { *this = {}; }
 };
 
-// ONE INSTANCE PER THREAD (#90). lesh has threads now - leshper's workers, each
+// ONE INSTANCE PER THREAD (#90). lesh has threads now - the host's workers, each
 // with an arena of its own (#126) - and the alternative to thread_local was an
 // atomic, which would cost more than the counter measures.
 //

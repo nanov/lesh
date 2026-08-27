@@ -24,6 +24,7 @@
 
 #include "leshper/registry.h"
 #include "substrate/assert.h"
+#include "substrate/char_utils.h"
 
 #include <algorithm>
 #include <string>
@@ -69,22 +70,6 @@ static_assert(static_cast<int>(element_status::pending) == LESH_PROMPT_PENDING);
 static_assert(static_cast<int>(element_status::neutral) == LESH_PROMPT_NEUTRAL);
 static_assert(static_cast<std::uint32_t>(surface_id::left) == LESH_PROMPT_LEFT);
 static_assert(static_cast<std::uint32_t>(surface_id::continuation) == LESH_PROMPT_CONTINUATION);
-
-// snake_case, and it is registry.cpp's rule restated rather than shared: that one
-// is in an anonymous namespace, TU-private on purpose, and exporting it to get
-// one copy would widen a surface to save six lines. The rule itself must not
-// drift - a module named `git-branch` and one named `git_branch` looking like one
-// name is the failure both spellings exist to design out.
-bool is_snake_case(std::string_view name) noexcept {
-	if (name.empty() || name[0] < 'a' || name[0] > 'z')
-		return false;
-	for (const char one : name) {
-		const bool ok = (one >= 'a' && one <= 'z') || (one >= '0' && one <= '9') || one == '_';
-		if (!ok)
-			return false;
-	}
-	return true;
-}
 
 // `lesh_buffer_get`'s convention, to the letter: the length is always reported, a
 // short buffer is LESH_ERR_TOOSMALL rather than a truncation, and a null `out`

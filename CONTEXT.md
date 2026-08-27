@@ -472,8 +472,8 @@ between the two — there is one door and it is `leshper::host`.
 **Event** _[lesh]_:
 The only way into the editor: a closed variant the host constructs and hands to
 `step`. A key, a resize, a worker result, a job notice, injected input, a signal,
-a paste, a timer expiry. There is no side channel — an eighth kind of input has
-to be argued for by adding an alternative to the variant. `completion_candidates`
+a paste, a timer expiry. There is no side channel — a new kind of input has
+to be argued for by adding an alternative to the variant (`event.h`). `completion_candidates`
 is an event type without being a variant alternative, because it answers a
 `want_completion` inside the turn that asked rather than arriving at `step`; it
 obeys the channel's rules regardless — trivially copyable, and the candidate list
@@ -484,12 +484,15 @@ is borrowed on the same terms.
 **Effect** _[lesh]_:
 The only way out of the editor: what one turn of its state machine emits
 alongside the new state. A repaint, a worker request, a spawn, an armed or
-disarmed timer, a request for completion candidates, and the three that end a
-line — accepted, cancelled, end of file. Synchronous, returned as a value, and
-carried out by the **host**. Trivially copyable, every one: a `static_assert` per
-type in `effect.h` says so, because an effect is emitted per turn and, for a
-timer, per expiry, and text on the channel travels as a borrowed view into
-storage the host owns. `want_completion` is carried out where it is raised rather
+disarmed timer, a request for completion candidates, and the four that end a
+line — accepted, cancelled, end of file, recursive edit. Synchronous, returned as
+a value, and carried out by the **host**. Trivially copyable, with one exception:
+a `static_assert` per type in `effect.h` says so, because an effect is emitted per
+turn and, for a timer, per expiry, and text on the channel travels as a borrowed
+view into storage the host owns. `spawn_request` is the exception — it carries an
+already-expanded argv and has no producer yet — and `effect.h` names it in the
+comment above those assertions, the way `event.h` names
+`completion_candidates`. `want_completion` is carried out where it is raised rather
 than after the turn, because `lesh_complete` answers a count the same ABI call
 reads back; it is the same value type either way.
 _Avoid_: using it for a reactor's output, which is a decoration or proposal

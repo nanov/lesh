@@ -4,6 +4,7 @@
 #include "leshper/keymap.h"
 #include "leshper/pager.h"
 #include "substrate/assert.h"
+#include "substrate/char_utils.h"
 #include "substrate/grapheme.h"
 
 #include <algorithm>
@@ -72,24 +73,6 @@ bool request_ok(const lesh_request* token) noexcept {
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
-
-// snake_case: a lowercase letter, then lowercase letters, digits, underscores.
-//
-// Narrow on purpose. The names are what a user types into a binding and what an
-// rc file re-sources idempotently; a name space that admits hyphens as well
-// would make `delete-backward-word` and `delete_backward_word` two actions that
-// look like one, which is the failure worth designing out rather than
-// documenting around.
-bool is_snake_case(std::string_view name) noexcept {
-	if (name.empty() || name[0] < 'a' || name[0] > 'z')
-		return false;
-	for (const char c : name) {
-		const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
-		if (!ok)
-			return false;
-	}
-	return true;
-}
 
 // ---------------------------------------------------------------------------
 // Text geometry, over the staged bytes.
@@ -529,7 +512,7 @@ int32_t lesh_action_register(lesh_registry* registry, const char* name,
 	// original, and an original you can overwrite is not one.
 	if (!given.empty() && given[0] == '.')
 		return LESH_ERR_REFUSED;
-	if (!is_snake_case(given))
+	if (!lesh::is_snake_case(given))
 		return LESH_ERR_INVAL;
 
 	const lesh_registry::action_entry entry{fn, userdata};
@@ -586,11 +569,12 @@ int32_t lesh_reactor_register(lesh_registry* registry, const char* name,
 	const std::string_view given{name};
 	if (!given.empty() && given[0] == '.')
 		return LESH_ERR_REFUSED;
-	if (!is_snake_case(given))
+	if (!lesh::is_snake_case(given))
 		return LESH_ERR_INVAL;
 
 	registry->reactors[std::string{given}] =
 		lesh_registry::reactor_entry{fn, userdata, event_mask};
+	++registry->reactors_generation;
 	return LESH_OK;
 }
 
@@ -642,7 +626,7 @@ int32_t lesh_timer_start(lesh_registry* registry, uint64_t interval_ms, const ch
 		return LESH_ERR_INVAL;
 
 	const std::string_view given{action};
-	if (!is_snake_case(given))
+	if (!lesh::is_snake_case(given))
 		return LESH_ERR_INVAL;
 
 	// The name is NOT resolved here. A timer armed before its action is
@@ -1080,7 +1064,7 @@ int32_t lesh_pending_operator_set(lesh_editor* editor, const char* action) {
 		editor->target->keymaps.pending_operator.clear();
 		return LESH_OK;
 	}
-	if (!is_snake_case(std::string_view{action}))
+	if (!lesh::is_snake_case(std::string_view{action}))
 		return LESH_ERR_INVAL;
 	editor->target->keymaps.pending_operator.assign(action);
 	return LESH_OK;
