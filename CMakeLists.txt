@@ -523,11 +523,11 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-# `lesh_fiber` is still named here explicitly: `lesh_ui` links it since #202, so
-# this is redundant rather than load-bearing - and it is kept, because the fiber
-# suite is the one consumer that must keep building if the host ever stops
-# needing the scheduler.
-target_link_libraries(lesh_tests PRIVATE lesh_leshnici lesh_fiber gtest_main)
+# `lesh_fiber` IS NO LONGER NAMED HERE (#202). It used to be, because nothing
+# else in the tree linked it; `lesh_ui` links it PUBLIC now, so it arrives
+# transitively through `lesh_leshnici`, and naming it as well makes the linker say
+# "ignoring duplicate libraries" on every build.
+target_link_libraries(lesh_tests PRIVATE lesh_leshnici gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale
 # expectation (#108).
@@ -611,7 +611,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici lesh_fiber)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici)
 
 # The committed src/substrate/unicode_tables.h must be exactly what the
 # generator emits from the vendored UCD (#108). The 766 conformance cases prove

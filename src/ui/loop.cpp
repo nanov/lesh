@@ -1566,6 +1566,7 @@ void event_loop::assert_quiesced() const noexcept {
 	const fiber::fiber* const running = _sched.current();
 	LESH_ASSERT(running == nullptr
 	            || running->group() != group_index(fiber_group::emitters));
+	(void)running;   // `LESH_ASSERT` is nothing in Release
 	// The other half, and the one only the loop can check: a fork taken with the
 	// terminal still in raw mode gives the child a terminal it cannot use.
 	LESH_ASSERT(!_options.manage_terminal || !_terminal.raw());
