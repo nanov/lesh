@@ -508,8 +508,16 @@ REPLACES the frame on screen rather than appending one (#185): it walks up to
 that frame's top row, erases from there down, and paints — and how far up that
 is is the **host's** answer, because after a resize a reflowing terminal has
 rewrapped the frame and the surface that was painted no longer describes it.
+Every row knows which KIND of line it begins (#189): a row a long line wrapped
+into is SOFT and the blitter reaches it by writing through the right edge, so
+the terminal joins it to the row above as one logical line and rewraps the pair
+the way the layout does; a row after a hard newline is a line of its own and is
+positioned to. Painting a soft row as a hard one is what left clipped fragments
+behind on a shrink and the old top row behind on a grow.
 _Avoid_: treating the cursor at repaint time as being at the surface's origin;
-that is true only of the first paint of a read.
+that is true only of the first paint of a read. _Avoid_: erasing to end of line
+or screen while a wrap is pending — the cursor is still on the last column and
+the erase eats the glyph just written.
 
 **Grapheme cluster** _[lesh]_:
 What a user calls a character: the unit the cursor rests on, one Backspace deletes,

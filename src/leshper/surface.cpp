@@ -79,9 +79,27 @@ void surface::resize(std::uint16_t columns, std::uint16_t rows) {
 	_columns = columns;
 	_rows = rows;
 	_cells.assign(static_cast<std::size_t>(columns) * rows, blank_cell);
+	_hard_rows.assign(rows, true);
 }
 
-void surface::clear() { _cells.assign(_cells.size(), blank_cell); }
+void surface::clear() {
+	_cells.assign(_cells.size(), blank_cell);
+	_hard_rows.assign(_hard_rows.size(), true);
+}
+
+bool surface::row_starts_hard_line(std::uint16_t row) const noexcept {
+	LESH_ASSERT(row < _rows);
+	// Hard when the answer is not known, which is the whole of the default:
+	// positioning to a row is what the blitter did before #189 and is correct
+	// for every row that is not a continuation of the one above it.
+	return row >= _hard_rows.size() || _hard_rows[row];
+}
+
+void surface::set_row_starts_hard_line(std::uint16_t row, bool starts) noexcept {
+	LESH_ASSERT(row < _rows);
+	if (row < _hard_rows.size())
+		_hard_rows[row] = starts;
+}
 
 const cell& surface::at(std::uint16_t row, std::uint16_t column) const noexcept {
 	LESH_ASSERT(row < _rows && column < _columns);

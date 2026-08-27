@@ -62,10 +62,17 @@ struct geometry {
 // rules for a zero-width cluster joining the cell before it, and for a control
 // that paints nothing, hold within a call and would be lost if this file fed it
 // one cluster at a time and re-derived them here.
-template <typename Emit>
+//
+// It also reports WHAT KIND OF LINE each row begins (#189), through a second
+// callback rather than in the emitted runs: a row's kind is decided by the
+// transition INTO it - `reserve` wrapped, or `break_line` broke - and there may
+// be no run on it at all. `next_row` is reached from exactly those two places,
+// which is why the distinction the blitter needs exists here and nowhere else.
+template <typename Emit, typename Note>
 class walker {
 public:
-	walker(const layout_input& in, Emit emit) : _in(in), _emit(std::move(emit)) {}
+	walker(const layout_input& in, Emit emit, Note note)
+	    : _in(in), _emit(std::move(emit)), _note(std::move(note)) {}
 
 	geometry run() {
 		place(_in.prompt, _in.prompt_pen, escapes::skip, no_cursor, secondary::no,
@@ -267,6 +274,9 @@ private:
 		flush();
 		next_row();
 		_column = 0;
+		// SOFT: this row exists only because the one above ran out of columns.
+		// The blitter reaches it by writing through the right edge (#189).
+		_note(_row, false);
 	}
 
 	void advance(int width) {
@@ -283,6 +293,10 @@ private:
 		flush();
 		next_row();
 		_column = 0;
+		// HARD, and said explicitly rather than left to the default: a line
+		// break at exactly the right edge has already had `record_cursor` call
+		// this row soft, and the newline is the later and truer word on it.
+		_note(_row, true);
 		// Noted even though nothing may land on it: a buffer ending in a
 		// newline HAS a last, empty line, and F-2 renders the buffer whole.
 		note_row(_row);
@@ -314,11 +328,16 @@ private:
 		std::uint16_t row = _row;
 		std::uint16_t column = _column;
 		if (column >= _in.columns) {
-			// The phantom column is not a cell the blitter can reach: every
-			// move it emits starts with `\r`, which cancels the terminal's
-			// pending wrap. See layout.h, decision 3.
-			if (row < last_row)
+			// The phantom column is not a cell the blitter can reach: the
+			// cursor is placed with an absolute move, and every one of those
+			// starts with `\r`, which cancels the terminal's pending wrap. See
+			// layout.h, decision 3.
+			if (row < last_row) {
 				++row;
+				// And the row it moves to is a soft continuation: the row above
+				// is full, which is exactly why the cursor could not stay on it.
+				_note(row, false);
+			}
 			column = 0;
 		}
 		_cursor_row = row;
@@ -339,6 +358,7 @@ private:
 
 	const layout_input& _in;
 	Emit _emit;
+	Note _note;
 
 	std::uint16_t _row = 0;
 	std::uint16_t _column = 0;
@@ -401,7 +421,8 @@ layout lay_out(cluster_pool& pool, const layout_input& in) {
 	LESH_ASSERT(edit_rows >= 1);
 
 	const geometry content =
-		walker{in, [](std::uint16_t, std::uint16_t, std::string_view, const style&) {}}.run();
+		walker{in, [](std::uint16_t, std::uint16_t, std::string_view, const style&) {},
+		       [](std::uint16_t, bool) {}}.run();
 
 	made.content_rows = content.content_rows;
 	made.cursor_row = content.cursor_row;
@@ -422,6 +443,18 @@ layout lay_out(cluster_pool& pool, const layout_input& in) {
 		       if (on_screen >= shown)
 			       return;
 		       screen.write(pool, on_screen, column, text, pen, in.width);
+	       },
+	       [&](std::uint16_t row, bool hard) {
+		       // #189, and row zero is deliberately not settable: the frame's
+		       // top row is where the blitter positions the cursor to, whatever
+		       // the content above the window was doing. Only the rows BELOW it
+		       // can be reached by writing through a wrap.
+		       if (row <= top)
+			       return;
+		       const std::uint16_t on_screen = static_cast<std::uint16_t>(row - top);
+		       if (on_screen >= shown)
+			       return;
+		       screen.set_row_starts_hard_line(on_screen, hard);
 	       }}.run();
 
 	// The pager's cells, copied in under the edit line. Cell for cell rather

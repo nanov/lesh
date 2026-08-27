@@ -1161,6 +1161,81 @@ TEST(UiLoopRender, ATerminalThatDoesNotReflowKeepsTheRowCountItAlreadyHad) {
 	EXPECT_FALSE(narrower.starts_with("\r\x1b[1A"));
 }
 
+TEST(UiLoopRender, AResizeRepaintsTheSoftRowsThroughTheWrapAndNeverMovesBetweenThem) {
+	// #189, and the half of #185 that its fix left open. The walk back up to the
+	// frame's top assumes the terminal reflowed the frame as ONE soft-wrapped
+	// logical line - but the paint moved between every pair of rows with `\r`
+	// and `ESC[B`, which makes each of them a hard line of its own. So the two
+	// models disagreed: a shrink clipped every row separately and left fragments,
+	// and a grow never rejoined them and left the old top row behind.
+	//
+	// `> ` plus a hundred cells is soft-wrapped at every width here - two rows at
+	// eighty, three at forty - so EVERY row below the top is a continuation, and
+	// any vertical move at all in the paint is a soft row painted as a hard one.
+	fake_tty tty;
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.enter_read();
+	tty.type(std::string(100, 'a'));
+	loop.turn(50);
+	ASSERT_EQ(buffer_of(loop).size(), 100u);
+	(void)tty.painted();
+
+	loop.editor().columns = 40;
+	loop.render();
+	const std::string narrower = tty.painted();
+	// Three rows at forty, and the cursor is on the last of them - so the frame
+	// the terminal is showing starts two rows up.
+	EXPECT_TRUE(narrower.starts_with("\r\x1b[2A\x1b[J"))
+		<< "expected a walk up two rows and an erase, got: " << narrower.substr(0, 16);
+	EXPECT_EQ(narrower.find("\x1b[1B"), std::string::npos)
+		<< "a soft row was reached by moving to it: " << narrower;
+	EXPECT_EQ(narrower.find("\x1b[B"), std::string::npos) << narrower;
+
+	// AND BACK, which is the case the ticket's screenshots are of. Two rows
+	// again, the second of them soft, and still not one move between them.
+	loop.editor().columns = 80;
+	loop.render();
+	const std::string wider = tty.painted();
+	EXPECT_TRUE(wider.starts_with("\r\x1b[1A\x1b[J"))
+		<< "expected a walk up one row, got: " << wider.substr(0, 16);
+	EXPECT_EQ(wider.find("\x1b[1B"), std::string::npos)
+		<< "a soft row was reached by moving to it: " << wider;
+	EXPECT_EQ(wider.find("\x1b[B"), std::string::npos) << wider;
+	EXPECT_NE(wider.find(std::string(100, 'a')), std::string::npos)
+		<< "the buffer must reach the wire as one unbroken run of cells";
+}
+
+TEST(UiLoopRender, ARepaintStillMovesToARowThatBeginsAfterAHardNewline) {
+	// The other side of #189: a hard newline is a line of its own to the
+	// terminal at every width, so the row it starts is POSITIONED to. Sixty
+	// cells wrap at forty columns and the `b` line does not, which puts one of
+	// each in the same paint.
+	loop_options options = pipe_options();
+	options.continuation = "..";
+	fake_tty tty;
+	event_loop loop{tty.fds(), options};
+	loop.enter_read();
+
+	state& s = loop.editor();
+	s.buffer.replace(s.buffer.begin_position(), s.buffer.begin_position(),
+	                 std::string(60, 'a') + "\n" + std::string(10, 'b'));
+	s.cursor = s.buffer.end_position();
+	s.gen.bump();
+	loop.render();
+	(void)tty.painted();
+
+	loop.editor().columns = 40;
+	loop.render();
+	const std::string narrower = tty.painted();
+	// Exactly one vertical move: none into the soft row, one into the row the
+	// newline starts.
+	std::size_t moves = 0;
+	for (std::size_t at = narrower.find("\x1b[1B"); at != std::string::npos;
+	     at = narrower.find("\x1b[1B", at + 1))
+		++moves;
+	EXPECT_EQ(moves, 1u) << narrower;
+}
+
 TEST(UiLoopRender, TheFirstPaintOfAReadErasesNothing) {
 	// The other half of the contract: with no previous frame the cursor really is
 	// at the surface's origin and the rows below it are not ours. An ESC[J here

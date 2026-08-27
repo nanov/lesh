@@ -1579,6 +1579,153 @@ TEST(LeshperBlitter, PaintWritesEveryRowAndClearsTheRest) {
 	EXPECT_EQ(blitter{pool}.paint(painted), "hi\x1b[K\r\x1b[1B\x1b[K\x1b[1A");
 }
 
+// ---------------------------------------------------------------------------
+// The right edge (#189): a soft-wrapped row is painted by writing THROUGH the
+// wrap, so the terminal joins it to the row above as one logical line and
+// reflows the pair the way `frame_top_above_cursor` assumes it will. A row that
+// begins after a hard newline is still positioned to.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperBlitter, ASoftWrappedRowIsPaintedByWritingThroughTheWrap) {
+	// No `\r`, no `ESC[B`, no positioning of any kind between the two rows: the
+	// glyph that starts the second row IS the move, and emitting it while the
+	// terminal holds a pending wrap is what marks the first row as continued.
+	cluster_pool pool;
+	surface painted{4, 2};
+	painted.write(pool, 0, 0, "abcd", style{});
+	painted.write(pool, 1, 0, "ef", style{});
+	painted.set_row_starts_hard_line(1, false);
+	painted.cursor() = cursor_placement{1, 2, true};
+
+	const std::string bytes = blitter{pool}.paint(painted);
+	EXPECT_EQ(bytes, "abcdef\x1b[K");
+	EXPECT_EQ(bytes.find("\x1b[1B"), std::string::npos) << bytes;
+	EXPECT_EQ(bytes.find('\r'), std::string::npos) << bytes;
+}
+
+TEST(LeshperBlitter, ARowAfterAHardNewlineIsStillPositionedTo) {
+	// The same cells, and the only difference is what kind of line row one
+	// begins. A hard row is a line of its own to the terminal, and the way to
+	// reach a line of its own is to move to it.
+	cluster_pool pool;
+	surface painted{4, 2};
+	painted.write(pool, 0, 0, "abcd", style{});
+	painted.write(pool, 1, 0, "ef", style{});
+	painted.cursor() = cursor_placement{1, 2, true};
+	ASSERT_TRUE(painted.row_starts_hard_line(1)) << "hard is the default";
+
+	EXPECT_EQ(blitter{pool}.paint(painted), "abcd\r\x1b[1Bef\x1b[K");
+}
+
+TEST(LeshperBlitter, AMixedFrameUsesEachWhereItIsDue) {
+	// A wrapped line and then a hard newline - what a two-line buffer whose
+	// first line is too long looks like. One join, one move.
+	cluster_pool pool;
+	surface painted{4, 3};
+	painted.write(pool, 0, 0, "abcd", style{});
+	painted.write(pool, 1, 0, "ef", style{});
+	painted.write(pool, 2, 0, "gh", style{});
+	painted.set_row_starts_hard_line(1, false);
+	painted.cursor() = cursor_placement{2, 2, true};
+
+	EXPECT_EQ(blitter{pool}.paint(painted), "abcdef\x1b[K\r\x1b[1Bgh\x1b[K");
+}
+
+TEST(LeshperBlitter, TheBlankAWideClusterLeftAtTheEdgeIsWrittenThrough) {
+	// A soft row is not always FULL: the one that wrapped because a two-column
+	// cluster would have straddled the edge leaves a blank column behind. That
+	// blank is written as a space, because the wrap is what the last glyph in the
+	// row does and there has to BE a last glyph. Half a wide cluster is not an
+	// option - #97's floor cannot express one.
+	cluster_pool pool;
+	surface painted{4, 2};
+	painted.write(pool, 0, 0, "abc", style{});
+	painted.write(pool, 1, 0, CJK_MIDDLE, style{});
+	painted.set_row_starts_hard_line(1, false);
+	painted.cursor() = cursor_placement{1, 2, true};
+
+	EXPECT_EQ(blitter{pool}.paint(painted),
+	          std::string("abc ").append(CJK_MIDDLE).append("\x1b[K"));
+}
+
+TEST(LeshperBlitter, TheFramesLastRowIsNeverWrittenThroughAndCannotScroll) {
+	// THE BOTTOM-RIGHT CORNER. Writing a glyph while the terminal holds a
+	// pending wrap on the screen's last row scrolls the screen. It cannot happen:
+	// a write-through only ever reaches the row BELOW, and the frame's last row
+	// has none - so it keeps the ordinary ending, the last cell and then `\r`.
+	cluster_pool pool;
+	surface painted{2, 2};
+	painted.write(pool, 0, 0, "ab", style{});
+	painted.write(pool, 1, 0, "cd", style{});
+	painted.set_row_starts_hard_line(1, false);
+	painted.cursor() = cursor_placement{1, 1, true};
+
+	const std::string bytes = blitter{pool}.paint(painted);
+	EXPECT_EQ(bytes, "abcd\r\x1b[1C");
+	EXPECT_TRUE(bytes.ends_with("\r\x1b[1C"))
+		<< "a glyph after the last cell of the last row would scroll the screen";
+}
+
+TEST(LeshperBlitter, NeverErasesToEndOfLineWhileAWrapIsPending) {
+	// fish's screen.rs and zsh's "clearing eol would be evil": with a wrap
+	// pending the cursor is still ON the last column, so `ESC[K` erases the glyph
+	// just written rather than a blank tail that is not there. One column wide is
+	// the shape that reaches it - the blank the write-through owes the terminal
+	// is itself in the last column.
+	cluster_pool pool;
+	surface painted{1, 2};
+	painted.write(pool, 0, 0, "a", style{});
+	painted.set_row_starts_hard_line(1, false);
+	painted.cursor() = cursor_placement{1, 0, true};
+
+	const std::string bytes = blitter{pool}.paint(painted);
+	EXPECT_EQ(bytes, "a \r");
+	EXPECT_EQ(bytes.find("\x1b[K"), std::string::npos) << bytes;
+}
+
+TEST(LeshperBlitter, ADiffThatRewritesASoftRowsLastColumnWritesThroughToo) {
+	// The diff path positions absolutely, EXCEPT here: this update rewrote the
+	// row above right up to its last column, so the terminal is holding a pending
+	// wrap that only a glyph can spend correctly. Moving instead would cancel it
+	// and turn a soft row hard - a rewrite must not change what kind of line a
+	// row is.
+	cluster_pool pool;
+	surface before{4, 2};
+	before.write(pool, 0, 0, "abcd", style{});
+	before.write(pool, 1, 0, "ef", style{});
+	before.set_row_starts_hard_line(1, false);
+	before.cursor() = cursor_placement{1, 2, true};
+
+	surface after = before;
+	after.write(pool, 0, 3, "z", style{});
+	after.write(pool, 1, 0, "g", style{});
+
+	// Up to row zero's last column, the glyph, and then `g` with NOTHING between
+	// them - the leading walk and the trailing return to the cursor are the diff
+	// path's ordinary absolute moves.
+	const std::string bytes = blitter{pool}.update(before, after);
+	EXPECT_EQ(bytes, "\r\x1b[1A\x1b[3Czg\r\x1b[2C");
+}
+
+TEST(LeshperBlitter, ADiffThatLeavesASoftRowsLastColumnAlonePositionsAsBefore) {
+	// The other half of the rule, and the reason the diff path needs no forcing:
+	// when the last column was not rewritten the terminal's own wrap flag was
+	// never disturbed, so moving to the next row cannot break a wrap that
+	// already happened.
+	cluster_pool pool;
+	surface before{4, 2};
+	before.write(pool, 0, 0, "abcd", style{});
+	before.write(pool, 1, 0, "ef", style{});
+	before.set_row_starts_hard_line(1, false);
+	before.cursor() = cursor_placement{1, 2, true};
+
+	surface after = before;
+	after.write(pool, 0, 2, "Z", style{});
+	after.write(pool, 1, 0, "g", style{});
+
+	EXPECT_EQ(blitter{pool}.update(before, after), "\r\x1b[1A\x1b[2CZ\r\x1b[1Bg\r\x1b[2C");
+}
+
 TEST(LeshperBlitter, PaintFromWalksUpToTheFramesTopAndErasesWhatWasBelowIt) {
 	// #185: a repaint with a frame still on screen REPLACES it. The cursor is
 	// wherever the last frame left it - `start.row` rows below that frame's top -

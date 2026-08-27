@@ -420,6 +420,16 @@ struct loop_options {
 	// wrong answer costs one frame's worth of stale rows above the repaint, not
 	// a corrupted screen: `\r` plus ESC[J still leave the terminal in a state
 	// the next frame is painted correctly into.
+	//
+	// IT IS NOW ONLY ABOUT THE TERMINAL (#189). It used to be about us as well:
+	// the blitter positioned to every row, so every row of the frame was a hard
+	// line and nothing was soft for a reflowing terminal to rewrap - `true` was
+	// describing a frame we had not painted, which is why a grow after a shrink
+	// under-counted the rows and the walk-up stopped short. The blitter now
+	// writes soft rows through the wrap, so `true` is correct BY CONSTRUCTION on
+	// a terminal that reflows. The setting stays because the other kind still
+	// exists: on xterm and Terminal.app a soft-wrapped row is still where it was,
+	// and the old row count is still the answer.
 	bool assume_reflow = true;
 
 	// The paste rule (#128's trap 4, fish's `read_normal_chars`): keep reading
