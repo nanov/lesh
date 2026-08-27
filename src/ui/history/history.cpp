@@ -1,5 +1,7 @@
 #include "ui/history/history.h"
 
+#include "ui/history/locking.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -374,10 +376,34 @@ open_report history::open(const std::string& directory) {
 	_log_path = directory + "/history.new.log";
 
 	// --- Tier 1 -------------------------------------------------------------
+	out.tier1_mapped = map_tier1() == blob_status::ok;
+	out.tier1_untouchable = _tier1_untouchable;
+	out.tier1_corrupt = _tier1_corrupt;
+
+	// --- Tier 2, read ---------------------------------------------------------
+	load_log();
+	out.log_frames = _log_frames;
+	out.log_discarded_bytes = _log_discarded_bytes;
+
+	// --- Tier 2, write --------------------------------------------------------
+	_log_fd = ::open(_log_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+	out.log_writable = _log_fd >= 0;
+
+	publish();
+	return out;
+}
+
+// Tier 1, opened and verified, with the two policy flags latched.
+//
+// SHARED BY `open` AND BY THE VACUUM'S REMAP, which is the whole reason it is a
+// function: a rewrite has to map its own output, and mapping it through a
+// second copy of these four cases is how the two would drift. #195's directory
+// watch calls the same one.
+blob_status history::map_tier1() {
 	auto mapped = std::make_shared<mapped_blob>();
-	switch (mapped->open(_data_path)) {
+	const blob_status status = mapped->open(_data_path);
+	switch (status) {
 	case blob_status::ok:
-		out.tier1_mapped = true;
 		// `const` from here on: a view hands this to workers, and nothing above
 		// this line will ever call a non-const member on it again.
 		_blob = std::move(mapped);
@@ -387,29 +413,36 @@ open_report history::open(const std::string& directory) {
 		// as many words). Any other errno costs Tier 1 and nothing else: the
 		// session runs on the log plus memory, exactly as it does before the
 		// first vacuum has ever written a blob.
+		_blob.reset();
 		break;
 	case blob_status::unknown_identifier:
 		// ADR-0010: NEVER DESTROY IT. A future lesh's file, or somebody else's.
+		_blob.reset();
 		_tier1_untouchable = true;
-		warn_once("is not a lesh history file");
+		warn_once("is not a lesh history file",
+		          "this session's history is the append log and these commands "
+		          "only, and the file will not be rewritten");
 		break;
 	case blob_status::corrupt:
-		// Ours, and the Verifier refused it. #194 decides whether a vacuum may
-		// rebuild one of these; until it does, the conservative treatment is
-		// the same one an unknown identifier gets, for the same reason - a file
-		// nobody has decided about is a file nobody may overwrite.
-		_tier1_untouchable = true;
-		warn_once("did not verify");
+		// Ours, and the Verifier refused it. #194's decision (`vacuum.h`): the
+		// next vacuum moves it aside and rebuilds, so this is a delay and not
+		// the permanent loss of Tier 1 that refusing forever would be.
+		_blob.reset();
+		_tier1_corrupt = true;
+		warn_once("did not verify",
+		          "it will be renamed aside and rebuilt at the next vacuum, and "
+		          "until then this session's history is the append log and "
+		          "these commands only");
 		break;
 	}
-	out.tier1_untouchable = _tier1_untouchable;
+	return status;
+}
 
-	// --- Tier 2, read ---------------------------------------------------------
-	//
-	// READ WHOLE AND ONCE, at open. The log holds the frames since the last
-	// vacuum - ~25 of them - so this is a few kilobytes, and the alternative
-	// (re-reading per request) is exactly the per-keystroke file I/O ADR-0010
-	// exists to remove.
+// READ WHOLE AND ONCE (at open, and again after a vacuum). The log holds the
+// frames since the last rewrite - ~`k_vacuum_frequency` of them - so this is a
+// few kilobytes, and the alternative (re-reading per request) is exactly the
+// per-keystroke file I/O ADR-0010 exists to remove.
+void history::load_log() {
 	const std::vector<std::byte> bytes = read_whole_file(_log_path);
 	auto loaded = std::make_shared<std::vector<item>>();
 	const log_scan scan = for_each(bytes, [&loaded](const record& one) {
@@ -427,19 +460,12 @@ open_report history::open(const std::string& directory) {
 	});
 	// The log is APPEND ORDER, oldest first; the walk is newest first.
 	std::reverse(loaded->begin(), loaded->end());
-	out.log_frames = scan.frames;
-	out.log_discarded_bytes = scan.discarded_bytes;
+	_log_frames = scan.frames;
+	_log_discarded_bytes = scan.discarded_bytes;
 	_logged = std::move(loaded);
-
-	// --- Tier 2, write --------------------------------------------------------
-	_log_fd = ::open(_log_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
-	out.log_writable = _log_fd >= 0;
-
-	publish();
-	return out;
 }
 
-void history::warn_once(const char* what) {
+void history::warn_once(const char* what, const char* consequence) {
 	if (_warned)
 		return;
 	_warned = true;
@@ -449,10 +475,7 @@ void history::warn_once(const char* what) {
 	// before the session starts, which is what makes this one legal. Once,
 	// because the condition does not change for the life of the process and a
 	// shell that said it every prompt would be a shell nobody could use.
-	std::fprintf(stderr,
-	             "lesh: %s %s; this session's history is the append log and "
-	             "these commands only, and the file will not be rewritten\n",
-	             _data_path.c_str(), what);
+	std::fprintf(stderr, "lesh: %s %s; %s\n", _data_path.c_str(), what, consequence);
 }
 
 // ---------------------------------------------------------------------------
@@ -541,8 +564,17 @@ void history::resolve_pending(std::int32_t exit_code) {
 	// THIS IS THE POINT THAT APPENDS THE FRAME (ADR-0010 §Recording). Before the
 	// wait there was no exit code to write, and after the process dies there is
 	// nobody to write it - so a command reaches the disk exactly once, here.
+	const bool appended = _new_items.back()->mode == persist_mode::disk;
 	(void)flush();
 	publish();
+
+	// AND THIS IS THE POINT THAT COUNTS IT (ADR-0010 §Vacuum: "every 25
+	// appends"). Only a `disk` item is an append - an ephemeral one never
+	// reaches the file, and counting it would make the cadence depend on how
+	// many secrets the user typed. After `publish`, so that a vacuum that
+	// crashes leaves a view describing the command that was just recorded.
+	if (appended)
+		maybe_vacuum();
 }
 
 bool history::flush() {
@@ -601,6 +633,145 @@ bool history::save() {
 	// the one question this milestone answers on its behalf.
 	(void)flush();
 	return _unwritable == 0;
+}
+
+// ---------------------------------------------------------------------------
+// The vacuum (ADR-0010 §Vacuum)
+// ---------------------------------------------------------------------------
+
+void history::set_vacuum_hook(std::function<void(vacuum_step)> hook) {
+	_vacuum_hook = std::move(hook);
+}
+
+void history::maybe_vacuum() {
+	// No directory, no files, nothing to compact. A memory-only history - what
+	// `vared` and most of the suite get - never reaches the rest of this, and
+	// neither does one whose owner turned the periodic rewrite off.
+	if (_data_path.empty() || !_automatic_vacuum)
+		return;
+
+	// fish `save_unless_disabled`: THE FIRST COUNTDOWN IS RANDOM in
+	// `[0, k_vacuum_frequency)` and every later one is the full period. A fixed
+	// start would mean a shell used for twenty commands and closed never
+	// vacuums at all - which is most shells - and the log would grow forever on
+	// exactly the machines nobody notices.
+	if (_vacuum_countdown < 0) {
+		std::uint64_t seed = 0;
+		random_bytes(&seed, sizeof(seed));
+		_vacuum_countdown =
+			static_cast<int>(seed % static_cast<std::uint64_t>(k_vacuum_frequency));
+	}
+	if (_vacuum_countdown > 0) {
+		--_vacuum_countdown;
+		return;
+	}
+
+	// One less than the period, because this call IS the first of the next
+	// twenty-five. fish's `countdown = kVacuumFrequency` followed by its
+	// unconditional `countdown--` says the same thing in two statements.
+	_vacuum_countdown = k_vacuum_frequency - 1;
+	(void)vacuum_now();
+}
+
+vacuum_result history::vacuum_now() {
+	++_vacuums;
+	if (_data_path.empty())
+		return vacuum_result{.status = vacuum_status::refused};
+
+	// EVERY RESOLVED, WRITABLE ITEM - see `vacuum_request::session` for why the
+	// unwritten ones alone are not enough. The spans borrow `_new_items`, which
+	// nothing touches until `vacuum` returns.
+	std::vector<record> session;
+	session.reserve(_new_items.size());
+	for (const std::shared_ptr<const item>& one : _new_items) {
+		if (one->pending || one->mode != persist_mode::disk)
+			continue;
+		session.push_back(record{
+			.cmd = as_bytes(one->cmd),
+			.when = one->when,
+			.cwd = as_bytes(one->cwd),
+			.exit_code = one->exit_code,
+			.session_id = one->session_id,
+		});
+	}
+
+	const vacuum_result done = vacuum(vacuum_request{
+		.data_path = _data_path,
+		.log_path = _log_path,
+		.session = session,
+		.policy = may_rewrite_tier1() ? tier1_policy::rewritable
+		                              : tier1_policy::untouchable,
+		.on_step = _vacuum_hook,
+	});
+
+	switch (done.status) {
+	case vacuum_status::refused:
+		// Not ours. Nothing was touched and nothing is owed.
+		return done;
+	case vacuum_status::gave_up:
+		// ADR-0010 step 3: "on give-up, do not drop data: fall back to plain
+		// append". IN A TWO-TIER DESIGN THAT IS THE TIER 2 APPEND, and `flush`
+		// is it - so the fallback is to make sure everything unwritten is in
+		// the log and to try the rewrite again in another period. There is
+		// nothing to append to `history.data`; it is a blob, not a log.
+		(void)flush();
+		return done;
+	case vacuum_status::renamed:
+		break;
+	}
+
+	// --- Everything below happens ONLY after a successful rename -------------
+
+	// THE LOG, AND ONLY IF IT IS STILL WHAT THE VACUUM MERGED. A sibling shell
+	// that appended a frame after the vacuum read the log would have that frame
+	// truncated away without it ever having reached the blob - the one path in
+	// this design that could lose a resolved command. Leaving the log alone
+	// instead costs duplicates, which the merge walk hides and the next vacuum
+	// removes. `vacuum_result::log_bytes_merged` carries the length.
+	if (_log_fd >= 0) {
+		const file_id now = file_id_of_path(_log_path);
+		if (now.valid && now.size == done.log_bytes_merged)
+			(void)::ftruncate(_log_fd, 0);
+	}
+
+	// THE CURSOR AND THE ITEMS (ADR-0010 as amended by #193): a successful
+	// vacuum clears `new_items` in the same `publish()` that maps the new blob,
+	// which is legal because `session_id` and not `new_items` tells own items
+	// from foreign ones. Without it `publish()` would be O(items this session)
+	// per command line for the whole life of the shell.
+	//
+	// A FILTER AND NOT A TRUNCATION, though, because "written" is not the same
+	// as "in the blob": a `memory` item advanced the cursor without being
+	// written anywhere, and dropping it here would be forgetting it. A pending
+	// item is behind the cursor by construction and is kept for the same
+	// reason.
+	std::deque<std::shared_ptr<const item>> keeping;
+	std::size_t cursor = 0;
+	for (std::size_t at = 0; at < _new_items.size(); ++at) {
+		const std::shared_ptr<const item>& one = _new_items[at];
+		const bool below_cursor = at < _first_unwritten;
+		if (below_cursor && !one->pending && one->mode == persist_mode::disk)
+			continue;
+		keeping.push_back(one);
+		if (below_cursor)
+			++cursor;
+	}
+	_new_items = std::move(keeping);
+	_first_unwritten = cursor;
+
+	// THE REMAP. #195 owns the flag - its directory watch is the other thing
+	// that sets it - and here the reload happens in the same call, because a
+	// writer that did not map its own output would keep serving the history it
+	// replaced.
+	_reload_needed = true;
+	(void)map_tier1();
+	load_log();
+	_reload_needed = false;
+
+	publish();
+	if (_vacuum_hook)
+		_vacuum_hook(vacuum_step::published);
+	return done;
 }
 
 // ---------------------------------------------------------------------------

@@ -49,6 +49,7 @@
 
 #include "ui/history/blob.h"
 #include "ui/history/log.h"
+#include "ui/history/vacuum.h"
 #include "ui/history_search.h"
 
 #include <cstddef>
@@ -124,10 +125,16 @@ struct open_report {
 	// ordinary state of a shell that has never vacuumed.
 	bool tier1_mapped = false;
 	// `history.data` exists and MUST NEVER BE WRITTEN: an unknown
-	// `file_identifier` (a future lesh, or somebody else's file entirely), or
-	// ours and rejected by the Verifier. The session runs on Tier 2 plus memory
-	// and warns once; #194's vacuum asks `may_rewrite_tier1()` and refuses.
+	// `file_identifier`, a future lesh's file or somebody else's entirely. The
+	// session runs on Tier 2 plus memory and warns once; the vacuum asks
+	// `may_rewrite_tier1()` and refuses.
 	bool tier1_untouchable = false;
+	// `history.data` is OURS and the Verifier rejected it. Not untouchable:
+	// #194 decided that such a file is rebuilt, after being renamed aside to
+	// `history.data.corrupt-<unix seconds>` so nothing is destroyed
+	// (`vacuum.h` carries the argument). Until the next vacuum the session runs
+	// on Tier 2 plus memory, exactly as it does for an untouchable one.
+	bool tier1_corrupt = false;
 	// The append log is open for writing. False costs this session's commands
 	// their place on disk and nothing else.
 	bool log_writable = false;
@@ -242,6 +249,41 @@ public:
 	// NO VACUUM. `save()` never rewrites `history.data` - see the seam below.
 	bool save();
 
+	// --- The vacuum (#194, ADR-0010 §Vacuum), LOOP THREAD ONLY ---------------
+
+	// Rewrites `history.data` NOW, whatever the countdown says, and does the
+	// bookkeeping a successful rewrite earns: the log is truncated, the write
+	// cursor rewinds, the items that are now in the blob leave `new_items`, and
+	// the new file is mapped and published in one step.
+	//
+	// PUBLIC BECAUSE THE TESTS DRIVE IT, and because the countdown is the only
+	// thing between this and the ordinary path - twenty-five `resolve_pending`
+	// calls do exactly this, and a suite that had to make twenty-five of them
+	// per assertion would be a suite nobody reads.
+	vacuum_result vacuum_now();
+
+	// Vacuums attempted this session, whatever they answered.
+	[[nodiscard]] std::size_t vacuums() const noexcept { return _vacuums; }
+
+	// Turns the periodic vacuum off, leaving `vacuum_now` available (fish's
+	// `history_t::disable_automatic_saving`).
+	//
+	// THE COUNTDOWN STARTS AT A RANDOM VALUE, which is a correctness property
+	// - a shell used for twenty commands and closed must still eventually
+	// vacuum - and a menace to anyone asserting about the files: one command
+	// in twenty-five triggers a rewrite, so a test that says "the log now
+	// holds this frame" is right twenty-four times and then is not. Every
+	// suite that is about the recording path rather than the rewrite turns
+	// this off; #194's own suite drives `vacuum_now` directly.
+	void set_automatic_vacuum(bool enabled) noexcept { _automatic_vacuum = enabled; }
+
+	// TEST-ONLY CRASH INJECTION. Called after each of ADR-0010 §Vacuum's steps
+	// (and after this class's own post-rename bookkeeping, `published`), so a
+	// test can `_exit` a forked child between any two of them and then assert
+	// on what a fresh `history` over the same directory can still see. Null in
+	// every shipping call; the hook is copied into each `vacuum_request`.
+	void set_vacuum_hook(std::function<void(vacuum_step)> hook);
+
 	// --- The read seam (#125's `history_source`) -----------------------------
 
 	// The merge walk, newest first, deduplicated on `cmd` bytes: this session's
@@ -262,11 +304,20 @@ public:
 	// dedup tie-break and for nothing else; nobody looks a session up by it.
 	[[nodiscard]] std::uint64_t session_id() const noexcept { return _session_id; }
 
-	// THE VACUUM SEAM (#194), and the one decision this milestone owes it.
-	// False when `history.data` is not ours or did not verify: ADR-0010 says
-	// such a file is never destroyed, and `rename`-ing a rebuilt blob over it
-	// would destroy it. #194 asks this before it writes; it is here, and not
-	// there, because the answer is settled at `open` and by nothing after it.
+	// THE VACUUM SEAM, and the decision #194 made behind it.
+	//
+	// False ONLY for an unknown `file_identifier`: those bytes are not ours,
+	// ADR-0010 says such a file is never destroyed, and `rename`-ing a rebuilt
+	// blob over it would destroy it.
+	//
+	// TRUE FOR A `corrupt` ONE - ours, and rejected by the Verifier - which is
+	// the question #193 left open and #194 closed. Refusing forever would let
+	// one flipped byte permanently disable Tier 1: the log would grow without
+	// bound and the condition would never clear, because nothing but a vacuum
+	// ever writes `history.data`. So it is rebuilt, and the broken file is
+	// renamed aside first so the decision stays reversible. `vacuum.h` carries
+	// the full argument, and the vacuum re-derives the answer from the file's
+	// CURRENT bytes as well - this is the early-out, settled at `open`.
 	[[nodiscard]] bool may_rewrite_tier1() const noexcept { return !_tier1_untouchable; }
 
 	// Items this session recorded and could not write - no log, or a failed
@@ -311,8 +362,15 @@ private:
 	void publish();
 	// Writes resolved, unwritten `disk` items to the log, advancing the cursor.
 	bool flush();
+	// Opens and verifies `history.data`, latching the two policy flags and
+	// warning at most once. Shared by `open` and by the remap a vacuum earns.
+	blob_status map_tier1();
+	// Reads `history.new.log` whole into `_logged`, newest first. Same.
+	void load_log();
+	// The countdown (ADR-0010 §Vacuum), and `vacuum_now` when it reaches zero.
+	void maybe_vacuum();
 	// One line on stderr, once per process lifetime of this object.
-	void warn_once(const char* what);
+	void warn_once(const char* what, const char* consequence);
 
 	// --- Loop-thread state; a walk never touches any of it -------------------
 
@@ -323,6 +381,9 @@ private:
 	// The write cursor: everything below it has been offered to the log.
 	std::size_t _first_unwritten = 0;
 	std::shared_ptr<const std::vector<item>> _logged;
+	// `load_log`'s counters, forwarded into the `open_report`.
+	std::size_t _log_frames = 0;
+	std::size_t _log_discarded_bytes = 0;
 	std::shared_ptr<const mapped_blob> _blob;
 	log_appender _appender;
 
@@ -335,9 +396,27 @@ private:
 
 	std::uint64_t _session_id = 0;
 	bool _tier1_untouchable = false;
+	bool _tier1_corrupt = false;
 	bool _warned = false;
 	std::size_t _warnings = 0;
 	std::size_t _unwritable = 0;
+
+	// --- The vacuum ----------------------------------------------------------
+
+	// Appends left before the next rewrite. NEGATIVE MEANS UNCHOSEN: the first
+	// append picks a random value in `[0, k_vacuum_frequency)`, so that a shell
+	// closed after twenty commands still eventually vacuums (fish
+	// `save_unless_disabled`).
+	int _vacuum_countdown = -1;
+	std::size_t _vacuums = 0;
+	bool _automatic_vacuum = true;
+	// Test-only, and empty in every shipping build - see `set_vacuum_hook`.
+	std::function<void(vacuum_step)> _vacuum_hook;
+	// Tier 1 on disk is not the Tier 1 we mapped. Set by a successful vacuum
+	// and cleared by the remap that follows it in the same call; #195's
+	// directory watch is the other thing that will set it, and the remap it
+	// wants is the same one.
+	bool _reload_needed = false;
 
 	// --- The one thing both threads touch ------------------------------------
 

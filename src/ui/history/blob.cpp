@@ -234,6 +234,55 @@ bool record_reader::read(std::span<const std::byte> payload, record& out) {
 // Reading a whole blob
 // ---------------------------------------------------------------------------
 
+blob_status read_records(std::span<const std::byte> bytes,
+                         const std::function<void(const record&)>& sink) {
+	// AN EMPTY IMAGE IS AN EMPTY HISTORY, the same answer `mapped_blob::open`
+	// gives a zero-byte file: `O_CREAT` in the vacuum's step 1 makes exactly
+	// that on a first run, and calling it damage would make a first vacuum
+	// look like a recovery.
+	if (bytes.empty())
+		return blob_status::ok;
+	if (bytes.size() < k_identifier_end)
+		return blob_status::unknown_identifier;
+
+	// The two checks in the order `mapped_blob::open` runs them, and for the
+	// reason stated there: the identifier and the Verifier have opposite
+	// policies attached, so the caller cannot tell them apart unless we do.
+	if (!fb::HistoryFileBufferHasIdentifier(bytes.data()))
+		return blob_status::unknown_identifier;
+
+	::flatbuffers::Verifier::Options options;
+	options.max_tables = k_verifier_max_tables;
+	::flatbuffers::Verifier verifier(
+		reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size(), options);
+	if (!fb::VerifyHistoryFileBuffer(verifier))
+		return blob_status::corrupt;
+
+	const fb::HistoryFile* const root = fb::GetHistoryFile(bytes.data());
+	const record_vector* const records = root->records();
+	if (records == nullptr)
+		return blob_status::ok;
+
+	// Spans into `bytes`, like everywhere else on this read path. The vacuum
+	// keys its dedup on them and never copies a command line it is going to
+	// evict, which is what keeps a 256 Ki rewrite from also being 256 Ki
+	// allocations.
+	for (::flatbuffers::uoffset_t at = 0; at < records->size(); ++at) {
+		const fb::Record* const one = records->Get(at);
+		if (one == nullptr)
+			continue;
+		const record yielding{
+			.cmd = bytes_of(one->cmd()),
+			.when = one->when(),
+			.cwd = bytes_of(one->cwd()),
+			.exit_code = one->exit_code(),
+			.session_id = one->session_id(),
+		};
+		sink(yielding);
+	}
+	return blob_status::ok;
+}
+
 mapped_blob::~mapped_blob() { close(); }
 
 mapped_blob::mapped_blob(mapped_blob&& other) noexcept

@@ -189,9 +189,40 @@ Amended by #193: a SUCCESSFUL vacuum clears `new_items` in the same `publish()`
 that maps the new blob — legal here because `session_id`, not `new_items`,
 tells own items from foreign ones (fish keeps them only for its boundary
 check, which this design dropped). Without it `publish()` is O(items this
-session) per command. A `corrupt` Tier 1 is treated like an unknown identifier
-(warn once, never touch, `may_rewrite_tier1() == false`) until #194 decides
-whether a verified-ours-but-broken file may be rebuilt from log + memory.
+session) per command.
+
+Amended by #194, five points, all in `src/ui/history/vacuum.{h,cpp}`:
+
+- **The corrupt-file policy, decided.** A `corrupt` Tier 1 — identifier ours,
+  Verifier says no — **is rebuilt**, after being `rename`d aside to
+  `history.data.corrupt-<unix seconds>` under the step 3 lock, so nothing is
+  destroyed. `may_rewrite_tier1()` is therefore true for it. Refusing forever
+  would let one flipped byte permanently disable Tier 1: the log grows without
+  bound, startup goes back to scanning it whole, and nothing ever clears the
+  condition because nothing but a vacuum writes `history.data`.
+  `unknown_identifier` keeps the unqualified rule — never touched, not even
+  renamed aside, because we cannot say what moving somebody else's file costs
+  them. Both answers are re-derived from the bytes the vacuum just read off the
+  fd, not trusted from `open`: the file can change in between.
+- **The merge takes every resolved item, not just the unwritten ones.** #193's
+  `flush` advances the cursor past an item the log refused (fish's never does),
+  so "unwritten" would exclude exactly the items with the most to lose. The
+  superset is free — the LRU collapses the overlap.
+- **The old blob is fed to the LRU oldest-first.** Tier 1 is stored
+  newest-first and the cap evicts least-recently-seen; feeding the file in the
+  order it is written would make the cap evict the newest records.
+- **The log is truncated only if it is still exactly the length the rewrite
+  merged.** A sibling appending between the read and the truncation would
+  otherwise have its frame deleted without it ever reaching the blob — the one
+  path in this design that could lose a resolved command. Unequal → leave the
+  log alone; the duplicates are the next vacuum's problem.
+- **Locking is `src/ui/history/locking.{h,cpp}`** (`lock_exclusive`, `unlock`,
+  `file_id_of_fd`, `file_id_of_path`, `file_id_equal`) — straightforward
+  `flock`/`stat` bodies, with #195 to fill in the 0.25 s give-up, the
+  `abandoned_locking` latch and the remote-filesystem refusal behind the same
+  four names. The periodic rewrite can be switched off
+  (`set_automatic_vacuum`, fish's `disable_automatic_saving`), which is what
+  makes every other suite's assertions about the files deterministic.
 
 `save()` on interactive exit flushes unwritten items to the log and does not
 vacuum. `~History` munmaps and closes everything (ADR-0007: the gate is "count

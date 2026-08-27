@@ -48,6 +48,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -312,6 +313,31 @@ enum class blob_status : std::uint8_t {
 	// truncated, garbled, or hand-edited.
 	corrupt,
 };
+
+// Verifies `bytes` as a whole `history.data` IMAGE and hands its records to
+// `sink`, newest first, exactly as a mapping would.
+//
+// THIS EXISTS FOR THE VACUUM (#194) AND FOR NOTHING ELSE. ADR-0010 §Vacuum
+// step 2 says the rewrite re-reads the old blob "via the fd (not the cached
+// mmap)", and the reason is the whole protocol: step 1 snapshots the file_id of
+// a descriptor it opened, and the records the rewrite merges have to be THAT
+// descriptor's bytes, or the file_id it re-checks in step 3 is guarding
+// contents it never read. `mapped_blob::open` takes a path and would race that
+// snapshot; this takes bytes the caller already pulled off the fd.
+//
+// THE STATUS IS RECOMPUTED FROM THESE BYTES, which is the other half of what
+// the vacuum needs. A `history.data` that verified at startup can have been
+// replaced since by a file that does not, and the policy attached to
+// `unknown_identifier` - never destroy it - has to be decided from what is
+// there NOW, not from what was there when the session began.
+//
+// `bytes` MUST BE EIGHT-BYTE ALIGNED, which FlatBuffers requires of any root
+// and which a `std::vector<std::byte>`'s storage satisfies by construction
+// (plain `operator new` is aligned for every fundamental type). A mapping is
+// page-aligned and also qualifies. `sink` is called zero or more times, never
+// after this returns, and the spans it is handed point INTO `bytes`.
+[[nodiscard]] blob_status read_records(std::span<const std::byte> bytes,
+                                       const std::function<void(const record&)>& sink);
 
 // `history.data`, open and mapped read-only.
 //
