@@ -424,17 +424,38 @@ void write_just_below_the_stack() {
 	(void)sched.tick();
 }
 
-__attribute__((noinline)) void eat_stack(int depth) {
+// THE RECURSION HAS TO SURVIVE THE OPTIMIZER, and until #203 it did not.
+//
+// The call was in TAIL POSITION, so Release rewrote it as a jump: one frame,
+// reused for ever, a stack that never grows, and a child that exits cleanly -
+// `AFiberThatOverflowsItsStackFaults` failed in the release binary while passing
+// under the sanitized gate, which is the shape of failure that makes a test
+// worth nothing. Two things that do NOT fix it, both tried:
+//
+//   `[[gnu::noinline]]` forbids INLINING, not the sibling-call rewrite; and
+//   using the callee's result in an arithmetic expression is exactly the
+//   ACCUMULATOR pattern LLVM's tail-recursion pass also folds into a loop.
+//
+// What does fix it is a SIDE EFFECT ORDERED AFTER THE CALL. The volatile store
+// below has to happen once the callee has returned, so the call cannot become a
+// jump and the frame cannot be reused - and the volatile read of `g_recurse`
+// keeps the exit test unpredictable, so nothing bounds the depth either.
+volatile int g_recurse = 1;
+volatile unsigned char g_deep_sink = 0;
+
+__attribute__((noinline)) unsigned char eat_stack(int depth) {
 	volatile unsigned char frame[2048];
 	frame[0] = static_cast<unsigned char>(depth);
 	frame[sizeof(frame) - 1] = static_cast<unsigned char>(depth);
-	if (frame[0] == 0xFF)   // never; keeps the recursion from being folded away
-		return;
-	eat_stack(depth + 1);
+	if (g_recurse == 0)   // never; the compiler cannot know that
+		return frame[sizeof(frame) - 1];
+	const unsigned char deeper = eat_stack(depth + 1);
+	g_deep_sink = static_cast<unsigned char>(deeper + frame[0]);
+	return frame[0];
 }
 
 void overflow_by_recursion(scheduler& /*on*/, void* /*userdata*/) {
-	eat_stack(0);
+	g_deep_sink = eat_stack(0);
 }
 
 void recurse_off_the_bottom_of_the_stack() {
@@ -462,6 +483,11 @@ TEST(FiberGuardPage, AFiberThatOverflowsItsStackFaults) {
 	// SIGSEGV, not corruption" - and with the test above it says both halves:
 	// an overflow dies, and it dies at the guard rather than after eating the
 	// bookkeeping.
+	//
+	// IN RELEASE TOO, since #203. It used to pass only where the optimizer left
+	// the recursion alone; see `eat_stack` for what made the call a jump and what
+	// makes it a call again. The gate is the debug binary, but a guard-page test
+	// that cannot fault in the build users run was measuring the compiler.
 	expect_faulted(run_in_child(&recurse_off_the_bottom_of_the_stack), "stack overflow");
 }
 
