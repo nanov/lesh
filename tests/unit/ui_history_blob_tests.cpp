@@ -21,7 +21,11 @@
 using namespace lesh::ui::history;
 
 // TIER 1 OF THE TWO-TIER HISTORY (#191, ADR-0010 §Tier 1): the round trip
-// through `history.data`, and the four ways opening one can go wrong.
+// through `history.data`, and the four ways opening one can go wrong. Plus, at
+// the seam where Tier 2 borrows this file's serializer, one record on its own -
+// `record_writer` and `record_reader` (#192), whose buffer is a different one
+// (a bare `Record` root, no identifier) reached by a different path (a log
+// frame, at an address FlatBuffers would not otherwise read from).
 //
 // The interesting half of this file is the failure half. A blob that round
 // trips is table stakes; what the format is FOR is that a file somebody else
@@ -280,6 +284,106 @@ TEST(UiHistoryBlob, RecordsAreViewsIntoOneMapping) {
 	const auto* const b = reinterpret_cast<const unsigned char*>(blob.records()[1].cwd.data());
 	const auto distance = static_cast<std::size_t>(a < b ? b - a : a - b);
 	EXPECT_LT(distance, blob.size_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// One record on its own - the Tier 2 payload (#192)
+// ---------------------------------------------------------------------------
+
+TEST(UiHistoryBlob, AStandaloneRecordRoundTripsEveryField) {
+	// The other buffer this file knows how to make: rooted at a bare `Record`,
+	// no file identifier, and it is what one frame of `history.new.log` carries.
+	record_writer writer;
+	const record written = make_record("kill -TERM %1", 1'724'000'001ull, "/var/tmp",
+	                                   -9, 0x0123'4567'89AB'CDEFull);
+	const std::span<const std::byte> built = writer.build(written);
+	const std::vector<std::byte> buffer{built.begin(), built.end()};
+
+	record_reader reader;
+	record read;
+	ASSERT_TRUE(reader.read(buffer, read));
+	EXPECT_EQ(as_text(read.cmd), "kill -TERM %1");
+	EXPECT_EQ(read.when, 1'724'000'001ull);
+	EXPECT_EQ(as_text(read.cwd), "/var/tmp");
+	EXPECT_EQ(read.exit_code, -9);
+	EXPECT_EQ(read.session_id, 0x0123'4567'89AB'CDEFull);
+}
+
+TEST(UiHistoryBlob, AStandaloneRecordBorrowsTheBytesItWasReadFrom) {
+	record_writer writer;
+	const record written = make_record("cat /etc/hosts", 3, "/etc");
+	const std::span<const std::byte> built = writer.build(written);
+	const std::vector<std::byte> buffer{built.begin(), built.end()};
+
+	// THE REBASE, stated as something a test can fail. `record_reader` verifies
+	// in an eight-aligned copy - a frame payload starts nine bytes into a file
+	// and FlatBuffers will not read an unaligned root - and then puts the spans
+	// back onto the caller's bytes. A reader that forgot the second half would
+	// hand out pointers into a scratch the next frame overwrites, and every
+	// assertion above would still pass.
+	record_reader reader;
+	record read;
+	ASSERT_TRUE(reader.read(buffer, read));
+	const auto* const first = reinterpret_cast<const unsigned char*>(buffer.data());
+	const auto* const cmd = reinterpret_cast<const unsigned char*>(read.cmd.data());
+	EXPECT_GE(cmd, first);
+	EXPECT_LE(cmd + read.cmd.size(), first + buffer.size());
+
+	// And reading a SECOND record does not disturb the first, which is the
+	// property #193's walk depends on.
+	const record other = make_record("cat /etc/services", 4, "/etc");
+	const std::span<const std::byte> rebuilt = writer.build(other);
+	const std::vector<std::byte> second{rebuilt.begin(), rebuilt.end()};
+	record also;
+	ASSERT_TRUE(reader.read(second, also));
+	EXPECT_EQ(as_text(read.cmd), "cat /etc/hosts");
+	EXPECT_EQ(as_text(also.cmd), "cat /etc/services");
+}
+
+TEST(UiHistoryBlob, AReaderIsReusableAndAcceptsTheSmallestRecord) {
+	record_writer writer;
+	record_reader reader;
+	for (int i = 0; i < 64; ++i) {
+		const std::string cmd(static_cast<std::size_t>(i) + 1, 'z');
+		const record written = make_record(cmd);
+		const std::span<const std::byte> built = writer.build(written);
+		const std::vector<std::byte> buffer{built.begin(), built.end()};
+		record read;
+		ASSERT_TRUE(reader.read(buffer, read)) << "length " << cmd.size();
+		EXPECT_EQ(as_text(read.cmd), cmd);
+		EXPECT_TRUE(read.cwd.empty());
+	}
+}
+
+TEST(UiHistoryBlob, ATruncatedOrGarbledStandaloneRecordIsRefusedAtEveryLength) {
+	record_writer writer;
+	const record written = make_record("make -j8 && ./build/debug/lesh_tests", 5,
+	                                   "/home/dn/src/lesh");
+	const std::span<const std::byte> built = writer.build(written);
+	const std::vector<std::byte> whole{built.begin(), built.end()};
+
+	// The reader stands between a frame whose CRC agreed by coincidence and a
+	// caller that trusts the spans it is handed, so "refused, and never a read
+	// off the end" is asserted the way Tier 1 asserts it: at every prefix, and
+	// at every single-byte flip. Nothing is claimed about WHICH answer comes
+	// back for a flip - a buffer can survive one - only that asking is safe.
+	record_reader reader;
+	for (std::size_t keep = 0; keep < whole.size(); ++keep) {
+		record read;
+		EXPECT_FALSE(reader.read(std::span{whole}.first(keep), read))
+			<< "truncated to " << keep;
+	}
+	for (std::size_t at = 0; at < whole.size(); ++at) {
+		std::vector<std::byte> damaged = whole;
+		damaged[at] = static_cast<std::byte>(std::to_integer<unsigned>(damaged[at]) ^ 0xA5u);
+		record read;
+		if (!reader.read(damaged, read))
+			continue;
+		for (std::byte b : read.cmd)
+			(void)b;
+		for (std::byte b : read.cwd)
+			(void)b;
+	}
 }
 
 // ---------------------------------------------------------------------------
