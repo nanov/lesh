@@ -565,7 +565,13 @@ TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 	lesh::ui::history::history store;
 	const lesh::ui::history::open_report report = store.open(home.history_dir());
 	ASSERT_FALSE(report.directory_unusable);
-	ASSERT_GT(report.log_frames, 0u) << "nothing was written to the history log";
+	// EITHER TIER WILL DO, and it has to be said this way since #194: the
+	// countdown starts at a random value in `[0, 25)`, so the shell that just
+	// exited had one chance in twenty-five of vacuuming these two commands out
+	// of the log and into `history.data` on its way through. The walk below is
+	// the assertion that matters and is indifferent to which tier answered.
+	ASSERT_TRUE(report.log_frames > 0u || report.tier1_mapped)
+		<< "nothing was written to either history tier";
 
 	std::vector<std::string> entries;
 	std::vector<std::int32_t> statuses;

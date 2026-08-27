@@ -86,6 +86,21 @@ namespace {
 	return out;
 }
 
+// `open`, with #194's PERIODIC VACUUM TURNED OFF.
+//
+// Nothing in this file is about the rewrite: these tests are about the file-id
+// check, the directory watch and the remote fallback, and they assert about the
+// two files byte for byte. #194's countdown starts at a random value in
+// `[0, 25)` - a correctness property, so that a shell used for twenty commands
+// still eventually vacuums - so one `run_command` in twenty-five would
+// otherwise truncate the log, replace `history.data` and fire the watch, and
+// this file would be right most of the time. `UiHistoryVacuum*` drives the
+// rewrite directly.
+[[nodiscard]] open_report open_quietly(history& store, const std::string& directory) {
+	store.set_automatic_vacuum(false);
+	return store.open(directory);
+}
+
 void run_command(history& store, std::string_view cmd, std::string_view cwd = "/tmp") {
 	if (store.add(cmd, cwd) == add_status::rejected)
 		return;
@@ -194,7 +209,7 @@ TEST_F(UiHistoryStaleWatch, ASiblingsVacuumIsSeenWithNoWriteOnOurSide) {
 
 	// The reader: opens, maps, and from here on types nothing.
 	history reader;
-	const open_report report = reader.open(dir);
+	const open_report report = open_quietly(reader, dir);
 	ASSERT_TRUE(report.tier1_mapped);
 	ASSERT_TRUE(report.watching) << "no watch, no test";
 	EXPECT_EQ(walk(reader), (std::vector<std::string>{"before the vacuum"}));
@@ -204,7 +219,7 @@ TEST_F(UiHistoryStaleWatch, ASiblingsVacuumIsSeenWithNoWriteOnOurSide) {
 	// THE SECOND INSTANCE - another terminal on the same directory - records two
 	// commands and then vacuums them into Tier 1.
 	history sibling;
-	ASSERT_FALSE(sibling.open(dir).directory_unusable);
+	ASSERT_FALSE(open_quietly(sibling, dir).directory_unusable);
 	run_command(sibling, "sibling one");
 	run_command(sibling, "sibling two");
 
@@ -235,7 +250,7 @@ TEST_F(UiHistoryStaleWatch, AChangeToSomethingElseInTheDirectoryIsNotAReload) {
 	// The watch is on the directory, so every sibling's temp file wakes every
 	// terminal on the machine. The `stat` is what turns that into nothing.
 	history store;
-	const open_report report = store.open(_temp.dir());
+	const open_report report = open_quietly(store, _temp.dir());
 	ASSERT_TRUE(report.watching);
 
 	write_file(_temp.dir() + "/somebody-elses-file", as_bytes("hello"));
@@ -269,7 +284,7 @@ TEST_F(UiHistoryStaleWatch, TheWatchDescriptorIsNotInheritedByChildren) {
 	// descriptor leaking into every child is both a leak and a way for a child to
 	// hold a reference on the user's data directory.
 	history store;
-	ASSERT_TRUE(store.open(_temp.dir()).watching);
+	ASSERT_TRUE(open_quietly(store, _temp.dir()).watching);
 	const int flags = ::fcntl(store.watch_fd(), F_GETFD);
 	ASSERT_NE(flags, -1);
 	EXPECT_NE(flags & FD_CLOEXEC, 0);
@@ -289,7 +304,7 @@ TEST_F(UiHistoryStaleAppend, AnAppendNoticesASiblingsVacuumWithoutTheWatch) {
 	vacuum_stand_in(dir, was);
 
 	history store;
-	ASSERT_TRUE(store.open(dir).tier1_mapped);
+	ASSERT_TRUE(open_quietly(store, dir).tier1_mapped);
 	ASSERT_EQ(walk(store), (std::vector<std::string>{"the old one"}));
 
 	const std::string fresh = "a sibling's command";
@@ -312,7 +327,7 @@ TEST_F(UiHistoryStaleAppend, AnAppendGoesToTheFileThatIsAtThePathAndNotToAnOrpha
 	const std::string log = dir + "/history.new.log";
 
 	history store;
-	ASSERT_TRUE(store.open(dir).log_writable);
+	ASSERT_TRUE(open_quietly(store, dir).log_writable);
 	run_command(store, "before");
 
 	// The sibling's vacuum, as far as the log is concerned: the old inode is
@@ -336,7 +351,7 @@ TEST_F(UiHistoryStaleAppend, AFlushWithNothingToWriteTouchesNothing) {
 	// append path is four syscalls. An `exit` typed at a prompt must not open and
 	// lock the log to write nothing.
 	history store;
-	ASSERT_TRUE(store.open(_temp.dir()).log_writable);
+	ASSERT_TRUE(open_quietly(store, _temp.dir()).log_writable);
 	run_command(store, "one");
 
 	const std::uint64_t locks_after_one_command = test_hooks::lock_attempts();
@@ -497,7 +512,7 @@ TEST_F(UiHistoryStaleRemote, AHeapBufferYieldsExactlyTheSameRecords) {
 	}
 
 	history mapped;
-	ASSERT_TRUE(mapped.open(mapped_dir.dir()).tier1_mapped);
+	ASSERT_TRUE(open_quietly(mapped, mapped_dir.dir()).tier1_mapped);
 	EXPECT_FALSE(mapped.tier1_copied());
 	EXPECT_GT(test_hooks::lock_attempts(), 0u)
 		<< "the LOCAL mapping takes the shared lock ADR-0010 asks for";
@@ -506,7 +521,7 @@ TEST_F(UiHistoryStaleRemote, AHeapBufferYieldsExactlyTheSameRecords) {
 	test_hooks::reset_locking_state();
 	test_hooks::set_remoteness_override(remoteness::remote);
 	history copied;
-	const open_report report = copied.open(_temp.dir());
+	const open_report report = open_quietly(copied, _temp.dir());
 	EXPECT_TRUE(report.directory_remote);
 	EXPECT_TRUE(report.tier1_mapped) << "remote or not, Tier 1 is readable";
 	EXPECT_TRUE(copied.tier1_copied());
@@ -526,7 +541,7 @@ TEST_F(UiHistoryStaleRemote, ARemoteBlobIsVerifiedLikeAnyOther) {
 
 	test_hooks::set_remoteness_override(remoteness::remote);
 	history store;
-	const open_report report = store.open(_temp.dir());
+	const open_report report = open_quietly(store, _temp.dir());
 	EXPECT_FALSE(report.tier1_mapped);
 	EXPECT_TRUE(report.tier1_untouchable) << "a file that is not ours is never rewritten";
 	EXPECT_FALSE(store.may_rewrite_tier1());
@@ -538,13 +553,13 @@ TEST_F(UiHistoryStaleRemote, AnEmptyAndAMissingTierOneAreBothFineWhenRemote) {
 	// neither is an error.
 	test_hooks::set_remoteness_override(remoteness::remote);
 	history missing;
-	EXPECT_FALSE(missing.open(_temp.dir()).tier1_mapped);
+	EXPECT_FALSE(open_quietly(missing, _temp.dir()).tier1_mapped);
 	EXPECT_TRUE(walk(missing).empty());
 
 	lesh::testing::temp_path empty_dir;
 	write_file(empty_dir.dir() + "/history.data", {});
 	history empty;
-	EXPECT_TRUE(empty.open(empty_dir.dir()).tier1_mapped);
+	EXPECT_TRUE(open_quietly(empty, empty_dir.dir()).tier1_mapped);
 	EXPECT_TRUE(walk(empty).empty());
 }
 
@@ -555,7 +570,7 @@ TEST_F(UiHistoryStaleRemote, ARemoteHistoryStillRecordsAndStillReloads) {
 	const std::string dir = _temp.dir();
 
 	history store;
-	const open_report report = store.open(dir);
+	const open_report report = open_quietly(store, dir);
 	ASSERT_TRUE(report.directory_remote);
 	ASSERT_TRUE(report.log_writable);
 
@@ -580,7 +595,7 @@ TEST_F(UiHistoryStaleRemote, ARemoteHistoryStillRecordsAndStillReloads) {
 
 TEST_F(UiHistoryStaleWatch, IncorporatingWithNothingPendingIsANoOp) {
 	history store;
-	ASSERT_FALSE(store.open(_temp.dir()).directory_unusable);
+	ASSERT_FALSE(open_quietly(store, _temp.dir()).directory_unusable);
 	store.incorporate_external_changes();
 	EXPECT_EQ(store.reloads(), 0u);
 }
@@ -593,7 +608,7 @@ TEST_F(UiHistoryStaleWatch, AReloadReAsksWhetherTierOneMayBeRewritten) {
 	write_file(dir + "/history.data", as_bytes("SOMEBODY ELSE'S FILE ENTIRELY"));
 
 	history store;
-	ASSERT_TRUE(store.open(dir).tier1_untouchable);
+	ASSERT_TRUE(open_quietly(store, dir).tier1_untouchable);
 	ASSERT_FALSE(store.may_rewrite_tier1());
 
 	// Some other lesh renames a real blob over it.
@@ -613,7 +628,7 @@ TEST_F(UiHistoryStaleWatch, AVanishedTierOneIsAReloadIntoNothingAndNotACrash) {
 	vacuum_stand_in(dir, was);
 
 	history store;
-	ASSERT_TRUE(store.open(dir).tier1_mapped);
+	ASSERT_TRUE(open_quietly(store, dir).tier1_mapped);
 	ASSERT_EQ(::unlink((dir + "/history.data").c_str()), 0);
 
 	run_command(store, "mine");

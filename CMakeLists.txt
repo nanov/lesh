@@ -305,6 +305,8 @@ add_library(lesh_ui STATIC
 	src/ui/history/locking.h
 	src/ui/history/log.cpp
 	src/ui/history/log.h
+	src/ui/history/vacuum.cpp
+	src/ui/history/vacuum.h
 	src/ui/history/watch.cpp
 	src/ui/history/watch.h
 	src/ui/loop.cpp
@@ -451,6 +453,7 @@ add_executable(lesh_tests
 	tests/unit/ui_history_search_tests.cpp
 	tests/unit/ui_history_stale_tests.cpp
 	tests/unit/ui_history_tests.cpp
+	tests/unit/ui_history_vacuum_tests.cpp
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/ui_bind_tests.cpp
 	tests/unit/leshper_vi_tests.cpp

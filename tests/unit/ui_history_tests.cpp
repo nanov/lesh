@@ -108,6 +108,21 @@ struct seen_entry {
 	return out;
 }
 
+// `open`, with #194's PERIODIC VACUUM TURNED OFF.
+//
+// Every test in this file is about the recording rules, the merge walk or the
+// snapshot discipline, and none of them is about the rewrite. The countdown
+// starts at a random value in `[0, 25)` - which is a correctness property, so
+// that a shell used for twenty commands still eventually vacuums - and one
+// command in twenty-five therefore moves the frames these tests assert about
+// out of the log and into `history.data`. Left on, this file would be right
+// most of the time. `UiHistoryVacuum*` is where the rewrite is tested, and it
+// drives it directly.
+[[nodiscard]] open_report open_quietly(history& store, const std::string& directory) {
+	store.set_automatic_vacuum(false);
+	return store.open(directory);
+}
+
 // Records `cmd` and finishes it, which is what a command that ran looks like.
 void run_command(history& store, std::string_view cmd, std::string_view cwd = "/tmp",
                  std::int32_t exit_code = 0) {
@@ -255,7 +270,7 @@ TEST(UiHistoryPlacement, TheDirectoryIsSevenHundredAndTheFilesAreSixHundred) {
 	const std::string dir = scratch.file("a/b/lesh");
 
 	history store;
-	const open_report report = store.open(dir);
+	const open_report report = open_quietly(store, dir);
 	ASSERT_FALSE(report.directory_unusable);
 	EXPECT_TRUE(report.log_writable);
 
@@ -275,7 +290,7 @@ TEST(UiHistoryPlacement, ADirectoryThatCannotBeMadeCostsTheDiskAndNotTheSession)
 	write_file(scratch.file("lesh"), as_bytes("not a directory"));
 
 	history store;
-	const open_report report = store.open(scratch.file("lesh"));
+	const open_report report = open_quietly(store, scratch.file("lesh"));
 	EXPECT_TRUE(report.directory_unusable);
 	EXPECT_FALSE(report.log_writable);
 
@@ -373,7 +388,7 @@ TEST(UiHistoryRecording, ALeadingSpaceIsRetrievableUntilTheNextCommand) {
 TEST(UiHistoryRecording, ALeadingSpaceNeverReachesTheLog) {
 	const lesh::testing::temp_path scratch;
 	history store;
-	ASSERT_FALSE(store.open(scratch.dir()).directory_unusable);
+	ASSERT_FALSE(open_quietly(store, scratch.dir()).directory_unusable);
 
 	run_command(store, "echo before");
 	run_command(store, " secret --token=hunter2");
@@ -391,7 +406,7 @@ TEST(UiHistoryRecording, ATabIndentedCommandIsOrdinaryHistory) {
 	// have been taught; a tab is what a paste from a script looks like.
 	const lesh::testing::temp_path scratch;
 	history store;
-	ASSERT_FALSE(store.open(scratch.dir()).directory_unusable);
+	ASSERT_FALSE(open_quietly(store, scratch.dir()).directory_unusable);
 	run_command(store, "\techo indented");
 	EXPECT_TRUE(store.save());
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
@@ -406,7 +421,7 @@ TEST(UiHistoryLogging, ResolvingIsWhatAppendsTheFrame) {
 	const lesh::testing::temp_path scratch;
 	const std::string log = scratch.file("history.new.log");
 	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	ASSERT_TRUE(open_quietly(store, scratch.dir()).log_writable);
 
 	ASSERT_EQ(store.add("echo hi", "/tmp"), add_status::added);
 	// Nothing yet: before the wait there is no exit code to write.
@@ -420,14 +435,14 @@ TEST(UiHistoryLogging, ARestartSeesTheWholeRecord) {
 	const lesh::testing::temp_path scratch;
 	{
 		history first;
-		ASSERT_TRUE(first.open(scratch.dir()).log_writable);
+		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, "echo one", "/one", 0);
 		run_command(first, "echo two", "/two", 7);
 		EXPECT_TRUE(first.save());
 	}
 
 	history second;
-	const open_report report = second.open(scratch.dir());
+	const open_report report = open_quietly(second, scratch.dir());
 	EXPECT_EQ(report.log_frames, 2u);
 	EXPECT_EQ(report.log_discarded_bytes, 0u);
 	// A first run has no `history.data` and that is not damage.
@@ -451,7 +466,7 @@ TEST(UiHistoryLogging, AMergeRewindsTheCursorSoTheNewerRunReachesDisk) {
 	const lesh::testing::temp_path scratch;
 	{
 		history first;
-		ASSERT_TRUE(first.open(scratch.dir()).log_writable);
+		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, "make", "/one", 0);
 		run_command(first, "make", "/two", 2);
 		EXPECT_TRUE(first.save());
@@ -460,7 +475,7 @@ TEST(UiHistoryLogging, AMergeRewindsTheCursorSoTheNewerRunReachesDisk) {
 	          (std::vector<std::string>{"make", "make"}));
 
 	history second;
-	ASSERT_EQ(second.open(scratch.dir()).log_frames, 2u);
+	ASSERT_EQ(open_quietly(second, scratch.dir()).log_frames, 2u);
 	const std::vector<seen_entry> seen = walk_merged(second);
 	ASSERT_EQ(seen.size(), 1u);
 	EXPECT_EQ(seen[0].exit_code, 2);
@@ -473,7 +488,7 @@ TEST(UiHistoryLogging, SaveFlushesAndDoesNotVacuum) {
 	// created and the log is not truncated - both of which are #194's.
 	const lesh::testing::temp_path scratch;
 	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	ASSERT_TRUE(open_quietly(store, scratch.dir()).log_writable);
 	run_command(store, "echo hi");
 	EXPECT_TRUE(store.save());
 
@@ -499,7 +514,7 @@ TEST(UiHistoryWalk, TheThreeTiersComeBackAsOneNewestFirstSequence) {
 	             record{.cmd = as_bytes("log two"), .when = 400});
 
 	history store;
-	const open_report report = store.open(scratch.dir());
+	const open_report report = open_quietly(store, scratch.dir());
 	ASSERT_TRUE(report.tier1_mapped);
 	ASSERT_EQ(report.log_frames, 2u);
 	run_command(store, "typed just now");
@@ -516,7 +531,7 @@ TEST(UiHistoryWalk, ACommandInEveryTierIsYieldedOnce) {
 	             record{.cmd = as_bytes("git status"), .when = 200});
 
 	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).tier1_mapped);
+	ASSERT_TRUE(open_quietly(store, scratch.dir()).tier1_mapped);
 	run_command(store, "git status");
 
 	EXPECT_EQ(walk(store), (std::vector<std::string>{"git status"}));
@@ -541,7 +556,7 @@ TEST(UiHistoryWalk, TheOrderingIsTheTieBreakAndOwnWins) {
 	             record{.cmd = as_bytes("only in the blob"), .when = 100, .session_id = 22});
 
 	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).tier1_mapped);
+	ASSERT_TRUE(open_quietly(store, scratch.dir()).tier1_mapped);
 	run_command(store, "shared");
 
 	const std::vector<seen_entry> seen = walk_merged(store);
@@ -593,12 +608,12 @@ TEST(UiHistoryWalk, CommandLinesAreBytesAndNotStrings) {
 	const std::string awkward = std::string("echo 'a\0b'\n\xff\xfe", 13);
 	{
 		history first;
-		ASSERT_TRUE(first.open(scratch.dir()).log_writable);
+		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, awkward);
 		EXPECT_TRUE(first.save());
 	}
 	history second;
-	ASSERT_EQ(second.open(scratch.dir()).log_frames, 1u);
+	ASSERT_EQ(open_quietly(second, scratch.dir()).log_frames, 1u);
 	EXPECT_EQ(walk(second), (std::vector<std::string>{awkward}));
 }
 
@@ -629,7 +644,7 @@ TEST(UiHistoryForeignFile, AnUnknownIdentifierIsLeftByteForByteAlone) {
 	write_file(data, original);
 
 	history store;
-	const open_report report = store.open(scratch.dir());
+	const open_report report = open_quietly(store, scratch.dir());
 	EXPECT_FALSE(report.tier1_mapped);
 	EXPECT_TRUE(report.tier1_untouchable);
 	// The one question this milestone answers on #194's behalf.
@@ -651,11 +666,11 @@ TEST(UiHistoryForeignFile, ItWarnsOnceAndNotOnceAgain) {
 
 	::testing::internal::CaptureStderr();
 	history store;
-	(void)store.open(scratch.dir());
+	(void)open_quietly(store, scratch.dir());
 	// A second open of the same directory - the reload #195 will make routine -
 	// must not say it again. A shell that warned every prompt would be a shell
 	// nobody could use.
-	(void)store.open(scratch.dir());
+	(void)open_quietly(store, scratch.dir());
 	const std::string said = ::testing::internal::GetCapturedStderr();
 
 	EXPECT_EQ(store.warnings(), 1u);
@@ -663,11 +678,13 @@ TEST(UiHistoryForeignFile, ItWarnsOnceAndNotOnceAgain) {
 	EXPECT_NE(said.find("not a lesh history file"), std::string::npos) << said;
 }
 
-TEST(UiHistoryForeignFile, ABlobOursAndBrokenIsAlsoLeftAlone) {
-	// #194 decides whether a vacuum may rebuild one of these. Until it does,
-	// the conservative treatment is the one an unknown identifier gets, for the
-	// same reason: a file nobody has decided about is a file nobody may
-	// overwrite.
+TEST(UiHistoryForeignFile, ABlobOursAndBrokenIsRebuildableButNotYetRebuilt) {
+	// #194's decision, from this side of the seam: a `corrupt` Tier 1 - ours,
+	// and rejected by the Verifier - is NOT untouchable. It is rebuilt at the
+	// next vacuum, after being renamed aside; until then the session runs on
+	// Tier 2 plus memory exactly as it would for a foreign file, and `open`
+	// itself still does not touch a byte of it.
+	// `UiHistoryVacuumCorrupt` is where the rebuild is asserted.
 	const lesh::testing::temp_path scratch;
 	blob_writer writer;
 	const record one[] = {record{.cmd = as_bytes("a command"), .when = 1}};
@@ -679,9 +696,11 @@ TEST(UiHistoryForeignFile, ABlobOursAndBrokenIsAlsoLeftAlone) {
 	write_file(scratch.file("history.data"), bytes);
 
 	history store;
-	const open_report report = store.open(scratch.dir());
-	EXPECT_TRUE(report.tier1_untouchable);
-	EXPECT_FALSE(store.may_rewrite_tier1());
+	const open_report report = open_quietly(store, scratch.dir());
+	EXPECT_FALSE(report.tier1_mapped);
+	EXPECT_FALSE(report.tier1_untouchable);
+	EXPECT_TRUE(report.tier1_corrupt);
+	EXPECT_TRUE(store.may_rewrite_tier1());
 	EXPECT_EQ(store.warnings(), 1u);
 	EXPECT_EQ(read_file(scratch.file("history.data")), bytes);
 }
