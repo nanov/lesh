@@ -428,7 +428,6 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	_read_buffer.reserve(4096);
 	_events.reserve(16);
 	_carried_events.reserve(16);
-	_deferred.reserve(8);
 	_signal_numbers.reserve(8);
 	_completions.reserve(8);
 	_out.reserve(4096);
@@ -591,14 +590,12 @@ turn_result event_loop::turn(int timeout_ms) {
 	_needs_render = false;
 	drain_registry_effects();
 
-	// Anything a blocked wait deferred is delivered first, in the order it
-	// arrived: a resize that landed while a command ran has been waiting for the
-	// editor to exist again.
-	if (!_deferred.empty()) {
-		for (leshper::event& one : _deferred)
-			_events.push_back(std::move(one));
-		_deferred.clear();
-	}
+	// THERE IS NO DEFERRED QUEUE ANY MORE (#201). `_deferred` held what the
+	// blocked `wait_on_shell` poll drained while a command ran - it was the only
+	// thing that polled during an execution, so what it read had to be kept
+	// somewhere until the editor existed again. Nothing polls during an execution
+	// now: the signal sits in the self-pipe, this turn's poll finds it readable,
+	// and `drain_signal_topic` turns it into an event like any other.
 
 	int at = 0;
 	int tty_at = -1, signal_at = -1, worker_at = -1, watch_at = -1;

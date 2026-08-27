@@ -807,7 +807,6 @@ private:
 	// and is walked by the next pass instead. A member, so the capacity survives
 	// the turn and the steady state allocates nothing.
 	std::vector<leshper::event> _carried_events;
-	std::vector<leshper::event> _deferred;      // signals that arrived while executing
 	std::vector<int> _signal_numbers;
 	std::vector<completion> _completions;
 	std::string _out;
