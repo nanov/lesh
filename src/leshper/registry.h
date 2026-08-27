@@ -61,9 +61,10 @@ struct reactor_batch;
 // names instead of a second sweep of the filesystem.
 //
 // FIXED AND INLINE, which is a departure from #130's "memoized in the request's
-// arena" and stronger than it: a token minted on the loop thread has no arena at
-// all (`current_worker_arena()` is null off a worker, which is every test that
-// drives a reactor through `loop_harness`), and an array inside the token
+// arena" and stronger than it: no token has a per-request arena at all any more
+// (the pool that handed one out went with #202; the highlighter carries its own,
+// and a reactor reached through `loop_harness` never had one), and an array
+// inside the token
 // allocates nothing anywhere rather than allocating cheaply in one of the two
 // places. Its life is exactly the request's, which is what "per request" asked
 // for.
@@ -330,6 +331,35 @@ struct lesh_request {
 
 	// Cooperative cancellation. Points at the loop's flag; never owned.
 	const std::atomic<bool>* superseded = nullptr;
+
+	// THE MID-COMPUTE YIELD (#202), AND WHY IT HANGS OFF THE CANCELLATION POLL.
+	//
+	// A reactor that runs on a fiber must give the host the thread back often
+	// enough that a keystroke is not left waiting behind a `$PATH` walk. The place
+	// a reactor ALREADY checks in is `lesh_request_superseded` - #124's
+	// `kPollEvery` in the token sweep, the per-entry poll in the autosuggester's
+	// history walk, the poll adjacent to every `stat` in `classify_command` - so
+	// THE POLL IS THE YIELD, which is #145's record in its own words. Every one of
+	// those sites becomes a yield point at no cost to the published interface:
+	// `abi.h` is unchanged, `lesh_reactor_fn` is unchanged, and a reactor written
+	// against the header gains a yield it never asked for and cannot misuse.
+	//
+	// CALLED BEFORE THE FLAG IS READ, never after. The host's reason for wanting
+	// the thread back is that it may then dispatch a keystroke, and a keystroke
+	// that changes the buffer is what SETS the flag - so a poll that read first
+	// and yielded second would answer with news one yield out of date and walk one
+	// more block for a line the user has already left.
+	//
+	// NULL IS THE ORDINARY CASE and means "there is nobody to yield to": a reactor
+	// dispatched from `loop_harness::react` runs on the host's own stack, where
+	// yielding would be yielding to itself. Only `run_reactor_here` called from
+	// inside a fiber fills these in.
+	//
+	// A FUNCTION POINTER AND A `void*`, not a `std::function`, for the reason
+	// every other seam in this file is: the token is minted per call on a path
+	// that runs per keystroke, and a capturing lambda would allocate there.
+	void (*cooperate)(void* userdata) = nullptr;
+	void* cooperate_userdata = nullptr;
 
 	// THE HOST (#168 Phase B; host.h). Never owned.
 	//

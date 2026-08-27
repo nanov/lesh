@@ -14,10 +14,15 @@
 
 #include <gtest/gtest.h>
 
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
 #include <cstddef>
 #include <deque>
 #include <string>
 #include <string_view>
+#include <vector>
 
 using namespace lesh::runtime;
 
@@ -161,6 +166,97 @@ TEST_F(CooperationTest, ACancelledPromptIsABoundary) {
 // boundaries too - a host must not be starved for the length of an `eval`.
 TEST_F(CooperationTest, EvalRunsBoundariesOfItsOwn) {
 	EXPECT_EQ(boundaries("eval ':; :'"), 1u + 2);
+}
+
+// ---------------------------------------------------------------------------
+// A FORKED CHILD COOPERATES WITH NOBODY (#202, answering #199's open question)
+// ---------------------------------------------------------------------------
+
+// The direct statement of the rule: `enter_subshell` puts the pointer back,
+// beside the `_tty_fd` clear it already did for the same class of reason.
+//
+// EVERY ROLE, which is the part worth pinning: the fd has an exception for a
+// foreground `( )`, because such a subshell genuinely manages the terminal for
+// the jobs it runs. There is no matching exception here - nothing a child can do
+// makes its parent's host the right thing to talk to - so a test that only
+// checked the default role would pass while a `( nvim )` called into a scheduler
+// that is not its own.
+TEST_F(CooperationTest, EnterSubshellPutsTheNoOpBack) {
+	for (const subshell_role role : {subshell_role::detached,
+	                                 subshell_role::foreground_job}) {
+		shell_state child;
+		child.set_cooperation(host);
+		ASSERT_EQ(&child.cooperation(), &host);
+		child.enter_subshell(role);
+		EXPECT_EQ(&child.cooperation(), &noop_cooperation())
+			<< "role " << static_cast<int>(role) << " inherited its parent's host";
+	}
+}
+
+namespace {
+
+// A cooperation that says WHICH PROCESS reached the boundary, down a pipe.
+//
+// COUNTING WOULD NOT DO, and that is the whole design of this test. A child's
+// increments land in the child's copy-on-write page, so a parent that counted
+// its own calls would read the same number whether or not the child had called
+// too - the test would pass for the wrong reason and keep passing after the
+// reset was deleted. One byte per boundary, 'P' from the process that installed
+// the host and 'C' from anybody else, makes the child's calls visible to the
+// parent because a pipe is shared where memory is not.
+class reporting_cooperation final : public cooperation {
+public:
+	explicit reporting_cooperation(int write_fd, pid_t owner) noexcept
+		: _fd(write_fd), _owner(owner) {}
+
+	void on_command_boundary() noexcept override {
+		const char who = ::getpid() == _owner ? 'P' : 'C';
+		// Nothing else: a boundary handler is called from inside the executor's
+		// command loop, and in a forked child the only safe things are raw libc.
+		while (::write(_fd, &who, 1) < 0 && errno == EINTR) {
+		}
+	}
+
+private:
+	int _fd = -1;
+	pid_t _owner = 0;
+};
+
+} // namespace
+
+TEST_F(CooperationTest, ASubshellNeverReachesItsParentsHost) {
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(fds), 0);
+	reporting_cooperation reporter{fds[1], ::getpid()};
+	state.set_cooperation(reporter);
+
+	// A DETACHED SUBSHELL AND A FOREGROUND ONE, and a command substitution, which
+	// is the third fork that runs shell code without exec'ing. Each body is two
+	// commands, so an inherited pointer would show up as several 'C's.
+	(void)run("( :; : )\n"
+	          "x=$( :; : )\n"
+	          ": | ( :; : )\n");
+
+	ASSERT_EQ(::close(fds[1]), 0);
+	std::string reported;
+	char chunk[256];
+	for (;;) {
+		const ssize_t got = ::read(fds[0], chunk, sizeof chunk);
+		if (got > 0) {
+			reported.append(chunk, static_cast<std::size_t>(got));
+			continue;
+		}
+		if (got < 0 && errno == EINTR)
+			continue;
+		break;
+	}
+	ASSERT_EQ(::close(fds[0]), 0);
+
+	EXPECT_EQ(reported.find('C'), std::string::npos)
+		<< "a forked child called into its parent's host: " << reported;
+	// AND THE PARENT DID REACH BOUNDARIES, so the absence above is evidence rather
+	// than an empty pipe: three commands at the top level is three of them.
+	EXPECT_GE(std::count(reported.begin(), reported.end(), 'P'), 3);
 }
 
 } // namespace

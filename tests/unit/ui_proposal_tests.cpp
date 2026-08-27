@@ -2,7 +2,7 @@
 #include "leshper/proposal.h"
 #include "leshper/registry.h"
 #include "ui/loop.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 
 #include "ui_fakes.h"
 
@@ -99,7 +99,7 @@ int32_t probing_action(lesh_editor* editor, const lesh_invocation*, void* userda
 	return LESH_OK;
 }
 
-// A loop, its helpers, and the editing context they all share.
+// A loop and the editing context it and its reactor fibers share.
 //
 // THE CONTEXT IS THE LOOP'S EDITOR'S, which is the wiring #134 does in
 // `ui/session.cpp` and the only wiring that works: `editor.cpp` dispatches a key
@@ -107,7 +107,6 @@ int32_t probing_action(lesh_editor* editor, const lesh_invocation*, void* userda
 // context's or a bound key reaches a different table than the reactors do.
 struct looped {
 	fake_tty tty;
-	worker_pool helpers{1};
 	event_loop loop{tty.fds(), pipe_options()};
 	offer what;
 	probe seen;
@@ -121,7 +120,6 @@ struct looped {
 		                               &seen),
 		          LESH_OK);
 		loop.attach_registry(context.actions());
-		loop.attach_helpers(helpers);
 		// A size, so a turn paints: the pipe has no winsize to report.
 		loop.editor().columns = 40;
 		loop.editor().rows = 6;
@@ -137,7 +135,8 @@ struct looped {
 		map->bind(encoded, action);
 	}
 
-	// Type, and wait for the offer to come back from the helper and be applied.
+	// Type, and wait for the offer to come back from the reactor's fiber and be
+	// applied.
 	[[nodiscard]] bool show(std::string_view typed) {
 		const std::size_t before = loop.applied_batches();
 		tty.type(typed);
@@ -161,7 +160,7 @@ struct looped {
 // ===========================================================================
 
 TEST(UiProposal, AKeyBoundToAcceptPutsTheAppliedProposalInTheBuffer) {
-	// THE WHOLE TRAIL, and the one #144 found broken: reactor -> worker ->
+	// THE WHOLE TRAIL, and the one #144 found broken: reactor -> its fiber ->
 	// `take_batch` -> `state::proposals` -> `lesh_proposal_read` -> a staged
 	// write the loop commits. Nothing here dispatches through the harness by
 	// hand; the key is bound and typed, exactly as a user's `bind` would be.
@@ -240,10 +239,15 @@ TEST(UiProposal, ABatchFromASupersededGenerationIsNeverReadable) {
 	looped driven;
 	driven.bind("<C-y>", "probe_proposal");
 
-	driven.helpers.submit("offerer",
-	                      snapshot_of(driven.loop.editor(), LESH_EVENT_BUFFER_CHANGED),
-	                      &offering_reactor, &driven.what);
+	// THE STALE BATCH, BUILT WITH THE GROUP PARKED (#202: there is no `submit` any
+	// more, and a fiber whose group is runnable would have computed and applied its
+	// answer inside the same turn as the keystroke). Parked, the send lands in the
+	// slot and the wake queues; the editor is moved on; the resume hands the fiber a
+	// snapshot that was already stale when it arrived.
+	driven.loop.quiesce();
+	driven.press("x");
 	driven.loop.editor().gen.bump();
+	driven.loop.resume_after_execution();
 	ASSERT_TRUE(turn_until(driven.loop, [&] { return driven.loop.dropped_batches() > 0; }));
 
 	EXPECT_TRUE(driven.loop.editor().proposals.empty());

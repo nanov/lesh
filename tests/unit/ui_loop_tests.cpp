@@ -4,7 +4,7 @@
 #include "ui/loop.h"
 #include "ui/shell_side.h"
 #include "ui/tty.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 #include "substrate/fork_guard.h"
 #include "substrate/log.h"
 
@@ -598,16 +598,16 @@ TEST(UiLoopSignals, SighupIsNeverTakenAtAll) {
 }
 
 // ===========================================================================
-// The worker topic
+// The reactors (#202: fibers, where this section used to be the `worker` topic)
 // ===========================================================================
 
-TEST(UiLoopWorkers, AReadableFdIsAnsweredWithDrain) {
-	// #126's rule, written in its own header: answer the readable fd with
-	// `drain()`, never by reading it. Reading it would leave the queue armed and
-	// the next wakeup would be lost forever.
+TEST(UiLoopReactors, AnEmissionLandsInTheEditorsOwnDecorations) {
+	// What the `worker` topic's drain rule used to be asserted through. There is
+	// no descriptor and no queue: the reactor's fiber applies its own batch inside
+	// the turn, so the assertion is about where the answer LANDS, which is the
+	// part that never depended on how it travelled.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	std::size_t seen = 0;
 	ASSERT_EQ(lesh_reactor_register(&reg, "counter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, &seen),
@@ -615,73 +615,70 @@ TEST(UiLoopWorkers, AReadableFdIsAnsweredWithDrain) {
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
 	tty.type("ab");
 	loop.turn(50);
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
-	EXPECT_TRUE(helpers.completions().empty());
-	EXPECT_FALSE(helpers.completions().armed()) << "drain disarms; a read would not have";
+	EXPECT_EQ(seen, 2u) << "the compute saw the whole line";
 	// #141: a taken batch lands in the editor's own decorations, namespaced by
 	// the reactor that emitted it. There is no loop-side store any more.
 	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
 	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "counter");
 }
 
-TEST(UiLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
+TEST(UiLoopReactors, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	// N-4, and the loop is the only applier, so this is the only place the rule
-	// is decided.
+	// is decided. The emitters group is parked while the notification is made, so
+	// the fiber is handed a snapshot that was already stale when it arrived -
+	// which is what `submit`-then-bump used to arrange one thread away.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	ASSERT_EQ(lesh_reactor_register(&reg, "counter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, nullptr),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
-	// Submit against the generation the editor is at, then move the editor on
-	// before the answer is drained.
-	helpers.submit("counter", snapshot_of(loop.editor(), LESH_EVENT_BUFFER_CHANGED),
-	               &counting_reactor, nullptr);
+	loop.quiesce();
+	tty.type("a");
+	loop.turn(50);
 	loop.editor().gen.bump();
+	loop.resume_after_execution();
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.dropped_batches() > 0; }));
 	EXPECT_EQ(loop.applied_batches(), 0u);
 	EXPECT_TRUE(loop.editor().marks.layers().empty());
 }
 
-TEST(UiLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
+TEST(UiLoopReactors, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 	// #154's regression anchor for F-25 on the REAL loop path - the deterministic
 	// in-harness cousin of the pty accept test, with no terminal timing in it.
-	// The autosuggester runs on a HELPER worker; the whole point of the ticket is
-	// that its proposal, not only its virtual text, survives the completion-queue
-	// handoff into `state::proposals` where `lesh_proposal_read` walks. Type a
-	// prefix, let the batch drain, dispatch the DEFAULT accept key, and the
-	// buffer must become the whole candidate with one undo entry for the accept.
+	// The autosuggester runs on ITS OWN FIBER since #202 (it was a helper worker,
+	// and before that a pool submission); the whole point of the ticket is that its
+	// proposal, not only its virtual text, reaches `state::proposals` where
+	// `lesh_proposal_read` walks. Type a prefix, let the batch land, dispatch the
+	// DEFAULT accept key, and the buffer must become the whole candidate with one
+	// undo entry for the accept.
 	//
 	// The unit suite drove the accepting actions through `loop_harness::react` +
 	// `apply_batch` - a fake scheduler on the test thread - so it never exercised
-	// the worker pool, the pipe and `take_batch` end to end. This does, which is
-	// the seam #154 was filed against.
+	// the real notify-compute-apply path end to end. This does, which is the seam
+	// #154 was filed against.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	vector_history_source history{{"echo hello"}};
 	owned_autosuggester self{&history};
 	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
-	// Type a prefix of the remembered line and let the helper's batch arrive.
+	// Type a prefix of the remembered line and let the reactor's batch arrive.
 	tty.type("ec");
 	ASSERT_TRUE(turn_until(loop, [&] {
 		return loop.applied_batches() > 0 && !loop.editor().proposals.empty();
@@ -832,24 +829,29 @@ TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
 	EXPECT_EQ(shell.called, "echo from an action");
 }
 
-TEST(UiLoopShell, AnEventPushedMidWalkDoesNotDangleTheEventWalk) {
-	// #162, and it is a heap-use-after-free rather than a tidiness point. The turn
-	// walked `_events` by reference while `handle` pushed onto it; once the push
-	// reallocates, the walk's iterator points into freed storage. The push that
-	// found it was a shell message drained inside `wait_on_shell`, which #201
-	// deleted - and the hazard did not go with it, because the shell-state reactor
-	// now pushes its own `worker_result` from inside `handle`, once per keystroke.
+TEST(UiLoopShell, ASixteenKeyTurnWithAnAcceptInTheMiddleLosesNothing) {
+	// WHAT #162 LEFT BEHIND, AND WHERE THE HAZARD WENT (#202). #162 was a
+	// heap-use-after-free: the turn walked `_events` by reference while `handle`
+	// pushed onto it, and the push reallocated the vector out from under the walk.
+	// Two producers found it in turn - a shell message drained inside
+	// `wait_on_shell` (deleted by #201) and the in-place shell reactor's own
+	// `worker_result` (deleted here) - and the reactor's push now happens from a
+	// FIBER SLICE, which `turn` runs between its two event walks rather than inside
+	// one. So the hazard has no producer left; the swap stays as the rule, and this
+	// is the test that says the SEQUENCE is still lossless.
 	//
-	// The repro is arithmetic, not luck. `event_loop` reserves exactly sixteen
-	// events, so sixteen bytes read in one go fill the queue to its capacity and
-	// the reactor's pushes are guaranteed to reallocate - and the accept is put in
-	// the MIDDLE of them so that the walk still has elements to dereference
-	// afterwards. Under the old code ASan fails here.
+	// The arithmetic is still the anchor. `event_loop` reserves exactly sixteen
+	// events, so sixteen bytes read in one go fill the queue to its capacity - and
+	// the accept is in the MIDDLE of them, so the walk still has elements to
+	// dereference after a `quiesce` has parked the emitters group underneath it.
 	fake_tty tty;
 	registry reg;
 	fake_shell shell;
+	// DECLARED BEFORE THE LOOP so it outlives it: `~event_loop` runs the emitters
+	// out to their next poll, and that poll reads the reactor's userdata.
+	std::size_t seen_length = 0;
 	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
-	                                &counting_reactor, nullptr),
+	                                &counting_reactor, &seen_length),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
@@ -872,35 +874,46 @@ TEST(UiLoopShell, AnEventPushedMidWalkDoesNotDangleTheEventWalk) {
 	EXPECT_EQ(shell.executed, "12345678");
 	EXPECT_EQ(buffer_of(loop), "abcdefg")
 		<< "the seven keys typed after the accept still reached the fresh line";
-	// Sixteen keys, plus one `worker_result` for each of the fifteen that changed
-	// the buffer - the accept itself changes none - and every one of those fifteen
-	// was pushed while the batch that produced it was being walked.
-	EXPECT_EQ(result.events, 31u)
-		<< "swapping the batch out must not drop what is pushed while it is walked";
-	EXPECT_EQ(loop.applied_batches(), 15u);
+	// SIXTEEN KEYS PLUS ONE. Fifteen of the sixteen change the buffer - the accept
+	// itself changes none - and all fifteen send into a capacity-one conflating
+	// slot, so there is ONE compute and ONE `worker_result`, pushed by the trailing
+	// slice and walked by the pass after it. It was 31 and 15 when every keystroke
+	// had a worker of its own; the drop to 17 and 1 is latest-wins arriving where
+	// #90 always said it should.
+	EXPECT_EQ(result.events, 17u)
+		<< "the event a trailing slice pushed was dropped rather than walked";
+	EXPECT_EQ(loop.applied_batches(), 1u);
+	// AND THE ONE COMPUTE IS FOR THE LINE THAT SURVIVED. Seven of the fifteen sends
+	// landed while the group was parked for the execution; the resume replayed the
+	// wake, and what the fiber then received was the newest of them.
+	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "highlighter");
+	EXPECT_EQ(seen_length, 7u) << "the batch was computed for `abcdefg`";
 }
 
 // ===========================================================================
 // Accept and quiesce
 // ===========================================================================
 
-TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
+TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	// The whole of quiesce, asserted from inside the execution: by the time
-	// `execute` runs, the helpers are parked and the terminal has been handed
+	// `execute` runs, the emitters group is parked and the terminal has been handed
 	// back. That is the moment a fork is legal - and since #201 the fork happens
 	// one stack frame below this assertion rather than on another thread, which
-	// makes the ordering the call's own.
+	// makes the ordering the call's own. #202 turned "the helper pool is parked"
+	// into one scheduler bit and left the ordering alone.
 	fake_tty tty;
 	fake_shell shell;
-	worker_pool helpers{2};
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_helpers(helpers);
 	loop.attach_shell(shell);
 	loop.enter_read();
 
 	bool parked_during_execute = false;
-	shell.on_execute = [&] { parked_during_execute = helpers.is_quiesced(); };
+	shell.on_execute = [&] {
+		parked_during_execute =
+			loop.reactors().group_parked(group_index(fiber_group::emitters));
+	};
 	shell.execute_status = 42;
 
 	tty.type("echo hi");
@@ -909,23 +922,21 @@ TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 
 	const std::optional<std::int32_t> status = loop.accept_current_line();
 
-	EXPECT_TRUE(parked_during_execute) << "quiesce is the helpers parked plus the terminal";
+	EXPECT_TRUE(parked_during_execute) << "quiesce is the emitters parked plus the terminal";
 	ASSERT_TRUE(status.has_value());
 	EXPECT_EQ(*status, 42);
 	EXPECT_EQ(shell.executed, "echo hi");
 	// The line is finished and the editor is fresh, in one edit so undo does not
 	// walk back into a command that has already run.
 	EXPECT_EQ(buffer_of(loop), "");
-	// Parking NESTS and resume released it: the pool is live again.
-	EXPECT_FALSE(helpers.is_quiesced());
+	// Parking NESTS and resume released it: the group is runnable again.
+	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_FALSE(loop.quiesced());
 }
 
 TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	fake_tty tty;
-	worker_pool helpers{1};
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
 	loop.quiesce();
@@ -938,7 +949,7 @@ TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	EXPECT_TRUE(loop.quiesced()) << "two parks need two resumes";
 	loop.resume_after_execution();
 	EXPECT_FALSE(loop.quiesced());
-	EXPECT_FALSE(helpers.is_quiesced());
+	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
 }
 
 TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsNotLost) {

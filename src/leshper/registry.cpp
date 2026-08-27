@@ -1195,6 +1195,14 @@ int32_t lesh_request_superseded(const lesh_request* request, int32_t* out) {
 	LESH_REQUEST_HANDLE(request);
 	if (out == nullptr)
 		return LESH_ERR_INVAL;
+	// THE POLL IS ALSO THE YIELD (#202). See `lesh_request::cooperate` for why
+	// this hangs off the cancellation poll rather than off a verb of its own, and
+	// why it runs BEFORE the flag is read: the host may dispatch a keystroke while
+	// this call is suspended, and that keystroke is what sets the flag. Null - a
+	// reactor running on the host's own stack - and the load below is the whole
+	// function, exactly as it was.
+	if (request->cooperate != nullptr)
+		request->cooperate(request->cooperate_userdata);
 	*out = request->superseded != nullptr
 	       && request->superseded->load(std::memory_order_relaxed) ? 1 : 0;
 	return LESH_OK;

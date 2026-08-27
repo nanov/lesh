@@ -1,5 +1,7 @@
 #include "ui/loop.h"
 
+#include "fiber/slot.h"
+
 #include "leshper/keymap.h"
 #include "substrate/assert.h"
 #include "substrate/fork_guard.h"
@@ -144,13 +146,81 @@ const char* name_of(topic which) noexcept {
 	switch (which) {
 		case topic::tty: return "tty";
 		case topic::signal: return "signal";
-		case topic::worker: return "worker";
 		case topic::timer: return "timer";
 		case topic::watch: return "watch";
 		case topic::count_: break;
 	}
 	return "?";
 }
+
+const char* name_of(phase which) noexcept {
+	switch (which) {
+		case phase::editing: return "editing";
+		case phase::executing: return "executing";
+		case phase::boundary: return "boundary";
+	}
+	return "?";
+}
+
+// ---------------------------------------------------------------------------
+// A reactor's lane (#202)
+// ---------------------------------------------------------------------------
+
+// ONE FIBER, ONE SLOT, AND THE STORAGE ITS COMPUTES SERVE OUT OF.
+//
+// WHAT THE SLOT CARRIES IS THE EVENT MASK, NOT THE SNAPSHOT, and that is the one
+// judgment call in this file. `slot<T>::send` takes `T` by value, so a
+// `slot<request_snapshot>` would have the host BUILD a snapshot per keystroke and
+// move it in - and a moved-from `std::string` has given its capacity away, so the
+// next keystroke allocates. Zero is the number the allocation gate holds this
+// path to (`AWarmShellReactorRoundCostsNoHeap`), so the snapshot stays in
+// storage the lane owns and the slot carries the notification: "these kinds
+// changed". Two snapshots rather than one, swapped at `recv`, because the sender
+// must be able to write the NEXT one while a compute is still reading the last -
+// which is exactly the `std::swap(job, owner->pending)` the helper pool used to
+// do, one thread further in.
+//
+// The `slot` is still doing the whole of its job: it is the conflating channel
+// whose send counter supersedes every outstanding token, it is what parks and
+// wakes the fiber, and its two debug counters answer "how many notifications did
+// this reactor get, and how many did nobody pick up".
+struct reactor_lane {
+	reactor_lane(event_loop& loop, fiber::scheduler& on, std::string_view named)
+		: owner(&loop), inbox(on), name(named) {}
+
+	event_loop* owner = nullptr;
+	// The channel: capacity one, conflating, latest wins. Overwrite IS
+	// cancellation (#90's rule as #198 generalized it).
+	fiber::slot<std::uint32_t> inbox;
+	// OWNED, because the fiber's name must outlive the scheduler and the registry
+	// key this was copied from is only guaranteed to outlive the dispatch table.
+	std::string name;
+	lesh_reactor_fn fn = nullptr;
+	void* userdata = nullptr;
+	fiber::fiber* self = nullptr;
+
+	// WHAT THE HOST WRITES and WHAT THE FIBER READS. Swapped at every `recv`, so
+	// both keep their capacity for the life of the session.
+	request_snapshot arriving;
+	request_snapshot computing;
+	leshper::reactor_batch batch;
+
+	// THE FLAG THE ABI POLLS, and how it reflects the slot.
+	//
+	// #202 kept `run_reactor_here`'s `const std::atomic<bool>&` rather than
+	// adapting `lesh_request_superseded` to a callback, so `abi.h` and #90's poll
+	// are untouched. The flag is RAISED by the send site and CLEARED by the fiber
+	// immediately after `recv`, which makes it exactly the token's own answer:
+	// `slot::send` bumps the counter that supersedes every outstanding token, and
+	// `slot::recv` mints a fresh one. `reactor_yield` asserts the two agree at
+	// every poll point, so the duplication is held to account by a check rather
+	// than by this comment.
+	std::atomic<bool> superseded{false};
+
+	std::size_t computes = 0;
+	std::size_t abandoned = 0;
+	std::size_t yields = 0;
+};
 
 // ---------------------------------------------------------------------------
 // signal_hub
@@ -414,7 +484,13 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	  _options(std::move(options)),
 	  _terminal(fds.input),
 	  _decoder(_options.escape_timeout),
-	  _blitter(_pool, _options.capabilities) {
+	  _blitter(_pool, _options.capabilities),
+	  // THE SCHEDULER (#202). `watchdog_action::log` for a shell - a frozen prompt
+	  // is bad and a dead prompt is worse - and the default stack size, which is
+	  // 512 KB and 1 MB under ASan: two fibers is one or two megabytes of reserved
+	  // address space, committed on touch.
+	  _sched(fiber::scheduler_options{0, std::chrono::milliseconds{50},
+	                                  _options.reactor_watchdog}) {
 	// The signal topic always exists, even in a loop that never installs a
 	// handler: `stop()` rings its pipe to wake a poll that has nothing else to
 	// say, and a test delivers to it through `deliver()`. Only `install()` is
@@ -429,7 +505,6 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	_events.reserve(16);
 	_carried_events.reserve(16);
 	_signal_numbers.reserve(8);
-	_completions.reserve(8);
 	_out.reserve(4096);
 	_accepted.reserve(256);
 
@@ -442,9 +517,19 @@ event_loop::~event_loop() {
 	// actor that owned their storage died (ADR-0007); there is no thread and no
 	// message pool. `run()` has returned by the time a caller destroys a loop,
 	// because `run()` is a call on the caller's own thread.
+	//
+	// ONE THING TO DO, AND IT IS NOT OPTIONAL (#202). v1 has no cancellation by
+	// destruction: `~scheduler` unmaps a parked fiber's stack WITHOUT unwinding
+	// it, so anything that stack owned is lost - and the one thing a reactor's
+	// stack always owns mid-compute is the snapshot's buffer, which
+	// `run_reactor_here` moved into the token and has not yet moved back. A loop
+	// destroyed with a fiber suspended inside a `$PATH` walk would therefore leak
+	// it, and `FiberLsanPositiveControl` is the proof that LeakSanitizer sees
+	// exactly this shape. So every emitter is superseded and run out to its next
+	// cancellation poll first, which is where it abandons the walk and parks back
+	// on `recv` owning nothing.
+	drain_emitters();
 }
-
-void event_loop::attach_helpers(worker_pool& pool) noexcept { _helpers = &pool; }
 
 void event_loop::attach_registry(leshper::registry& reg) noexcept { _registry = &reg; }
 
@@ -558,6 +643,13 @@ int event_loop::poll_timeout_ms() const noexcept {
 		if (!soonest.has_value() || armed.due < *soonest)
 			soonest = armed.due;
 	}
+	// A RUNNABLE REACTOR IS A ZERO TIMEOUT (#202, and the owner's tick: "if no new
+	// keys arrived, tick them"). A fiber that has yielded mid-walk is work this
+	// loop owes, so the poll must not sleep on top of it - it asks the terminal
+	// what is there and comes straight back to the slice. With nothing runnable
+	// the loop blocks exactly as it always did.
+	if (_sched.runnable(group_mask(fiber_group::emitters)))
+		return 0;
 	if (!soonest.has_value())
 		return -1;  // nothing waits on time; block until a topic speaks
 
@@ -597,8 +689,19 @@ turn_result event_loop::turn(int timeout_ms) {
 	// now: the signal sits in the self-pipe, this turn's poll finds it readable,
 	// and `drain_signal_topic` turns it into an event like any other.
 
+	// THE LEADING SLICES (#202). Every emitter that was runnable when this turn
+	// began gets one, BEFORE the terminal is polled - which is what continues a
+	// walk that yielded at its last cancellation poll. `tick` snapshots the ready
+	// set up front (#198), so a fiber woken by another fiber's slice waits for the
+	// next turn and this call is bounded work.
+	//
+	// The events and the render a leading slice produces are this turn's: the walk
+	// and the render below are after it, so a batch that lands here is applied and
+	// painted without waiting for another poll.
+	(void)tick_emitters();
+
 	int at = 0;
-	int tty_at = -1, signal_at = -1, worker_at = -1, watch_at = -1;
+	int tty_at = -1, signal_at = -1, watch_at = -1;
 	const auto poll_on = [&](int fd) {
 		_poll[static_cast<std::size_t>(at)].fd = fd;
 		_poll[static_cast<std::size_t>(at)].events = POLLIN;
@@ -609,10 +712,15 @@ turn_result event_loop::turn(int timeout_ms) {
 		tty_at = poll_on(_fds.input);
 	if (_signals != nullptr)
 		signal_at = poll_on(_signals->wakeup_fd());
-	if (_helpers != nullptr)
-		worker_at = poll_on(_helpers->completions().wakeup_fd());
 	if (_watch_fd >= 0)
 		watch_at = poll_on(_watch_fd);
+
+	// AND THE CALLER'S TIMEOUT IS CLAMPED THE SAME WAY `poll_timeout_ms` IS
+	// (#202). `turn()` computes its timeout and finds the zero there; `turn(ms)`
+	// is what the tests and the paste path call, and a reactor mid-walk must not
+	// be held behind somebody's 50 ms either.
+	if (timeout_ms != 0 && _sched.runnable(group_mask(fiber_group::emitters)))
+		timeout_ms = 0;
 
 	const int ready = ::poll(_poll.data(), static_cast<nfds_t>(at), timeout_ms);
 	if (ready < 0) {
@@ -654,8 +762,6 @@ turn_result event_loop::turn(int timeout_ms) {
 	    && (ready < 0 || revents_of(_poll[static_cast<std::size_t>(signal_at)]) != 0))
 		drain_signal_topic(result);
 	fire_timers(now, result);
-	if (worker_at >= 0 && revents_of(_poll[static_cast<std::size_t>(worker_at)]) != 0)
-		drain_worker_topic(result);
 	// LAST, AND IT PRODUCES NO EVENT. Everything above turns a descriptor into
 	// something the editor sees; the watch turns one into a fact about a file the
 	// editor has never heard of. Last because it is the least urgent thing in a
@@ -673,17 +779,32 @@ turn_result event_loop::turn(int timeout_ms) {
 	// reallocates: a heap-use-after-free ASan catches. The push lands in the
 	// emptied `_events` now and the outer pass picks it up, so nothing is dropped
 	// and nothing dangles.
-	while (!_events.empty()) {
-		_carried_events.clear();
-		_carried_events.swap(_events);
-		for (const leshper::event& one : _carried_events) {
-			handle(one, result);
+	// AND THE TRAILING SLICES, BETWEEN THE TWO WALKS (#202). The owner asked for
+	// "reactor slices before and after the UI part"; the record adds that whatever
+	// a trailing slice emits may land on the next (immediate) turn. It lands on
+	// THIS one, and the reason is not ambition: `turn` clears `_events` and
+	// `_needs_render` at the top, so a `worker_result` pushed after the last walk
+	// and a repaint asked for after the last render would BOTH be dropped rather
+	// than deferred. Walking once more after the slices is three lines and keeps
+	// #201's property - the highlight lands in the turn that produced the
+	// keystroke, one paint where there used to be two.
+	for (bool sliced = false;;) {
+		while (!_events.empty()) {
+			_carried_events.clear();
+			_carried_events.swap(_events);
+			for (const leshper::event& one : _carried_events) {
+				handle(one, result);
+				if (_exiting)
+					break;
+			}
+			result.events += _carried_events.size();
 			if (_exiting)
 				break;
 		}
-		result.events += _carried_events.size();
-		if (_exiting)
+		if (sliced || _exiting)
 			break;
+		sliced = true;
+		(void)tick_emitters();
 	}
 
 	if (_needs_render && !_exiting) {
@@ -832,36 +953,6 @@ void event_loop::take_batch(leshper::reactor_batch& answer) {
 	// held them, so the shell painted a suggestion no action could read.
 	++_applied;
 	_needs_render = true;
-}
-
-void event_loop::drain_worker_topic(turn_result& result) {
-	if (_helpers == nullptr)
-		return;
-	++result.topics_drained;
-
-	// #126's rule, written in its header: ANSWER THE READABLE FD WITH `drain()`.
-	// It consumes the byte and empties the queue under one lock. Reading the fd
-	// here instead would leave the queue armed, so no further byte would ever be
-	// written and the next wakeup would be lost permanently.
-	_completions.clear();
-	_helpers->completions().drain(_completions);
-
-	for (completion& done : _completions) {
-		if (done.empty())
-			continue;
-		leshper::reactor_batch& answer = done.batch();
-		LESH_LOG(log::level::debug, log::category::event,
-		         "topic=worker reactor=%s gen=%llu status=%d", answer.reactor.c_str(),
-		         static_cast<unsigned long long>(answer.computed_against.value()),
-		         static_cast<int>(answer.status));
-		const leshper::generation at = answer.computed_against;
-		take_batch(answer);
-		// The editor sees the arrival too: `step` carries the same drop rule and
-		// emits the redraw, and the replay file records it (#109's `event`).
-		_events.push_back(leshper::worker_result{at});
-	}
-	// Every message goes home the moment its batch has been taken.
-	_completions.clear();
 }
 
 void event_loop::drain_watch_topic(turn_result& result) {
@@ -1051,16 +1142,24 @@ void event_loop::refresh_dispatch_table() {
 		return;
 	}
 	for (const auto& [name, entry] : _registry->reactors) {
-		// ADR-0009: the highlighter runs where SHELL STATE is owned, because it
-		// reads the alias, function and builtin tables and that state has exactly
-		// one owner - which since #201 means in place, on this thread. Everything
-		// else is state-free - history search, the autosuggester, path checks -
-		// and stays on the stateless helper pool.
-		// The comparison is made HERE, once per table change, rather than once
-		// per reactor per keystroke.
+		// ADR-0009: the highlighter reads the alias, function and builtin tables,
+		// and that state has exactly one owner - which since #201 is this thread and
+		// since #202 is a fiber on it. So what the comparison still decides is
+		// WHOSE HOST is stamped on the token, and it is made HERE, once per table
+		// change, rather than once per reactor per keystroke.
+		//
+		// AND THE FIBER IS SPAWNED HERE (#202), which is what the ticket means by
+		// "spawned when the dispatch table is (re)built": `lane_for` creates the
+		// lane and its fiber the first time a name is seen and hands back the
+		// existing one on every rebuild after that. The fn and userdata are
+		// refreshed from the registry on every rebuild, so a re-registered reactor
+		// runs its new function on the fiber it already had.
+		reactor_lane& lane = lane_for(name);
+		lane.fn = entry.fn;
+		lane.userdata = entry.userdata;
 		_dispatch_table.push_back(reactor_dispatch{
 			std::string_view{name}, entry.fn, entry.userdata, entry.event_mask,
-			name == _options.shell_thread_reactor});
+			name == _options.shell_thread_reactor, &lane});
 	}
 	_dispatch_built_from = _registry;
 	_dispatch_generation = _registry->reactors_generation;
@@ -1084,59 +1183,207 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 		const std::uint32_t served = one.event_mask & kinds;
 		if (served == 0)
 			continue;
-
-		if (_shell != nullptr && one.on_shell_thread) {
-			run_shell_reactor_here(one.name, one.fn, one.userdata, served);
+		LESH_ASSERT(one.lane != nullptr);
+		reactor_lane& lane = *one.lane;
+		if (lane.fn == nullptr)
 			continue;
-		}
-		if (_helpers != nullptr)
-			_helpers->submit(one.name, _state, served, one.fn, one.userdata);
+
+		// INTO THE LANE'S OWN STORAGE, so the fan-out allocates nothing warm:
+		// `take_snapshot` assigns into the buffer the last keystroke grew.
+		take_snapshot(lane.arriving, _state, served);
+		// THE STAMP (#151). Not the snapshot-taker's and not the reactor's: the loop
+		// serves one shell, and this is that shell's door, on every token it mints
+		// for the reactor that reads shell state. Every other reactor is state-free
+		// and gets the honest null `take_snapshot` just wrote.
+		if (one.on_shell_thread)
+			lane.arriving.host = _shell_host;
+
+		// AND THE SEND IS THE CANCELLATION. `slot::send` bumps the counter that
+		// supersedes every outstanding token; the flag beside it is that counter as
+		// the ABI's poll can read it (see `reactor_lane::superseded`). A reactor
+		// mid-walk sees it at its next poll, abandons, and loops back to `recv`;
+		// a reactor parked on `recv` is woken by the send itself.
+		lane.superseded.store(true, std::memory_order_relaxed);
+		lane.inbox.send(served);
 	}
 }
 
-void event_loop::run_shell_reactor_here(std::string_view reactor, lesh_reactor_fn fn,
-                                        void* userdata, std::uint32_t kinds) {
-	// SYNCHRONOUSLY, IN PLACE, AND THIS SHAPE IS TEMPORARY (#201, step 1 of #145).
-	// The highlighter reads the alias, function and builtin tables, so it must run
-	// on the thread that owns them - which used to mean posting to the shell
-	// thread's `highlight` slot and waiting for the answer on the `shell` topic,
-	// and now means calling it here, because this thread is that thread. THE NEXT
-	// STEP MAKES IT A FIBER: a reactor that walks `$PATH` holds the keystroke it
-	// was computed for until it returns, and the only thing that gives the walk a
-	// yield point back is a stack of its own. Until then a slow highlight is
-	// latency on the next key, which is the trade #145's architecture review
-	// priced and accepted for one step.
+// ---------------------------------------------------------------------------
+// The reactor fibers (#202, step 1d of #145)
+// ---------------------------------------------------------------------------
+
+bool event_loop::tick_emitters() {
+	const bool more = _sched.tick(group_mask(fiber_group::emitters));
+	return more;
+}
+
+reactor_lane& event_loop::lane_for(std::string_view name) {
+	for (const std::unique_ptr<reactor_lane>& each : _lanes) {
+		if (each->name == name)
+			return *each;
+	}
+	_lanes.push_back(std::make_unique<reactor_lane>(*this, _sched, name));
+	reactor_lane& made = *_lanes.back();
+	// THE NAME IS THE LANE'S OWN COPY, because `spawn` requires a name that
+	// outlives the scheduler and the registry's key only outlives the table.
 	//
-	// WHAT IS CORRECT ABOUT IT ANYWAY: the token is minted here, stamped with THIS
-	// shell's host, and reads tables nothing else can be writing - `_writing` is
-	// down, because the two writers are calls this same thread makes from
-	// `accept_current_line` and `call_port`.
-	//
-	// INTO MEMBERS, so the round allocates nothing warm: `take_snapshot` assigns
-	// into the buffer the last keystroke grew, `run_reactor_here` lends it to the
-	// token and hands it back, and the batch's vectors are cleared rather than
-	// freed.
-	take_snapshot(_shell_snapshot, _state, kinds);
-	// THE STAMP (#151). Not the snapshot-taker's and not the reactor's: the loop
-	// serves one shell, and this is that shell's door, on every token it mints.
-	_shell_snapshot.host = _shell_host;
-	run_reactor_here(reactor, fn, userdata, _shell_snapshot, _shell_superseded,
-	                 _shell_batch);
+	// SPAWNED INTO `emitters`, and spawning into a PARKED group is legal (#200):
+	// the fiber is ready, is not runnable, and takes its first slice at the resume.
+	// So a reactor registered from inside a command - a binding sourced by an rc
+	// file, say - is not a special case.
+	made.self = &_sched.spawn(&event_loop::reactor_body, &made, made.name.c_str(),
+	                          group_index(fiber_group::emitters));
 	LESH_LOG(log::level::debug, log::category::reactor,
-	         "shell reactor %.*s gen=%llu status=%d spans=%zu",
-	         static_cast<int>(reactor.size()), reactor.data(),
-	         static_cast<unsigned long long>(_shell_batch.computed_against.value()),
-	         static_cast<int>(_shell_batch.status), _shell_batch.spans.size());
-	// APPLIED NOW, and the generation rule still decides - it just cannot fail
-	// from here, because the batch was computed against the state it is being
-	// applied to.
-	take_batch(_shell_batch);
-	// AND THE EDITOR HEARS ABOUT THE ARRIVAL, exactly as it does for a helper's
-	// answer: `step` carries the same drop rule, emits the redraw, and the replay
-	// file records it (#109's `event`). The event goes into `_events` while the
-	// walk that led here is in progress, which is what the swap in `turn` is for
-	// (#162).
-	_events.push_back(leshper::worker_result{_shell_batch.computed_against});
+	         "reactor fiber spawned: %s", made.name.c_str());
+	return made;
+}
+
+void event_loop::reactor_body(fiber::scheduler& on, void* userdata) {
+	reactor_lane& lane = *static_cast<reactor_lane*>(userdata);
+	(void)on;
+	// FOR EVER. A reactor fiber is never called and never returns: it parks on its
+	// slot, computes what it is sent, applies the batch, and parks again (#145's
+	// pinned rule - "no fiber call stack"). The host is the only resumer, and the
+	// only way out is the process ending or `~scheduler` unmapping the stack, which
+	// `drain_emitters` makes sure happens with the fiber parked on `recv`.
+	for (;;) {
+		const std::uint32_t kinds = lane.inbox.recv();
+		// CLEARED RIGHT AFTER `recv`, which is what makes the flag equal to the
+		// token's own answer: `recv` minted a fresh token, so nothing outstanding is
+		// superseded until the next send.
+		lane.superseded.store(false, std::memory_order_relaxed);
+		// AND THE HOST'S WRITE BUFFER BECOMES THE COMPUTE'S. Both keep their
+		// capacity, so the next notification assigns into the string this compute is
+		// about to give back rather than allocating one.
+		std::swap(lane.arriving, lane.computing);
+		LESH_ASSERT(lane.computing.event_kind == kinds
+		            && "the slot's notification and the snapshot it arrived with disagree");
+		(void)kinds;
+		++lane.computes;
+		run_reactor_here(lane.name, lane.fn, lane.userdata, lane.computing,
+		                 lane.superseded, lane.batch,
+		                 reactor_cooperation{&event_loop::reactor_yield, &lane});
+		lane.owner->apply_reactor_batch(lane);
+	}
+}
+
+void event_loop::reactor_yield(void* userdata) {
+	reactor_lane& lane = *static_cast<reactor_lane*>(userdata);
+	++lane.yields;
+	// THE YIELD IS THE WHOLE OF IT. The host gets the thread back, polls the
+	// terminal, dispatches whatever arrived - and a keystroke that changed the
+	// buffer sends into this very slot on its way through, which is what the poll
+	// this call is inside of is about to read.
+	lane.owner->_sched.yield();
+	// AND THE FLAG STILL COVERS THE SLOT (see `reactor_lane::superseded`).
+	//
+	// AN IMPLICATION AND NOT AN EQUALITY, which is the honest invariant: a SEND
+	// must never fail to raise the flag - that direction is the whole of #90's
+	// cancellation and the one a broken send site would break - while the flag is
+	// deliberately a superset, because `quiesce()` and `drain_emitters()` raise it
+	// with nothing sent. That is #115's lever kept: parking supersedes what is in
+	// flight, through the poll the ABI already has, rather than waiting it out.
+	//
+	// Asserted HERE because this is the one place both are observable at a moment
+	// the host has just had the thread, so a send that bumped the counter without
+	// raising the flag fails on the next poll rather than in a stale highlight
+	// nobody can reproduce.
+	LESH_ASSERT((!lane.inbox.superseded() || lane.superseded.load(std::memory_order_relaxed))
+	            && "a send left this reactor's cancellation flag down");
+}
+
+void event_loop::apply_reactor_batch(reactor_lane& lane) {
+	// THE RECEIVER'S HALF OF THE DROP RULE, and it is two rules deep on purpose.
+	//
+	// The first is the token's: a batch computed under a superseded token is for a
+	// line the user has left, and it is not applied at all - which is what makes
+	// "an emission computed for the dead line is never applied" true at accept,
+	// where `quiesce` raised every flag before parking the group.
+	//
+	// The second is `apply_batch`'s generation rule (N-4, ADR-0008), inside
+	// `take_batch`, and it stays exactly where it was: it is the one applier both
+	// this path and `loop_harness`' go through.
+	if (lane.superseded.load(std::memory_order_relaxed)
+	    || lane.batch.status == LESH_ERR_SUPERSEDED) {
+		++lane.abandoned;
+		LESH_LOG(log::level::debug, log::category::reactor,
+		         "abandoned %s: gen=%llu", lane.name.c_str(),
+		         static_cast<unsigned long long>(lane.batch.computed_against.value()));
+		return;
+	}
+	LESH_LOG(log::level::debug, log::category::reactor,
+	         "reactor %s gen=%llu status=%d spans=%zu", lane.name.c_str(),
+	         static_cast<unsigned long long>(lane.batch.computed_against.value()),
+	         static_cast<int>(lane.batch.status), lane.batch.spans.size());
+	take_batch(lane.batch);
+	// AND THE EDITOR HEARS ABOUT THE ARRIVAL: `step` carries the same drop rule,
+	// emits the redraw, and the replay file records it (#109's `event`). Pushed
+	// from inside a slice, which `turn` runs BETWEEN its two event walks - so this
+	// push cannot reallocate a vector somebody is walking, and the walk that
+	// follows the trailing slices is what picks it up.
+	_events.push_back(leshper::worker_result{lane.batch.computed_against});
+}
+
+const reactor_lane* event_loop::lane_named(std::string_view reactor) const noexcept {
+	for (const std::unique_ptr<reactor_lane>& each : _lanes) {
+		if (each->name == reactor)
+			return each.get();
+	}
+	return nullptr;
+}
+
+void event_loop::drain_emitters() {
+	// EVERY EMITTER OUT OF ITS COMPUTE AND BACK ONTO `recv`. See the destructor for
+	// why this is not optional. The group is resumed first because a parked group's
+	// fibers are not runnable and `tick` would skip them; every flag is raised so
+	// that a walk in progress abandons at its next poll rather than finishing.
+	if (_sched.group_parked(group_index(fiber_group::emitters)))
+		_sched.resume_group(group_index(fiber_group::emitters));
+	for (const std::unique_ptr<reactor_lane>& each : _lanes)
+		each->superseded.store(true, std::memory_order_relaxed);
+	// BOUNDED, and the bound is a diagnostic rather than a policy: a reactor that
+	// ignores its cancellation poll cannot be made to stop, and spinning here
+	// for ever at shutdown would be worse than saying so and leaving.
+	constexpr int ceiling = 4096;
+	int slices = 0;
+	while (_sched.runnable(group_mask(fiber_group::emitters))) {
+		if (++slices > ceiling) {
+			LESH_LOG(log::level::warn, log::category::reactor,
+			         "a reactor fiber would not give up after %d slices", ceiling);
+			break;
+		}
+		(void)_sched.tick(group_mask(fiber_group::emitters));
+	}
+}
+
+std::size_t event_loop::reactor_slices(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr || lane->self == nullptr ? 0 : lane->self->slices();
+}
+
+std::size_t event_loop::reactor_computes(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr ? 0 : lane->computes;
+}
+
+std::size_t event_loop::reactor_abandoned(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr ? 0 : lane->abandoned;
+}
+
+std::size_t event_loop::reactor_yields(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr ? 0 : lane->yields;
+}
+
+std::uint64_t event_loop::reactor_sends(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr ? 0 : lane->inbox.sends();
+}
+
+std::size_t event_loop::reactor_superseded_sends(std::string_view reactor) const noexcept {
+	const reactor_lane* const lane = lane_named(reactor);
+	return lane == nullptr ? 0 : lane->inbox.superseded_sends();
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,19 +1500,35 @@ leshper::cursor_placement event_loop::frame_top_above_cursor() {
 // ---------------------------------------------------------------------------
 
 void event_loop::quiesce() {
-	// The helpers' half is #126's and nests; the terminal's half is ours.
-	if (_helpers != nullptr)
-		_helpers->park_all();
-	if (_park_depth == 0 && _options.manage_terminal)
-		_terminal.leave_raw();
-	if (_park_depth == 0)
+	if (_park_depth == 0) {
+		// THE EMITTERS DIE AT ACCEPT - "cancel, park", in the owner's words, and
+		// not kill. Every flag is raised first, so a walk in progress abandons at
+		// its next poll and `apply_reactor_batch` declines whatever it produced;
+		// then the group's bit goes down, which makes every one of them unrunnable
+		// in one store (#200). The fibers stay alive and own nothing of the dead
+		// line, and the next line's first send is waiting for them at the resume.
+		for (const std::unique_ptr<reactor_lane>& each : _lanes)
+			each->superseded.store(true, std::memory_order_relaxed);
+		// ONE OF THE TWO PHASE WRITES, and the derivation runs one way only: the
+		// group bit is written FROM the phase and never independently.
+		_phase = phase::executing;
+		_sched.park_group(group_index(fiber_group::emitters));
+		if (_options.manage_terminal)
+			_terminal.leave_raw();
 		_decoder.reset();
+	}
 	++_park_depth;
 }
 
 void event_loop::resume_after_execution() {
 	LESH_ASSERT(_park_depth > 0);
 	--_park_depth;
+	// THE SECOND PHASE WRITE. `execute` has returned, so the history append has
+	// already happened inside `session::execute` and the prompt is refreshed on
+	// the way out of the command; `boundary` is that instant, and it is the phase
+	// an `observers` group would still be runnable in.
+	if (_park_depth == 0)
+		_phase = phase::boundary;
 	if (_park_depth == 0 && _options.manage_terminal) {
 		// The order is the read-entry order, because that is what this is: the
 		// terminal comes back, then the modes, then the size.
@@ -1284,15 +1547,26 @@ void event_loop::resume_after_execution() {
 		// diff against: the next render is a full repaint.
 		_have_previous = false;
 		_needs_render = true;
+		// AND THE EDITOR IS BACK. The emitters are runnable again from here, and
+		// each of them is parked on `recv` owning nothing of the line that just
+		// ran - the supersede at `quiesce` is what made that true.
+		_phase = phase::editing;
+		_sched.resume_group(group_index(fiber_group::emitters));
 	}
-	if (_helpers != nullptr)
-		_helpers->resume();
 }
 
 void event_loop::assert_quiesced() const noexcept {
 	LESH_ASSERT(_park_depth > 0);
-	if (_helpers != nullptr)
-		_helpers->assert_quiesced();
+	// THE EMITTERS' HALF (#202). Two clauses: the group's bit is down, and no
+	// emitter is mid-slice. The second is structurally true - the host is the only
+	// resumer, every yield returns here, and nothing a reactor can reach forks -
+	// and #91 chose crash-on-violation over `pthread_atfork` precisely so that the
+	// day somebody adds a fork site inside a slice, the sanitized gate says so.
+	LESH_ASSERT(_sched.group_parked(group_index(fiber_group::emitters)));
+	const fiber::fiber* const running = _sched.current();
+	LESH_ASSERT(running == nullptr
+	            || running->group() != group_index(fiber_group::emitters));
+	(void)running;   // `LESH_ASSERT` is nothing in Release
 	// The other half, and the one only the loop can check: a fork taken with the
 	// terminal still in raw mode gives the child a terminal it cannot use.
 	LESH_ASSERT(!_options.manage_terminal || !_terminal.raw());

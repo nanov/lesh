@@ -2,7 +2,6 @@
 #include "leshper/editor.h"
 #include "ui/loop.h"
 #include "ui/reactor_call.h"
-#include "ui/workers.h"
 #include "leshper/event.h"
 #include "leshper/keymap.h"
 #include "leshper/host.h"
@@ -345,6 +344,14 @@ public:
 
 	[[nodiscard]] ui::event_loop& loop() const { return *_loop; }
 
+	// Bytes into the pipe the loop reads as its terminal.
+	void type(std::string_view bytes) const {
+		[&] {
+			ASSERT_EQ(::write(_in[1], bytes.data(), bytes.size()),
+			          static_cast<ssize_t>(bytes.size()));
+		}();
+	}
+
 	void drain_output() const {
 		char chunk[4096];
 		while (::read(_out[0], chunk, sizeof(chunk)) > 0) {
@@ -547,63 +554,111 @@ TEST_F(AllocationTest, AKeystrokeStepCostsNoHeapBeyondUndo) {
 	EXPECT_EQ(counted, 0u) << "a cursor-motion keystroke reached the heap";
 }
 
-// --- The submit path (the reorg cleanup) -----------------------------------
+// --- The fan-out (#202, where the submit path was) -------------------------
 
 namespace {
 
-// A reactor that does nothing, so what is measured is the CHANNEL and not a
-// reactor's own work.
+// A reactor that does nothing, so what is measured is the CHANNEL and the token
+// mint and not a reactor's own work.
 std::int32_t idle_reactor(lesh_request*, void*) { return LESH_OK; }
 
 } // namespace
 
-TEST_F(AllocationTest, SubmittingAWarmReactorRoundCostsNoHeap) {
-	// THE HOST'S HALF OF FANNING A KEYSTROKE OUT, and it is zero.
+TEST_F(AllocationTest, TwoReactorFibersAddNothingToWhatAKeystrokeAlreadyCost) {
+	// THE TICKET'S OWN NUMBER, AND IT IS A DELTA (#202). What the ticket asks is
+	// that the steady-state keystroke "must not allocate more than before", and the
+	// honest way to say that is to run the SAME keystroke through two loops that
+	// differ in one thing - whether any reactor is registered - and compare.
 	//
-	// It was not. `notify_reactors` called `snapshot_of`, which built a fresh
-	// `request_snapshot` - one malloc for its buffer - and `submit` then MOVED it
-	// into the slot, freeing the buffer the slot was already holding. One malloc
-	// and one free per reactor per keystroke, for a line whose length changes by
-	// one byte. The slot is now filled IN PLACE (`take_snapshot`), and the worker
-	// SWAPS the task out and hands the storage back at the end of `compute`
-	// instead of moving it away and resetting the slot.
+	// WHY NOT AN ABSOLUTE ZERO: a keystroke through the real loop costs TWO mallocs
+	// per key TODAY, in `input_decoder::feed`, and it cost them before this ticket
+	// too - `drain_tty`, `decode.cpp` and `tty.cpp` are byte-identical on this
+	// branch. Asserting zero here would fail for a reason that has nothing to do
+	// with fibers and would hide the number that does. The isolated compute is
+	// pinned at zero separately by `AWarmShellReactorRoundCostsNoHeap`, and the
+	// editor's own half by `AKeystrokeStepCostsNoHeapBeyondUndo`; this is the
+	// channel between them, and its contribution is what this measures.
 	//
-	// THE ROUND TRIPS BEFORE THE WINDOW ARE THE POINT, not a warm-up formality:
-	// they are what proves the storage came back. If `compute` stopped returning
-	// the buffer, the slot would be empty here and the first submit below would
-	// allocate.
+	// EACH HALF OF THAT ZERO WAS SEPARATELY WORTH A MALLOC PER KEYSTROKE, and each
+	// is a decision this test is the pin for:
+	//
+	//   - the snapshot is ASSIGNED into the lane's own storage (`take_snapshot`),
+	//     never built at the call site and moved in;
+	//   - the slot carries the EVENT MASK and not the snapshot, because
+	//     `slot<T>::send` takes `T` by value and a moved-from `std::string` has
+	//     given its capacity away - so the lane owns two snapshots and SWAPS them
+	//     at `recv`, which is where the compute's storage comes back;
+	//   - `run_reactor_here` HANDS THE BUFFER BACK when the reactor returns rather
+	//     than letting the token's destructor free what it borrowed;
+	//   - the batch's vectors are SWAPPED into the decoration layer rather than
+	//     copied, so the storage cycles both ways.
+	//
+	// A CURSOR MOTION AND NOT AN INSERT, for the reason
+	// `AKeystrokeStepCostsNoHeapBeyondUndo` gives: an insertion records an undo
+	// entry, which owns the replaced and inserted text. So the key is Ctrl-B -
+	// `backward_char`, one byte, no escape sequence to disambiguate - the cursor is
+	// put back by assignment between rounds (two integers), and the reactors are
+	// registered for `cursor_moved`.
 	//
 	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
-	// object) and every submit uses the SAME line, so a zero means capacity was
-	// reused rather than never needed.
+	// object) and every round uses the same one, so a matching pair of numbers
+	// means capacity was reused rather than never needed.
 	using namespace lesh::leshper;
+	log::shutdown();
 
-	state s;
-	apply_edit(s, position{}, position{},
-	           "git log --oneline --graph --decorate --all | head -40");
+	// How many mallocs 100 identical keystrokes cost a loop with `reactors`
+	// reactors registered, and how many computes those keystrokes reached.
+	const auto measure = [&](int reactors, std::size_t& computes) {
+		registry reg;
+		if (reactors >= 1) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		if (reactors >= 2) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "autosuggester", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		loop_over_a_pipe driven;
+		driven.loop().attach_registry(reg);
+		apply_edit(driven.loop().editor(), position{}, position{},
+		           "git log --oneline --graph --decorate --all | head -40");
+		const position end = driven.loop().editor().buffer.end_position();
 
-	ui::worker_pool helpers{1};
-	std::vector<ui::completion> done;
-	for (int round = 0; round < 5; ++round) {
-		helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
-		ASSERT_GE(helpers.completions().wait_and_drain(done, 1), 1u);
-		for (ui::completion& one : done)
-			one.recycle();
-		done.clear();
-	}
+		const auto round = [&] {
+			driven.loop().editor().cursor = end;
+			driven.type("\x02");
+			(void)driven.loop().turn(0);
+		};
+		// Warm: the two lanes, their fibers, their snapshots and their batches all
+		// take their capacity here. The fibers are SPAWNED in one of these rounds,
+		// which mmaps a stack - not a malloc, and once.
+		for (int i = 0; i < 8; ++i)
+			round();
+		const size_t counted = mallocs_during([&] {
+			for (int i = 0; i < 100; ++i)
+				round();
+		});
+		computes = driven.loop().reactor_computes("highlighter");
+		return counted;
+	};
 
-	// PARKED FOR THE WINDOW. A worker running inside it would be counting its
-	// own allocations, which are the compute's and not the submit's; parked, the
-	// only thing that moves is the slot.
-	helpers.park_all();
-	const size_t counted = mallocs_during([&] {
-		for (int i = 0; i < 100; ++i)
-			helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
-	});
-	helpers.resume();
-	EXPECT_EQ(counted, 0u) << "a warm submit reached the heap";
+	std::size_t none_computed = 0;
+	std::size_t both_computed = 0;
+	const size_t without = measure(0, none_computed);
+	const size_t with = measure(2, both_computed);
 
-	helpers.supersede_all();
+	EXPECT_EQ(none_computed, 0u) << "the control loop ran a reactor";
+	EXPECT_GE(both_computed, 100u) << "the rounds did not each reach the reactor";
+	EXPECT_EQ(with, without)
+		<< "two reactor fibers added " << (with - without)
+		<< " allocations to a keystroke that already cost " << without;
+	// AND THE ABSOLUTE NUMBER IS PINNED TOO, so that the pre-existing cost cannot
+	// grow behind the delta: two mallocs per key, in the decoder, unchanged by this
+	// ticket. A change here is a finding either way and belongs in whatever moves
+	// it, not in a number nobody re-derives.
+	EXPECT_EQ(without, 200u) << "a keystroke's own allocation count moved";
 }
 
 // --- The reactor channel and the completion channel (#168 Phase B) ---------
