@@ -373,11 +373,12 @@ add_subdirectory("tools")
 # `&leshnici::install_prompt_modules` into
 # `run_interactive_shell` and the session calls it on the engine it built.
 #
-# Every dependency is named, PRIVATE and explicit - transitivity is not relied
-# on anywhere in this file.
+# The graph is stated ONCE, on the libraries' PUBLIC link lines above; an
+# executable names only the top of it. Listing the whole stack here as well
+# handed every archive to the linker twice ("ld: warning: ignoring duplicate
+# libraries"), and said nothing the libraries had not already said.
 add_executable(lesh src/main.cpp)
-target_link_libraries(lesh PRIVATE
-	lesh_ui lesh_leshnici lesh_leshper lesh_runtime lesh_syntax lesh_substrate)
+target_link_libraries(lesh PRIVATE lesh_leshnici)
 
 add_executable(lesh_tests
 	tests/base_tests.cpp
@@ -432,9 +433,7 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE
-	lesh_ui lesh_leshnici lesh_leshper lesh_runtime lesh_syntax lesh_substrate
-	gtest gtest_main)
+target_link_libraries(lesh_tests PRIVATE lesh_leshnici gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale
 # expectation (#108).
@@ -480,8 +479,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE
-	lesh_ui lesh_leshnici lesh_leshper lesh_runtime lesh_substrate lesh_syntax)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici)
 
 # The committed src/substrate/unicode_tables.h must be exactly what the
 # generator emits from the vendored UCD (#108). The 766 conformance cases prove
