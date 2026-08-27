@@ -15,9 +15,10 @@
 // synthetic facts. What is left for a running test is what a constant expression
 // cannot see - a real `.git` on a real disk, a spawn, and a deadline.
 
-#include "leshnici/git_head.h"
-#include "leshnici/module_git.h"
-#include "leshnici/prompt_modules.h"
+#include "leshnici/leshnici.h"
+#include "leshnici/prompt/git.h"
+#include "leshnici/prompt/git_head.h"
+#include "leshnici/prompt/modules.h"
 #include "ui/prompt/prompt.h"
 #include "temp_path.h"
 
@@ -59,9 +60,9 @@
 
 namespace {
 
-using lesh::leshnici::git_head;
-using lesh::leshnici::git_probe_options;
-using lesh::leshnici::read_git_head;
+using lesh::leshnici::prompt::git_head;
+using lesh::leshnici::prompt::git_probe_options;
+using lesh::leshnici::prompt::read_git_head;
 using lesh::ui::prompt::element_status;
 using lesh::ui::prompt::engine;
 using lesh::ui::prompt::surface_id;
@@ -158,12 +159,12 @@ private:
 TEST(LeshniciGitModule, OmitsBeforeTouchingTheFilesystem) {
 	prompt::state facts = quiet();
 	EXPECT_FALSE(facts.fs_allowed);
-	EXPECT_EQ(run_module(lesh::leshnici::kModuleGit, "", facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(lesh::leshnici::prompt::kModuleGit, "", facts).status, element_status::omitted);
 
 	// Allowed, but with nowhere to look.
 	facts.fs_allowed = true;
 	facts.pwd = std::string_view{};
-	EXPECT_EQ(run_module(lesh::leshnici::kModuleGit, "", facts).status, element_status::omitted);
+	EXPECT_EQ(run_module(lesh::leshnici::prompt::kModuleGit, "", facts).status, element_status::omitted);
 }
 
 void write_text(const std::string& path, std::string_view text) {

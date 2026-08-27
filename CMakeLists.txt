@@ -339,18 +339,19 @@ target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
 # so an engine built anywhere else, a unit test or a tool, is the bare
 # seven-module one.
 add_library(lesh_leshnici STATIC
-	src/leshnici/builtin_cat.cpp
-	src/leshnici/builtin_head.cpp
-	src/leshnici/builtin_ls.cpp
-	src/leshnici/builtin_tail.cpp
-	src/leshnici/builtins.cpp
-	src/leshnici/builtins.h
-	src/leshnici/byte_stream.h
-	src/leshnici/git_head.cpp
-	src/leshnici/git_head.h
-	src/leshnici/module_git.h
-	src/leshnici/prompt_modules.cpp
-	src/leshnici/prompt_modules.h)
+	src/leshnici/coreutils/builtins.cpp
+	src/leshnici/coreutils/builtins.h
+	src/leshnici/coreutils/byte_stream.h
+	src/leshnici/coreutils/cat.cpp
+	src/leshnici/coreutils/head.cpp
+	src/leshnici/coreutils/ls.cpp
+	src/leshnici/coreutils/tail.cpp
+	src/leshnici/leshnici.h
+	src/leshnici/prompt/git.h
+	src/leshnici/prompt/git_head.cpp
+	src/leshnici/prompt/git_head.h
+	src/leshnici/prompt/modules.cpp
+	src/leshnici/prompt/modules.h)
 # BOTH HALVES OF THE TREE, and #165 is what added the second. The prompt modules
 # need `lesh_ui` (they register against `ui::prompt::engine`, #170); the extension builtins
 # need `lesh_runtime` (they are `builtin_result (*)(shell_state&, char**)` and

@@ -8,7 +8,7 @@
 // INVOKED, which is the whole of recalculation-by-cause, and everything that
 // crosses the C ABI.
 
-#include "leshnici/prompt_modules.h"
+#include "leshnici/leshnici.h"
 #include "leshper/abi.h"
 #include "leshper/registry.h"
 #include "ui/prompt/abi.h"

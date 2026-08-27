@@ -1,5 +1,6 @@
-#include "leshnici/builtins.h"
+#include "leshnici/leshnici.h"
 
+#include "leshnici/coreutils/builtins.h"
 #include "runtime/builtins.h"
 #include "runtime/diagnostic.h"
 #include "runtime/shell_state.h"
@@ -21,18 +22,18 @@ namespace {
 // different facts - a kind, a home, a `command -v` spelling. Here every row
 // answers the same way: regular, implemented in this library, reported by name.
 // A second table would be a second thing to keep in step for no fact it could
-// hold, so the name and the function are one row and `builtins.h` above is the
-// human-readable index.
+// hold, so the name and the function are one row and `coreutils/builtins.h` is
+// the human-readable index.
 //
 // ORDER IS ALPHABETICAL AND MEANS NOTHING ELSE. Lookup is a linear scan over
 // four rows, which is cheaper than any structure that would make the order
 // matter; when this list is long enough for that to be false it wants a sorted
 // table and a binary search, not a rearrangement.
 constexpr std::array<runtime::extension_builtin, 4> kExtensionBuiltins = {{
-	{"cat", &builtin_cat},
-	{"head", &builtin_head},
-	{"ls", &builtin_ls},
-	{"tail", &builtin_tail},
+	{"cat", &coreutils::builtin_cat},
+	{"head", &coreutils::builtin_head},
+	{"ls", &coreutils::builtin_ls},
+	{"tail", &coreutils::builtin_tail},
 }};
 
 } // namespace

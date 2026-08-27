@@ -1,5 +1,6 @@
-#include "leshnici/builtins.h"
+#include "leshnici/leshnici.h"
 
+#include "leshnici/coreutils/builtins.h"
 #include "runtime/builtins.h"
 #include "runtime/executor.h"
 #include "runtime/invocation.h"
@@ -209,8 +210,8 @@ TEST_F(LeshniciBuiltinsTest, ACollisionWithACoreBuiltinIsRefusedWhole) {
 	// CORE WINS, and the refusal takes the whole table with it: a partially
 	// installed set is a shell whose behaviour depends on which row was wrong.
 	static constexpr std::array<extension_builtin, 2> collides = {{
-		{"ls", &lesh::leshnici::builtin_ls},
-		{"cd", &lesh::leshnici::builtin_ls},
+		{"ls", &lesh::leshnici::coreutils::builtin_ls},
+		{"cd", &lesh::leshnici::coreutils::builtin_ls},
 	}};
 	shell_state fresh;
 	EXPECT_FALSE(fresh.set_extension_builtins(

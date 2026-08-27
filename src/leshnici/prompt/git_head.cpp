@@ -1,4 +1,4 @@
-#include "leshnici/git_head.h"
+#include "leshnici/prompt/git_head.h"
 
 #include "substrate/fork_guard.h"
 
@@ -30,7 +30,7 @@
 extern "C" char** environ;
 #endif
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::prompt {
 
 namespace {
 
@@ -797,4 +797,4 @@ git_head read_git_head(std::string_view directory, const git_probe_options& opti
 	}
 }
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::prompt

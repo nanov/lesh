@@ -40,7 +40,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::coreutils {
 
 // 64 KiB, the size at which the read syscall stops being the cost.
 inline constexpr std::size_t kIoBufferSize = 64 * 1024;
@@ -103,4 +103,4 @@ inline void print_file_header(const char* name, bool first) {
 	std::printf(first ? "==> %s <==\n" : "\n==> %s <==\n", name);
 }
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::coreutils

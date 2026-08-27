@@ -352,6 +352,8 @@ because it reads a filesystem where every built-in is a pure function of the
 facts struct. `ls`, `cat`, `head` and `tail` are the first builtins, behind
 `set -o leshnici` — on by default when the shell is interactive, off in every
 script — so the POSIX command search a script sees is unchanged.
+`coreutils/` and `prompt/` are its two halves (`lesh::leshnici::coreutils`,
+`::prompt`); `leshnici.h` is the visible list.
 _Avoid_: calling a leshnici prompt module a built-in; a template naming one on an
 engine without leshnici is refused as an unknown module, like any other name.
 Assuming a leshnici builtin runs in a script: it does not until the option is on.
