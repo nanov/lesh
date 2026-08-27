@@ -203,18 +203,18 @@ struct merged_entry {
 // The history
 // ---------------------------------------------------------------------------
 
-class history final : public history_source {
+class store final : public history_source {
 public:
 	// A history with no files behind it: reads and records in memory, writes
 	// nothing, warns about nothing. This is what `vared` and every unit test
 	// that must not touch the developer's own history get, and it is also the
 	// state a shell runs in when `open` could not reach a data directory - one
 	// object, one code path, no null checks at the call sites.
-	history();
-	~history() override;
+	store();
+	~store() override;
 
-	history(const history&) = delete;
-	history& operator=(const history&) = delete;
+	store(const store&) = delete;
+	store& operator=(const store&) = delete;
 
 	// Where the files live (ADR-0010 §Placement): `$XDG_DATA_HOME/lesh`, or
 	// `~/.local/share/lesh`. `nullopt` when neither is usable, which is the

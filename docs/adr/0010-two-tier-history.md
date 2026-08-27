@@ -119,7 +119,8 @@ pending item loses it — no sentinel write.
 
 ### Read path — the `history_source` seam (Q13/Q14)
 
-`History` **implements the existing `lesh::ui::history_source`**
+The class is `lesh::ui::history::store` (`src/ui/history/store.{h,cpp}`; it was
+`history::history` until the namespace/class double was renamed). `store` **implements the existing `lesh::ui::history_source`**
 (`for_each_newest_first(bool-returning callback)`, `ui/history_search.h`). The
 prompt's `HistorySearch` class is **not built**: `lesh::ui::history_search`
 (line/prefix/token, ranges, cancel poll, zero-alloc scratch) is the searcher

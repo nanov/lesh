@@ -1,4 +1,4 @@
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 
 #include "ui/history/locking.h"
 
@@ -332,7 +332,7 @@ private:
 // Construction
 // ---------------------------------------------------------------------------
 
-history::history() : _session_id(generate_uuidv7().low) {
+store::store() : _session_id(generate_uuidv7().low) {
 	// A VIEW BEFORE ANY CALLER CAN ASK FOR ONE. `for_each_newest_first` is
 	// callable the instant this object exists - a worker could be handed the
 	// source before `open` is called - so the empty view is published here
@@ -340,14 +340,14 @@ history::history() : _session_id(generate_uuidv7().low) {
 	publish();
 }
 
-history::~history() {
+store::~store() {
 	// ADR-0007. The mapping goes with the last view holding it; this is the
 	// descriptor the appender writes through, which is ours alone.
 	if (_log_fd >= 0)
 		::close(_log_fd);
 }
 
-std::size_t history::scratch_growths() noexcept {
+std::size_t store::scratch_growths() noexcept {
 	return g_scratch_growths.load(std::memory_order_relaxed);
 }
 
@@ -355,7 +355,7 @@ std::size_t history::scratch_growths() noexcept {
 // Opening
 // ---------------------------------------------------------------------------
 
-std::optional<std::string> history::default_data_directory() {
+std::optional<std::string> store::default_data_directory() {
 	if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg != nullptr && xdg[0] == '/')
 		return std::string{xdg} + "/lesh";
 	if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0')
@@ -363,7 +363,7 @@ std::optional<std::string> history::default_data_directory() {
 	return std::nullopt;
 }
 
-open_report history::open(const std::string& directory) {
+open_report store::open(const std::string& directory) {
 	open_report out;
 
 	// A SECOND `open` REPLACES THE FIRST, descriptor and all. Nothing calls it
@@ -432,7 +432,7 @@ open_report history::open(const std::string& directory) {
 // the whole reason it is a function: a rewrite has to map its own output, a
 // sibling's rewrite has to be noticed, and mapping through a second copy of
 // these four cases is how the three would drift.
-blob_status history::map_tier1() {
+blob_status store::map_tier1() {
 	// THE ID FIRST. See `_data_id`'s declaration: taking it before the open is
 	// what makes a race here cost a wasted remap rather than a permanently stale
 	// mapping.
@@ -492,7 +492,7 @@ blob_status history::map_tier1() {
 // log holds the frames since the last rewrite - ~`k_vacuum_frequency` of them -
 // so this is a few kilobytes, and the alternative (re-reading per request) is
 // exactly the per-keystroke file I/O ADR-0010 exists to remove.
-void history::load_log() {
+void store::load_log() {
 	const std::vector<std::byte> bytes = read_whole_file(_log_path);
 	auto loaded = std::make_shared<std::vector<item>>();
 	const log_scan scan = for_each(bytes, [&loaded](const record& one) {
@@ -515,7 +515,7 @@ void history::load_log() {
 	_logged = std::move(loaded);
 }
 
-void history::reload_tier1() {
+void store::reload_tier1() {
 	// CLEARED FIRST, unconditionally. A reload that failed - the file is gone
 	// again, or the new one does not verify - has still incorporated everything
 	// there was to incorporate, and leaving the flag up would re-run it on every
@@ -535,7 +535,7 @@ void history::reload_tier1() {
 	// itself, which is bookkeeping about a file this process just wrote.
 }
 
-void history::note_tier1_identity() {
+void store::note_tier1_identity() {
 	// PLAIN `==` AND NOT `file_id_equal`, and the difference is the point. The
 	// helper refuses to call two failed `stat`s a match, which is what a TOCTOU
 	// check needs; here two failures mean "there was no `history.data` before
@@ -545,14 +545,14 @@ void history::note_tier1_identity() {
 		_reload_needed = true;
 }
 
-void history::incorporate_external_changes() {
+void store::incorporate_external_changes() {
 	if (!_reload_needed)
 		return;
 	// `publish` is what consumes the flag - see its declaration.
 	publish();
 }
 
-void history::drain_watch() {
+void store::drain_watch() {
 	// CONSUME FIRST, whatever we decide afterwards. An undrained notification
 	// leaves the descriptor readable and turns the loop's `poll` into a spin.
 	if (!_watch.drain())
@@ -565,7 +565,7 @@ void history::drain_watch() {
 	incorporate_external_changes();
 }
 
-void history::warn_once(const char* what, const char* consequence) {
+void store::warn_once(const char* what, const char* consequence) {
 	if (_warned)
 		return;
 	_warned = true;
@@ -582,7 +582,7 @@ void history::warn_once(const char* what, const char* consequence) {
 // Recording
 // ---------------------------------------------------------------------------
 
-add_status history::add(std::string_view cmd, std::string_view cwd, bool pending) {
+add_status store::add(std::string_view cmd, std::string_view cwd, bool pending) {
 	// fish #6032. A blank line is not history in any shell, and the rule lives
 	// here rather than at the call site so that the second call site cannot get
 	// it wrong.
@@ -646,7 +646,7 @@ add_status history::add(std::string_view cmd, std::string_view cwd, bool pending
 	return add_status::added;
 }
 
-void history::resolve_pending(std::int32_t exit_code) {
+void store::resolve_pending(std::int32_t exit_code) {
 	// The pending item is always the back: `add` puts it there and nothing adds
 	// behind it. Nothing pending is not an error - a cancelled line never
 	// reached `add`, and a second call has nothing left to do.
@@ -677,7 +677,7 @@ void history::resolve_pending(std::int32_t exit_code) {
 		maybe_vacuum();
 }
 
-int history::open_locked_log() {
+int store::open_locked_log() {
 	if (_log_path.empty())
 		return -1;
 
@@ -716,7 +716,7 @@ int history::open_locked_log() {
 	return -1;
 }
 
-bool history::flush() {
+bool store::flush() {
 	// NOTHING TO WRITE MEANS NO SYSCALLS. `save()` and `resolve_pending` both
 	// call this unconditionally, and without the early-out an `exit` typed at a
 	// prompt would open and lock the log to write nothing.
@@ -790,7 +790,7 @@ bool history::flush() {
 	return complete;
 }
 
-bool history::save() {
+bool store::save() {
 	// THE ANSWER IS ABOUT THE SESSION AND NOT ABOUT THIS CALL. `flush` reports
 	// what it could not write NOW, but an item dropped three commands ago is
 	// just as absent from the file, and "did the history get saved" is the only
@@ -808,11 +808,11 @@ bool history::save() {
 // The vacuum (ADR-0010 §Vacuum)
 // ---------------------------------------------------------------------------
 
-void history::set_vacuum_hook(std::function<void(vacuum_step)> hook) {
+void store::set_vacuum_hook(std::function<void(vacuum_step)> hook) {
 	_vacuum_hook = std::move(hook);
 }
 
-void history::maybe_vacuum() {
+void store::maybe_vacuum() {
 	// No directory, no files, nothing to compact. A memory-only history - what
 	// `vared` and most of the suite get - never reaches the rest of this, and
 	// neither does one whose owner turned the periodic rewrite off.
@@ -842,7 +842,7 @@ void history::maybe_vacuum() {
 	(void)vacuum_now();
 }
 
-vacuum_result history::vacuum_now() {
+vacuum_result store::vacuum_now() {
 	++_vacuums;
 	if (_data_path.empty())
 		return vacuum_result{.status = vacuum_status::refused};
@@ -949,7 +949,7 @@ vacuum_result history::vacuum_now() {
 // The snapshot view
 // ---------------------------------------------------------------------------
 
-void history::publish() {
+void store::publish() {
 	// THE RELOAD, CONSUMED HERE AND NOWHERE ELSE (#195). Every route to a stale
 	// mapping - the watch's drain, the append path's id check - sets one flag,
 	// and the one place that builds a view is the one place that clears it.
@@ -973,7 +973,7 @@ void history::publish() {
 // A TRAILING RETURN TYPE, because `view` is private: written the other way
 // round the return type is looked up at namespace scope, before the declarator
 // says which class this member belongs to.
-auto history::snapshot() const noexcept -> std::shared_ptr<const view> {
+auto store::snapshot() const noexcept -> std::shared_ptr<const view> {
 	return std::atomic_load(&_view);
 }
 
@@ -981,7 +981,7 @@ auto history::snapshot() const noexcept -> std::shared_ptr<const view> {
 // The merge walk
 // ---------------------------------------------------------------------------
 
-void history::for_each_merged_newest_first(
+void store::for_each_merged_newest_first(
 	const std::function<bool(const merged_entry&)>& fn) const {
 	// ONCE, AT THE TOP. Everything below reads a graph that nothing will modify
 	// - a mutation on the loop thread builds a new view and swaps the pointer,
@@ -1051,7 +1051,7 @@ void history::for_each_merged_newest_first(
 	}
 }
 
-void history::for_each_newest_first(const std::function<bool(std::string_view)>& fn) const {
+void store::for_each_newest_first(const std::function<bool(std::string_view)>& fn) const {
 	for_each_merged_newest_first([&fn](const merged_entry& one) {
 		return fn(as_text(one.what.cmd));
 	});

@@ -1,4 +1,4 @@
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 
 #include "ui/history/blob.h"
 #include "ui/history/locking.h"
@@ -140,9 +140,9 @@ struct yielded {
 	merged_entry::origin from = merged_entry::origin::session;
 };
 
-[[nodiscard]] std::vector<yielded> walk(const history& store) {
+[[nodiscard]] std::vector<yielded> walk(const store& storage) {
 	std::vector<yielded> out;
-	store.for_each_merged_newest_first([&out](const merged_entry& one) {
+	storage.for_each_merged_newest_first([&out](const merged_entry& one) {
 		out.push_back(yielded{
 			.cmd = as_text(one.what.cmd),
 			.when = one.what.when,
@@ -298,7 +298,7 @@ void check_no_duplicate_records(const std::string& dir) {
 
 // One `history` instance and everything the model knows about it.
 struct session_state {
-	std::unique_ptr<history> store;
+	std::unique_ptr<store> storage;
 	// Which terminal this is, for a failure message. Survives a restart.
 	std::size_t slot = 0;
 
@@ -376,7 +376,7 @@ public:
 		// off the disk and anything on the disk it does not yield is lost.
 		const on_disk now = scan(_dir);
 		for (const session_state& one : _sessions) {
-			const std::vector<std::string> seen = commands_of(walk(*one.store));
+			const std::vector<std::string> seen = commands_of(walk(*one.storage));
 			for (const std::string& wanted : now.everything) {
 				EXPECT_NE(std::find(seen.begin(), seen.end(), wanted), seen.end())
 					<< where() << ": session " << one.slot << " lost " << printable(wanted)
@@ -488,12 +488,12 @@ private:
 		// one positive test in this file that the OWN copy is the one that wins.
 		const bool was_on_disk = scan(_dir).everything.count(cmd) != 0;
 
-		ASSERT_NE(one.store->add(cmd, cwd_pool()[pick(cwd_pool().size())]),
+		ASSERT_NE(one.storage->add(cmd, cwd_pool()[pick(cwd_pool().size())]),
 		          add_status::rejected)
 			<< where();
 		one.ephemeral.clear();
-		one.store->resolve_pending(exit_code());
-		EXPECT_EQ(one.store->unwritable_items(), 0u)
+		one.storage->resolve_pending(exit_code());
+		EXPECT_EQ(one.storage->unwritable_items(), 0u)
 			<< where() << ": the resolve could not write its frame";
 
 		const on_disk now = scan(_dir);
@@ -504,14 +504,14 @@ private:
 
 		if (!was_on_disk)
 			return;
-		const std::vector<yielded> seen = walk(*one.store);
+		const std::vector<yielded> seen = walk(*one.storage);
 		const auto found = std::find_if(seen.begin(), seen.end(),
 		                                [&cmd](const yielded& e) { return e.cmd == cmd; });
 		ASSERT_NE(found, seen.end()) << where() << ": the command just run is not in the walk";
 		EXPECT_EQ(found->from, merged_entry::origin::session)
 			<< where() << ": the disk's copy of " << printable(cmd)
 			<< " beat this session's own, newer one";
-		EXPECT_EQ(found->session_id, one.store->session_id()) << where();
+		EXPECT_EQ(found->session_id, one.storage->session_id()) << where();
 		EXPECT_EQ(found->when, _clock) << where();
 	}
 
@@ -524,10 +524,10 @@ private:
 		_what = "ephemeral " + printable(cmd) + " on session " + std::to_string(one.slot);
 		tick();
 
-		ASSERT_NE(one.store->add(cmd, "/tmp"), add_status::rejected) << where();
+		ASSERT_NE(one.storage->add(cmd, "/tmp"), add_status::rejected) << where();
 		one.ephemeral = cmd;
 		_ephemeral_ever.insert(cmd);
-		one.store->resolve_pending(exit_code());
+		one.storage->resolve_pending(exit_code());
 	}
 
 	// Empty and whitespace-only, which no shell records (fish #6032). Nothing
@@ -537,9 +537,9 @@ private:
 		_what = "blank " + printable(cmd) + " on session " + std::to_string(one.slot);
 		tick();
 
-		const std::size_t items = one.store->session_items();
-		EXPECT_EQ(one.store->add(cmd, "/tmp"), add_status::rejected) << where();
-		EXPECT_EQ(one.store->session_items(), items)
+		const std::size_t items = one.storage->session_items();
+		EXPECT_EQ(one.storage->add(cmd, "/tmp"), add_status::rejected) << where();
+		EXPECT_EQ(one.storage->session_items(), items)
 			<< where() << ": a blank line became an item";
 	}
 
@@ -552,7 +552,7 @@ private:
 		_what = "add-unpending " + printable(cmd) + " on session " + std::to_string(one.slot);
 		tick();
 
-		ASSERT_NE(one.store->add(cmd, "/tmp", /*pending=*/false), add_status::rejected)
+		ASSERT_NE(one.storage->add(cmd, "/tmp", /*pending=*/false), add_status::rejected)
 			<< where();
 		one.ephemeral.clear();
 		if (scan(_dir).everything.count(cmd) == 0)
@@ -567,7 +567,7 @@ private:
 		_what = "leave-pending " + printable(cmd) + " on session " + std::to_string(one.slot);
 		tick();
 
-		ASSERT_NE(one.store->add(cmd, "/tmp"), add_status::rejected) << where();
+		ASSERT_NE(one.storage->add(cmd, "/tmp"), add_status::rejected) << where();
 		one.ephemeral.clear();
 		one.pending = cmd;
 		_forbidden.insert(cmd);
@@ -575,13 +575,13 @@ private:
 
 	void resolve(session_state& one) {
 		_what = "resolve " + printable(one.pending) + " on session " + std::to_string(one.slot);
-		one.store->resolve_pending(exit_code());
+		one.storage->resolve_pending(exit_code());
 		const std::string was = one.pending;
 		one.pending.clear();
 		// It is an ordinary command line from here on: resolved, written, and
 		// allowed everywhere the others are.
 		_forbidden.erase(was);
-		EXPECT_EQ(one.store->unwritable_items(), 0u) << where();
+		EXPECT_EQ(one.storage->unwritable_items(), 0u) << where();
 		const on_disk now = scan(_dir);
 		EXPECT_EQ(now.everything.count(was), 1u)
 			<< where() << ": a resolved command did not reach the disk";
@@ -590,7 +590,7 @@ private:
 
 	void save(session_state& one) {
 		_what = "save session " + std::to_string(one.slot);
-		EXPECT_TRUE(one.store->save()) << where() << ": items this session cannot write";
+		EXPECT_TRUE(one.storage->save()) << where() << ": items this session cannot write";
 
 		const on_disk now = scan(_dir);
 		for (const std::string& cmd : one.owed) {
@@ -606,7 +606,7 @@ private:
 	// and the same reason every other suite turns it off.
 	void compact(session_state& one) {
 		_what = "vacuum session " + std::to_string(one.slot);
-		const vacuum_result done = one.store->vacuum_now();
+		const vacuum_result done = one.storage->vacuum_now();
 		// Nothing in this file makes a target unwritable or holds the race
 		// open, so the rewrite has no licence to answer anything else.
 		ASSERT_EQ(done.status, vacuum_status::renamed)
@@ -619,7 +619,7 @@ private:
 		const on_disk now = scan(_dir);
 		one.log_at_load = now.log;
 		one.blob_at_map = now.blob;
-		one.reloads_seen = one.store->reloads();
+		one.reloads_seen = one.storage->reloads();
 		one.owed.clear();
 		note_disk(now);
 	}
@@ -634,28 +634,28 @@ private:
 	// no notification to drain.
 	void notice(session_state& one) {
 		_what = "notice on session " + std::to_string(one.slot);
-		if (one.store->watch_fd() >= 0) {
+		if (one.storage->watch_fd() >= 0) {
 			for (int drains = 0; drains < 4; ++drains) {
 				struct ::pollfd waiting {};
-				waiting.fd = one.store->watch_fd();
+				waiting.fd = one.storage->watch_fd();
 				waiting.events = POLLIN;
 				if (::poll(&waiting, 1, 0) <= 0 || (waiting.revents & POLLIN) == 0)
 					break;
-				one.store->drain_watch();
+				one.storage->drain_watch();
 			}
 		}
-		one.store->incorporate_external_changes();
+		one.storage->incorporate_external_changes();
 	}
 
 	// ANOTHER TERMINAL, CLOSED AND REOPENED on the same directory. The instance
 	// is destroyed - which is the only way to test that nothing was being held
 	// in it - and a fresh one with a fresh `session_id` opens the same files.
 	void restart(session_state& one, bool saving) {
-		if (one.store) {
+		if (one.storage) {
 			_what = "restart session " + std::to_string(one.slot)
 			        + (saving ? " after a save" : " without saving");
 			if (saving) {
-				EXPECT_TRUE(one.store->save()) << where();
+				EXPECT_TRUE(one.storage->save()) << where();
 				const on_disk saved = scan(_dir);
 				for (const std::string& cmd : one.owed) {
 					EXPECT_EQ(saved.everything.count(cmd), 1u)
@@ -666,7 +666,7 @@ private:
 			// A SESSION THAT DIES HOLDING A PENDING ITEM LOSES IT, by design and
 			// with no sentinel write - so those bytes stay forbidden for the
 			// rest of the run rather than becoming an ordinary command line.
-			one.store.reset();
+			one.storage.reset();
 		} else {
 			_what = "open session " + std::to_string(one.slot);
 		}
@@ -675,13 +675,13 @@ private:
 		one.ephemeral.clear();
 		one.owed.clear();
 
-		one.store = std::make_unique<history>();
+		one.storage = std::make_unique<store>();
 		// #194's countdown off, and #196's cap on: the program decides when a
 		// rewrite happens, and the cap is low enough that eviction is a thing
 		// that actually occurs in a forty-step run.
-		one.store->set_automatic_vacuum(false);
-		one.store->set_vacuum_cap(_cap);
-		const open_report report = one.store->open(_dir);
+		one.storage->set_automatic_vacuum(false);
+		one.storage->set_vacuum_cap(_cap);
+		const open_report report = one.storage->open(_dir);
 		ASSERT_FALSE(report.directory_unusable) << where();
 		ASSERT_TRUE(report.log_writable) << where();
 		EXPECT_FALSE(report.tier1_untouchable) << where();
@@ -692,7 +692,7 @@ private:
 		const on_disk now = scan(_dir);
 		one.log_at_load = now.log;
 		one.blob_at_map = now.blob;
-		one.reloads_seen = one.store->reloads();
+		one.reloads_seen = one.storage->reloads();
 		note_disk(now);
 	}
 
@@ -732,8 +732,8 @@ private:
 			// mapped has to follow. Nothing else in this single-threaded program
 			// writes `history.data`, so the file as it is now IS what the
 			// reload mapped.
-			if (one.store->reloads() != one.reloads_seen) {
-				one.reloads_seen = one.store->reloads();
+			if (one.storage->reloads() != one.reloads_seen) {
+				one.reloads_seen = one.storage->reloads();
 				one.blob_at_map = now.blob;
 			}
 			// Anything this session owed the disk and the disk now has is
@@ -767,7 +767,7 @@ private:
 		// AND A FRESH INSTANCE GETS ALL OF IT BACK. The one reader with no
 		// memory: everything it yields came off the files, and everything on the
 		// files it does not yield is a command the user cannot reach any more.
-		history probe;
+		store probe;
 		probe.set_automatic_vacuum(false);
 		const open_report report = probe.open(_dir);
 		ASSERT_FALSE(report.directory_unusable) << where();
@@ -827,7 +827,7 @@ private:
 	}
 
 	void check_one_walk(const session_state& one) {
-		const std::vector<yielded> seen = walk(*one.store);
+		const std::vector<yielded> seen = walk(*one.storage);
 		const std::string whose = "session " + std::to_string(one.slot);
 
 		check_no_duplicates(commands_of(seen), whose.c_str());
@@ -902,7 +902,7 @@ private:
 		for (const yielded& entry : seen) {
 			if (entry.from != merged_entry::origin::session)
 				continue;
-			EXPECT_EQ(entry.session_id, one.store->session_id())
+			EXPECT_EQ(entry.session_id, one.storage->session_id())
 				<< where() << ": " << whose << " has a foreign item in its own tier";
 			if (previous != nullptr) {
 				EXPECT_LE(entry.when, previous->when)
@@ -1070,17 +1070,17 @@ TEST_F(UiHistoryProperty, TheCapIsReachedAndTheEvictionPathRuns) {
 	const lesh::testing::temp_path scratch;
 	test_hooks::set_now_override(1'700'000'000);
 
-	history store;
-	store.set_automatic_vacuum(false);
-	store.set_vacuum_cap(4);
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	store storage;
+	storage.set_automatic_vacuum(false);
+	storage.set_vacuum_cap(4);
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
 	for (int at = 0; at < 10; ++at) {
 		test_hooks::set_now_override(1'700'000'000 + static_cast<std::uint64_t>(at));
-		ASSERT_NE(store.add("command " + std::to_string(at), "/tmp"), add_status::rejected);
-		store.resolve_pending(0);
+		ASSERT_NE(storage.add("command " + std::to_string(at), "/tmp"), add_status::rejected);
+		storage.resolve_pending(0);
 	}
 
-	const vacuum_result done = store.vacuum_now();
+	const vacuum_result done = storage.vacuum_now();
 	ASSERT_EQ(done.status, vacuum_status::renamed);
 	EXPECT_EQ(done.records_written, 4u);
 	EXPECT_EQ(done.evicted, 6u);
@@ -1116,16 +1116,16 @@ void crash_at(const std::string& dir, vacuum_step stop_at, std::uint64_t clock) 
 	ASSERT_GE(child, 0) << "fork failed: " << std::strerror(errno);
 	if (child == 0) {
 		test_hooks::set_now_override(clock);
-		history store;
-		store.set_automatic_vacuum(false);
-		(void)store.open(dir);
-		(void)store.add("the dying session's command", "/tmp", /*pending=*/false);
-		(void)store.save();
-		store.set_vacuum_hook([stop_at](vacuum_step step) {
+		store storage;
+		storage.set_automatic_vacuum(false);
+		(void)storage.open(dir);
+		(void)storage.add("the dying session's command", "/tmp", /*pending=*/false);
+		(void)storage.save();
+		storage.set_vacuum_hook([stop_at](vacuum_step step) {
 			if (step == stop_at)
 				::_exit(70);
 		});
-		(void)store.vacuum_now();
+		(void)storage.vacuum_now();
 		::_exit(0);
 	}
 	int status = 0;
@@ -1163,7 +1163,7 @@ TEST_F(UiHistoryPropertyCrash, ARandomProgramSurvivesAKillAtEveryVacuumStep) {
 			if (HasFatalFailure())
 				return;
 
-			history reopened;
+			store reopened;
 			reopened.set_automatic_vacuum(false);
 			const open_report report = reopened.open(scratch.dir());
 			EXPECT_FALSE(report.tier1_untouchable) << "step " << static_cast<int>(step);

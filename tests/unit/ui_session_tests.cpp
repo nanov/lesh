@@ -5,7 +5,7 @@
 #include "runtime/builtins.h"
 #include "runtime/history_store.h"
 #include "runtime/shell_state.h"
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 #include "ui/session.h"
 
 #include "interactive_signal_guard.h"
@@ -111,12 +111,12 @@ TEST(UiSessionPrompt, AFixedSourceIsWhatVaredAndTheTestsPass) {
 
 TEST(UiSessionHistory, TheStoreWalksNewestFirstThroughTheAdapter) {
 	const lesh::testing::temp_path scratch;
-	lesh::runtime::history_store store{scratch.file("history")};
-	EXPECT_TRUE(store.append("one"));
-	EXPECT_TRUE(store.append("two"));
-	EXPECT_TRUE(store.append("three"));
+	lesh::runtime::history_store storage{scratch.file("history")};
+	EXPECT_TRUE(storage.append("one"));
+	EXPECT_TRUE(storage.append("two"));
+	EXPECT_TRUE(storage.append("three"));
 
-	const history_store_source source{store};
+	const history_store_source source{storage};
 	std::vector<std::string> seen;
 	source.for_each_newest_first([&](std::string_view entry) {
 		seen.emplace_back(entry);
@@ -134,12 +134,12 @@ TEST(UiSessionHistory, AWalkThatStopsSeesNothingAfterTheStop) {
 	// matters to the searcher's supersede poll is that `fn` is not called again,
 	// and that is what this asserts.
 	const lesh::testing::temp_path scratch;
-	lesh::runtime::history_store store{scratch.file("history")};
-	EXPECT_TRUE(store.append("one"));
-	EXPECT_TRUE(store.append("two"));
-	EXPECT_TRUE(store.append("three"));
+	lesh::runtime::history_store storage{scratch.file("history")};
+	EXPECT_TRUE(storage.append("one"));
+	EXPECT_TRUE(storage.append("two"));
+	EXPECT_TRUE(storage.append("three"));
 
-	const history_store_source source{store};
+	const history_store_source source{storage};
 	std::vector<std::string> seen;
 	source.for_each_newest_first([&](std::string_view entry) {
 		seen.emplace_back(entry);
@@ -151,8 +151,8 @@ TEST(UiSessionHistory, AWalkThatStopsSeesNothingAfterTheStop) {
 
 TEST(UiSessionHistory, AMissingFileIsAnEmptyHistoryAndNotAnError) {
 	const lesh::testing::temp_path scratch;
-	const lesh::runtime::history_store store{scratch.file("never-written")};
-	const history_store_source source{store};
+	const lesh::runtime::history_store storage{scratch.file("never-written")};
+	const history_store_source source{storage};
 	std::size_t seen = 0;
 	source.for_each_newest_first([&](std::string_view) {
 		++seen;
@@ -172,10 +172,10 @@ TEST(UiSessionHistory, AMissingFileIsAnEmptyHistoryAndNotAnError) {
 // ===========================================================================
 
 TEST(UiSessionHistory, TheBundleCarriesOneStoreUnderBothVerbs) {
-	lesh::ui::history::history store;
+	lesh::ui::history::store storage;
 	provider_bundle providers;
-	providers.history = &store;
-	providers.recorder = &store;
+	providers.history = &storage;
+	providers.recorder = &storage;
 
 	// What `session::execute` does, in the order it does it: add before the
 	// run, resolve after the wait.
@@ -225,12 +225,12 @@ TEST(UiSessionHistory, TheRecordedDirectoryIsTheShellsLogicalPwd) {
 	std::string_view pwd;
 	ASSERT_TRUE(state.lookup(std::string_view{"PWD"}, pwd));
 
-	lesh::ui::history::history store;
-	ASSERT_NE(store.add("echo hi", pwd), lesh::ui::history::add_status::rejected);
-	store.resolve_pending(0);
+	lesh::ui::history::store storage;
+	ASSERT_NE(storage.add("echo hi", pwd), lesh::ui::history::add_status::rejected);
+	storage.resolve_pending(0);
 
 	std::string recorded;
-	store.for_each_merged_newest_first([&recorded](const lesh::ui::history::merged_entry& one) {
+	storage.for_each_merged_newest_first([&recorded](const lesh::ui::history::merged_entry& one) {
 		recorded.assign(reinterpret_cast<const char*>(one.what.cwd.data()),
 		                one.what.cwd.size());
 		return false;

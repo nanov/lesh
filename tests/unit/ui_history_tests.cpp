@@ -1,4 +1,4 @@
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 
 #include "ui/history/blob.h"
 #include "ui/history/log.h"
@@ -69,9 +69,9 @@ namespace {
 }
 
 // Every command line the walk yields, newest first.
-[[nodiscard]] std::vector<std::string> walk(const history& store) {
+[[nodiscard]] std::vector<std::string> walk(const store& storage) {
 	std::vector<std::string> out;
-	static_cast<const lesh::ui::history_source&>(store).for_each_newest_first(
+	static_cast<const lesh::ui::history_source&>(storage).for_each_newest_first(
 		[&out](std::string_view entry) {
 			out.emplace_back(entry);
 			return true;
@@ -92,9 +92,9 @@ struct seen_entry {
 	merged_entry::origin from = merged_entry::origin::session;
 };
 
-[[nodiscard]] std::vector<seen_entry> walk_merged(const history& store) {
+[[nodiscard]] std::vector<seen_entry> walk_merged(const store& storage) {
 	std::vector<seen_entry> out;
-	store.for_each_merged_newest_first([&out](const merged_entry& one) {
+	storage.for_each_merged_newest_first([&out](const merged_entry& one) {
 		out.push_back(seen_entry{
 			.cmd = as_text(one.what.cmd),
 			.cwd = as_text(one.what.cwd),
@@ -118,17 +118,17 @@ struct seen_entry {
 // out of the log and into `history.data`. Left on, this file would be right
 // most of the time. `UiHistoryVacuum*` is where the rewrite is tested, and it
 // drives it directly.
-[[nodiscard]] open_report open_quietly(history& store, const std::string& directory) {
-	store.set_automatic_vacuum(false);
-	return store.open(directory);
+[[nodiscard]] open_report open_quietly(store& storage, const std::string& directory) {
+	storage.set_automatic_vacuum(false);
+	return storage.open(directory);
 }
 
 // Records `cmd` and finishes it, which is what a command that ran looks like.
-void run_command(history& store, std::string_view cmd, std::string_view cwd = "/tmp",
+void run_command(store& storage, std::string_view cmd, std::string_view cwd = "/tmp",
                  std::int32_t exit_code = 0) {
-	if (store.add(cmd, cwd) == add_status::rejected)
+	if (storage.add(cmd, cwd) == add_status::rejected)
 		return;
-	store.resolve_pending(exit_code);
+	storage.resolve_pending(exit_code);
 }
 
 [[nodiscard]] std::vector<std::byte> read_file(const std::string& path) {
@@ -237,12 +237,12 @@ TEST(UiHistoryPlacement, XdgWinsAndHomeIsTheFallback) {
 	{
 		const scoped_env xdg{"XDG_DATA_HOME", "/somewhere/data"};
 		const scoped_env home{"HOME", "/home/somebody"};
-		EXPECT_EQ(history::default_data_directory(), "/somewhere/data/lesh");
+		EXPECT_EQ(store::default_data_directory(), "/somewhere/data/lesh");
 	}
 	{
 		const scoped_env xdg{"XDG_DATA_HOME", nullptr};
 		const scoped_env home{"HOME", "/home/somebody"};
-		EXPECT_EQ(history::default_data_directory(), "/home/somebody/.local/share/lesh");
+		EXPECT_EQ(store::default_data_directory(), "/home/somebody/.local/share/lesh");
 	}
 }
 
@@ -252,7 +252,7 @@ TEST(UiHistoryPlacement, ARelativeXdgIsIgnoredRatherThanResolved) {
 	// the cwd would follow the user around with `cd`.
 	const scoped_env xdg{"XDG_DATA_HOME", "relative/data"};
 	const scoped_env home{"HOME", "/home/somebody"};
-	EXPECT_EQ(history::default_data_directory(), "/home/somebody/.local/share/lesh");
+	EXPECT_EQ(store::default_data_directory(), "/home/somebody/.local/share/lesh");
 }
 
 TEST(UiHistoryPlacement, NoHomeAndNoXdgIsNoStoreAtAll) {
@@ -261,7 +261,7 @@ TEST(UiHistoryPlacement, NoHomeAndNoXdgIsNoStoreAtAll) {
 	// as an error.
 	const scoped_env xdg{"XDG_DATA_HOME", nullptr};
 	const scoped_env home{"HOME", nullptr};
-	EXPECT_FALSE(history::default_data_directory().has_value());
+	EXPECT_FALSE(store::default_data_directory().has_value());
 }
 
 TEST(UiHistoryPlacement, TheDirectoryIsSevenHundredAndTheFilesAreSixHundred) {
@@ -269,8 +269,8 @@ TEST(UiHistoryPlacement, TheDirectoryIsSevenHundredAndTheFilesAreSixHundred) {
 	const lesh::testing::temp_path scratch;
 	const std::string dir = scratch.file("a/b/lesh");
 
-	history store;
-	const open_report report = open_quietly(store, dir);
+	store storage;
+	const open_report report = open_quietly(storage, dir);
 	ASSERT_FALSE(report.directory_unusable);
 	EXPECT_TRUE(report.log_writable);
 
@@ -280,7 +280,7 @@ TEST(UiHistoryPlacement, TheDirectoryIsSevenHundredAndTheFilesAreSixHundred) {
 	EXPECT_EQ(permissions_of(dir), 0700u);
 	EXPECT_EQ(permissions_of(scratch.file("a/b")), 0755u);
 
-	run_command(store, "echo hi");
+	run_command(storage, "echo hi");
 	EXPECT_EQ(permissions_of(dir + "/history.new.log"), 0600u);
 }
 
@@ -289,16 +289,16 @@ TEST(UiHistoryPlacement, ADirectoryThatCannotBeMadeCostsTheDiskAndNotTheSession)
 	// A regular file where the data directory belongs.
 	write_file(scratch.file("lesh"), as_bytes("not a directory"));
 
-	history store;
-	const open_report report = open_quietly(store, scratch.file("lesh"));
+	store storage;
+	const open_report report = open_quietly(storage, scratch.file("lesh"));
 	EXPECT_TRUE(report.directory_unusable);
 	EXPECT_FALSE(report.log_writable);
 
 	// And the session still remembers its own commands, which is the point.
-	run_command(store, "echo hi");
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"echo hi"}));
-	EXPECT_FALSE(store.save());
-	EXPECT_EQ(store.unwritable_items(), 1u);
+	run_command(storage, "echo hi");
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"echo hi"}));
+	EXPECT_FALSE(storage.save());
+	EXPECT_EQ(storage.unwritable_items(), 1u);
 }
 
 // ===========================================================================
@@ -309,60 +309,60 @@ TEST(UiHistoryRecording, APendingItemIsNotHistoryUntilItHasAnExitStatus) {
 	// ADR-0010 §Recording: `add` before the run, `resolve_pending` after the
 	// wait. Between the two the command is in `new_items` and invisible - a
 	// history entry with no exit code is an entry the format cannot hold.
-	history store;
-	ASSERT_EQ(store.add("sleep 1", "/tmp"), add_status::added);
-	EXPECT_TRUE(walk(store).empty());
-	EXPECT_EQ(store.session_items(), 1u);
+	store storage;
+	ASSERT_EQ(storage.add("sleep 1", "/tmp"), add_status::added);
+	EXPECT_TRUE(walk(storage).empty());
+	EXPECT_EQ(storage.session_items(), 1u);
 
-	store.resolve_pending(0);
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"sleep 1"}));
+	storage.resolve_pending(0);
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"sleep 1"}));
 }
 
 TEST(UiHistoryRecording, ASecondResolveDoesNothingAndIsNotAnError) {
-	history store;
-	run_command(store, "echo hi");
-	store.resolve_pending(1);
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"echo hi"}));
-	EXPECT_EQ(walk_merged(store)[0].exit_code, 0);
+	store storage;
+	run_command(storage, "echo hi");
+	storage.resolve_pending(1);
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"echo hi"}));
+	EXPECT_EQ(walk_merged(storage)[0].exit_code, 0);
 }
 
 TEST(UiHistoryRecording, BlankLinesAreNeverHistory) {
 	// fish #6032. The rule is the store's and not the call site's, so that the
 	// second call site cannot get it wrong.
-	history store;
-	EXPECT_EQ(store.add("", "/tmp"), add_status::rejected);
-	EXPECT_EQ(store.add("   ", "/tmp"), add_status::rejected);
-	EXPECT_EQ(store.add("\t\n \r", "/tmp"), add_status::rejected);
-	EXPECT_EQ(store.session_items(), 0u);
-	EXPECT_TRUE(walk(store).empty());
+	store storage;
+	EXPECT_EQ(storage.add("", "/tmp"), add_status::rejected);
+	EXPECT_EQ(storage.add("   ", "/tmp"), add_status::rejected);
+	EXPECT_EQ(storage.add("\t\n \r", "/tmp"), add_status::rejected);
+	EXPECT_EQ(storage.session_items(), 0u);
+	EXPECT_TRUE(walk(storage).empty());
 }
 
 TEST(UiHistoryRecording, TheSameCommandTwiceInARowIsOneItem) {
 	// fish `history_item_t::merge`: same text, same persist mode, so the item
 	// already at the back takes the newer timestamp.
-	history store;
-	run_command(store, "git status");
-	run_command(store, "git status");
-	EXPECT_EQ(store.session_items(), 1u);
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"git status"}));
+	store storage;
+	run_command(storage, "git status");
+	run_command(storage, "git status");
+	EXPECT_EQ(storage.session_items(), 1u);
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"git status"}));
 
 	// NOT adjacent is not a merge: the rule is about repetition, not about
 	// duplicates, and the dedup in the walk is what keeps the second one from
 	// being SHOWN twice.
-	run_command(store, "ls");
-	run_command(store, "git status");
-	EXPECT_EQ(store.session_items(), 3u);
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"git status", "ls"}));
+	run_command(storage, "ls");
+	run_command(storage, "git status");
+	EXPECT_EQ(storage.session_items(), 3u);
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"git status", "ls"}));
 }
 
 TEST(UiHistoryRecording, AMergedItemTakesTheNewerRunsDirectoryAndExitCode) {
-	history store;
-	ASSERT_EQ(store.add("make", "/one"), add_status::added);
-	store.resolve_pending(0);
-	ASSERT_EQ(store.add("make", "/two"), add_status::merged);
-	store.resolve_pending(2);
+	store storage;
+	ASSERT_EQ(storage.add("make", "/one"), add_status::added);
+	storage.resolve_pending(0);
+	ASSERT_EQ(storage.add("make", "/two"), add_status::merged);
+	storage.resolve_pending(2);
 
-	const std::vector<seen_entry> seen = walk_merged(store);
+	const std::vector<seen_entry> seen = walk_merged(storage);
 	ASSERT_EQ(seen.size(), 1u);
 	// The merged item is REWRITTEN with the newer timestamp, so its cwd and its
 	// exit code have to be the ones that timestamp belongs to - a record whose
@@ -376,39 +376,39 @@ TEST(UiHistoryRecording, ALeadingSpaceIsRetrievableUntilTheNextCommand) {
 	// "until the next add" is that the up-arrow right after a secret command
 	// still finds it - the user can fix a typo in the thing they did not want
 	// remembered - and that the command after it takes it away.
-	history store;
-	run_command(store, " secret --token=hunter2");
-	EXPECT_EQ(walk(store), (std::vector<std::string>{" secret --token=hunter2"}));
+	store storage;
+	run_command(storage, " secret --token=hunter2");
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{" secret --token=hunter2"}));
 
-	run_command(store, "echo ok");
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"echo ok"}));
-	EXPECT_EQ(store.session_items(), 1u);
+	run_command(storage, "echo ok");
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"echo ok"}));
+	EXPECT_EQ(storage.session_items(), 1u);
 }
 
 TEST(UiHistoryRecording, ALeadingSpaceNeverReachesTheLog) {
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_FALSE(open_quietly(store, scratch.dir()).directory_unusable);
+	store storage;
+	ASSERT_FALSE(open_quietly(storage, scratch.dir()).directory_unusable);
 
-	run_command(store, "echo before");
-	run_command(store, " secret --token=hunter2");
-	run_command(store, "echo after");
-	EXPECT_TRUE(store.save());
+	run_command(storage, "echo before");
+	run_command(storage, " secret --token=hunter2");
+	run_command(storage, "echo after");
+	EXPECT_TRUE(storage.save());
 
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
 	          (std::vector<std::string>{"echo before", "echo after"}));
 	// And nothing failed to write: an ephemeral item is not an unwritten one.
-	EXPECT_EQ(store.unwritable_items(), 0u);
+	EXPECT_EQ(storage.unwritable_items(), 0u);
 }
 
 TEST(UiHistoryRecording, ATabIndentedCommandIsOrdinaryHistory) {
 	// A LITERAL SPACE and not any whitespace. The space is the gesture users
 	// have been taught; a tab is what a paste from a script looks like.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_FALSE(open_quietly(store, scratch.dir()).directory_unusable);
-	run_command(store, "\techo indented");
-	EXPECT_TRUE(store.save());
+	store storage;
+	ASSERT_FALSE(open_quietly(storage, scratch.dir()).directory_unusable);
+	run_command(storage, "\techo indented");
+	EXPECT_TRUE(storage.save());
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
 	          (std::vector<std::string>{"\techo indented"}));
 }
@@ -420,28 +420,28 @@ TEST(UiHistoryRecording, ATabIndentedCommandIsOrdinaryHistory) {
 TEST(UiHistoryLogging, ResolvingIsWhatAppendsTheFrame) {
 	const lesh::testing::temp_path scratch;
 	const std::string log = scratch.file("history.new.log");
-	history store;
-	ASSERT_TRUE(open_quietly(store, scratch.dir()).log_writable);
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, scratch.dir()).log_writable);
 
-	ASSERT_EQ(store.add("echo hi", "/tmp"), add_status::added);
+	ASSERT_EQ(storage.add("echo hi", "/tmp"), add_status::added);
 	// Nothing yet: before the wait there is no exit code to write.
 	EXPECT_TRUE(log_commands(log).empty());
 
-	store.resolve_pending(3);
+	storage.resolve_pending(3);
 	EXPECT_EQ(log_commands(log), (std::vector<std::string>{"echo hi"}));
 }
 
 TEST(UiHistoryLogging, ARestartSeesTheWholeRecord) {
 	const lesh::testing::temp_path scratch;
 	{
-		history first;
+		store first;
 		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, "echo one", "/one", 0);
 		run_command(first, "echo two", "/two", 7);
 		EXPECT_TRUE(first.save());
 	}
 
-	history second;
+	store second;
 	const open_report report = open_quietly(second, scratch.dir());
 	EXPECT_EQ(report.log_frames, 2u);
 	EXPECT_EQ(report.log_discarded_bytes, 0u);
@@ -465,7 +465,7 @@ TEST(UiHistoryLogging, AMergeRewindsTheCursorSoTheNewerRunReachesDisk) {
 	// fine - the walk dedups on the way back in and #194's vacuum collapses it.
 	const lesh::testing::temp_path scratch;
 	{
-		history first;
+		store first;
 		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, "make", "/one", 0);
 		run_command(first, "make", "/two", 2);
@@ -474,7 +474,7 @@ TEST(UiHistoryLogging, AMergeRewindsTheCursorSoTheNewerRunReachesDisk) {
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
 	          (std::vector<std::string>{"make", "make"}));
 
-	history second;
+	store second;
 	ASSERT_EQ(open_quietly(second, scratch.dir()).log_frames, 2u);
 	const std::vector<seen_entry> seen = walk_merged(second);
 	ASSERT_EQ(seen.size(), 1u);
@@ -487,10 +487,10 @@ TEST(UiHistoryLogging, SaveFlushesAndDoesNotVacuum) {
 	// observable half of "does not vacuum" is that `history.data` is not
 	// created and the log is not truncated - both of which are #194's.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_TRUE(open_quietly(store, scratch.dir()).log_writable);
-	run_command(store, "echo hi");
-	EXPECT_TRUE(store.save());
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, scratch.dir()).log_writable);
+	run_command(storage, "echo hi");
+	EXPECT_TRUE(storage.save());
 
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")).size(), 1u);
 	struct ::stat info {};
@@ -513,13 +513,13 @@ TEST(UiHistoryWalk, TheThreeTiersComeBackAsOneNewestFirstSequence) {
 	append_frame(scratch.file("history.new.log"),
 	             record{.cmd = as_bytes("log two"), .when = 400});
 
-	history store;
-	const open_report report = open_quietly(store, scratch.dir());
+	store storage;
+	const open_report report = open_quietly(storage, scratch.dir());
 	ASSERT_TRUE(report.tier1_mapped);
 	ASSERT_EQ(report.log_frames, 2u);
-	run_command(store, "typed just now");
+	run_command(storage, "typed just now");
 
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"typed just now", "log two", "log one",
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"typed just now", "log two", "log one",
 	                                                 "blob newer", "blob older"}));
 }
 
@@ -530,11 +530,11 @@ TEST(UiHistoryWalk, ACommandInEveryTierIsYieldedOnce) {
 	append_frame(scratch.file("history.new.log"),
 	             record{.cmd = as_bytes("git status"), .when = 200});
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, scratch.dir()).tier1_mapped);
-	run_command(store, "git status");
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, scratch.dir()).tier1_mapped);
+	run_command(storage, "git status");
 
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"git status"}));
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"git status"}));
 }
 
 TEST(UiHistoryWalk, TheOrderingIsTheTieBreakAndOwnWins) {
@@ -555,16 +555,16 @@ TEST(UiHistoryWalk, TheOrderingIsTheTieBreakAndOwnWins) {
 	append_frame(scratch.file("history.new.log"),
 	             record{.cmd = as_bytes("only in the blob"), .when = 100, .session_id = 22});
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, scratch.dir()).tier1_mapped);
-	run_command(store, "shared");
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, scratch.dir()).tier1_mapped);
+	run_command(storage, "shared");
 
-	const std::vector<seen_entry> seen = walk_merged(store);
+	const std::vector<seen_entry> seen = walk_merged(storage);
 	ASSERT_EQ(seen.size(), 2u);
 	// This session's copy of `shared` won, and carries this session's id.
 	EXPECT_EQ(seen[0].cmd, "shared");
 	EXPECT_EQ(seen[0].from, merged_entry::origin::session);
-	EXPECT_EQ(seen[0].session_id, store.session_id());
+	EXPECT_EQ(seen[0].session_id, storage.session_id());
 	// And where this session has no opinion, the LOG beats the mapping for the
 	// same reason: it is the tier that was written later.
 	EXPECT_EQ(seen[1].cmd, "only in the blob");
@@ -575,8 +575,8 @@ TEST(UiHistoryWalk, TheOrderingIsTheTieBreakAndOwnWins) {
 TEST(UiHistoryWalk, TheSessionIdIsNotZeroAndNotShared) {
 	// It exists for the tie-break and for nothing else, but a store that handed
 	// every session the same one would make the tie-break meaningless.
-	const history one;
-	const history two;
+	const store one;
+	const store two;
 	EXPECT_NE(one.session_id(), 0u);
 	EXPECT_NE(one.session_id(), two.session_id());
 	// RFC 9562's variant bits are the two high ones of the low half.
@@ -586,13 +586,13 @@ TEST(UiHistoryWalk, TheSessionIdIsNotZeroAndNotShared) {
 TEST(UiHistoryWalk, AWalkThatStopsSeesNothingAfterTheStop) {
 	// #125's requirement on `history_source`: the callback can stop, because the
 	// supersede poll would otherwise be a formality.
-	history store;
-	run_command(store, "one");
-	run_command(store, "two");
-	run_command(store, "three");
+	store storage;
+	run_command(storage, "one");
+	run_command(storage, "two");
+	run_command(storage, "three");
 
 	std::vector<std::string> seen;
-	static_cast<const lesh::ui::history_source&>(store).for_each_newest_first(
+	static_cast<const lesh::ui::history_source&>(storage).for_each_newest_first(
 		[&seen](std::string_view entry) {
 			seen.emplace_back(entry);
 			return false;
@@ -607,12 +607,12 @@ TEST(UiHistoryWalk, CommandLinesAreBytesAndNotStrings) {
 	const lesh::testing::temp_path scratch;
 	const std::string awkward = std::string("echo 'a\0b'\n\xff\xfe", 13);
 	{
-		history first;
+		store first;
 		ASSERT_TRUE(open_quietly(first, scratch.dir()).log_writable);
 		run_command(first, awkward);
 		EXPECT_TRUE(first.save());
 	}
-	history second;
+	store second;
 	ASSERT_EQ(open_quietly(second, scratch.dir()).log_frames, 1u);
 	EXPECT_EQ(walk(second), (std::vector<std::string>{awkward}));
 }
@@ -643,18 +643,18 @@ TEST(UiHistoryForeignFile, AnUnknownIdentifierIsLeftByteForByteAlone) {
 	const std::vector<std::byte> original = blob_with_a_foreign_identifier();
 	write_file(data, original);
 
-	history store;
-	const open_report report = open_quietly(store, scratch.dir());
+	store storage;
+	const open_report report = open_quietly(storage, scratch.dir());
 	EXPECT_FALSE(report.tier1_mapped);
 	EXPECT_TRUE(report.tier1_untouchable);
 	// The one question this milestone answers on #194's behalf.
-	EXPECT_FALSE(store.may_rewrite_tier1());
+	EXPECT_FALSE(storage.may_rewrite_tier1());
 
 	// The session runs on Tier 2 plus memory, which is the whole of what
 	// ADR-0010 asks for - and then the file is still there, unchanged.
-	run_command(store, "echo hi");
-	EXPECT_TRUE(store.save());
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"echo hi"}));
+	run_command(storage, "echo hi");
+	EXPECT_TRUE(storage.save());
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"echo hi"}));
 	EXPECT_EQ(read_file(data), original);
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
 	          (std::vector<std::string>{"echo hi"}));
@@ -665,15 +665,15 @@ TEST(UiHistoryForeignFile, ItWarnsOnceAndNotOnceAgain) {
 	write_file(scratch.file("history.data"), blob_with_a_foreign_identifier());
 
 	::testing::internal::CaptureStderr();
-	history store;
-	(void)open_quietly(store, scratch.dir());
+	store storage;
+	(void)open_quietly(storage, scratch.dir());
 	// A second open of the same directory - the reload #195 will make routine -
 	// must not say it again. A shell that warned every prompt would be a shell
 	// nobody could use.
-	(void)open_quietly(store, scratch.dir());
+	(void)open_quietly(storage, scratch.dir());
 	const std::string said = ::testing::internal::GetCapturedStderr();
 
-	EXPECT_EQ(store.warnings(), 1u);
+	EXPECT_EQ(storage.warnings(), 1u);
 	EXPECT_NE(said.find("history.data"), std::string::npos) << said;
 	EXPECT_NE(said.find("not a lesh history file"), std::string::npos) << said;
 }
@@ -695,13 +695,13 @@ TEST(UiHistoryForeignFile, ABlobOursAndBrokenIsRebuildableButNotYetRebuilt) {
 		bytes[at] = std::byte{0xEE};
 	write_file(scratch.file("history.data"), bytes);
 
-	history store;
-	const open_report report = open_quietly(store, scratch.dir());
+	store storage;
+	const open_report report = open_quietly(storage, scratch.dir());
 	EXPECT_FALSE(report.tier1_mapped);
 	EXPECT_FALSE(report.tier1_untouchable);
 	EXPECT_TRUE(report.tier1_corrupt);
-	EXPECT_TRUE(store.may_rewrite_tier1());
-	EXPECT_EQ(store.warnings(), 1u);
+	EXPECT_TRUE(storage.may_rewrite_tier1());
+	EXPECT_EQ(storage.warnings(), 1u);
 	EXPECT_EQ(read_file(scratch.file("history.data")), bytes);
 }
 
@@ -714,10 +714,10 @@ TEST(UiHistoryView, AWalkSeesTheViewItStartedWithAndNothingAfterIt) {
 	// three commands underneath it; the walk finishes and has seen the history
 	// as it was when it started - not a mixture, not a torn container, and not
 	// a crash.
-	history store;
-	run_command(store, "one");
-	run_command(store, "two");
-	run_command(store, "three");
+	store storage;
+	run_command(storage, "one");
+	run_command(storage, "two");
+	run_command(storage, "three");
 
 	std::promise<void> walk_began;
 	std::promise<void> mutations_done;
@@ -727,7 +727,7 @@ TEST(UiHistoryView, AWalkSeesTheViewItStartedWithAndNothingAfterIt) {
 	std::vector<std::string> seen;
 	std::thread walker([&] {
 		bool first = true;
-		static_cast<const lesh::ui::history_source&>(store).for_each_newest_first(
+		static_cast<const lesh::ui::history_source&>(storage).for_each_newest_first(
 			[&](std::string_view entry) {
 				seen.emplace_back(entry);
 				if (first) {
@@ -740,39 +740,39 @@ TEST(UiHistoryView, AWalkSeesTheViewItStartedWithAndNothingAfterIt) {
 	});
 
 	began.wait();
-	run_command(store, "four");
-	run_command(store, "five");
-	run_command(store, " six");
+	run_command(storage, "four");
+	run_command(storage, "five");
+	run_command(storage, " six");
 	mutations_done.set_value();
 	walker.join();
 
 	EXPECT_EQ(seen, (std::vector<std::string>{"three", "two", "one"}));
 	// And the next walk sees all of it, which is what makes the first one a
 	// snapshot rather than a bug.
-	EXPECT_EQ(walk(store),
+	EXPECT_EQ(walk(storage),
 	          (std::vector<std::string>{" six", "five", "four", "three", "two", "one"}));
 }
 
 TEST(UiHistoryView, AWalkOnAFreshStoreIsEmptyRatherThanUndefined) {
 	// The view is published by the constructor, because a worker can be handed
 	// the source before `open` is ever called - and `vared` never calls it.
-	const history store;
-	EXPECT_TRUE(walk(store).empty());
+	const store storage;
+	EXPECT_TRUE(walk(storage).empty());
 }
 
 TEST(UiHistoryView, TwoThreadsWalkingAtOnceDoNotShareScratch) {
 	// The dedup table is thread-local, which is the only reason two workers can
 	// walk the same history at the same time. If they shared one, this would
 	// come back short.
-	history store;
+	store storage;
 	for (int i = 0; i < 200; ++i)
-		run_command(store, "command " + std::to_string(i));
+		run_command(storage, "command " + std::to_string(i));
 
 	std::vector<std::vector<std::string>> results(4);
 	std::vector<std::thread> walkers;
 	walkers.reserve(results.size());
 	for (std::vector<std::string>& into : results)
-		walkers.emplace_back([&store, &into] { into = walk(store); });
+		walkers.emplace_back([&storage, &into] { into = walk(storage); });
 	for (std::thread& one : walkers)
 		one.join();
 
@@ -787,16 +787,16 @@ TEST(UiHistoryView, AWarmWalkGrowsNoScratch) {
 	// #90's rule, on the instrument that can actually see this class's scratch:
 	// the arena counter `UiAutosuggest` reads would not notice a `std::vector`
 	// growing inside the walk, and `scratch_growths` would.
-	history store;
+	store storage;
 	for (int i = 0; i < 300; ++i)
-		run_command(store, "command " + std::to_string(i));
+		run_command(storage, "command " + std::to_string(i));
 
 	// Warm: the first walks on this thread are where the table grows to fit.
-	(void)walk(store);
-	(void)walk(store);
+	(void)walk(storage);
+	(void)walk(storage);
 
-	const std::size_t before = history::scratch_growths();
+	const std::size_t before = store::scratch_growths();
 	for (int i = 0; i < 20; ++i)
-		(void)walk(store);
-	EXPECT_EQ(history::scratch_growths(), before);
+		(void)walk(storage);
+	EXPECT_EQ(store::scratch_growths(), before);
 }

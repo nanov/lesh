@@ -1,5 +1,5 @@
 #include "leshper/abi.h"
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 #include "ui/history_search.h"
 #include "ui/reactors.h"
 #include "leshper/layout.h"
@@ -320,15 +320,15 @@ TEST(UiAutosuggest, TheSuggestionComesOutOfTheRealStoreToo) {
 	// is the only thing most of this file needs, but "the autosuggester works
 	// against the thing `main` actually wires" is not something a vector can be
 	// asked.
-	lesh::ui::history::history store;
+	lesh::ui::history::store storage;
 	for (const char* entry : {"git log --oneline", "git status --short"}) {
-		ASSERT_NE(store.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
-		store.resolve_pending(0);
+		ASSERT_NE(storage.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
+		storage.resolve_pending(0);
 	}
 
 	registry reg;
 	loop_harness loop{reg};
-	owned_autosuggester self{&store};
+	owned_autosuggester self{&storage};
 	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
 
 	const lesh::leshper::state s = suggest_fixture::line("git s");
@@ -351,16 +351,16 @@ TEST(UiAutosuggest, TheComputePathTakesNothingFromTheHeapOverTheRealStore) {
 	// arena counter is #90's and watches the reactor's snapshot; `scratch_growths`
 	// is the store's own and watches the dedup table, which is a `std::vector`
 	// the arena counter would never notice.
-	lesh::ui::history::history store;
+	lesh::ui::history::store storage;
 	for (int i = 0; i < 64; ++i) {
 		const std::string entry = "git status --short --branch " + std::to_string(i);
-		ASSERT_NE(store.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
-		store.resolve_pending(0);
+		ASSERT_NE(storage.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
+		storage.resolve_pending(0);
 	}
 
 	registry reg;
 	loop_harness loop{reg};
-	owned_autosuggester self{&store};
+	owned_autosuggester self{&storage};
 	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
 
 	std::string line;
@@ -376,10 +376,10 @@ TEST(UiAutosuggest, TheComputePathTakesNothingFromTheHeapOverTheRealStore) {
 
 	auto& counters = lesh::metrics::allocations();
 	const std::size_t heap_before = counters.heap_allocations;
-	const std::size_t growths_before = lesh::ui::history::history::scratch_growths();
+	const std::size_t growths_before = lesh::ui::history::store::scratch_growths();
 	const std::vector<reactor_batch> again = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 	EXPECT_EQ(counters.heap_allocations, heap_before);
-	EXPECT_EQ(lesh::ui::history::history::scratch_growths(), growths_before);
+	EXPECT_EQ(lesh::ui::history::store::scratch_growths(), growths_before);
 	EXPECT_EQ(again.size(), 1u);
 }
 

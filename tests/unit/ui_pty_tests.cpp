@@ -1,4 +1,4 @@
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 
 #include "temp_path.h"
 
@@ -562,8 +562,8 @@ TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 	// THE WIRING, END TO END (#193). A second store opened over the same data
 	// directory is a RESTART: it reads `history.new.log` the way the next shell
 	// would, so what this asserts on is what the user's next session will see.
-	lesh::ui::history::history store;
-	const lesh::ui::history::open_report report = store.open(home.history_dir());
+	lesh::ui::history::store storage;
+	const lesh::ui::history::open_report report = storage.open(home.history_dir());
 	ASSERT_FALSE(report.directory_unusable);
 	// EITHER TIER WILL DO, and it has to be said this way since #194: the
 	// countdown starts at a random value in `[0, 25)`, so the shell that just
@@ -575,7 +575,7 @@ TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 
 	std::vector<std::string> entries;
 	std::vector<std::int32_t> statuses;
-	store.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
+	storage.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
 		entries.emplace_back(reinterpret_cast<const char*>(one.what.cmd.data()),
 		                     one.what.cmd.size());
 		statuses.push_back(one.what.exit_code);
@@ -611,10 +611,10 @@ TEST(UiPty, ALeadingSpaceKeepsACommandOutOfTheHistoryFile) {
 		EXPECT_TRUE(shell.reap().has_value()) << "Ctrl-D did not end the session";
 	}
 
-	lesh::ui::history::history store;
-	ASSERT_FALSE(store.open(home.history_dir()).directory_unusable);
+	lesh::ui::history::store storage;
+	ASSERT_FALSE(storage.open(home.history_dir()).directory_unusable);
 	std::vector<std::string> entries;
-	store.for_each_newest_first([&](std::string_view entry) {
+	storage.for_each_newest_first([&](std::string_view entry) {
 		entries.emplace_back(entry);
 		return true;
 	});

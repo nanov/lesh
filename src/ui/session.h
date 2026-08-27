@@ -60,7 +60,7 @@ class engine;
 }
 
 namespace lesh::ui::history {
-class history;
+class store;
 }
 
 namespace lesh::ui {
@@ -68,9 +68,10 @@ namespace lesh::ui {
 // ONE NAME FOR THE STORE, and it exists to dodge a lookup, not to add a
 // vocabulary. `provider_bundle` below has a member called `history` - the read
 // side, #125's seam - and a member declaration inside that struct that said
-// `history::history` would find the MEMBER first and fail. The alias is
-// resolved out here, where `history` is unambiguously the namespace.
-using history_recorder = history::history;
+// `history::store` would find the MEMBER first and fail. The alias is
+// resolved out here, where `history` is unambiguously the namespace. (The
+// class was `history::history` until the namespace/class double was renamed.)
+using history_recorder = history::store;
 
 // ---------------------------------------------------------------------------
 // The four providers (#94, A-5).
@@ -231,7 +232,7 @@ struct provider_bundle {
 	// nothing is recorded - F-17's `vared`, and every test that must not write to
 	// the user's own history.
 	//
-	// USUALLY THE SAME OBJECT AS `history` ABOVE (#193): `ui::history::history`
+	// USUALLY THE SAME OBJECT AS `history` ABOVE (#193): `ui::history::store`
 	// IS a `history_source`, so the bundle points at one object twice, once per
 	// verb. They are two fields and not one because the read side is an override
 	// point - a user-supplied provider serves the searcher exactly as the

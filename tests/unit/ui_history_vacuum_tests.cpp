@@ -1,7 +1,7 @@
 #include "ui/history/vacuum.h"
 
 #include "ui/history/blob.h"
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 #include "ui/history/locking.h"
 #include "ui/history/log.h"
 
@@ -151,9 +151,9 @@ struct seen {
 }
 
 // Every command line the merge walk yields, newest first.
-[[nodiscard]] std::vector<std::string> walk(const history& store) {
+[[nodiscard]] std::vector<std::string> walk(const store& storage) {
 	std::vector<std::string> out;
-	static_cast<const lesh::ui::history_source&>(store).for_each_newest_first(
+	static_cast<const lesh::ui::history_source&>(storage).for_each_newest_first(
 		[&out](std::string_view entry) {
 			out.emplace_back(entry);
 			return true;
@@ -161,11 +161,11 @@ struct seen {
 	return out;
 }
 
-void run_command(history& store, std::string_view cmd, std::string_view cwd = "/tmp",
+void run_command(store& storage, std::string_view cmd, std::string_view cwd = "/tmp",
                  std::int32_t exit_code = 0) {
-	if (store.add(cmd, cwd) == add_status::rejected)
+	if (storage.add(cmd, cwd) == add_status::rejected)
 		return;
-	store.resolve_pending(exit_code);
+	storage.resolve_pending(exit_code);
 }
 
 [[nodiscard]] ::mode_t permissions_of(const std::string& path) {
@@ -250,11 +250,11 @@ TEST(UiHistoryVacuumMerge, AllThreeSourcesReachTheBlobAndTheLogIsEmptiedAfter) {
 	write_blob(data, older);
 	append_frame(log, record{.cmd = as_bytes("from the log"), .when = 200});
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, "from this session");
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, "from this session");
 
-	const vacuum_result done = store.vacuum_now();
+	const vacuum_result done = storage.vacuum_now();
 	ASSERT_EQ(done.status, vacuum_status::renamed);
 	EXPECT_EQ(done.records_written, 3u);
 	EXPECT_EQ(done.retries, 0u);
@@ -276,21 +276,21 @@ TEST(UiHistoryVacuumMerge, TheWalkIsUnchangedAndNewItemsIsEmptyAfterwards) {
 	// Both halves matter - the second is the whole point of the amendment, and
 	// the first is what makes it safe.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, "one");
-	run_command(store, "two");
-	run_command(store, "three");
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, "one");
+	run_command(storage, "two");
+	run_command(storage, "three");
 
-	const std::vector<std::string> before = walk(store);
+	const std::vector<std::string> before = walk(storage);
 	ASSERT_EQ(before, (std::vector<std::string>{"three", "two", "one"}));
 
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 
-	EXPECT_EQ(walk(store), before);
+	EXPECT_EQ(walk(storage), before);
 	// Every one of them is in the file now, so none of them needs to be in the
 	// deque - which is what stops `publish()` from being O(session) per command.
-	EXPECT_EQ(store.session_items(), 0u);
+	EXPECT_EQ(storage.session_items(), 0u);
 }
 
 TEST(UiHistoryVacuumMerge, DedupKeepsTheNewestRunWhole) {
@@ -310,12 +310,12 @@ TEST(UiHistoryVacuumMerge, DedupKeepsTheNewestRunWhole) {
 	}};
 	write_blob(data, older);
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
 	// The same command line, run again, from somewhere else, successfully.
-	run_command(store, "git status", "/new/place", 0);
+	run_command(storage, "git status", "/new/place", 0);
 
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 
 	const std::vector<seen> kept = blob_records(data);
 	ASSERT_EQ(kept.size(), 1u) << "the same command line twice is one record";
@@ -342,9 +342,9 @@ TEST(UiHistoryVacuumMerge, AnOlderRepeatDoesNotDragTheTimestampBackwards) {
 	                         .cwd = as_bytes("/ancient"),
 	                         .exit_code = 2});
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 
 	const std::vector<seen> kept = blob_records(data);
 	ASSERT_EQ(kept.size(), 1u);
@@ -444,12 +444,12 @@ TEST(UiHistoryVacuumMerge, AnEphemeralItemNeverReachesTheFile) {
 	// merged the whole deque instead of the writable part of it would write a
 	// secret to disk twenty-five commands after the user typed it.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, " a secret");
-	run_command(store, "not a secret");
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, " a secret");
+	run_command(storage, "not a secret");
 
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 	EXPECT_EQ(blob_commands(scratch.file("history.data")),
 	          (std::vector<std::string>{"not a secret"}));
 }
@@ -463,19 +463,19 @@ TEST(UiHistoryVacuumMerge, ADirectoryItCannotWriteGivesUpAndKeepsEverything) {
 	ASSERT_EQ(::mkdir(dir.c_str(), 0700), 0);
 	ASSERT_EQ(::chmod(dir.c_str(), 0500), 0);
 
-	history store;
-	const open_report report = store.open(dir);
+	store storage;
+	const open_report report = storage.open(dir);
 	ASSERT_FALSE(report.directory_unusable);
 	ASSERT_FALSE(report.log_writable) << "the fixture needs an unwritable directory";
 
-	run_command(store, "nowhere to write this");
-	EXPECT_EQ(store.unwritable_items(), 1u);
+	run_command(storage, "nowhere to write this");
+	EXPECT_EQ(storage.unwritable_items(), 1u);
 
-	const vacuum_result done = store.vacuum_now();
+	const vacuum_result done = storage.vacuum_now();
 	EXPECT_EQ(done.status, vacuum_status::gave_up);
 	// Still in memory, still walkable, and no `history.data` invented beside
 	// it: nothing was lost and nothing was claimed.
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"nowhere to write this"}));
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"nowhere to write this"}));
 	EXPECT_TRUE(read_file(scratch.file("ro/history.data")).empty());
 
 	::chmod(dir.c_str(), 0700);
@@ -498,10 +498,10 @@ TEST(UiHistoryVacuumOwnership, TheModeOfTheOriginalSurvivesTheRewrite) {
 	write_blob(data, older);
 	ASSERT_EQ(::chmod(data.c_str(), 0640), 0);
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, "newer");
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, "newer");
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 
 	EXPECT_EQ(permissions_of(data), 0640u)
 		<< "the rewritten file is a new inode and must wear the old one's mode";
@@ -515,10 +515,10 @@ TEST(UiHistoryVacuumOwnership, AFirstVacuumWritesSixHundred) {
 	const scoped_umask relaxed{0};
 	const lesh::testing::temp_path scratch;
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, "the very first command");
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, "the very first command");
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 
 	EXPECT_EQ(permissions_of(scratch.file("history.data")), 0600u);
 }
@@ -533,19 +533,19 @@ TEST(UiHistoryVacuumTemp, NothingIsLeftBehindOnSuccessOnRefusalOrOnGivingUp) {
 	// world-readable-by-accident file that nothing will ever clean up.
 	{
 		const lesh::testing::temp_path scratch;
-		history store;
-		ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-		run_command(store, "echo hi");
-		ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
+		store storage;
+		ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+		run_command(storage, "echo hi");
+		ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
 		EXPECT_TRUE(temp_files(scratch.dir()).empty());
 	}
 	{
 		const lesh::testing::temp_path scratch;
 		write_file(scratch.file("history.data"), foreign_blob());
-		history store;
-		ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-		run_command(store, "echo hi");
-		ASSERT_EQ(store.vacuum_now().status, vacuum_status::refused);
+		store storage;
+		ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+		run_command(storage, "echo hi");
+		ASSERT_EQ(storage.vacuum_now().status, vacuum_status::refused);
 		EXPECT_TRUE(data_siblings(scratch.dir()).empty())
 			<< "a refusal creates nothing at all, not even a temp to remove";
 	}
@@ -668,20 +668,20 @@ TEST(UiHistoryVacuumRace, AnAppendThatLandsDuringTheRewriteIsNotTruncatedAway) {
 	const std::string data = scratch.file("history.data");
 	const std::string log = scratch.file("history.new.log");
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
-	run_command(store, "ours");
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
+	run_command(storage, "ours");
 
 	bool appended = false;
-	store.set_vacuum_hook([&](vacuum_step step) {
+	storage.set_vacuum_hook([&](vacuum_step step) {
 		if (step != vacuum_step::temp_built || appended)
 			return;
 		appended = true;
 		append_frame(log, record{.cmd = as_bytes("a sibling's command"), .when = 999});
 	});
 
-	ASSERT_EQ(store.vacuum_now().status, vacuum_status::renamed);
-	store.set_vacuum_hook(nullptr);
+	ASSERT_EQ(storage.vacuum_now().status, vacuum_status::renamed);
+	storage.set_vacuum_hook(nullptr);
 
 	// The blob does not have it - it landed after the merge, by construction.
 	EXPECT_EQ(blob_commands(data), (std::vector<std::string>{"ours"}));
@@ -693,7 +693,7 @@ TEST(UiHistoryVacuumRace, AnAppendThatLandsDuringTheRewriteIsNotTruncatedAway) {
 
 	// And a fresh session sees both, which is what the user actually cares
 	// about.
-	history reopened;
+	store reopened;
 	(void)reopened.open(scratch.dir());
 	const std::vector<std::string> seen_now = walk(reopened);
 	EXPECT_NE(std::find(seen_now.begin(), seen_now.end(), "ours"), seen_now.end());
@@ -717,14 +717,14 @@ TEST(UiHistoryVacuumCorrupt, OursAndBrokenIsMovedAsideAndRebuilt) {
 	const std::vector<std::byte> broken = corrupt_blob();
 	write_file(data, broken);
 
-	history store;
-	const open_report report = store.open(scratch.dir());
+	store storage;
+	const open_report report = storage.open(scratch.dir());
 	ASSERT_FALSE(report.tier1_mapped);
 	ASSERT_TRUE(report.tier1_corrupt);
-	ASSERT_TRUE(store.may_rewrite_tier1());
-	run_command(store, "a command worth keeping");
+	ASSERT_TRUE(storage.may_rewrite_tier1());
+	run_command(storage, "a command worth keeping");
 
-	const vacuum_result done = store.vacuum_now();
+	const vacuum_result done = storage.vacuum_now();
 	ASSERT_EQ(done.status, vacuum_status::renamed);
 	ASSERT_TRUE(done.corrupt_moved_aside);
 
@@ -747,17 +747,17 @@ TEST(UiHistoryVacuumCorrupt, AnUnknownIdentifierIsNotMovedAsideAndNotRebuilt) {
 	const std::vector<std::byte> theirs = foreign_blob();
 	write_file(data, theirs);
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).tier1_untouchable);
-	ASSERT_FALSE(store.may_rewrite_tier1());
-	run_command(store, "echo hi");
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).tier1_untouchable);
+	ASSERT_FALSE(storage.may_rewrite_tier1());
+	run_command(storage, "echo hi");
 
-	const vacuum_result done = store.vacuum_now();
+	const vacuum_result done = storage.vacuum_now();
 	EXPECT_EQ(done.status, vacuum_status::refused);
 	EXPECT_FALSE(done.corrupt_moved_aside);
 	EXPECT_EQ(read_file(data), theirs) << "byte for byte, or the rule means nothing";
 	// The session is not damaged by the refusal: it runs on Tier 2 and memory.
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"echo hi"}));
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"echo hi"}));
 	EXPECT_EQ(log_commands(scratch.file("history.new.log")),
 	          (std::vector<std::string>{"echo hi"}));
 }
@@ -771,17 +771,17 @@ TEST(UiHistoryVacuumCorrupt, AFileThatBecomesForeignMidRewriteIsStillRefused) {
 	const record ours[] = {record{.cmd = as_bytes("ours"), .when = 1}};
 	write_blob(data, ours);
 
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).tier1_mapped);
-	ASSERT_TRUE(store.may_rewrite_tier1());
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).tier1_mapped);
+	ASSERT_TRUE(storage.may_rewrite_tier1());
 
 	const std::vector<std::byte> theirs = foreign_blob();
-	store.set_vacuum_hook([&](vacuum_step step) {
+	storage.set_vacuum_hook([&](vacuum_step step) {
 		if (step == vacuum_step::target_opened)
 			write_file(data, theirs);
 	});
-	const vacuum_result done = store.vacuum_now();
-	store.set_vacuum_hook(nullptr);
+	const vacuum_result done = storage.vacuum_now();
+	storage.set_vacuum_hook(nullptr);
 
 	EXPECT_EQ(done.status, vacuum_status::refused);
 	EXPECT_EQ(read_file(data), theirs);
@@ -827,19 +827,19 @@ void crash_at(const std::string& dir, vacuum_step stop_at) {
 	const ::pid_t child = ::fork();
 	ASSERT_GE(child, 0) << "fork failed: " << std::strerror(errno);
 	if (child == 0) {
-		history store;
-		(void)store.open(dir);
+		store storage;
+		(void)storage.open(dir);
 		// `add(pending=false)` plus `save()` and NOT `resolve_pending`, which
 		// would run the countdown - and a countdown that starts at zero one
 		// time in twenty-five would have vacuumed before the hook was set.
 		// The step under test has to be the first vacuum this child runs.
-		(void)store.add("session", "/tmp", false);
-		(void)store.save();
-		store.set_vacuum_hook([stop_at](vacuum_step step) {
+		(void)storage.add("session", "/tmp", false);
+		(void)storage.save();
+		storage.set_vacuum_hook([stop_at](vacuum_step step) {
 			if (step == stop_at)
 				::_exit(70);
 		});
-		(void)store.vacuum_now();
+		(void)storage.vacuum_now();
 		::_exit(0);
 	}
 	int status = 0;
@@ -865,7 +865,7 @@ TEST(UiHistoryVacuumCrash, NoResolvedCommandIsLostAtAnyStep) {
 		if (::testing::Test::HasFatalFailure())
 			return;
 
-		history reopened;
+		store reopened;
 		const open_report report = reopened.open(scratch.dir());
 		EXPECT_FALSE(report.tier1_untouchable)
 			<< "step " << static_cast<int>(step) << " left a file we refuse to touch";
@@ -901,23 +901,23 @@ TEST(UiHistoryVacuumCountdown, ItFiresWithinOnePeriodAndThenEveryPeriod) {
 	// happened by the end of the first period, and exactly one more by the end
 	// of the second.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
 
 	for (int at = 0; at < k_vacuum_frequency; ++at)
-		run_command(store, "command " + std::to_string(at));
-	const std::size_t after_one_period = store.vacuums();
+		run_command(storage, "command " + std::to_string(at));
+	const std::size_t after_one_period = storage.vacuums();
 	EXPECT_EQ(after_one_period, 1u);
 
 	for (int at = 0; at < k_vacuum_frequency; ++at)
-		run_command(store, "later " + std::to_string(at));
-	EXPECT_EQ(store.vacuums(), 2u);
+		run_command(storage, "later " + std::to_string(at));
+	EXPECT_EQ(storage.vacuums(), 2u);
 
 	// And the vacuums were real ones - the countdown is not just a counter.
 	// Not an assertion on the FILE's size, because where in the second period
 	// the second rewrite landed is exactly the random part: the commands after
 	// it are in the log, and the walk is what unites the two.
-	EXPECT_EQ(walk(store).size(), static_cast<std::size_t>(2 * k_vacuum_frequency));
+	EXPECT_EQ(walk(storage).size(), static_cast<std::size_t>(2 * k_vacuum_frequency));
 	EXPECT_FALSE(blob_commands(scratch.file("history.data")).empty());
 }
 
@@ -926,22 +926,22 @@ TEST(UiHistoryVacuumCountdown, AnEphemeralCommandIsNotAnAppendAndDoesNotCount) {
 	// cadence that counted them would depend on how many secrets the user
 	// typed, which is both wrong and a small side channel.
 	const lesh::testing::temp_path scratch;
-	history store;
-	ASSERT_TRUE(store.open(scratch.dir()).log_writable);
+	store storage;
+	ASSERT_TRUE(storage.open(scratch.dir()).log_writable);
 
 	for (int at = 0; at < 4 * k_vacuum_frequency; ++at)
-		run_command(store, " secret " + std::to_string(at));
-	EXPECT_EQ(store.vacuums(), 0u);
+		run_command(storage, " secret " + std::to_string(at));
+	EXPECT_EQ(storage.vacuums(), 0u);
 }
 
 TEST(UiHistoryVacuumCountdown, AMemoryOnlyHistoryNeverVacuums) {
 	// No `open`, no directory, nothing to rewrite - which is what `vared` and
 	// most of the suite hold. The guard is in `maybe_vacuum` so that this stays
 	// true however many commands go through it.
-	history store;
+	store storage;
 	for (int at = 0; at < 3 * k_vacuum_frequency; ++at)
-		run_command(store, "command " + std::to_string(at));
-	EXPECT_EQ(store.vacuums(), 0u);
+		run_command(storage, "command " + std::to_string(at));
+	EXPECT_EQ(storage.vacuums(), 0u);
 }
 
 // ===========================================================================

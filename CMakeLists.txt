@@ -298,8 +298,8 @@ add_library(lesh_ui STATIC
 	src/ui/history_search.h
 	src/ui/history/blob.cpp
 	src/ui/history/blob.h
-	src/ui/history/history.cpp
-	src/ui/history/history.h
+	src/ui/history/store.cpp
+	src/ui/history/store.h
 	src/ui/history/history_generated.h
 	src/ui/history/locking.cpp
 	src/ui/history/locking.h

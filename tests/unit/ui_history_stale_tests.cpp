@@ -1,4 +1,4 @@
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 
 #include "ui/history/blob.h"
 #include "ui/history/locking.h"
@@ -76,9 +76,9 @@ namespace {
 	return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
-[[nodiscard]] std::vector<std::string> walk(const history& store) {
+[[nodiscard]] std::vector<std::string> walk(const store& storage) {
 	std::vector<std::string> out;
-	static_cast<const lesh::ui::history_source&>(store).for_each_newest_first(
+	static_cast<const lesh::ui::history_source&>(storage).for_each_newest_first(
 		[&out](std::string_view entry) {
 			out.emplace_back(entry);
 			return true;
@@ -96,15 +96,15 @@ namespace {
 // otherwise truncate the log, replace `history.data` and fire the watch, and
 // this file would be right most of the time. `UiHistoryVacuum*` drives the
 // rewrite directly.
-[[nodiscard]] open_report open_quietly(history& store, const std::string& directory) {
-	store.set_automatic_vacuum(false);
-	return store.open(directory);
+[[nodiscard]] open_report open_quietly(store& storage, const std::string& directory) {
+	storage.set_automatic_vacuum(false);
+	return storage.open(directory);
 }
 
-void run_command(history& store, std::string_view cmd, std::string_view cwd = "/tmp") {
-	if (store.add(cmd, cwd) == add_status::rejected)
+void run_command(store& storage, std::string_view cmd, std::string_view cwd = "/tmp") {
+	if (storage.add(cmd, cwd) == add_status::rejected)
 		return;
-	store.resolve_pending(0);
+	storage.resolve_pending(0);
 }
 
 void write_file(const std::string& path, std::span<const std::byte> bytes) {
@@ -153,17 +153,17 @@ void vacuum_stand_in(const std::string& directory, std::span<const record> newes
 // creation wakes it once before the rename does, and that first wake is a
 // `stat` that finds nothing changed. And a notification is asynchronous: the
 // kernel owes us the event, not the moment.
-[[nodiscard]] bool drain_until_reloaded(history& store, int budget_ms = 5000) {
-	const std::size_t before = store.reloads();
+[[nodiscard]] bool drain_until_reloaded(store& storage, int budget_ms = 5000) {
+	const std::size_t before = storage.reloads();
 	const auto deadline =
 		std::chrono::steady_clock::now() + std::chrono::milliseconds{budget_ms};
 	while (std::chrono::steady_clock::now() < deadline) {
 		struct ::pollfd waiting {};
-		waiting.fd = store.watch_fd();
+		waiting.fd = storage.watch_fd();
 		waiting.events = POLLIN;
 		if (::poll(&waiting, 1, 50) > 0 && (waiting.revents & POLLIN) != 0)
-			store.drain_watch();
-		if (store.reloads() > before)
+			storage.drain_watch();
+		if (storage.reloads() > before)
 			return true;
 	}
 	return false;
@@ -208,7 +208,7 @@ TEST_F(UiHistoryStaleWatch, ASiblingsVacuumIsSeenWithNoWriteOnOurSide) {
 	}
 
 	// The reader: opens, maps, and from here on types nothing.
-	history reader;
+	store reader;
 	const open_report report = open_quietly(reader, dir);
 	ASSERT_TRUE(report.tier1_mapped);
 	ASSERT_TRUE(report.watching) << "no watch, no test";
@@ -218,7 +218,7 @@ TEST_F(UiHistoryStaleWatch, ASiblingsVacuumIsSeenWithNoWriteOnOurSide) {
 
 	// THE SECOND INSTANCE - another terminal on the same directory - records two
 	// commands and then vacuums them into Tier 1.
-	history sibling;
+	store sibling;
 	ASSERT_FALSE(open_quietly(sibling, dir).directory_unusable);
 	run_command(sibling, "sibling one");
 	run_command(sibling, "sibling two");
@@ -249,8 +249,8 @@ TEST_F(UiHistoryStaleWatch, ASiblingsVacuumIsSeenWithNoWriteOnOurSide) {
 TEST_F(UiHistoryStaleWatch, AChangeToSomethingElseInTheDirectoryIsNotAReload) {
 	// The watch is on the directory, so every sibling's temp file wakes every
 	// terminal on the machine. The `stat` is what turns that into nothing.
-	history store;
-	const open_report report = open_quietly(store, _temp.dir());
+	store storage;
+	const open_report report = open_quietly(storage, _temp.dir());
 	ASSERT_TRUE(report.watching);
 
 	write_file(_temp.dir() + "/somebody-elses-file", as_bytes("hello"));
@@ -260,32 +260,32 @@ TEST_F(UiHistoryStaleWatch, AChangeToSomethingElseInTheDirectoryIsNotAReload) {
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{300};
 	while (std::chrono::steady_clock::now() < deadline) {
 		struct ::pollfd waiting {};
-		waiting.fd = store.watch_fd();
+		waiting.fd = storage.watch_fd();
 		waiting.events = POLLIN;
 		if (::poll(&waiting, 1, 20) > 0 && (waiting.revents & POLLIN) != 0)
-			store.drain_watch();
+			storage.drain_watch();
 	}
-	EXPECT_EQ(store.reloads(), 0u);
-	EXPECT_FALSE(store.reload_needed());
+	EXPECT_EQ(storage.reloads(), 0u);
+	EXPECT_FALSE(storage.reload_needed());
 }
 
 TEST_F(UiHistoryStaleWatch, AMemoryOnlyHistoryWatchesNothing) {
 	// The state `vared` and every unit test that must not touch the developer's
 	// own history runs in: no directory, so no descriptor for the loop to poll,
 	// and the topic simply does not exist.
-	history store;
-	EXPECT_EQ(store.watch_fd(), -1);
-	store.drain_watch();
-	EXPECT_EQ(store.reloads(), 0u);
+	store storage;
+	EXPECT_EQ(storage.watch_fd(), -1);
+	storage.drain_watch();
+	EXPECT_EQ(storage.reloads(), 0u);
 }
 
 TEST_F(UiHistoryStaleWatch, TheWatchDescriptorIsNotInheritedByChildren) {
 	// This is a shell: it forks and execs on every command line. A notification
 	// descriptor leaking into every child is both a leak and a way for a child to
 	// hold a reference on the user's data directory.
-	history store;
-	ASSERT_TRUE(open_quietly(store, _temp.dir()).watching);
-	const int flags = ::fcntl(store.watch_fd(), F_GETFD);
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, _temp.dir()).watching);
+	const int flags = ::fcntl(storage.watch_fd(), F_GETFD);
 	ASSERT_NE(flags, -1);
 	EXPECT_NE(flags & FD_CLOEXEC, 0);
 }
@@ -303,18 +303,18 @@ TEST_F(UiHistoryStaleAppend, AnAppendNoticesASiblingsVacuumWithoutTheWatch) {
 	const record was[] = {record_for(first, 100)};
 	vacuum_stand_in(dir, was);
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, dir).tier1_mapped);
-	ASSERT_EQ(walk(store), (std::vector<std::string>{"the old one"}));
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, dir).tier1_mapped);
+	ASSERT_EQ(walk(storage), (std::vector<std::string>{"the old one"}));
 
 	const std::string fresh = "a sibling's command";
 	const record now[] = {record_for(fresh, 200), record_for(first, 100)};
 	vacuum_stand_in(dir, now);
 
 	// One command typed here, and the check runs on its append.
-	run_command(store, "mine");
-	EXPECT_EQ(store.reloads(), 1u);
-	EXPECT_EQ(walk(store),
+	run_command(storage, "mine");
+	EXPECT_EQ(storage.reloads(), 1u);
+	EXPECT_EQ(walk(storage),
 	          (std::vector<std::string>{"mine", "a sibling's command", "the old one"}));
 }
 
@@ -326,16 +326,16 @@ TEST_F(UiHistoryStaleAppend, AnAppendGoesToTheFileThatIsAtThePathAndNotToAnOrpha
 	const std::string dir = _temp.dir();
 	const std::string log = dir + "/history.new.log";
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, dir).log_writable);
-	run_command(store, "before");
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, dir).log_writable);
+	run_command(storage, "before");
 
 	// The sibling's vacuum, as far as the log is concerned: the old inode is
 	// gone and a new, empty file has the name.
 	ASSERT_EQ(::unlink(log.c_str()), 0);
 	write_file(log, {});
 
-	run_command(store, "after");
+	run_command(storage, "after");
 
 	const std::vector<std::byte> bytes = read_file(log);
 	std::vector<std::string> framed;
@@ -343,22 +343,22 @@ TEST_F(UiHistoryStaleAppend, AnAppendGoesToTheFileThatIsAtThePathAndNotToAnOrpha
 	               [&framed](const record& one) { framed.push_back(as_text(one.cmd)); });
 	EXPECT_EQ(framed, (std::vector<std::string>{"after"}))
 		<< "the frame went to the orphaned inode";
-	EXPECT_EQ(store.unwritable_items(), 0u);
+	EXPECT_EQ(storage.unwritable_items(), 0u);
 }
 
 TEST_F(UiHistoryStaleAppend, AFlushWithNothingToWriteTouchesNothing) {
 	// `save()` and `resolve_pending` both call `flush` unconditionally, and the
 	// append path is four syscalls. An `exit` typed at a prompt must not open and
 	// lock the log to write nothing.
-	history store;
-	ASSERT_TRUE(open_quietly(store, _temp.dir()).log_writable);
-	run_command(store, "one");
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, _temp.dir()).log_writable);
+	run_command(storage, "one");
 
 	const std::uint64_t locks_after_one_command = test_hooks::lock_attempts();
 	ASSERT_GT(locks_after_one_command, 0u) << "the append is supposed to lock";
 
-	EXPECT_TRUE(store.save());
-	EXPECT_TRUE(store.save());
+	EXPECT_TRUE(storage.save());
+	EXPECT_TRUE(storage.save());
 	EXPECT_EQ(test_hooks::lock_attempts(), locks_after_one_command);
 }
 
@@ -511,7 +511,7 @@ TEST_F(UiHistoryStaleRemote, AHeapBufferYieldsExactlyTheSameRecords) {
 		write_file(_temp.dir() + "/history.data", other.build(written));
 	}
 
-	history mapped;
+	store mapped;
 	ASSERT_TRUE(open_quietly(mapped, mapped_dir.dir()).tier1_mapped);
 	EXPECT_FALSE(mapped.tier1_copied());
 	EXPECT_GT(test_hooks::lock_attempts(), 0u)
@@ -520,7 +520,7 @@ TEST_F(UiHistoryStaleRemote, AHeapBufferYieldsExactlyTheSameRecords) {
 	// FROM ZERO, so the count below is the remote history's alone.
 	test_hooks::reset_locking_state();
 	test_hooks::set_remoteness_override(remoteness::remote);
-	history copied;
+	store copied;
 	const open_report report = open_quietly(copied, _temp.dir());
 	EXPECT_TRUE(report.directory_remote);
 	EXPECT_TRUE(report.tier1_mapped) << "remote or not, Tier 1 is readable";
@@ -540,25 +540,25 @@ TEST_F(UiHistoryStaleRemote, ARemoteBlobIsVerifiedLikeAnyOther) {
 	write_file(_temp.dir() + "/history.data", as_bytes("not a flatbuffer at all"));
 
 	test_hooks::set_remoteness_override(remoteness::remote);
-	history store;
-	const open_report report = open_quietly(store, _temp.dir());
+	store storage;
+	const open_report report = open_quietly(storage, _temp.dir());
 	EXPECT_FALSE(report.tier1_mapped);
 	EXPECT_TRUE(report.tier1_untouchable) << "a file that is not ours is never rewritten";
-	EXPECT_FALSE(store.may_rewrite_tier1());
-	EXPECT_TRUE(walk(store).empty());
+	EXPECT_FALSE(storage.may_rewrite_tier1());
+	EXPECT_TRUE(walk(storage).empty());
 }
 
 TEST_F(UiHistoryStaleRemote, AnEmptyAndAMissingTierOneAreBothFineWhenRemote) {
 	// The first run of a shell whose home is on NFS. Neither is damage and
 	// neither is an error.
 	test_hooks::set_remoteness_override(remoteness::remote);
-	history missing;
+	store missing;
 	EXPECT_FALSE(open_quietly(missing, _temp.dir()).tier1_mapped);
 	EXPECT_TRUE(walk(missing).empty());
 
 	lesh::testing::temp_path empty_dir;
 	write_file(empty_dir.dir() + "/history.data", {});
-	history empty;
+	store empty;
 	EXPECT_TRUE(open_quietly(empty, empty_dir.dir()).tier1_mapped);
 	EXPECT_TRUE(walk(empty).empty());
 }
@@ -569,22 +569,22 @@ TEST_F(UiHistoryStaleRemote, ARemoteHistoryStillRecordsAndStillReloads) {
 	test_hooks::set_remoteness_override(remoteness::remote);
 	const std::string dir = _temp.dir();
 
-	history store;
-	const open_report report = open_quietly(store, dir);
+	store storage;
+	const open_report report = open_quietly(storage, dir);
 	ASSERT_TRUE(report.directory_remote);
 	ASSERT_TRUE(report.log_writable);
 
-	run_command(store, "typed here");
-	EXPECT_EQ(store.unwritable_items(), 0u);
+	run_command(storage, "typed here");
+	EXPECT_EQ(storage.unwritable_items(), 0u);
 
 	const std::string theirs = "typed over there";
 	const record after[] = {record_for(theirs, 400)};
 	vacuum_stand_in(dir, after);
 
-	run_command(store, "typed here again");
-	EXPECT_GE(store.reloads(), 1u);
-	EXPECT_TRUE(store.tier1_copied());
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"typed here again", "typed here",
+	run_command(storage, "typed here again");
+	EXPECT_GE(storage.reloads(), 1u);
+	EXPECT_TRUE(storage.tier1_copied());
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"typed here again", "typed here",
 	                                                 "typed over there"}));
 	EXPECT_EQ(test_hooks::lock_attempts(), 0u);
 }
@@ -594,10 +594,10 @@ TEST_F(UiHistoryStaleRemote, ARemoteHistoryStillRecordsAndStillReloads) {
 // ===========================================================================
 
 TEST_F(UiHistoryStaleWatch, IncorporatingWithNothingPendingIsANoOp) {
-	history store;
-	ASSERT_FALSE(open_quietly(store, _temp.dir()).directory_unusable);
-	store.incorporate_external_changes();
-	EXPECT_EQ(store.reloads(), 0u);
+	store storage;
+	ASSERT_FALSE(open_quietly(storage, _temp.dir()).directory_unusable);
+	storage.incorporate_external_changes();
+	EXPECT_EQ(storage.reloads(), 0u);
 }
 
 TEST_F(UiHistoryStaleWatch, AReloadReAsksWhetherTierOneMayBeRewritten) {
@@ -607,18 +607,18 @@ TEST_F(UiHistoryStaleWatch, AReloadReAsksWhetherTierOneMayBeRewritten) {
 	const std::string dir = _temp.dir();
 	write_file(dir + "/history.data", as_bytes("SOMEBODY ELSE'S FILE ENTIRELY"));
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, dir).tier1_untouchable);
-	ASSERT_FALSE(store.may_rewrite_tier1());
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, dir).tier1_untouchable);
+	ASSERT_FALSE(storage.may_rewrite_tier1());
 
 	// Some other lesh renames a real blob over it.
 	const std::string cmd = "ours now";
 	const record ours[] = {record_for(cmd, 100)};
 	vacuum_stand_in(dir, ours);
 
-	ASSERT_TRUE(drain_until_reloaded(store)) << "the watch never fired";
-	EXPECT_TRUE(store.may_rewrite_tier1());
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"ours now"}));
+	ASSERT_TRUE(drain_until_reloaded(storage)) << "the watch never fired";
+	EXPECT_TRUE(storage.may_rewrite_tier1());
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"ours now"}));
 }
 
 TEST_F(UiHistoryStaleWatch, AVanishedTierOneIsAReloadIntoNothingAndNotACrash) {
@@ -627,11 +627,11 @@ TEST_F(UiHistoryStaleWatch, AVanishedTierOneIsAReloadIntoNothingAndNotACrash) {
 	const record was[] = {record_for(cmd, 100)};
 	vacuum_stand_in(dir, was);
 
-	history store;
-	ASSERT_TRUE(open_quietly(store, dir).tier1_mapped);
+	store storage;
+	ASSERT_TRUE(open_quietly(storage, dir).tier1_mapped);
 	ASSERT_EQ(::unlink((dir + "/history.data").c_str()), 0);
 
-	run_command(store, "mine");
-	EXPECT_EQ(store.reloads(), 1u);
-	EXPECT_EQ(walk(store), (std::vector<std::string>{"mine"}));
+	run_command(storage, "mine");
+	EXPECT_EQ(storage.reloads(), 1u);
+	EXPECT_EQ(walk(storage), (std::vector<std::string>{"mine"}));
 }

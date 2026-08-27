@@ -5,7 +5,7 @@
 #include "leshper/registry.h"
 #include "ui/completion.h"
 #include "ui/editor_host.h"
-#include "ui/history/history.h"
+#include "ui/history/store.h"
 #include "ui/loop.h"
 #include "ui/prompt/prompt.h"
 #include "ui/reactors.h"
@@ -1156,11 +1156,11 @@ int run_interactive_shell(runtime::shell_state& state, buffer_pool& pool,
 	// #113's `runtime::history_store` and `~/.lesh_history` are wired to nothing
 	// from here on. The class stays in the tree, compiling and tested, as the
 	// historical implementation (ADR-0010 §Placement).
-	std::optional<history::history> own_history;
+	std::optional<history::store> own_history;
 	const vector_history_source empty_history;
 	provider_bundle providers = given;
 	if (providers.history == nullptr && providers.recorder == nullptr) {
-		if (const std::optional<std::string> dir = history::history::default_data_directory()) {
+		if (const std::optional<std::string> dir = history::store::default_data_directory()) {
 			own_history.emplace();
 			(void)own_history->open(*dir);
 		}
