@@ -216,13 +216,26 @@ Amended by #194, five points, all in `src/ui/history/vacuum.{h,cpp}`:
   otherwise have its frame deleted without it ever reaching the blob — the one
   path in this design that could lose a resolved command. Unequal → leave the
   log alone; the duplicates are the next vacuum's problem.
-- **Locking is `src/ui/history/locking.{h,cpp}`** (`lock_exclusive`, `unlock`,
-  `file_id_of_fd`, `file_id_of_path`, `file_id_equal`) — straightforward
-  `flock`/`stat` bodies, with #195 to fill in the 0.25 s give-up, the
-  `abandoned_locking` latch and the remote-filesystem refusal behind the same
-  four names. The periodic rewrite can be switched off
-  (`set_automatic_vacuum`, fish's `disable_automatic_saving`), which is what
-  makes every other suite's assertions about the files deterministic.
+- **The periodic rewrite can be switched off** — `set_automatic_vacuum`,
+  fish's `disable_automatic_saving`. The countdown starting random in
+  `[0, 25)` is a correctness property (a shell used for twenty commands and
+  closed must still eventually vacuum) and a menace to every other suite: one
+  command in twenty-five moves the frames those tests assert about out of the
+  log and into `history.data`. `UiHistoryVacuum*` drives `vacuum_now()`
+  directly; every other suite that opens a real directory turns the periodic
+  rewrite off. `vacuum_request::cap` and `::max_tries` are knobs for the same
+  reason — reaching the 256 Ki cap or 1024 retries honestly is a benchmark,
+  not a unit test.
+
+Locking is `src/ui/history/locking.{h,cpp}`, the seam #194 and #195 share.
+#194 was written against a stub of it and #195 landed first, so the merge takes
+#195's bodies: `file_id_t` with `k_invalid_file_id` for a failed `stat`, the
+0.25 s give-up, the process-wide `abandoned_locking` latch and the
+remote-filesystem refusal. One behaviour changed hands — `file_id_equal` says
+**two failed `stat`s are NOT a match**, where the stub called them equal. The
+vacuum's step 3 is unaffected: "the target is gone" was always its own
+disjunct, and it, not the comparison, is what lets a first vacuum on a fresh
+machine proceed.
 
 `save()` on interactive exit flushes unwritten items to the log and does not
 vacuum. `~History` munmaps and closes everything (ADR-0007: the gate is "count
