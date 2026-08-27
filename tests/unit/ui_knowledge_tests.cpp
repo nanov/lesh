@@ -6,7 +6,8 @@
 #include "runtime/shell_state.h"
 #include "substrate/arena.h"
 #include "syntax/parser.h"
-#include "ui/shell_actor.h"
+#include "ui/loop.h"
+#include "ui/shell_side.h"
 #include "ui/shell_state_knowledge.h"
 #include "ui/workers.h"
 
@@ -43,11 +44,13 @@ using lesh::testing::scoped_env_path;
 //   standing between the highlighter and the shell, and faking it here would
 //   leave the one join nobody had checked.
 //
-//   `shell_actor` - the thing that puts the knowledge on a token (#151). It was
-//   the loop, and the token build on the far side dropped the field, which is
-//   why `exit` and `bind` painted red in a real shell while every test passed.
-//   `shell_writing_flag` turns ADR-0009's rule into an assertion that can fire,
-//   with a death test that fires it.
+//   `event_loop` - the thing that puts the knowledge on a token. It was the
+//   loop, then `shell_actor` (#151), and it is the loop again (#201) - the
+//   difference being that the pointer now arrives WITH THE SHELL at
+//   `attach_shell` instead of being copied across a thread, which is the copy
+//   that dropped the field and made `exit` and `bind` paint red in a real shell
+//   while every test passed. `shell_writing_flag` turns ADR-0009's rule into an
+//   assertion that can fire, with a death test that fires it.
 //
 // The layers BELOW these - the ABI verb and the highlighter's classes - are
 // `ui_command_kind_tests.cpp`, which drives the ABI verb over a fake host.
@@ -214,13 +217,13 @@ TEST(UiKnowledge, TheAdapterAnswersTheVerbEndToEnd) {
 }
 
 // ---------------------------------------------------------------------------
-// The actor's stamp (#151).
+// The loop's stamp (#151, #201).
 // ---------------------------------------------------------------------------
 
 namespace {
 
 // A `shell_side` with nothing behind it. These tests are about the token the
-// actor MINTS, not about anything it runs.
+// loop MINTS, not about anything it runs.
 class idle_shell final : public shell_side {
 public:
 	std::int32_t execute(std::string_view) override { return 0; }
@@ -229,7 +232,9 @@ public:
 
 // A shell that breaks ADR-0009 deliberately: it reads the tables from inside
 // `execute`, which is the one moment the rule forbids. Nothing in the tree does
-// this; it exists so that the tripwire has something to trip on.
+// this; it exists so that the tripwire has something to trip on. It is no less
+// forbidden for being on one thread - what the rule is about is a table being
+// read mid-rewrite, not which thread is doing the reading.
 class reading_shell final : public shell_side {
 public:
 	explicit reading_shell(const shell_knowledge& knowledge) noexcept
@@ -247,24 +252,41 @@ private:
 	const shell_knowledge* _knowledge;
 };
 
-// Runs one reactor through the actor's `highlight` slot and answers the probe.
-void serve_one_highlight(shell_actor& actor, probe& asked) {
-	lesh::leshper::state s;
-	s.gen.bump();
-	request_snapshot asking = snapshot_of(s, LESH_EVENT_BUFFER_CHANGED);
-	// THE LOOP DOES NOT FILL THIS IN, and that is the whole change: what the
-	// shell knows is not something the loop knows about the shell.
-	EXPECT_EQ(asking.host, nullptr);
-	actor.post_highlight("probe", &probe_reactor, &asked, std::move(asking));
-	ASSERT_TRUE(actor.serve_one());
-	std::vector<shell_message> inbox;
-	EXPECT_EQ(actor.replies().drain(inbox), 1u);
-	actor.replies().recycle(inbox);
+// A loop over a pipe with the shell attached, its shell-state reactor named
+// `probe`, and one keystroke put through it.
+//
+// THE SEAM UNDER TEST IS THE MINT (#201). `shell_actor::serve_one` was what this
+// used to drive; the reactor runs inside `notify_reactors` now, so the way to
+// reach it is a buffer change - which is also the only way a real session ever
+// reaches it.
+void run_one_shell_reactor(shell_side& shell, const lesh::leshper::host* host, probe& asked,
+                           shell_writing_flag* writing = nullptr) {
+	lesh::testing::fake_tty tty;
+	registry reg;
+	ASSERT_EQ(lesh_reactor_register(&reg, "probe", LESH_EVENT_BUFFER_CHANGED,
+	                                &probe_reactor, &asked),
+	          LESH_OK);
+
+	loop_options options;
+	options.manage_terminal = false;
+	options.shell_thread_reactor = "probe";
+	event_loop loop{tty.fds(), options};
+	loop.attach_registry(reg);
+	loop.attach_shell(shell, host, writing);
+	// WHAT `snapshot_of` LEAVES NULL AND THE LOOP FILLS IN. The pointer is not
+	// something the loop knows about the shell; it arrived with the shell, which
+	// is why the assertion is about where it came from.
+	EXPECT_EQ(snapshot_of(lesh::leshper::state{}, LESH_EVENT_BUFFER_CHANGED).host, nullptr);
+	EXPECT_EQ(loop.shell_host(), host);
+
+	loop.enter_read();
+	tty.type("x");
+	loop.turn(50);
 }
 
 } // namespace
 
-TEST(UiKnowledge, TheActorStampsItsShellsTablesOnTheTokenItServes) {
+TEST(UiKnowledge, TheLoopStampsItsShellsTablesOnTheTokenItMints) {
 	// #151's defect, at the seam it lived in. The shell-thread reactor's token was
 	// built from a snapshot that carried the pointer, and the build copied every
 	// field except that one - so `lesh_request_command_kind` saw a null adapter,
@@ -275,18 +297,17 @@ TEST(UiKnowledge, TheActorStampsItsShellsTablesOnTheTokenItServes) {
 	fake_knowledge shell;
 	shell.define("exit", command_kind::builtin);
 	const editor_host host{&shell};
-	shell_actor actor{nothing, &host};
 
 	probe asked;
 	asked.ask = {"exit"};
-	serve_one_highlight(actor, asked);
+	run_one_shell_reactor(nothing, &host, asked);
 
 	ASSERT_EQ(asked.kinds.size(), 1u);
 	EXPECT_EQ(asked.kinds.front(), LESH_COMMAND_BUILTIN);
 	EXPECT_EQ(shell.asked, (std::vector<std::string>{"exit"}));
 }
 
-TEST(UiKnowledge, AnActorWithNoTablesLeavesTheTokenOnTheEnvironmentFallback) {
+TEST(UiKnowledge, AShellWithNoTablesLeavesTheTokenOnTheEnvironmentFallback) {
 	// The null the constructor still accepts, and what it means: no shell
 	// attached, empty tables, `getenv("PATH")` - a leshper embedded in something
 	// that is not this shell.
@@ -301,11 +322,10 @@ TEST(UiKnowledge, AnActorWithNoTablesLeavesTheTokenOnTheEnvironmentFallback) {
 	// filesystem knowledge.
 	const environment_knowledge environment;
 	const editor_host host{&environment};
-	shell_actor actor{nothing, &host};
 
 	probe asked;
 	asked.ask = {"tool", "nosuchtool"};
-	serve_one_highlight(actor, asked);
+	run_one_shell_reactor(nothing, &host, asked);
 
 	ASSERT_EQ(asked.kinds.size(), 2u);
 	EXPECT_EQ(asked.kinds[0], LESH_COMMAND_EXTERNAL);
@@ -350,23 +370,30 @@ TEST(UiKnowledge, TheWritingFlagIsDownExceptInsideTheTwoWriters) {
 
 	watching_shell shell{writing, up_during_execute, up_during_port_call};
 	const editor_host host{&knowledge};
-	shell_actor actor{shell, &host, &writing};
 
-	lesh::leshper::state s;
+	// THE LOOP RAISES IT NOW (#201), because the loop is what makes the two calls.
+	// It was `shell_actor::serve_execute` and `serve_port_call`; the scope moved
+	// with the call site and the flag did not move at all.
+	lesh::testing::fake_tty tty;
+	loop_options options;
+	options.manage_terminal = false;
+	event_loop loop{tty.fds(), options};
+	loop.attach_shell(shell, &host, &writing);
+	loop.enter_read();
+
 	EXPECT_FALSE(writing.writing());
-	actor.post_execute("anything", s.gen);
-	ASSERT_TRUE(actor.serve_one());
+	// An empty line, which is what a cancel is - the shortest way to reach
+	// `execute` with no keystroke in the way.
+	loop.finish_cancelled_line();
 	EXPECT_TRUE(up_during_execute);
 	EXPECT_FALSE(writing.writing()) << "the scope puts it down again";
 
-	(void)actor.post_port_call("anything", s.gen);
-	ASSERT_TRUE(actor.serve_one());
+	(void)loop.call_port("anything");
 	EXPECT_TRUE(up_during_port_call);
 	EXPECT_FALSE(writing.writing());
 
 	// And a read is legal now, which is the state every reader in the tree runs
-	// in: between slots on the shell thread, or on the loop thread while the loop
-	// is not blocked on one of the two writers.
+	// in: anywhere in a turn that is not inside one of the two calls.
 	std::string_view ignored;
 	(void)knowledge.path(ignored);
 }
@@ -386,10 +413,14 @@ TEST(UiKnowledgeDeathTest, AReadWhileTheShellIsWritingTripsTheAssertion) {
 	const shell_state_knowledge knowledge{state, &writing};
 	reading_shell wrong{knowledge};
 	const editor_host host{&knowledge};
-	shell_actor actor{wrong, &host, &writing};
 
-	lesh::leshper::state s;
-	actor.post_execute("anything", s.gen);
-	EXPECT_DEATH((void)actor.serve_one(), "assertion failed");
+	lesh::testing::fake_tty tty;
+	loop_options options;
+	options.manage_terminal = false;
+	event_loop loop{tty.fds(), options};
+	loop.attach_shell(wrong, &host, &writing);
+	loop.enter_read();
+
+	EXPECT_DEATH(loop.finish_cancelled_line(), "assertion failed");
 }
 #endif

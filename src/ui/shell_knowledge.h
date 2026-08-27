@@ -99,13 +99,15 @@ enum class name_domain : std::uint8_t {
 // version of #130 - and until this type existed it was a paragraph in an ADR
 // that a future reader could only obey by remembering. What makes the rule
 // checkable is that there are exactly TWO writers, `shell_side::execute` and
-// `shell_side::port_call`, and both are entered from one place: `shell_actor`
-// serving a slot. So the actor raises this flag around them and every read
-// through an adapter that holds one asserts it is down.
+// `shell_side::port_call`, and both are entered from one place: the loop
+// calling them (`event_loop::accept_current_line`, `finish_cancelled_line`,
+// `call_port`; it was `shell_actor` serving a slot until #201). So the loop
+// raises this flag around them and every read through an adapter that holds one
+// asserts it is down.
 //
 // WHY AN ATOMIC WHEN THE CLAIM IS THAT THERE IS NO CONCURRENCY. Because the
-// claim is exactly what is being checked: the flag is written on the shell
-// thread and read wherever a reader happens to be - the shell thread for the
+// claim was exactly what was being checked: the flag was written on the shell
+// thread and read wherever a reader happened to be - the shell thread for the
 // highlighter, the LOOP thread for the completer (see `enumerate` below) - and
 // a plain `bool` read across those would be the data race the assertion exists
 // to catch, which is a poor way to catch it. Relaxed on both sides: this is a
@@ -193,15 +195,16 @@ public:
 	// makes the lifetime the caller's. #137 records a cached command list as the
 	// v2 that makes it free.
 	//
-	// ASKED FROM THE LOOP THREAD (#151), and that is legal by ADR-0009 rather
+	// ASKED FROM INSIDE AN ACTION (#151), and that is legal by ADR-0009 rather
 	// than in spite of it. The loop reads shell state while nothing EXECUTES,
-	// and nothing can: `execute` and `port_call` are the only writers, the loop
-	// itself is what requests them, and it is blocked in `wait_on_shell` for the
-	// whole of each. #139 routed this through a round trip on the actor's
-	// `enumerate` slot; #151 deleted the slot, because a copy the loop makes for
-	// itself and a copy the shell thread makes for it are the same copy with one
-	// less protocol. `shell_writing_flag` above is the tripwire that keeps the
-	// argument true.
+	// and nothing can: `execute` and `port_call` are the only writers, and the
+	// loop is what CALLS them - so a dispatch is by construction not inside
+	// either (it was "blocked in `wait_on_shell` for the whole of each" until
+	// #201, which is the same argument with a thread in it). #139 routed this
+	// through a round trip on the actor's `enumerate` slot; #151 deleted the
+	// slot, because a copy the loop makes for itself and a copy the shell makes
+	// for it are the same copy with one less protocol. `shell_writing_flag`
+	// above is the tripwire that keeps the argument true.
 	//
 	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
 	// out of `classify`: the walk is a readdir per directory and it belongs on

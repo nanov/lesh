@@ -25,10 +25,11 @@
 // WHAT HAPPENED TO `read(providers) -> line`. #94 fixed leshper's entry as
 // `read(providers) -> line`: a call that takes a provider bundle and answers one
 // accepted line. ADR-0009 arrived after it and inverted the ownership - the LOOP
-// is a thread and drives the read; the shell is the main thread and serves the
-// loop's slots - so the accepted line is DELIVERED to `shell_side::execute`
-// rather than returned to a caller that is, by then, parked in
-// `shell_actor::run`. What survives unchanged is the part #94 was actually
+// drives the read - so the accepted line is DELIVERED to `shell_side::execute`
+// rather than returned to a caller. #201 took the thread out of that sentence
+// and left the inversion: the loop runs on main and CALLS `execute`, so the
+// delivery is a call the loop makes rather than a slot the shell serves. What
+// survives unchanged is the part #94 was actually
 // about: the bundle. `run_interactive_shell` takes one, the four providers are
 // named types (history is filled in by the ui itself when left null - it is
 // editor state, not a shell fact, #193), and #102's `vared` passes a different bundle to the nested read

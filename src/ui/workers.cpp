@@ -68,7 +68,7 @@ void take_snapshot(request_snapshot& into, const leshper::state& target,
 	// pointer a previous submit had set and hand it to a caller that meant null,
 	// which is the one field where "left over from last time" is not obviously
 	// wrong at the point of use. A submit that wants one sets it after (see the
-	// field's note, and `shell_actor::serve_highlight`).
+	// field's note, and `event_loop::run_shell_reactor_here`).
 	into.host = nullptr;
 }
 

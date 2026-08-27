@@ -2,7 +2,7 @@
 #include "ui/reactors.h"
 #include "leshper/keymap.h"
 #include "ui/loop.h"
-#include "ui/shell_actor.h"
+#include "ui/shell_side.h"
 #include "ui/tty.h"
 #include "ui/workers.h"
 #include "substrate/fork_guard.h"
@@ -42,7 +42,13 @@ using namespace lesh::ui;
 using lesh::testing::fake_tty;
 namespace log = lesh::log;
 
-// THE EVENT LOOP (#129): poll(2), six topics since #195, quiesce.
+// THE EVENT LOOP (#129): poll(2), five topics, quiesce.
+//
+// ONE THREAD SINCE #201. There is no `loop.start()` and no shell thread to
+// spawn beside it: `run()` is a call on the calling thread, and the loop reaches
+// the shell by calling `shell_side` - so a test that used to post to a slot,
+// start the actor and wait for a byte now calls the loop and asserts on what
+// came back. `fake_shell` is unchanged, which is the point of the interface.
 //
 // EVERY TEST HERE DRIVES FDS THE TEST OWNS. Pipes for the ordinary path,
 // `openpty` where real termios is the point, and never the process's own
@@ -536,10 +542,13 @@ TEST(UiLoopSignals, TheLoopNeverWritesADisposition) {
 	guards.child().default_action();
 
 	fake_tty tty;
-	// THE HUB IS DECLARED BEFORE THE LOOP, for the reason `session` states about
-	// its actor: `~event_loop` calls `request_stop`, which pokes the attached
-	// hub's pipe. A hub declared after the loop dies first and that poke is a use
-	// after scope - ASan says so immediately, which is how this line got written.
+	// THE HUB IS STILL DECLARED BEFORE THE LOOP. It had to be while `~event_loop`
+	// called `request_stop` and `request_stop` poked the attached hub's pipe - a
+	// hub declared after the loop died first and that poke was a use after scope,
+	// which ASan said immediately and is how this line got written. #201 deleted
+	// both the destructor's call and the poke; the declaration order stays,
+	// because the loop borrows the hub either way and a borrowed thing outliving
+	// its borrower is not a rule worth re-deriving per member.
 	signal_hub hub;
 	event_loop loop{tty.fds(), pipe_options()};
 	ASSERT_TRUE(hub.install());
@@ -702,139 +711,85 @@ TEST(UiLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 }
 
 // ===========================================================================
-// The shell topic (ADR-0009)
+// The shell, called directly (ADR-0009 as amended by #201)
 // ===========================================================================
 
-TEST(UiLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopic) {
+TEST(UiLoopShell, TheShellStateReactorRunsInPlaceAndLandsWithinTheTurn) {
+	// ADR-0009's keystone, with the thread taken out of it (#201): the reactor
+	// that reads the alias, function and builtin tables runs on the thread that
+	// owns them, and that is this one. What used to be post-serve-reply-drain
+	// across a pipe is a call inside `notify_reactors`, so the batch is applied
+	// before the turn that produced the keystroke returns - one turn, not two.
 	fake_tty tty;
 	registry reg;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
 	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, nullptr),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	tty.type("x");
 	loop.turn(50);
-	EXPECT_FALSE(actor.idle()) << "the highlight went to the shell thread's slot";
 
-	// The shell thread, run by hand: `serve_one` is what `run()` is written in
-	// terms of, so driving it here exercises the same path.
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_TRUE(actor.replies().armed());
-
-	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
+	EXPECT_EQ(loop.applied_batches(), 1u) << "the same turn applied it";
+	EXPECT_EQ(loop.dropped_batches(), 0u);
 	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
 	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "highlighter");
-	EXPECT_FALSE(actor.replies().armed()) << "drain disarms the shell topic too";
 }
 
-TEST(UiLoopShell, ANewerHighlightOverwritesAPendingOne) {
-	// ADR-0009: "a newer highlight overwrites a pending one, which is the
-	// cancellation." There is no cancel call in the seam, and that is the point.
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-
-	state target;
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-	target.gen.bump();
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-
-	EXPECT_EQ(actor.dropped(), 1u);
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_FALSE(actor.serve_one()) << "one slot, depth one, latest wins";
-
-	std::vector<shell_message> inbox;
-	ASSERT_EQ(actor.replies().drain(inbox), 1u);
-	EXPECT_EQ(inbox.front().computed_against, target.gen);
-	actor.replies().recycle(inbox);
-}
-
-TEST(UiLoopShell, ExecuteOutranksAPendingHighlight) {
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-
-	state target;
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-	actor.post_execute("echo hi", target.gen);
-
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_EQ(shell.executed, "echo hi") << "priority order: execute, port_call, highlight";
-}
-
-TEST(UiLoopShell, MessagesAreRecycledRatherThanReallocated) {
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-	state target;
-
-	std::vector<shell_message> inbox;
-	for (int round = 0; round < 5; ++round) {
-		actor.post_highlight("highlighter", &counting_reactor, nullptr,
-		                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-		ASSERT_TRUE(actor.serve_one());
-		ASSERT_EQ(actor.replies().drain(inbox), 1u);
-		actor.replies().recycle(inbox);
-		EXPECT_TRUE(inbox.empty());
-	}
-	EXPECT_EQ(actor.served(), 5u);
-}
-
-TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
-	// #92's contract, unchanged by the thread split: the action blocks, the loop
-	// waits on the `shell` and `signal` topics, and the terminal keeps the
-	// EDITOR's modes throughout (fish #7770).
+TEST(UiLoopShell, EveryKeystrokesHighlightIsFinishedBeforeTheNextOneIsRead) {
+	// WHAT REPLACED LATEST-WINS. ADR-0009 gave the `highlight` slot depth one and
+	// said "a newer highlight overwrites a pending one, which is the
+	// cancellation"; with the reactor run in place there is never a pending one to
+	// overwrite, because the call returns before the loop can read the next key.
+	// Five keystrokes are five batches applied and none dropped - and the store
+	// still holds one layer, because latest-wins lives there and always did.
+	//
+	// THE COST OF THIS IS THE NEXT TICKET'S. A reactor that walks `$PATH` holds
+	// the keystroke it was computed for until it returns; the fiber step is what
+	// gives the walk a yield point back.
 	fake_tty tty;
+	registry reg;
 	fake_shell shell;
-	shell.port_status = 3;
-	shell_actor actor{shell, nullptr};
+	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
+	                                &counting_reactor, nullptr),
+	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_registry(reg);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
-	std::thread shell_thread{[&] { actor.run(); }};
-	const port_result answered = loop.call_port("echo from an action");
-	actor.stop();
-	shell_thread.join();
+	for (const char* key : {"e", "c", "h", "o", " "}) {
+		tty.type(key);
+		loop.turn(50);
+	}
 
-	EXPECT_TRUE(answered.answered);
-	EXPECT_EQ(answered.status, 3);
-	EXPECT_EQ(shell.called, "echo from an action");
+	EXPECT_EQ(loop.applied_batches(), 5u);
+	EXPECT_EQ(loop.dropped_batches(), 0u);
+	EXPECT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(buffer_of(loop), "echo ");
 }
 
-TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
-	// #162, and it is a heap-use-after-free rather than a tidiness point. The
-	// turn walked `_events` by reference; handling an accept blocks in
-	// `wait_on_shell`, and a shell message arriving there goes to
-	// `handle_shell_message`, which PUSHES onto that same vector. Once the push
-	// reallocates, the walk's iterator points into freed storage.
-	//
-	// The repro is arithmetic, not luck. `enter_read` reserves exactly sixteen
-	// events, so sixteen bytes read in one go fill the queue to its capacity and
-	// the next push is guaranteed to reallocate - and the accept is put in the
-	// MIDDLE of them so that the walk still has elements to dereference
-	// afterwards. Under ASan the old code fails here; a user reaches the same
-	// place by typing a second line before the first one's prompt comes back
-	// while a background job reports in.
+TEST(UiLoopShell, AcceptCallsExecuteOnThisThreadBeforeTheTurnReturns) {
+	// THE WHOLE OF #201 IN ONE ASSERTION. `execute` used to be a message filled in
+	// on this thread and run on another, with the loop blocked in a second poll
+	// until the reply came back. It is a call now: it happens inside the turn that
+	// carried the accept, on the thread that made it.
 	fake_tty tty;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
+	shell.execute_status = 42;
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	// Enter is the session's binding, not a default (F-35), so the accepting key
-	// is bound here the way `ui_session_tests.cpp` binds one: Ctrl-A, one byte,
-	// so the byte count and the event count are the same number.
+	// is bound here the way `ui_session_tests.cpp` binds one.
 	editing_context& context = context_of(loop.editor());
 	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", &accepting_action, nullptr),
 	          LESH_OK);
@@ -844,31 +799,85 @@ TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
 	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
 	map->bind(encoded, "ask_accept");
 
-	// From inside `execute`, on the shell thread: replies the loop is not waiting
-	// for. `wait_on_shell` matches on `execute_done` and hands everything else to
-	// `handle_shell_message`. A default generation is deliberate - the batch is
-	// dropped by the generation rule, and the event is pushed either way.
-	shell.on_execute = [&] {
-		for (int i = 0; i < 4; ++i) {
-			shell_message extra = actor.replies().acquire();
-			extra.which = shell_message::kind::highlight_done;
-			extra.computed_against = generation{};
-			actor.replies().post(std::move(extra));
-		}
-	};
+	std::thread::id ran_on;
+	shell.on_execute = [&] { ran_on = std::this_thread::get_id(); };
 
-	std::thread shell_thread{[&] { actor.run(); }};
+	tty.type("echo hi\x01");
+	const turn_result result = loop.turn(50);
+
+	EXPECT_EQ(shell.executed, "echo hi") << "no second turn was needed";
+	EXPECT_EQ(ran_on, std::this_thread::get_id()) << "and no second thread";
+	EXPECT_EQ(loop.exit_status(), 42);
+	EXPECT_EQ(buffer_of(loop), "") << "the line is finished and the editor is fresh";
+	EXPECT_FALSE(result.exiting);
+}
+
+TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
+	// #92's contract, and the implementation change #92 predicted, twice: ADR-0009
+	// made it a cross-thread round trip, #201 made it a call. The action blocks
+	// either way, and the terminal keeps the EDITOR's modes throughout (fish
+	// #7770).
+	fake_tty tty;
+	fake_shell shell;
+	shell.port_status = 3;
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_shell(shell);
+	loop.enter_read();
+
+	const port_result answered = loop.call_port("echo from an action");
+
+	EXPECT_TRUE(answered.answered);
+	EXPECT_EQ(answered.status, 3);
+	EXPECT_EQ(shell.called, "echo from an action");
+}
+
+TEST(UiLoopShell, AnEventPushedMidWalkDoesNotDangleTheEventWalk) {
+	// #162, and it is a heap-use-after-free rather than a tidiness point. The turn
+	// walked `_events` by reference while `handle` pushed onto it; once the push
+	// reallocates, the walk's iterator points into freed storage. The push that
+	// found it was a shell message drained inside `wait_on_shell`, which #201
+	// deleted - and the hazard did not go with it, because the shell-state reactor
+	// now pushes its own `worker_result` from inside `handle`, once per keystroke.
+	//
+	// The repro is arithmetic, not luck. `event_loop` reserves exactly sixteen
+	// events, so sixteen bytes read in one go fill the queue to its capacity and
+	// the reactor's pushes are guaranteed to reallocate - and the accept is put in
+	// the MIDDLE of them so that the walk still has elements to dereference
+	// afterwards. Under the old code ASan fails here.
+	fake_tty tty;
+	registry reg;
+	fake_shell shell;
+	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
+	                                &counting_reactor, nullptr),
+	          LESH_OK);
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_registry(reg);
+	loop.attach_shell(shell);
+	loop.enter_read();
+
+	editing_context& context = context_of(loop.editor());
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", &accepting_action, nullptr),
+	          LESH_OK);
+	keymap* map = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(map, nullptr);
+	std::string encoded;
+	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
+	map->bind(encoded, "ask_accept");
+
 	tty.type("12345678\x01" "abcdefg");
 	const turn_result result = loop.turn(50);
-	actor.stop();
-	shell_thread.join();
 
 	EXPECT_EQ(shell.executed, "12345678");
 	EXPECT_EQ(buffer_of(loop), "abcdefg")
 		<< "the seven keys typed after the accept still reached the fresh line";
-	EXPECT_EQ(result.events, 20u)
-		<< "sixteen keys plus the four mid-walk arrivals: swapping the batch out "
-		   "must not drop what is pushed while it is being walked";
+	// Sixteen keys, plus one `worker_result` for each of the fifteen that changed
+	// the buffer - the accept itself changes none - and every one of those fifteen
+	// was pushed while the batch that produced it was being walked.
+	EXPECT_EQ(result.events, 31u)
+		<< "swapping the batch out must not drop what is pushed while it is walked";
+	EXPECT_EQ(loop.applied_batches(), 15u);
 }
 
 // ===========================================================================
@@ -877,16 +886,17 @@ TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
 
 TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 	// The whole of quiesce, asserted from inside the execution: by the time
-	// `execute` runs on the shell thread, the helpers are parked and the loop is
-	// blocked in its poll. That is the moment a fork is legal.
+	// `execute` runs, the helpers are parked and the terminal has been handed
+	// back. That is the moment a fork is legal - and since #201 the fork happens
+	// one stack frame below this assertion rather than on another thread, which
+	// makes the ordering the call's own.
 	fake_tty tty;
 	fake_shell shell;
 	worker_pool helpers{2};
-	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_helpers(helpers);
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	bool parked_during_execute = false;
@@ -897,10 +907,7 @@ TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
 	loop.turn(50);
 	ASSERT_EQ(buffer_of(loop), "echo hi");
 
-	std::thread shell_thread{[&] { actor.run(); }};
 	const std::optional<std::int32_t> status = loop.accept_current_line();
-	actor.stop();
-	shell_thread.join();
 
 	EXPECT_TRUE(parked_during_execute) << "quiesce is the helpers parked plus the terminal";
 	ASSERT_TRUE(status.has_value());
@@ -934,26 +941,26 @@ TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	EXPECT_FALSE(helpers.is_quiesced());
 }
 
-TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
+TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsNotLost) {
+	// #201 moved the mechanism and kept the fact. The loop used to be blocked in a
+	// second poll over the `shell` and `signal` topics for the whole execution and
+	// pushed what arrived onto `_deferred`; now nothing polls while `execute` runs,
+	// and what holds the signal is the self-pipe byte the handler wrote. Either
+	// way the next ordinary turn delivers it: nothing is dropped because the
+	// editor was not there to receive it.
 	fake_tty tty;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
-	// Delivered from inside `execute`, which is exactly the window where the
-	// loop is blocked on the `shell` and `signal` topics only.
+	// Delivered from inside `execute`, which is the window where the editor does
+	// not exist as far as the terminal is concerned.
 	shell.on_execute = [&] { loop.signals().deliver(SIGINT); };
 
-	std::thread shell_thread{[&] { actor.run(); }};
 	loop.accept_current_line();
-	actor.stop();
-	shell_thread.join();
 
-	// The next ordinary turn delivers it: nothing is dropped because the editor
-	// was not there to receive it.
 	const turn_result result = loop.turn(0);
 	EXPECT_EQ(result.events, 1u);
 }
@@ -1250,20 +1257,52 @@ TEST(UiLoopRender, TheFirstPaintOfAReadErasesNothing) {
 }
 
 // ===========================================================================
-// The thread (#134's two calls)
+// Running (#134's sequencing; ONE call since #201)
 // ===========================================================================
 
-TEST(UiLoopThread, StopWakesALoopBlockedInPoll) {
+namespace {
+
+std::thread::id g_action_thread{};
+
+int32_t stopping_action(lesh_editor*, const lesh_invocation*, void* self) {
+	g_action_thread = std::this_thread::get_id();
+	static_cast<event_loop*>(self)->request_stop();
+	return LESH_OK;
+}
+
+} // namespace
+
+TEST(UiLoopRun, RunTurnsOnTheCallingThreadUntilRequestStop) {
+	// WHAT REPLACED `start()`/`stop()`/`running()`. There is no loop thread and
+	// nothing to join: `run()` turns on the caller's thread - which in a real
+	// session is main - and leaves when `request_stop` has been set, which is what
+	// Ctrl-D, an `exit` and a hangup all do. The action below stands in for all
+	// three, and records the thread it ran on to say which one that is.
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 
-	loop.start();
-	EXPECT_TRUE(loop.running());
-	// Blocked in `poll` with nothing to say: `stop` rings the signal topic's own
-	// pipe, which is the wakeup that always exists.
-	std::this_thread::sleep_for(std::chrono::milliseconds{10});
-	loop.stop();
-	EXPECT_FALSE(loop.running());
+	editing_context& context = context_of(loop.editor());
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_stop", &stopping_action, &loop),
+	          LESH_OK);
+	keymap* map = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(map, nullptr);
+	std::string encoded;
+	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
+	map->bind(encoded, "ask_stop");
+
+	g_action_thread = std::thread::id{};
+	// In the pipe before the first poll, so `run` reads it on its first turn
+	// rather than blocking for a key that would never come.
+	tty.type("\x01");
+	loop.run();
+
+	EXPECT_EQ(g_action_thread, std::this_thread::get_id());
+	// `run` left the read on its way out, which is what every exit path owes the
+	// terminal - and the prompt it painted before the first poll is proof it got
+	// as far as a turn at all.
+	// The prompt's trailing space is an ESC[K and a move rather than a byte, so
+	// what is asserted is the character the prompt starts with.
+	EXPECT_NE(tty.painted().find('>'), std::string::npos);
 }
 
 // ===========================================================================

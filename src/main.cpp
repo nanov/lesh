@@ -109,9 +109,15 @@ std::string read_all(std::istream& in) {
 // the session is constructed first and started second.
 //
 // NON-INTERACTIVE SHELLS REACH NONE OF THIS. Not the rc, not the history file,
-// not the editor, not a second thread. That is #101's decision and it is also
+// not the editor, not the helper pool. That is #101's decision and it is also
 // what keeps `-c` fast and the conformance score honest: the two paths share
 // `shell_state`, the parser and the executor, and nothing else.
+//
+// AND THE INTERACTIVE ONE NO LONGER SPAWNS A THREAD FOR THE EDITOR (#201). The
+// loop runs on this thread - `run_interactive_shell` returns when the read is
+// over - so what an interactive session adds to the process is the stateless
+// helper pool and nothing else. Main is still the thread that forks, execs and
+// reaps, and still the one a signal is delivered to.
 int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
                     const char* term) {
 	// #97 decision 3: below the floor, leshper never starts. One line, exit 2,

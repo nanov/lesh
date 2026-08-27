@@ -5,6 +5,8 @@
 
 Amended 2026-08-27 (#168 Phase A): the loop is the host's (`src/ui/loop.cpp`); the two-owner rule stands.
 
+Amended 2026-08-27 (#201, step 1 of #145): **the loop thread is gone; the two-owner rule is now one owner.** The loop runs on main and calls `shell_side::execute` and `shell_side::port_call` directly; `shell_actor`, its three latest-wins slots, its condition variable and the `shell` topic are deleted, and the shell-state reactor runs in place on the thread that owns the tables it reads. This ADR's own reasoning is what permitted it: the two threads were separated because *worker threads* read shell state, and #151 made the shell-state reactor the one reader — so there was nothing left for a second thread to protect. What survives unchanged: the two ROLES (the shell owns `shell_state`, the loop owns editor state and the terminal, and they take turns), the generation as the one version, the stateless helper pool, quiesce before the fork, and `shell_writing_flag` as the assertion that "one writer, announced" still holds. The signal mask is NOT moved to main (#142, #143: a mask survives `execve` and main forks). The superseding ADR is the cleanup ticket's, once the park/quiesce apparatus is structural.
+
 ## Context
 
 leshper runs reactors on worker threads while the user types (A-10/A-11), and

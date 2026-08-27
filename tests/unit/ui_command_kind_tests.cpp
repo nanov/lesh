@@ -47,10 +47,10 @@ using lesh::testing::scoped_env_path;
 //   this ticket's).
 //
 // THE OTHER TWO LAYERS ARE `ui_knowledge_tests.cpp` (#168): `shell_state_knowledge`
-// over a real `shell_state`, and the `shell_actor` that stamps the tables on the
-// token it serves. Both are the HOST's - a shell, a thread, an adapter - and
-// nothing here includes `ui/`, which is what makes this file's suite the one that
-// runs with no shell and no thread.
+// over a real `shell_state`, and the `event_loop` that stamps the tables on the
+// token it mints (it was `shell_actor` until #201). Both are the HOST's - a
+// shell, a loop, an adapter - and nothing here includes `ui/`, which is what
+// makes this file's suite the one that runs with no shell and no loop.
 //
 // There is no copy-on-write test and no race test in this file, and their
 // absence is the ticket's content rather than an omission: ADR-0009 gave shell

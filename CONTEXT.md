@@ -179,7 +179,7 @@ link failure, not a review comment. Two rules are load-bearing and worth saying
 out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
 shapes; the host fills them in over shell state), and `lesh_ui` is the ONE
 library that links both halves. The editor/host line runs between the last two:
-`loop`, `tty`, `workers` and `shell_actor` are `src/ui/` (#168 Phase A), so
+`loop`, `tty`, `workers` and the shell handoff are `src/ui/` (#168 Phase A), so
 nothing under `src/leshper/` holds a thread, a descriptor or a clock; the
 highlighter, the autosuggester, the history search and the completion sources are
 `src/ui/` too (#168 Phase B), so **`lesh_leshper` links `lesh_substrate` and
@@ -548,37 +548,40 @@ A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
 **Topic** _[lesh]_:
-A source of loop events — `tty`, `signal`, `worker`, `timer`. The loop polls
+A source of loop events — `tty`, `signal`, `worker`, `timer`, `watch`. The loop polls
 topics and drains each into events; a topic's file descriptor or deadline
 is its implementation detail. A plugin's fd-readable hook is one more topic.
 _Avoid_: naming the fd; the topic is what the editor sees.
 
 **Quiesce** _[lesh]_:
 Parking every worker at a known-idle point, holding no lock, before the
-loop thread forks — the only thing that makes `fork()` safe in a threaded
-shell, since the child inherits every other thread's held locks frozen.
+fork — the only thing that makes `fork()` safe in a threaded shell, since the
+child inherits every other thread's held locks frozen.
 Resumed after the command is reaped. Needed because lesh runs shell code in
 forked children (subshells); fish, which only ever execs, does not park and
 relies on the child touching nothing before exec — lesh does both.
 
-**Shell thread** _[lesh]_:
-The main thread: the one owner of shell state. Executes at accept; while a
-line is edited it serves three latest-wins slots — `execute`, `port_call`,
-`highlight` — one at a time, so a writing action and a reading highlighter
-never overlap. Everything else in the process is stateless or owns only
-editor state.
-_Avoid_: reading shell state from any other thread; a definitions version or
+**Shell side** _[lesh]_:
+The one owner of shell state — `shell_side::execute` and `port_call` over the
+executor (`src/ui/session.cpp`). It executes at accept and runs an action's
+shell code, and nothing reads shell state while either is running. It was the
+main THREAD serving three latest-wins slots (`execute`, `port_call`,
+`highlight`) until #201 deleted them: the loop calls the two verbs, so the
+serialization is a call stack rather than a channel. Everything else in the
+process is stateless or owns only editor state.
+_Avoid_: reading shell state from a helper thread; a definitions version or
 concurrent collection for it — one owner makes both unnecessary (ADR-0009).
 
-**Loop thread** _[lesh]_:
-The **host's** spawned thread — `src/ui/loop.cpp`, not leshper's (#168): owns
-editor state and the tty while editing, waits in `poll` on its topics, blocks
-across execution, and drops any shell-thread message whose generation is not
-current. It keeps the previous frame's INPUT beside the previous frame, so that
-a resize can re-lay it at the new size and answer where the terminal has moved
-that frame's top row to (#185; `loop_options::assume_reflow` picks the model).
-That it is a thread at all is the host's private choice; the editor it drives is
-told nothing about it.
+**Loop** _[lesh]_:
+The **host's** poll loop — `src/ui/loop.cpp`, not leshper's (#168): owns editor
+state and the tty while editing, waits in `poll` on its topics, and drops any
+result whose generation is not current. It runs ON MAIN since #201 (it was a
+spawned thread, and `run()` is now what `session::run` calls), which makes the
+shell-state reactor a call in place rather than a message. It keeps the previous
+frame's INPUT beside the previous frame, so that a resize can re-lay it at the
+new size and answer where the terminal has moved that frame's top row to (#185;
+`loop_options::assume_reflow` picks the model). Which thread it is on is the
+host's private choice; the editor it drives is told nothing about it.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,

@@ -1027,13 +1027,12 @@ enum class place_result : std::uint8_t {
 // re-read - a slot that is not due is copied, not recomputed. A changed `$?` or a
 // changed `$PWD` is a NEW PROMPT and goes through `render_full`.
 //
-// LOOP-THREAD ONLY, like every other registry here (#93). No locking anywhere,
-// and the rule is really "one thread at a time": #157's wiring calls
-// `render_full` from the SHELL thread, in the window ADR-0009 gives it while the
-// loop is blocked in `wait_on_shell` - the same window `loop_options::prompt` has
-// been written in since #129. `render_tick` is the loop's own. See
-// `session::refresh_prompt` in `ui/session.cpp`, where the argument is made in
-// full.
+// ONE CALLER AT A TIME, like every other registry here (#93). No locking
+// anywhere: #157's wiring calls `render_full` from the shell side, inside the
+// `execute` the loop called - the same window `loop_options::prompt` has been
+// written in since #129, and one thread rather than two since #201.
+// `render_tick` is the loop's own. See `session::refresh_prompt` in
+// `ui/session.cpp`, where the argument is made in full.
 class engine {
 public:
 	engine();
