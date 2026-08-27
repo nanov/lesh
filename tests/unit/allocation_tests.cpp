@@ -564,15 +564,23 @@ std::int32_t idle_reactor(lesh_request*, void*) { return LESH_OK; }
 
 } // namespace
 
-TEST_F(AllocationTest, AWarmKeystrokeThroughTwoReactorFibersCostsNoHeap) {
-	// THE WHOLE STEADY-STATE KEYSTROKE, AND IT IS ZERO. This is what
-	// `SubmittingAWarmReactorRoundCostsNoHeap` measured before #202 and it now
-	// measures strictly more: the turn, the decode, the dispatch, the fan-out into
-	// two reactors' slots, the two fiber resumes, the two token mints, the two
-	// computes and the two applies.
+TEST_F(AllocationTest, TwoReactorFibersAddNothingToWhatAKeystrokeAlreadyCost) {
+	// THE TICKET'S OWN NUMBER, AND IT IS A DELTA (#202). What the ticket asks is
+	// that the steady-state keystroke "must not allocate more than before", and the
+	// honest way to say that is to run the SAME keystroke through two loops that
+	// differ in one thing - whether any reactor is registered - and compare.
 	//
-	// EACH HALF WAS SEPARATELY WORTH A MALLOC PER KEYSTROKE and each is a decision
-	// this test is the pin for:
+	// WHY NOT AN ABSOLUTE ZERO: a keystroke through the real loop costs TWO mallocs
+	// per key TODAY, in `input_decoder::feed`, and it cost them before this ticket
+	// too - `drain_tty`, `decode.cpp` and `tty.cpp` are byte-identical on this
+	// branch. Asserting zero here would fail for a reason that has nothing to do
+	// with fibers and would hide the number that does. The isolated compute is
+	// pinned at zero separately by `AWarmShellReactorRoundCostsNoHeap`, and the
+	// editor's own half by `AKeystrokeStepCostsNoHeapBeyondUndo`; this is the
+	// channel between them, and its contribution is what this measures.
+	//
+	// EACH HALF OF THAT ZERO WAS SEPARATELY WORTH A MALLOC PER KEYSTROKE, and each
+	// is a decision this test is the pin for:
 	//
 	//   - the snapshot is ASSIGNED into the lane's own storage (`take_snapshot`),
 	//     never built at the call site and moved in;
@@ -582,58 +590,75 @@ TEST_F(AllocationTest, AWarmKeystrokeThroughTwoReactorFibersCostsNoHeap) {
 	//     at `recv`, which is where the compute's storage comes back;
 	//   - `run_reactor_here` HANDS THE BUFFER BACK when the reactor returns rather
 	//     than letting the token's destructor free what it borrowed;
-	//   - the batch's vectors are CLEARED rather than replaced.
+	//   - the batch's vectors are SWAPPED into the decoration layer rather than
+	//     copied, so the storage cycles both ways.
 	//
 	// A CURSOR MOTION AND NOT AN INSERT, for the reason
 	// `AKeystrokeStepCostsNoHeapBeyondUndo` gives: an insertion records an undo
-	// entry, which owns the replaced and inserted text, and folding that in would
-	// make this test unable to fail for the reason it exists. So the key is
-	// `<Left>`, the cursor is put back by assignment between rounds (two integers),
-	// and the reactors are registered for `cursor_moved`.
+	// entry, which owns the replaced and inserted text. So the key is Ctrl-B -
+	// `backward_char`, one byte, no escape sequence to disambiguate - the cursor is
+	// put back by assignment between rounds (two integers), and the reactors are
+	// registered for `cursor_moved`.
 	//
 	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
-	// object) and every round uses the same one, so a zero means capacity was
-	// reused rather than never needed.
+	// object) and every round uses the same one, so a matching pair of numbers
+	// means capacity was reused rather than never needed.
 	using namespace lesh::leshper;
 	log::shutdown();
 
-	registry reg;
-	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_CURSOR_MOVED,
-	                                &idle_reactor, nullptr),
-	          LESH_OK);
-	ASSERT_EQ(lesh_reactor_register(&reg, "autosuggester", LESH_EVENT_CURSOR_MOVED,
-	                                &idle_reactor, nullptr),
-	          LESH_OK);
+	// How many mallocs 100 identical keystrokes cost a loop with `reactors`
+	// reactors registered, and how many computes those keystrokes reached.
+	const auto measure = [&](int reactors, std::size_t& computes) {
+		registry reg;
+		if (reactors >= 1) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		if (reactors >= 2) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "autosuggester", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		loop_over_a_pipe driven;
+		driven.loop().attach_registry(reg);
+		apply_edit(driven.loop().editor(), position{}, position{},
+		           "git log --oneline --graph --decorate --all | head -40");
+		const position end = driven.loop().editor().buffer.end_position();
 
-	loop_over_a_pipe driven;
-	driven.loop().attach_registry(reg);
-	apply_edit(driven.loop().editor(), position{}, position{},
-	           "git log --oneline --graph --decorate --all | head -40");
-	const position end = driven.loop().editor().buffer.end_position();
-
-	const auto round = [&] {
-		driven.loop().editor().cursor = end;
-		driven.type("\x1b[D");
-		(void)driven.loop().turn(0);
+		const auto round = [&] {
+			driven.loop().editor().cursor = end;
+			driven.type("\x02");
+			(void)driven.loop().turn(0);
+		};
+		// Warm: the two lanes, their fibers, their snapshots and their batches all
+		// take their capacity here. The fibers are SPAWNED in one of these rounds,
+		// which mmaps a stack - not a malloc, and once.
+		for (int i = 0; i < 8; ++i)
+			round();
+		const size_t counted = mallocs_during([&] {
+			for (int i = 0; i < 100; ++i)
+				round();
+		});
+		computes = driven.loop().reactor_computes("highlighter");
+		return counted;
 	};
 
-	// Warm: the two lanes, their fibers, their snapshots and their batches all
-	// take their capacity in the first few rounds. The fibers are SPAWNED in one of
-	// them, which mmaps a stack - that is not a malloc, and it happens once.
-	for (int i = 0; i < 8; ++i)
-		round();
-	ASSERT_EQ(driven.loop().reactor_fibers(), 2u) << "the rounds below measure nothing";
-	ASSERT_GE(driven.loop().reactor_computes("highlighter"), 4u);
-	ASSERT_GE(driven.loop().reactor_computes("autosuggester"), 4u);
-	const std::size_t computed_before = driven.loop().reactor_computes("highlighter");
+	std::size_t none_computed = 0;
+	std::size_t both_computed = 0;
+	const size_t without = measure(0, none_computed);
+	const size_t with = measure(2, both_computed);
 
-	const size_t counted = mallocs_during([&] {
-		for (int i = 0; i < 100; ++i)
-			round();
-	});
-	EXPECT_EQ(counted, 0u) << "a warm keystroke through two reactor fibers reached the heap";
-	EXPECT_EQ(driven.loop().reactor_computes("highlighter") - computed_before, 100u)
-		<< "the rounds above did not each reach the reactor";
+	EXPECT_EQ(none_computed, 0u) << "the control loop ran a reactor";
+	EXPECT_GE(both_computed, 100u) << "the rounds did not each reach the reactor";
+	EXPECT_EQ(with, without)
+		<< "two reactor fibers added " << (with - without)
+		<< " allocations to a keystroke that already cost " << without;
+	// AND THE ABSOLUTE NUMBER IS PINNED TOO, so that the pre-existing cost cannot
+	// grow behind the delta: two mallocs per key, in the decoder, unchanged by this
+	// ticket. A change here is a finding either way and belongs in whatever moves
+	// it, not in a number nobody re-derives.
+	EXPECT_EQ(without, 200u) << "a keystroke's own allocation count moved";
 }
 
 // --- The reactor channel and the completion channel (#168 Phase B) ---------
