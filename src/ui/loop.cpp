@@ -147,6 +147,7 @@ const char* name_of(topic which) noexcept {
 		case topic::worker: return "worker";
 		case topic::timer: return "timer";
 		case topic::shell: return "shell";
+		case topic::watch: return "watch";
 		case topic::count_: break;
 	}
 	return "?";
@@ -457,6 +458,25 @@ void event_loop::attach_signals(signal_hub& hub) noexcept {
 	_resizes_seen = hub.resize_count();
 }
 
+void event_loop::attach_watch(int fd, void (*on_readable)(void* userdata),
+                              void* userdata) noexcept {
+	// BOTH OR NEITHER. A descriptor with no hook would be polled forever and
+	// never consumed, which is the spin this topic's whole contract is about.
+	if (fd < 0 || on_readable == nullptr) {
+		detach_watch();
+		return;
+	}
+	_watch_fd = fd;
+	_watch_hook = on_readable;
+	_watch_userdata = userdata;
+}
+
+void event_loop::detach_watch() noexcept {
+	_watch_fd = -1;
+	_watch_hook = nullptr;
+	_watch_userdata = nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // The read entry
 // ---------------------------------------------------------------------------
@@ -578,21 +598,23 @@ turn_result event_loop::turn(int timeout_ms) {
 	}
 
 	int at = 0;
-	int tty_at = -1, signal_at = -1, worker_at = -1, shell_at = -1;
-	const auto watch = [&](int fd) {
+	int tty_at = -1, signal_at = -1, worker_at = -1, shell_at = -1, watch_at = -1;
+	const auto poll_on = [&](int fd) {
 		_poll[static_cast<std::size_t>(at)].fd = fd;
 		_poll[static_cast<std::size_t>(at)].events = POLLIN;
 		_poll[static_cast<std::size_t>(at)].revents = 0;
 		return at++;
 	};
 	if (_fds.input >= 0)
-		tty_at = watch(_fds.input);
+		tty_at = poll_on(_fds.input);
 	if (_signals != nullptr)
-		signal_at = watch(_signals->wakeup_fd());
+		signal_at = poll_on(_signals->wakeup_fd());
 	if (_helpers != nullptr)
-		worker_at = watch(_helpers->completions().wakeup_fd());
+		worker_at = poll_on(_helpers->completions().wakeup_fd());
 	if (_shell != nullptr)
-		shell_at = watch(_shell->replies().wakeup_fd());
+		shell_at = poll_on(_shell->replies().wakeup_fd());
+	if (_watch_fd >= 0)
+		watch_at = poll_on(_watch_fd);
 
 	const int ready = ::poll(_poll.data(), static_cast<nfds_t>(at), timeout_ms);
 	if (ready < 0) {
@@ -638,6 +660,14 @@ turn_result event_loop::turn(int timeout_ms) {
 		drain_worker_topic(result);
 	if (shell_at >= 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0)
 		drain_shell_topic(result);
+	// LAST, AND IT PRODUCES NO EVENT. Everything above turns a descriptor into
+	// something the editor sees; the watch turns one into a fact about a file the
+	// editor has never heard of. Last because it is the least urgent thing in a
+	// turn - a history that is one turn out of date is a history that is one turn
+	// out of date - and because running it after the drains means the view it
+	// swaps in is the one the events below will read.
+	if (watch_at >= 0 && revents_of(_poll[static_cast<std::size_t>(watch_at)]) != 0)
+		drain_watch_topic(result);
 
 	// SWAPPED OUT BEFORE THE WALK, the way `drain_registry_effects` does it
 	// (#162). `handle` on an accepted line blocks in `wait_on_shell`, and a shell
@@ -848,6 +878,19 @@ void event_loop::drain_shell_topic(turn_result& result) {
 	for (shell_message& answer : _inbox)
 		handle_shell_message(answer);
 	_shell->replies().recycle(_inbox);
+}
+
+void event_loop::drain_watch_topic(turn_result& result) {
+	if (_watch_hook == nullptr)
+		return;
+	++result.topics_drained;
+	++_watch_drains;
+	LESH_LOG(log::level::debug, log::category::loop, "topic=watch fd=%d", _watch_fd);
+	// THE HOOK CONSUMES THE DESCRIPTOR, not this function - see `attach_watch`.
+	// The loop never reads the fd, because it does not know what a read off it
+	// means: an inotify record and a kevent are two different shapes and neither
+	// is the loop's business.
+	_watch_hook(_watch_userdata);
 }
 
 void event_loop::handle_shell_message(shell_message& answer) {

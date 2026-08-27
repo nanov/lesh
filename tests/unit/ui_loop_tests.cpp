@@ -42,7 +42,7 @@ using namespace lesh::ui;
 using lesh::testing::fake_tty;
 namespace log = lesh::log;
 
-// THE EVENT LOOP (#129): poll(2), five topics, quiesce.
+// THE EVENT LOOP (#129): poll(2), six topics since #195, quiesce.
 //
 // EVERY TEST HERE DRIVES FDS THE TEST OWNS. Pipes for the ordinary path,
 // `openpty` where real termios is the point, and never the process's own
@@ -1624,4 +1624,116 @@ TEST(UiLoopTerminal, FatalRestoreHandlersAreInstalledOnlyOverTheDefault) {
 
 	// Installed twice, nothing is at SIG_DFL any more, so nothing is taken.
 	EXPECT_EQ(install_fatal_restore_handlers(), 0);
+}
+
+// ===========================================================================
+// The watch topic (#195) - §8's fd-readable hook, and the loop's sixth topic
+// ===========================================================================
+//
+// THE LOOP KNOWS NOTHING ABOUT WHAT IS ON THE OTHER END, which is why these
+// tests use a plain pipe. The one shipped user is the history's directory watch
+// (inotify on Linux, a kqueue on macOS) and its own tests are in
+// `ui_history_stale_tests.cpp`; what is being tested HERE is the contract the
+// loop holds up: poll the fd, run the hook on the loop thread when it is
+// readable, run it never otherwise, and count the turn as a drained topic.
+
+namespace {
+
+struct watch_probe {
+	int fd = -1;
+	std::size_t runs = 0;
+
+	// Consumes what made the fd readable, which is the topic's rule: a hook that
+	// leaves its descriptor readable turns the poll into a spin.
+	static void on_readable(void* userdata) {
+		auto* self = static_cast<watch_probe*>(userdata);
+		++self->runs;
+		char drained[64];
+		while (::read(self->fd, drained, sizeof(drained)) > 0) {
+		}
+	}
+};
+
+} // namespace
+
+TEST(UiLoopWatch, AReadableWatchFdRunsTheHookOnTheLoopThread) {
+	fake_tty tty;
+	int pipe_fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(pipe_fds), 0);
+	ASSERT_EQ(::fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK), 0);
+
+	watch_probe probe;
+	probe.fd = pipe_fds[0];
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_watch(pipe_fds[0], &watch_probe::on_readable, &probe);
+	EXPECT_EQ(loop.watch_fd(), pipe_fds[0]);
+	loop.enter_read();
+
+	// Nothing on the pipe: the topic exists and stays quiet.
+	const turn_result quiet = loop.turn(0);
+	EXPECT_EQ(probe.runs, 0u);
+	EXPECT_EQ(loop.watch_drains(), 0u);
+	EXPECT_EQ(quiet.topics_drained, 0u);
+
+	ASSERT_EQ(::write(pipe_fds[1], "x", 1), 1);
+	ASSERT_TRUE(turn_until(loop, [&] { return probe.runs > 0; }));
+	EXPECT_EQ(loop.watch_drains(), 1u);
+
+	// AND THE HOOK CONSUMED IT, so the next turn is quiet again. Without that
+	// the loop would spin at 100% on a level-triggered descriptor - the failure
+	// mode this topic's contract is entirely about.
+	const std::size_t after = probe.runs;
+	loop.turn(0);
+	EXPECT_EQ(probe.runs, after);
+
+	loop.detach_watch();
+	EXPECT_EQ(loop.watch_fd(), -1);
+	::close(pipe_fds[0]);
+	::close(pipe_fds[1]);
+}
+
+TEST(UiLoopWatch, ADetachedWatchIsNeverPolled) {
+	// The loop must not hold on to a descriptor it was told to forget: a history
+	// destroyed before the session would otherwise leave the loop polling a
+	// closed fd, which `poll` reports as POLLNVAL forever.
+	fake_tty tty;
+	int pipe_fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(pipe_fds), 0);
+
+	watch_probe probe;
+	probe.fd = pipe_fds[0];
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_watch(pipe_fds[0], &watch_probe::on_readable, &probe);
+	loop.detach_watch();
+	loop.enter_read();
+
+	ASSERT_EQ(::write(pipe_fds[1], "x", 1), 1);
+	for (int i = 0; i < 5; ++i)
+		loop.turn(0);
+	EXPECT_EQ(probe.runs, 0u);
+	EXPECT_EQ(loop.watch_drains(), 0u);
+
+	::close(pipe_fds[0]);
+	::close(pipe_fds[1]);
+}
+
+TEST(UiLoopWatch, AnFdWithNoHookIsNotATopic) {
+	// Both or neither (`attach_watch`): a descriptor with nothing to consume it
+	// is the spin above with no way out, so the attachment refuses rather than
+	// half-arming.
+	fake_tty tty;
+	int pipe_fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(pipe_fds), 0);
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_watch(pipe_fds[0], nullptr, nullptr);
+	EXPECT_EQ(loop.watch_fd(), -1);
+
+	loop.attach_watch(-1, &watch_probe::on_readable, nullptr);
+	EXPECT_EQ(loop.watch_fd(), -1);
+
+	::close(pipe_fds[0]);
+	::close(pipe_fds[1]);
 }

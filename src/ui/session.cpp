@@ -593,6 +593,25 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	_loop.attach_helpers(_helpers);
 	_loop.attach_shell(_actor);
 	_loop.attach_signals(_signals);
+	// THE HISTORY'S DIRECTORY WATCH, as the loop's sixth topic (#195, ADR-0010
+	// §Locking and staleness; fish #3565). One `int` and one function pointer:
+	// the loop learns that a descriptor exists and that something wants to be
+	// told when it is readable, and nothing else - not inotify, not kqueue, not
+	// what a history is.
+	//
+	// THE RECORDER AND NOT THE `history_source`, because the drain MUTATES: it
+	// re-maps Tier 1 and publishes a new view, which is a write and belongs to
+	// the write-side pointer. A bundle with no recorder (every test, and `vared`)
+	// attaches nothing and the topic does not exist, which is exactly right - a
+	// memory-only history has no directory to watch.
+	if (_providers.recorder != nullptr) {
+		_loop.attach_watch(
+			_providers.recorder->watch_fd(),
+			[](void* userdata) {
+				static_cast<history_recorder*>(userdata)->drain_watch();
+			},
+			_providers.recorder);
+	}
 	// #135's door is NOT attached to the loop (#151). The actor was given it at
 	// construction and stamps it on every token it serves, so the loop never
 	// holds a pointer to state it does not own; see `event_loop`'s note where

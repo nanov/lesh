@@ -301,8 +301,12 @@ add_library(lesh_ui STATIC
 	src/ui/history/history.cpp
 	src/ui/history/history.h
 	src/ui/history/history_generated.h
+	src/ui/history/locking.cpp
+	src/ui/history/locking.h
 	src/ui/history/log.cpp
 	src/ui/history/log.h
+	src/ui/history/watch.cpp
+	src/ui/history/watch.h
 	src/ui/loop.cpp
 	src/ui/loop.h
 	src/ui/prompt/abi.h
@@ -445,6 +449,7 @@ add_executable(lesh_tests
 	tests/unit/ui_history_blob_tests.cpp
 	tests/unit/ui_history_log_tests.cpp
 	tests/unit/ui_history_search_tests.cpp
+	tests/unit/ui_history_stale_tests.cpp
 	tests/unit/ui_history_tests.cpp
 	tests/unit/leshper_keymap_tests.cpp
 	tests/unit/ui_bind_tests.cpp

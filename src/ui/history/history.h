@@ -35,20 +35,30 @@
 // first walk's buckets and clears them by bumping an integer. `scratch_growths`
 // below is the instrument that says so out loud.
 //
+// STALENESS IS HERE NOW (#195, ADR-0010 §Locking and staleness), and it is
+// three facts and one flag. The APPEND takes an exclusive lock and checks, in
+// the same breath, whether the `history.data` it has mapped is still the one on
+// disk. The DIRECTORY WATCH answers the same question for a session that never
+// appends - fish #3565, a tab left open all day that keeps serving a mapping of
+// a file three vacuums ago. A REMOTE data directory turns both the lock and the
+// `mmap` off and reads Tier 1 into a heap buffer instead (fish PR #5097). All
+// three converge on `_reload_needed`, which the next `publish()` consumes by
+// re-mapping. NOTHING IS CHECKED PER READ: the walk is what runs on a keystroke,
+// and a `stat` on that path is the syscall this whole design removed.
+//
 // WHAT IS NOT HERE, AND WHOSE IT IS. The VACUUM - the LRU dedup, the 256 Ki
 // cap, the temp-and-`rename` - is #194; `save()` flushes and returns, and
 // `may_rewrite_tier1()` is the policy hook it will ask before it writes.
-// STALENESS - `file_id_t`, the directory watch topic, the remote-filesystem
-// heap fallback, `flock` - is #195; nothing here locks and nothing here
-// re-checks the file it mapped. `remove`, `clear` and a `history` builtin are
-// phase 2 (ADR-0010 §Phase 2).
+// `remove`, `clear` and a `history` builtin are phase 2 (ADR-0010 §Phase 2).
 //
 // ADR-0007: the mapping and the log descriptor are the two things that are not
 // self-freeing, and the destructor closes both. Everything else is a standard
 // container or a `shared_ptr`.
 
 #include "ui/history/blob.h"
+#include "ui/history/locking.h"
 #include "ui/history/log.h"
+#include "ui/history/watch.h"
 #include "ui/history_search.h"
 
 #include <cstddef>
@@ -139,6 +149,14 @@ struct open_report {
 	// The data directory could not be created or reached. The session runs on
 	// memory alone: reads work, `save()` writes nothing.
 	bool directory_unusable = false;
+	// The data directory is on a network filesystem (#195). Tier 1 is READ
+	// rather than mapped and nothing in this process locks; everything a caller
+	// can see is otherwise identical.
+	bool directory_remote = false;
+	// The directory watch is armed, so a vacuum in another terminal reaches this
+	// session with no write on its side. False costs fish #3565's freshness and
+	// nothing else - an appending session still notices at its next append.
+	bool watching = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -242,6 +260,49 @@ public:
 	// NO VACUUM. `save()` never rewrites `history.data` - see the seam below.
 	bool save();
 
+	// --- Staleness (#195, ADR-0010 §Locking and staleness) -------------------
+
+	// The descriptor the ui loop's `watch` topic polls, or -1 when this history
+	// is watching nothing (memory-only, or a directory that would not give one
+	// out). BORROWED: the loop never closes it, and this object outlives the
+	// attachment.
+	[[nodiscard]] int watch_fd() const noexcept { return _watch.fd(); }
+
+	// WHAT THE LOOP RUNS WHEN THAT DESCRIPTOR IS READABLE. Consumes the
+	// notification, re-`stat`s `history.data`, and - if it is not the file this
+	// history has mapped - reloads and publishes, so the very next walk sees the
+	// other terminal's commands.
+	//
+	// LOOP THREAD, like every other mutation (ADR-0009). It cannot race `add` or
+	// `resolve_pending`: those run on the SHELL thread, and for the whole of the
+	// time they do, the loop thread is blocked in `wait_on_shell`, which polls
+	// the `shell` and `signal` topics and no others.
+	//
+	// A SPURIOUS WAKE IS THE COMMON CASE and costs one `stat`: the watch is on
+	// the DIRECTORY (it has to be - a `rename` over a file never fires on that
+	// file), so a sibling shell creating its vacuum temp file wakes every
+	// terminal on the machine, and only the `rename` that follows changes the id.
+	void drain_watch();
+
+	// Whether something has told this history that its Tier 1 mapping is out of
+	// date. Cleared by the reload the next `publish()` performs.
+	[[nodiscard]] bool reload_needed() const noexcept { return _reload_needed; }
+
+	// Re-maps, re-verifies and re-caches now, if anything is pending; a no-op
+	// otherwise. `drain_watch` calls it, and so may a caller that wants the
+	// freshest possible view at a chosen moment. LOOP THREAD.
+	void incorporate_external_changes();
+
+	// Times Tier 1 has been re-mapped after the initial `open`. A test
+	// instrument, and the one that tells "the reload happened" from "the records
+	// were there all along".
+	[[nodiscard]] std::size_t reloads() const noexcept { return _reloads; }
+
+	// Whether Tier 1 is a heap buffer rather than a mapping, because the data
+	// directory is remote (#195, fish PR #5097). Nothing above this line
+	// branches on it; it is here so a test and a log line can say which path ran.
+	[[nodiscard]] bool tier1_copied() const noexcept { return _remote; }
+
 	// --- The read seam (#125's `history_source`) -----------------------------
 
 	// The merge walk, newest first, deduplicated on `cmd` bytes: this session's
@@ -266,7 +327,17 @@ public:
 	// False when `history.data` is not ours or did not verify: ADR-0010 says
 	// such a file is never destroyed, and `rename`-ing a rebuilt blob over it
 	// would destroy it. #194 asks this before it writes; it is here, and not
-	// there, because the answer is settled at `open` and by nothing after it.
+	// there, because the answer is a property of the FILE and this class is what
+	// opens it.
+	//
+	// A RELOAD RE-ASKS IT (#195), and that is the only way it ever changes. The
+	// answer used to be "settled at `open`", which was true when `open` was the
+	// only thing that mapped Tier 1. It is a statement about the bytes currently
+	// mapped, and a vacuum in another terminal replaces those bytes: a foreign
+	// file that some other lesh has since renamed ours over is a file this
+	// session may rewrite, and a good file replaced by a future format's is not.
+	// Re-running the same classification on the same code path is what keeps the
+	// two in step.
 	[[nodiscard]] bool may_rewrite_tier1() const noexcept { return !_tier1_untouchable; }
 
 	// Items this session recorded and could not write - no log, or a failed
@@ -308,11 +379,40 @@ private:
 
 	[[nodiscard]] std::shared_ptr<const view> snapshot() const noexcept;
 	// Freezes the current state into a new view and swaps it in. LOOP THREAD.
+	//
+	// CONSUMES `_reload_needed` FIRST (ADR-0010: "`reload_needed` -> next view
+	// build re-maps, re-verifies, re-caches the id"). Here rather than at the
+	// three places that set the flag, so that every route to a stale mapping -
+	// the watch, the append-path id check, and whatever #196 adds - is served by
+	// one implementation and cannot forget.
 	void publish();
 	// Writes resolved, unwritten `disk` items to the log, advancing the cursor.
 	bool flush();
 	// One line on stderr, once per process lifetime of this object.
 	void warn_once(const char* what);
+
+	// --- Tier 1's mapping, and re-establishing it ----------------------------
+
+	// Opens `history.data`, maps it (or READS it, when the directory is remote),
+	// classifies the outcome and caches its `file_id_t`. Both `open` and the
+	// reload go through here, which is what keeps `_tier1_untouchable` and
+	// `_data_id` in step with `_blob` by construction.
+	void map_tier1();
+	// `map_tier1` plus the bookkeeping a RE-map needs: the flag cleared and the
+	// counter bumped. Called by `publish` and by nothing else.
+	void reload_tier1();
+
+	// The append path's descriptor (ADR-0010: "On every append: open, lock,
+	// verify `file_id_for_path == file_id_for_fd`; retry up to 1024").
+	//
+	// -1 when it could not be had, which is when `flush` falls back to the
+	// session's own `_log_fd`. The returned descriptor is LOCKED and the caller
+	// closes it, which is also what releases the lock.
+	[[nodiscard]] int open_locked_log();
+	// One `stat` of `history.data`, compared with the cached id: the other half
+	// of the append-path check, and the thing that makes an appending session
+	// notice a sibling's vacuum without a watch.
+	void note_tier1_identity();
 
 	// --- Loop-thread state; a walk never touches any of it -------------------
 
@@ -332,6 +432,26 @@ private:
 	// because this is a shell and every command line forks: a child has no
 	// business inheriting a writable descriptor onto the user's history.
 	int _log_fd = -1;
+
+	// --- Staleness, all loop-thread ------------------------------------------
+
+	// The identity of the `history.data` whose bytes `_blob` holds, taken BEFORE
+	// the open rather than after it. The order is deliberate: a vacuum landing
+	// between the `stat` and the `open` then leaves a cached id that is one
+	// generation OLD, so the next check says "changed" and re-maps a file that
+	// was already current - a wasted remap. The other order would leave the id
+	// one generation NEW against an old mapping, and the next check would say
+	// "unchanged" forever. One of those failure modes is free and the other is
+	// fish #3565 again.
+	file_id_t _data_id = k_invalid_file_id;
+	// Set by the watch drain and by the append path; consumed by `publish`.
+	bool _reload_needed = false;
+	std::size_t _reloads = 0;
+	// The data directory is on a network filesystem: no locks, no `mmap`.
+	// Settled at `open` and never re-asked - a directory does not change
+	// filesystems under a running shell.
+	bool _remote = false;
+	directory_watch _watch;
 
 	std::uint64_t _session_id = 0;
 	bool _tier1_untouchable = false;
