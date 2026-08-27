@@ -206,6 +206,78 @@ public:
 		return count_of(needle) >= times;
 	}
 
+	// The same wait, ON THE TEXT WITH THE ESCAPE SEQUENCES TAKEN OUT (#201).
+	//
+	// WHY IT IS NEEDED NOW. A keystroke's highlight used to land a turn after the
+	// keystroke, so the first paint of what was typed was UNCOLOURED and the typed
+	// bytes appeared contiguously on the wire; the highlighter runs in place now,
+	// so the first paint of a word already carries its spans and `echo $((6*`
+	// reaches the terminal as `ESC[38;2;...m` `echo` `ESC[39m` ` ` `ESC[...m`
+	// `$((6*`. The SCREEN is identical - one paint instead of two - and a test
+	// that waits for the echo of what it typed has to say so without depending on
+	// which spans the highlighter emitted.
+	[[nodiscard]] bool wait_for_uncoloured(std::string_view needle, std::size_t times = 1,
+	                                       std::chrono::milliseconds budget =
+	                                           std::chrono::seconds{10}) {
+		const auto deadline = std::chrono::steady_clock::now() + budget;
+		while (count_of_uncoloured(needle) < times
+		       && std::chrono::steady_clock::now() < deadline) {
+			char chunk[512];
+			const ssize_t n = ::read(_master, chunk, sizeof(chunk));
+			if (n > 0) {
+				_seen.append(chunk, static_cast<std::size_t>(n));
+				continue;
+			}
+			if (n == 0)
+				break;  // the slave side is gone
+			if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+				break;
+			std::this_thread::sleep_for(std::chrono::milliseconds{5});
+		}
+		return count_of_uncoloured(needle) >= times;
+	}
+
+	// `_seen` with the escape sequences dropped: ESC[ ... final, ESC] ... BEL,
+	// and any other two-byte ESC pair. Enough for what a frame of ours contains -
+	// SGR runs, ESC[K, cursor moves and the bracketed-paste toggles - and
+	// deliberately not a terminal emulator: nothing here replays the moves, so
+	// this is the BYTES a user would have seen typed, not the screen.
+	[[nodiscard]] std::string uncoloured() const {
+		std::string out;
+		out.reserve(_seen.size());
+		for (std::size_t at = 0; at < _seen.size(); ++at) {
+			if (_seen[at] != '\x1b') {
+				out.push_back(_seen[at]);
+				continue;
+			}
+			if (at + 1 >= _seen.size())
+				break;
+			const char kind = _seen[at + 1];
+			if (kind == '[') {
+				at += 2;
+				while (at < _seen.size()
+				       && !(_seen[at] >= '@' && _seen[at] <= '~'))
+					++at;
+			} else if (kind == ']') {
+				at += 2;
+				while (at < _seen.size() && _seen[at] != '\a')
+					++at;
+			} else {
+				++at;
+			}
+		}
+		return out;
+	}
+
+	[[nodiscard]] std::size_t count_of_uncoloured(std::string_view needle) const {
+		const std::string plain = uncoloured();
+		std::size_t found = 0;
+		for (std::size_t at = plain.find(needle); at != std::string::npos;
+		     at = plain.find(needle, at + needle.size()))
+			++found;
+		return found;
+	}
+
 	[[nodiscard]] std::size_t count_of(std::string_view needle) const {
 		std::size_t found = 0;
 		for (std::size_t at = _seen.find(needle); at != std::string::npos;
@@ -1315,7 +1387,12 @@ TEST(UiPty, ABoundKeyAcceptsTheSuggestionTheLoopApplied) {
 
 	// A prefix of the remembered line, then the bound key, then Enter.
 	shell.type("echo $((6*");
-	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	// THE ECHO OF WHAT WAS TYPED, UNCOLOURED (#201). Still the first occurrence -
+	// the run above typed its whole line and its Enter in one go, so that line was
+	// accepted inside the same turn and never painted - and uncoloured because the
+	// highlighter's spans are in the first paint of a word now, which puts an SGR
+	// run between `echo` and `$((6*`. See `wait_for_uncoloured`.
+	ASSERT_TRUE(shell.wait_for_uncoloured("echo $((6*")) << "saw: " << shell.seen();
 	shell.type("\x07\r");
 
 	EXPECT_TRUE(shell.wait_for("42", 2)) << "the accept never reached the buffer; saw: "
@@ -1382,7 +1459,12 @@ TEST(UiPty, AControlVByteReachesTheShellNowThatIEXTENIsOff) {
 	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
 
 	shell.type("echo $((6*");
-	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	// THE ECHO OF WHAT WAS TYPED, UNCOLOURED (#201). Still the first occurrence -
+	// the run above typed its whole line and its Enter in one go, so that line was
+	// accepted inside the same turn and never painted - and uncoloured because the
+	// highlighter's spans are in the first paint of a word now, which puts an SGR
+	// run between `echo` and `$((6*`. See `wait_for_uncoloured`.
+	ASSERT_TRUE(shell.wait_for_uncoloured("echo $((6*")) << "saw: " << shell.seen();
 	shell.type("\x16\r");
 
 	EXPECT_TRUE(shell.wait_for("42", 2))
@@ -1409,7 +1491,12 @@ TEST(UiPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
 	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
 
 	shell.type("echo $((6*");
-	ASSERT_TRUE(shell.wait_for("echo $((6*")) << "saw: " << shell.seen();
+	// THE ECHO OF WHAT WAS TYPED, UNCOLOURED (#201). Still the first occurrence -
+	// the run above typed its whole line and its Enter in one go, so that line was
+	// accepted inside the same turn and never painted - and uncoloured because the
+	// highlighter's spans are in the first paint of a word now, which puts an SGR
+	// run between `echo` and `$((6*`. See `wait_for_uncoloured`.
+	ASSERT_TRUE(shell.wait_for_uncoloured("echo $((6*")) << "saw: " << shell.seen();
 	// The suggestion is computed on a worker, so the ghost text lands a moment
 	// after the echo of what was typed. Long enough that it certainly has.
 	std::this_thread::sleep_for(std::chrono::milliseconds{300});
