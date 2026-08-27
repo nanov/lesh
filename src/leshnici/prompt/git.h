@@ -6,14 +6,14 @@
 // the facts struct; this one reads a filesystem, which is why it needs
 // `git_head.{h,cpp}` beside it and why it is not in `prompt/modules.h`. The
 // engine learns it when the wiring site installs the shipped extension set -
-// see `prompt_modules.h` - and by no other route.
+// see `prompt/modules.h` - and by no other route.
 
-#include "leshnici/git_head.h"
+#include "leshnici/prompt/git_head.h"
 #include "ui/prompt/module.h"
 
 #include <string_view>
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::prompt {
 
 // The vocabulary is leshper's; the module is ours. Named rather than pulled in
 // wholesale so the class body below is the same text it was in `prompt.h`.
@@ -67,4 +67,4 @@ protected:
 // One object for the whole process, exactly as the built-ins are.
 inline constexpr module_git kModuleGit{};
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::prompt

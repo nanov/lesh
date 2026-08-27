@@ -1,4 +1,4 @@
-#include "leshnici/builtins.h"
+#include "leshnici/coreutils/builtins.h"
 
 #include "runtime/diagnostic.h"
 #include "substrate/args.h"
@@ -20,7 +20,7 @@
 #include <unistd.h>
 #include <vector>
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::coreutils {
 
 namespace {
 
@@ -330,4 +330,4 @@ runtime::builtin_result builtin_ls(runtime::shell_state&, char** argv) {
 	return {status};
 }
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::coreutils

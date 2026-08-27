@@ -53,7 +53,7 @@ otherwise be counted as this run's. Six times on this map a runner defect has
 masqueraded as a shell bug, and this is the cheapest one to fall into.
 
 **Editor-only changes need no sweep.** A change confined to `src/leshper/` or to
-leshnici's PROMPT MODULES (`src/leshnici/prompt_modules.*`, `module_git.h`,
+leshnici's PROMPT MODULES (`src/leshnici/prompt/`: `modules.*`, `git.h`,
 `git_head.*`) cannot move the corpus or the conformance score - not because the
 binary leaves that code out (`lesh` links `lesh_leshper`, and `lesh_leshnici`
 above `lesh_ui` since #170), but because the conformance corpus is non-interactive: every case runs
@@ -61,8 +61,9 @@ a script on a pipe, and nothing in it ever enters the line editor. Iterate with
 `./build/debug/lesh_tests --gtest_filter='Leshper*:Leshnici*'` (milliseconds),
 adding `:Grapheme*` when positions or width are involved. The full sanitized gate
 still runs once at merge; the exemption is from the sweeps, not the gate.
-**leshnici's BUILTINS are NOT exempt** (#165). `src/leshnici/builtins.*`,
-`builtin_*.cpp` and `byte_stream.h` are shell builtins, not editor code: they run
+**leshnici's BUILTINS are NOT exempt** (#165). `src/leshnici/coreutils/`
+(`builtins.*`, `ls.cpp`, `cat.cpp`, `head.cpp`, `tail.cpp` and `byte_stream.h`)
+are shell builtins, not editor code: they run
 in a script the moment it says `set -o leshnici`, and the seam that reaches them
 is in `src/runtime/` (`extension_builtin`, `shell_state::set_extension_builtins`,
 `try_run_builtin`, `classify_builtin`'s state-aware overload). A change to either

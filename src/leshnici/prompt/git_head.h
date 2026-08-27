@@ -48,7 +48,7 @@
 #include <string>
 #include <string_view>
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::prompt {
 
 // What HEAD says, in the vocabulary a prompt segment renders.
 //
@@ -93,4 +93,4 @@ struct git_probe_options {
 // filesystem is not touched.
 [[nodiscard]] git_head read_git_head(std::string_view directory, const git_probe_options& options = {});
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::prompt

@@ -1,6 +1,6 @@
-#include "leshnici/builtins.h"
+#include "leshnici/coreutils/builtins.h"
 
-#include "leshnici/byte_stream.h"
+#include "leshnici/coreutils/byte_stream.h"
 #include "runtime/diagnostic.h"
 #include "substrate/args.h"
 
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <unistd.h>
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::coreutils {
 
 namespace {
 
@@ -77,4 +77,4 @@ runtime::builtin_result builtin_cat(runtime::shell_state&, char** argv) {
 	return {status};
 }
 
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::coreutils

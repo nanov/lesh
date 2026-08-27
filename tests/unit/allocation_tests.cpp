@@ -7,7 +7,7 @@
 #include "leshper/keymap.h"
 #include "leshper/host.h"
 #include "leshper/registry.h"
-#include "leshnici/prompt_modules.h"
+#include "leshnici/leshnici.h"
 #include "ui/prompt/prompt.h"
 #include "leshper/state.h"
 #include "runtime/expander.h"

@@ -35,8 +35,7 @@ x .d88"               z`    ^%    .uef^"
 #include <unistd.h>
 #include <vector>
 
-#include "leshnici/builtins.h"
-#include "leshnici/prompt_modules.h"
+#include "leshnici/leshnici.h"
 #include "runtime/executor.h"
 #include "runtime/history_store.h"
 #include "runtime/invocation.h"

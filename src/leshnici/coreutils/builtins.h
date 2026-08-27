@@ -1,12 +1,12 @@
 #pragma once
 
-// LESHNICI'S BUILTINS, AND THE ONE VERB THAT INSTALLS THEM (#165).
+// LESHNICI'S COREUTILS BUILTINS (#165).
 //
-// The visible list, exactly as `prompt_modules.h` is for the prompt side: what
-// the shipped extension set adds to a shell, and the single call that adds it.
-// `src/main.cpp` includes this header and calls `install_builtins`; nothing else
-// in the program needs to know that `ls` runs in-process, and nothing below
-// leshnici can find out.
+// `ls`, `cat`, `head` and `tail`: the four functions the shipped extension
+// set's builtin table wires together. `leshnici.h` is the visible list and
+// `install_builtins` the one verb that installs them - `src/main.cpp` includes
+// that header, not this one - so nothing outside `coreutils/` needs to know
+// that `ls` runs in-process, and nothing below leshnici can find out.
 //
 // WHY THESE EXIST AT ALL. A shell that draws its own prompt and edits its own
 // line still forks `/bin/ls` to answer "what is in this directory", which costs a
@@ -30,7 +30,7 @@
 #include "runtime/builtins.h"
 #include "runtime/shell_state.h"
 
-namespace lesh::leshnici {
+namespace lesh::leshnici::coreutils {
 
 // `ls [-a] [-l] [-1] [file...]`. Operands are paths and default to `.`.
 [[nodiscard]] runtime::builtin_result builtin_ls(runtime::shell_state& state, char** argv);
@@ -46,12 +46,4 @@ namespace lesh::leshnici {
 // `tail [-n count] [file...]`. The last ten lines by default.
 [[nodiscard]] runtime::builtin_result builtin_tail(runtime::shell_state& state, char** argv);
 
-// Hands `state` the extension table. Reports and installs nothing when a name
-// collides with a core builtin - `shell_state::set_extension_builtins` writes
-// the diagnostic, one line per collision, and the shell runs with the core set.
-//
-// Idempotent: the table is `constexpr` with static storage duration and the
-// state holds a view of it, so calling this twice leaves one installation.
-void install_builtins(runtime::shell_state& state);
-
-} // namespace lesh::leshnici
+} // namespace lesh::leshnici::coreutils
