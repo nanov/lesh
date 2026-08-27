@@ -366,6 +366,8 @@ add_library(lesh_ui STATIC
 	src/ui/prompt/module_status.h
 	src/ui/prompt/module_time.h
 	src/ui/prompt/modules.h
+	src/ui/reactor_call.cpp
+	src/ui/reactor_call.h
 	src/ui/reactors.cpp
 	src/ui/reactors.h
 	src/ui/session.cpp
@@ -373,6 +375,7 @@ add_library(lesh_ui STATIC
 	src/ui/shell_knowledge.h
 	src/ui/shell_actor.cpp
 	src/ui/shell_actor.h
+	src/ui/shell_side.h
 	src/ui/shell_state_knowledge.h
 	src/ui/tty.cpp
 	src/ui/tty.h

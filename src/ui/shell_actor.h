@@ -76,7 +76,9 @@
 
 #include "leshper/abi.h"
 #include "leshper/registry.h"
+#include "ui/reactor_call.h"
 #include "ui/shell_knowledge.h"
+#include "ui/shell_side.h"
 #include "leshper/state.h"
 #include "ui/workers.h"
 
@@ -186,53 +188,6 @@ private:
 	int _read_fd = -1;
 	int _write_fd = -1;
 	bool _armed = false;
-};
-
-// ---------------------------------------------------------------------------
-// A-5: what the editing session needs from the shell, and nothing more.
-// ---------------------------------------------------------------------------
-
-// The interface the host DECLARES and `ui/session.cpp` implements (#134), the
-// same shape `history_source` (#125) has. The reason is no longer a link rule -
-// `lesh_ui` links `lesh_runtime` - but the one that outlived it: the actor and
-// the loop must be drivable with no shell behind them, which is what every test
-// in `ui_loop_tests.cpp` and `ui_knowledge_tests.cpp` does, and a direct call
-// into `shell_state` would make a shell a prerequisite for editing at all.
-//
-// TWO METHODS, and their narrowness is the decision. Everything else the shell
-// knows stays HOST-SIDE in `shell_knowledge` - stamped on the token for a
-// reactor, read directly by the completer - and never crosses to the editor as
-// itself; what crosses is `leshper::host`, the one door, and never a call. What
-// is here is only what has to BE a call, and the rule that decides it is that both
-// of these RUN CODE: they change the world, and the world is the shell's. #139
-// added a third for the completer's name list and #151 took it away again, once
-// the owner's reading of ADR-0009 made the direct read legal - which is the rule
-// holding rather than being bent.
-//
-// Both run ON THE SHELL THREAD, synchronously, with nothing else of the
-// shell's running. Neither may touch the terminal: the loop has restored the
-// modes and given up the foreground group before `execute` is posted, and an
-// action's `port_call` runs with the EDITOR'S modes still in force - fish #7770,
-// never re-enable ECHO around an action's shell code.
-class shell_side {
-public:
-	virtual ~shell_side() = default;
-
-	// Runs an accepted command line to completion. Answers its exit status.
-	//
-	// The fork happens inside here, on this thread, which is the main thread -
-	// and it is legal because the loop has already parked the helpers and is
-	// blocked in its poll. The child claims the terminal itself between fork and
-	// exec, so nothing here needs the loop's cooperation on process groups.
-	virtual std::int32_t execute(std::string_view line) = 0;
-
-	// #92's port: runs an action's shell code. Answers its status.
-	//
-	// Lane discipline is the implementation's, not this interface's: builtins
-	// and functions in-process, externals through spawn, fork-requiring forms
-	// refused loudly. What this seam fixes is only that the call is synchronous
-	// from the action's point of view, which is #92's contract unchanged.
-	virtual std::int32_t port_call(std::string_view code) = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -392,28 +347,5 @@ private:
 	bool _stopping = false;
 	bool _busy = false;
 };
-
-// Runs one reactor against a snapshot ON THE CALLING THREAD, into `into`.
-//
-// The token minting the shell thread needs, factored out so it is written once:
-// #135 wants it for the highlighter, `shell_actor` uses it for the `highlight`
-// slot, and a test uses it to run a reactor with no thread at all. What it is
-// NOT is a second reactor path - it builds exactly the `request_token`
-// registry.cpp and workers.cpp build, and asserts `token_is_live` on it for the
-// same reason workers.cpp does: the thread key is computed in three places now,
-// and a disagreement would make every accessor on the token refuse.
-//
-// `superseded` is the flag the reactor's cooperative poll reads; it must outlive
-// the call.
-//
-// `snapshot` IS BORROWED AND GIVEN BACK, not consumed. Its buffer moves into the
-// token so the bytes are not copied twice, and moves back when the reactor
-// returns - so a caller that serves out of a long-lived slot keeps the string it
-// grew instead of watching the token's destructor free it. Nothing points into
-// it afterwards: a reactor's view of the buffer is valid for its call and no
-// longer. Every other field is read, not taken.
-void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
-                      request_snapshot& snapshot, const std::atomic<bool>& superseded,
-                      leshper::reactor_batch& into);
 
 } // namespace lesh::ui
