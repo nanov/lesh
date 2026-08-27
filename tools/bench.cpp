@@ -16,6 +16,7 @@
 // Build:  cmake --build --preset bench --target lesh_bench
 // Run:    ./build/bench/tools/lesh_bench
 
+#include "fiber/scheduler.h"
 #include "runtime/executor.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
@@ -73,6 +74,13 @@ void report_header(const char* title) {
 
 // Keeps the optimiser from deleting a scan whose result nothing reads.
 volatile int benchmark_sink = 0;
+
+// The fiber under the switch-cost measurement below: yield, forever. One slice
+// is one `yield` plus the resume that follows it, i.e. one round trip.
+void yield_forever(fiber::scheduler& on, void* /*userdata*/) {
+	for (;;)
+		on.yield();
+}
 
 } // namespace
 
@@ -203,6 +211,50 @@ int main() {
 			std::printf("  %-26s %6zu %9zu %10.0f %9.2f\n", l.name, l.text.size(),
 			            clusters, ns, ns / static_cast<double>(l.text.size()));
 		}
+	}
+
+	// Fiber switch cost. THE NUMBER THAT DECIDES WHETHER THE WHOLE COOPERATIVE
+	// DESIGN IS AFFORDABLE (#198, part of #82): the host loop slices reactors
+	// twice per turn, so a switch has to be cheap next to the work between
+	// switches - a keystroke's re-lex is hundreds of nanoseconds, so a switch in
+	// the single-digit nanoseconds is free and a switch in the microseconds is a
+	// redesign.
+	//
+	// One "round trip" is `scheduler::run_one_slice` on a fiber whose body does
+	// nothing but `yield`: host -> fiber -> host, two context switches plus our
+	// own bookkeeping. So this is an upper bound on minicoro's bare
+	// `mco_resume`/`mco_yield` pair, not a measurement of it in isolation.
+	//
+	// Measured on the dev machine when this landed (#198), release, arm64:
+	//
+	//   13.1-13.4 ns   this figure - one `run_one_slice` round trip
+	//    6.0- 6.5 ns   minicoro's bare `mco_resume`/`mco_yield` pair, same
+	//                  machine, same day, `-O3 -DNDEBUG`, thread_local current-co
+	//    5.9- 6.3 ns   the same pair with `-DMCO_NO_MULTITHREAD`
+	//
+	// So: the research note's 5.4 ns reproduces (6.0-6.5 for the same thing
+	// today), the `thread_local` current-coroutine pointer we deliberately keep
+	// costs a few tenths of a nanosecond rather than the ~12 ns the note's
+	// 5.4-vs-17.3 bracket might suggest - that bracket was MCO_DEBUG's asserts,
+	// not the TLS load - and the remaining ~7 ns is OUR bookkeeping per slice:
+	// the state transitions, the slice counter, the status read and the
+	// error check. Against a keystroke's re-lex, which is hundreds of
+	// nanoseconds, both halves are free.
+	//
+	// In Debug this figure is meaningless: ASan instruments every frame and the
+	// watchdog reads the clock twice per slice.
+	std::printf("\nfiber switch cost (host -> fiber -> host, one slice each)\n");
+	{
+		fiber::scheduler sched;
+		fiber::fiber& f = sched.spawn(&yield_forever, nullptr, "bench");
+		const double ns = time_ns(2000000, [&] { sched.run_one_slice(f); });
+		std::printf("  %-40s %12.1f ns\n", "yield/resume round trip", ns);
+		std::printf("  %-40s %12zu bytes (guard %zu)\n", "stack per fiber",
+		            f.stack().stack_size, f.stack().guard_size);
+#ifdef LESH_ENABLE_ASSERTS
+		std::printf("  (Debug/RelWithDebInfo: instrumented and watchdogged - "
+		            "read the release number)\n");
+#endif
 	}
 
 	std::printf("\n");
