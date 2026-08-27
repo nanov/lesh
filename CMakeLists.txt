@@ -451,6 +451,7 @@ add_executable(lesh_tests
 	tests/unit/ui_history_blob_tests.cpp
 	tests/unit/ui_history_log_tests.cpp
 	tests/unit/ui_history_search_tests.cpp
+	tests/unit/ui_history_property_tests.cpp
 	tests/unit/ui_history_stale_tests.cpp
 	tests/unit/ui_history_tests.cpp
 	tests/unit/ui_history_vacuum_tests.cpp

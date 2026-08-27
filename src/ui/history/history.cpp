@@ -92,7 +92,15 @@ struct uuidv7 {
 	return out;
 }
 
+// The injected clock (#196), and the flag that says whether there is one. Not
+// atomic and not a member: it is test-only, it is read on the loop thread with
+// every other piece of `add`'s state, and a shipping build never writes it.
+bool g_now_overridden = false;
+std::uint64_t g_now_override = 0;
+
 [[nodiscard]] std::uint64_t unix_now() noexcept {
+	if (g_now_overridden)
+		return g_now_override;
 	return static_cast<std::uint64_t>(std::time(nullptr));
 }
 
@@ -862,6 +870,8 @@ vacuum_result history::vacuum_now() {
 		.session = session,
 		.policy = may_rewrite_tier1() ? tier1_policy::rewritable
 		                              : tier1_policy::untouchable,
+		// `k_history_save_max` unless a test lowered it (#196).
+		.cap = _vacuum_cap,
 		.on_step = _vacuum_hook,
 	});
 
@@ -1046,5 +1056,23 @@ void history::for_each_newest_first(const std::function<bool(std::string_view)>&
 		return fn(as_text(one.what.cmd));
 	});
 }
+
+// ---------------------------------------------------------------------------
+// The clock, for tests only (#196)
+// ---------------------------------------------------------------------------
+
+namespace test_hooks {
+
+void set_now_override(std::uint64_t seconds) noexcept {
+	g_now_overridden = true;
+	g_now_override = seconds;
+}
+
+void clear_now_override() noexcept {
+	g_now_overridden = false;
+	g_now_override = 0;
+}
+
+} // namespace test_hooks
 
 } // namespace lesh::ui::history
