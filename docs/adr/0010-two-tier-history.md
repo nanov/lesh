@@ -185,6 +185,14 @@ rewrites ~25 MB, accepted for now).
 Writers never truncate or modify `history.data` in place — so a stale mapping
 goes stale, never invalid, and cannot SIGBUS on a local fs.
 
+Amended by #193: a SUCCESSFUL vacuum clears `new_items` in the same `publish()`
+that maps the new blob — legal here because `session_id`, not `new_items`,
+tells own items from foreign ones (fish keeps them only for its boundary
+check, which this design dropped). Without it `publish()` is O(items this
+session) per command. A `corrupt` Tier 1 is treated like an unknown identifier
+(warn once, never touch, `may_rewrite_tier1() == false`) until #194 decides
+whether a verified-ours-but-broken file may be rebuilt from log + memory.
+
 `save()` on interactive exit flushes unwritten items to the log and does not
 vacuum. `~History` munmaps and closes everything (ADR-0007: the gate is "count
 zero at exit", not "no long-lived descriptors").
