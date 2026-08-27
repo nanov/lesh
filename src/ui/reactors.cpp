@@ -594,7 +594,7 @@ highlighter* highlighter_create() { return new highlighter{}; }
 
 void highlighter_destroy(highlighter* self) noexcept { delete self; }
 
-std::size_t register_builtin_reactors(lesh_registry& reg, highlighter& self) {
+std::size_t register_reactors(lesh_registry& reg, highlighter& self) {
 	// Interning is loop-thread only (ADR-0008), so a reactor interns everything
 	// it will ever emit at registration and carries plain integers to the worker.
 	for (const style_slot& slot : kStyles) {

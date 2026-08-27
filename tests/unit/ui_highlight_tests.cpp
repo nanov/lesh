@@ -23,7 +23,7 @@ using namespace lesh::ui;
 //
 // Every test below drives the highlighter the way the loop will: build a state,
 // hand it to the harness fake, and read the batch back. Nothing here calls into
-// builtin_reactors.cpp directly, because there IS no other entry point - the
+// reactors.cpp directly, because there IS no other entry point - the
 // reactor is a function pointer in the registry and a `void*` beside it, exactly
 // as a Lua reactor would be, and asserting on it through the ABI is asserting on
 // the property that matters (A-11).
@@ -54,7 +54,7 @@ struct highlight_fixture {
 
 	highlight_fixture() {
 		reg.host = &host;
-		register_builtin_reactors(reg, self.get());
+		register_reactors(reg, self.get());
 	}
 
 	[[nodiscard]] reactor_batch paint(std::string_view line) {
@@ -512,7 +512,7 @@ TEST(UiReactorTheme, EverySemanticNameTheBuiltinReactorsInternHasADefault) {
 	// exactly what would go stale.
 	registry reg;
 	owned_highlighter painter;
-	ASSERT_EQ(register_builtin_reactors(reg, painter.get()), 1u);
+	ASSERT_EQ(register_reactors(reg, painter.get()), 1u);
 	owned_autosuggester suggester{nullptr};
 	ASSERT_EQ(register_autosuggester(reg, suggester.get()), 1u);
 

@@ -4,6 +4,8 @@
 #include "ui/loop.h"
 #include "ui/workers.h"
 
+#include "ui_fakes.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -15,6 +17,7 @@
 
 using namespace lesh::leshper;
 using namespace lesh::ui;
+using lesh::testing::fake_tty;
 
 // WHAT A REACTOR OFFERED, REACHED BY AN ACTION THE HOST RAN (#133, #144, F-25).
 //
@@ -37,50 +40,6 @@ using namespace lesh::ui;
 namespace {
 
 // --- The loop ---------------------------------------------------------------
-
-// A pipe standing in for a terminal, as everywhere else in leshper's tests:
-// never the process's own tty.
-class fake_tty {
-public:
-	fake_tty() {
-		[&] { ASSERT_EQ(::pipe(_in), 0); }();
-		[&] { ASSERT_EQ(::pipe(_out), 0); }();
-		::fcntl(_in[0], F_SETFL, O_NONBLOCK);
-		::fcntl(_out[0], F_SETFL, O_NONBLOCK);
-	}
-	~fake_tty() {
-		for (int fd : {_in[0], _in[1], _out[0], _out[1]})
-			if (fd >= 0)
-				::close(fd);
-	}
-
-	fake_tty(const fake_tty&) = delete;
-	fake_tty& operator=(const fake_tty&) = delete;
-
-	[[nodiscard]] loop_fds fds() const { return loop_fds{_in[0], _out[1]}; }
-
-	void type(std::string_view bytes) const {
-		ASSERT_EQ(::write(_in[1], bytes.data(), bytes.size()),
-		          static_cast<ssize_t>(bytes.size()));
-	}
-
-	// Everything the loop has written since the last call.
-	[[nodiscard]] std::string painted() const {
-		std::string all;
-		char chunk[4096];
-		for (;;) {
-			const ssize_t n = ::read(_out[0], chunk, sizeof(chunk));
-			if (n <= 0)
-				break;
-			all.append(chunk, static_cast<std::size_t>(n));
-		}
-		return all;
-	}
-
-private:
-	int _in[2]{-1, -1};
-	int _out[2]{-1, -1};
-};
 
 loop_options pipe_options() {
 	loop_options options;
@@ -201,7 +160,7 @@ struct looped {
 // The real loop: applied by `take_batch`, read by an action it dispatched
 // ===========================================================================
 
-TEST(UiLoopProposals, AKeyBoundToAcceptPutsTheAppliedProposalInTheBuffer) {
+TEST(UiProposal, AKeyBoundToAcceptPutsTheAppliedProposalInTheBuffer) {
 	// THE WHOLE TRAIL, and the one #144 found broken: reactor -> worker ->
 	// `take_batch` -> `state::proposals` -> `lesh_proposal_read` -> a staged
 	// write the loop commits. Nothing here dispatches through the harness by
@@ -223,7 +182,7 @@ TEST(UiLoopProposals, AKeyBoundToAcceptPutsTheAppliedProposalInTheBuffer) {
 	EXPECT_TRUE(driven.loop.editor().undo.can_undo());
 }
 
-TEST(UiLoopProposals, AnActionReadsIndexZeroOfWhatTheLoopApplied) {
+TEST(UiProposal, AnActionReadsIndexZeroOfWhatTheLoopApplied) {
 	looped driven;
 	driven.bind("<C-y>", "probe_proposal");
 
@@ -235,7 +194,7 @@ TEST(UiLoopProposals, AnActionReadsIndexZeroOfWhatTheLoopApplied) {
 	EXPECT_EQ(driven.seen.bytes, "git status");
 }
 
-TEST(UiLoopProposals, ATimerDispatchSeesTheSameViewAKeystrokeDoes) {
+TEST(UiProposal, ATimerDispatchSeesTheSameViewAKeystrokeDoes) {
 	// The loop dispatches a timer expiry through its OWN harness and a keystroke
 	// through the context's, and before #144 those were two objects with two
 	// stores. The view is the state's now, so there is one - and this is the path
@@ -253,7 +212,7 @@ TEST(UiLoopProposals, ATimerDispatchSeesTheSameViewAKeystrokeDoes) {
 	EXPECT_EQ(driven.seen.bytes, "git status");
 }
 
-TEST(UiLoopProposals, ANewerBatchFromOneReactorReplacesWhatItOfferedBefore) {
+TEST(UiProposal, ANewerBatchFromOneReactorReplacesWhatItOfferedBefore) {
 	// Latest-wins, through the loop rather than through the store: the reactor
 	// answers twice and the second answer is the one an action reads. Not two
 	// offers stacked up, which would make index 1 a suggestion about a buffer
@@ -274,7 +233,7 @@ TEST(UiLoopProposals, ANewerBatchFromOneReactorReplacesWhatItOfferedBefore) {
 	EXPECT_EQ(driven.seen.status, LESH_ERR_NOTFOUND) << "there is one offer, not two";
 }
 
-TEST(UiLoopProposals, ABatchFromASupersededGenerationIsNeverReadable) {
+TEST(UiProposal, ABatchFromASupersededGenerationIsNeverReadable) {
 	// N-4 from the accepting side. The batch was computed against a generation
 	// the editor has left behind, so it is dropped rather than applied - and an
 	// action cannot read a proposal about text the buffer no longer holds.
@@ -293,7 +252,7 @@ TEST(UiLoopProposals, ABatchFromASupersededGenerationIsNeverReadable) {
 	EXPECT_EQ(driven.seen.status, LESH_ERR_NOTFOUND);
 }
 
-TEST(UiLoopProposals, DismissingTakesTheBatchOffTheScreenAndOutOfTheView) {
+TEST(UiProposal, DismissingTakesTheBatchOffTheScreenAndOutOfTheView) {
 	// #133's dismissal in the running loop: the whole batch goes, virtual text
 	// included, and the loop repaints - a dismissal changes neither the buffer
 	// nor the cursor, so the redraw has to be asked for by the dismissal itself.
@@ -318,7 +277,7 @@ TEST(UiLoopProposals, DismissingTakesTheBatchOffTheScreenAndOutOfTheView) {
 	EXPECT_EQ(driven.seen.status, LESH_ERR_NOTFOUND) << "nothing left to accept";
 }
 
-TEST(UiLoopProposals, TheLineBoundaryTakesTheOffersWithTheDecorations) {
+TEST(UiProposal, TheLineBoundaryTakesTheOffersWithTheDecorations) {
 	// A proposal is what THIS line would become, and this line has just run.
 	looped driven;
 	ASSERT_TRUE(driven.show("git"));

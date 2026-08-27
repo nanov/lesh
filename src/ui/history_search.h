@@ -204,9 +204,6 @@ public:
 	history_search() = default;
 	explicit history_search(options opts) noexcept : _options(opts) {}
 
-	[[nodiscard]] const options& current_options() const noexcept { return _options; }
-	void set_options(options opts) noexcept { _options = opts; }
-
 	// Walks `source` newest first, calling `on_match` for each entry that
 	// matches `query` under the current mode.
 	//

@@ -29,7 +29,7 @@
 //
 // WHERE IT GOES. `$LESH_LOG_FILE`, defaulting to
 // `${XDG_STATE_HOME:-~/.local/state}/lesh/log`, directory created. NEVER STDERR
-// WHILE LESHPER OWNS THE TERMINAL (#98): a stray write corrupts the screen, and
+// WHILE THE HOST OWNS THE TERMINAL (#98): a stray write corrupts the screen, and
 // there is no flag that turns that back on. stderr is reachable only by a
 // NON-INTERACTIVE shell that set a level and named no file. Off by default in
 // both shells - this is opt-in diagnostics, not a background cost.
@@ -301,7 +301,7 @@ struct settings {
 	// The one thing that distinguishes "write it here" from "write it wherever
 	// lesh keeps its state", and therefore the field that decides whether a
 	// NON-INTERACTIVE shell talks to stderr instead (#98 forbids that outright
-	// while leshper owns the terminal, whatever this says).
+	// while the host owns the terminal, whatever this says).
 	bool log_path_explicit = false;
 	// Where the structured sink goes. Empty means no replay file.
 	std::string replay_path;
@@ -334,7 +334,7 @@ struct settings {
 
 // What the process knows that the environment does not.
 struct options {
-	// Whether leshper owns the terminal. TRUE FORBIDS STDERR outright (#98) -
+	// Whether the host owns the terminal. TRUE FORBIDS STDERR outright (#98) -
 	// there is no override, because the failure mode is a corrupted screen and
 	// the user cannot see the message that corrupted it.
 	bool interactive = false;

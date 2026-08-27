@@ -1,6 +1,5 @@
 #include "ui/completion.h"
 
-#include "substrate/assert.h"
 #include "syntax/lexer.h"
 #include "syntax/token.h"
 
@@ -14,7 +13,7 @@
 #include <unistd.h>
 #include <vector>
 
-// LOOK AT THE INCLUDES, the way builtin_reactors.cpp asks you to.
+// LOOK AT THE INCLUDES, the way `ui/reactors.cpp` asks you to.
 //
 // `syntax/` and `substrate/` and the POSIX headers the directory walk needs -
 // and NO `runtime/` header. THAT USED TO BE A LINK PROPERTY AND IS NOT ANY MORE
@@ -475,7 +474,7 @@ void shell_completer::gather_names(name_domain which, leshper::pager_kind kind,
 	if (_knowledge == nullptr)
 		return;
 	scratch.clear();
-	// DIRECTLY, ON THIS THREAD (#151). See complete.h: the loop reads shell state
+	// DIRECTLY, ON THIS THREAD (#151). See completion.h: the loop reads shell state
 	// while nothing executes, and inside an action nothing can.
 	_knowledge->enumerate(which, scratch);
 	for (const std::string& name : scratch) {

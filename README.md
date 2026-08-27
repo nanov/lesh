@@ -33,18 +33,22 @@ parameter and arithmetic expansion, field splitting, pathname expansion,
 here-documents, redirections, traps and the POSIX builtins. The single-pass parser it
 replaced has been deleted.
 
-What does not work yet: **anything interactive**. Deleting the old shell took the
-replxx line editor, the prompt and history with it, and lesh's own line editor is
-built separately and bound at the end — so at a terminal it says `no interactive mode
-yet` and exits. Brace expansion and array/map variables went the same way; they return
-with the curated zsh layer, on the new core.
+Interactive works too, on lesh's own line editor. `lesh -i` gets syntax
+highlighting driven by the real lexer, autosuggestions from history, path
+completion, rebindable keys (`bind`), and a prompt built from a template
+(`prompt`, with `{path}`, `{git}`, `{status}`, `{time}` and the rest).
+
+What does not work yet: **job control** — a stopped or backgrounded child is
+reported and the terminal reclaimed, but there is no job table and no `fg`/`bg`.
+Brace expansion and array/map variables went with the old shell; they return with
+the curated zsh layer, on the new core.
 
 ## What it is aiming at
 
 - **Full POSIX sh conformance** as the language floor, with a curated zsh-inspired
   layer on top admitted one feature at a time.
-- **Its own line editor.** replxx was a stopgap and is gone; the replacement is
-  written against the real lexer and the error-tolerant parser.
+- **Its own line editor.** replxx was a stopgap and is gone; the replacement is in,
+  written against the real lexer and the error-tolerant parser, and still growing.
 - **A plugin API** in LuaJIT, over a flat C capability surface its FFI consumes directly.
 - **One self-contained binary.** Everything vendored and statically linked; no runtime
   shared-library dependencies.

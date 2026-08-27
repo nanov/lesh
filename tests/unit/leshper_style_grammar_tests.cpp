@@ -5,56 +5,30 @@
 // namespace already proves every interesting spec at compile time - a failure
 // there is a build failure, which is the right outcome for a grammar rule that
 // regressed. What a running test adds is what a constant expression cannot
-// exercise: the runtime codegen path (the constexpr proofs never touch it), the
-// SGR round trip through `prompt.h`'s `emit_sgr` and `sgr.h`'s `apply_sgr` -
-// which needs all three headers in one place and so cannot live in
-// `style_grammar.h` without that header including `prompt.h` and risking the
-// cycle the template-parser ticket would then close - and a fuzz-ish sweep over
-// every short spec, which is cheap here and would just be restating the
-// selftest's cases as a loop if it lived there instead.
+// exercise: the runtime codegen path (the constexpr proofs never touch it) and
+// a fuzz-ish sweep over every short spec, which is cheap here and would just be
+// restating the selftest's cases as a loop if it lived there instead.
+//
+// AND NOTHING FROM `ui/`. The SGR round trip needs `ui/prompt/`'s `emit_sgr`,
+// which is the HOST's since #170, so it is `ui_style_grammar_tests.cpp`'s. The
+// grammar is the editor's and its tests reach no further than the editor.
 
-#include "ui/prompt/prompt.h"
-#include "leshper/sgr.h"
 #include "leshper/style_grammar.h"
 #include "leshper/surface.h"
 
 #include <gtest/gtest.h>
 
 #include <cstddef>
-#include <cstdint>
-#include <string>
 #include <string_view>
 
 namespace {
 
-using lesh::leshper::apply_sgr;
 using lesh::leshper::attribute;
 using lesh::leshper::color;
 using lesh::leshper::has;
 using lesh::leshper::parse_style;
 using lesh::leshper::style;
 using lesh::leshper::style_parse;
-
-// The round trip: a spec parses into a `style`, `prompt::emit_sgr` turns that
-// into SGR bytes from reset semantics, and `sgr.h`'s `apply_sgr` reads those
-// bytes back into the style they came from. `constexpr` so the same function
-// backs both the compile-time proof below and the runtime assertions further
-// down - two ways of running the same check are not two checks.
-constexpr bool style_round_trips_through_sgr(std::string_view spec) {
-	const style_parse parsed = parse_style(spec);
-	if (!parsed.ok)
-		return false;
-	std::string bytes;
-	lesh::ui::prompt::emit_sgr(parsed.value, bytes);
-	return apply_sgr(std::string_view{bytes}, style{}) == parsed.value;
-}
-
-// The one round trip the ticket asks for as a compile-time proof: this is the
-// only site where `style_grammar.h`, `sgr.h` and `prompt.h` may all meet,
-// because `style_grammar.h` itself must not include `prompt.h` (a later ticket
-// has `prompt.h` include the grammar, and a header cannot include its own
-// includer).
-static_assert(style_round_trips_through_sgr("cyan+black.bold"));
 
 } // namespace
 
@@ -165,17 +139,6 @@ TEST(LeshperStyleGrammar, ErrorsReportTheFailingItemsByteOffset) {
 		EXPECT_FALSE(result.ok) << one.spec;
 		EXPECT_EQ(result.error_at, one.error_at) << one.spec;
 	}
-}
-
-TEST(LeshperStyleGrammar, RoundTripsThroughSgr) {
-	EXPECT_TRUE(style_round_trips_through_sgr(""));
-	EXPECT_TRUE(style_round_trips_through_sgr("cyan"));
-	EXPECT_TRUE(style_round_trips_through_sgr("cyan+black.bold"));
-	EXPECT_TRUE(style_round_trips_through_sgr("#89dceb+#333333"));
-	EXPECT_TRUE(style_round_trips_through_sgr("bright-red.undercurl.reverse"));
-	// A spec that fails to parse never round-trips - there is no `style` to
-	// compare against.
-	EXPECT_FALSE(style_round_trips_through_sgr("CYAN"));
 }
 
 // A cheap, deterministic sweep: every one- and two-byte spec, including bytes

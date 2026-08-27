@@ -23,7 +23,7 @@
 // `leshper_keymap_tests.cpp` and drive a REAL keymap registry, because what they
 // were proving was that twenty adapter lines are enough to cross the link
 // boundary. That question is already answered for the prompt in
-// `leshper_prompt_tests.cpp`, over a real engine. What is left, and what belongs
+// `ui_prompt_tests.cpp`, over a real engine. What is left, and what belongs
 // here, is the half `bind`'s tests cannot separate: which console verb a given
 // command line reaches, how many times, and what the builtin prints when the far
 // side refuses. A recording fake answers all three exactly; a real engine would

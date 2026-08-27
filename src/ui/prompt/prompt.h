@@ -1,5 +1,8 @@
 #pragma once
 
+// THE HOST'S SINCE #170 - `lesh::ui::prompt`, `src/ui/prompt/`; was
+// `lesh::leshper::prompt`.
+//
 // The prompt engine (#157, architecture spec §6.10): the element is the
 // PLACEMENT, `(…)` is the only combinator, and a module is a typed singleton
 // object that owns its own parameter grammar.

@@ -3,7 +3,6 @@
 #include "syntax/lexer.h"
 
 #include <string>
-#include <utility>
 
 namespace lesh::ui {
 

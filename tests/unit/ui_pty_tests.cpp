@@ -896,13 +896,7 @@ TEST(UiPty, ControlZStopsEveryStageOfAForegroundPipeline) {
 	// ONE LINE, one `wait_for`, exactly as the simple-command case next door does
 	// it - `kill` takes every pid at once. Typing a second line before the prompt
 	// for the first has come back is what this file's budgeted waits exist to
-	// avoid, and here it is not merely untidy: continuing two stopped processes
-	// while another line is queued lands a SIGCHLD job notice in the event queue
-	// mid-`accept_current_line`, and that path has a live heap-use-after-free in
-	// `src/leshper/loop.cpp` (the queue reallocates under the `const event&`
-	// `event_loop::handle` is still holding). It is not this ticket's bug and not
-	// this ticket's file to fix; staying prompt-synchronized is the convention
-	// anyway.
+	// avoid, and staying prompt-synchronized is this file's convention.
 	std::string cleanup = "kill -CONT";
 	for (const pid_t pid : stopped)
 		cleanup += " " + std::to_string(pid);

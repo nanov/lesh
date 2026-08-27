@@ -68,7 +68,7 @@ void unring(int fd) noexcept {
 // ---------------------------------------------------------------------------
 
 void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
-                      request_snapshot snapshot, const std::atomic<bool>& superseded,
+                      request_snapshot& snapshot, const std::atomic<bool>& superseded,
                       leshper::reactor_batch& into) {
 	LESH_ASSERT(fn != nullptr);
 
@@ -81,7 +81,8 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 
 	leshper::request_token token;
 	// Moved, not copied: the snapshot was taken on the loop thread and its
-	// buffer has no second reader.
+	// buffer has no second reader. It goes BACK at the end of this function, so
+	// a caller serving out of a long-lived slot keeps the storage.
 	token.buffer = std::move(snapshot.buffer);
 	token.cursor = snapshot.cursor;
 	token.selection_start = snapshot.selection_start;
@@ -113,6 +114,10 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 
 	token.call_token = 0;
 	token.owner_thread = 0;
+	// AND THE STORAGE GOES BACK, exactly as `worker_pool::compute` hands it back
+	// to its scratch task. Without this the token's destructor would free a
+	// buffer the slot is about to want again.
+	snapshot.buffer = std::move(token.buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -190,16 +195,6 @@ void shell_channel::recycle(std::vector<shell_message>& used) {
 	used.clear();
 }
 
-bool shell_channel::empty() const {
-	std::lock_guard lock(_mutex);
-	return _queue.empty();
-}
-
-std::size_t shell_channel::size() const {
-	std::lock_guard lock(_mutex);
-	return _queue.size();
-}
-
 bool shell_channel::armed() const {
 	std::lock_guard lock(_mutex);
 	return _armed;
@@ -260,6 +255,28 @@ void shell_actor::post_highlight(std::string_view reactor, lesh_reactor_fn fn, v
 	_work.notify_one();
 }
 
+void shell_actor::post_highlight(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
+                                 const leshper::state& target, std::uint32_t event_kind) {
+	{
+		std::lock_guard lock(_mutex);
+		if (_highlight.filled)
+			++_dropped;  // latest-wins, counted
+		_highlight.reactor.assign(reactor);
+		_highlight.fn = fn;
+		_highlight.userdata = userdata;
+		// STRAIGHT INTO THE SLOT'S OWN STORAGE. Not built and then moved: written
+		// where it already lives, so the buffer the previous round left behind is
+		// reused rather than freed. `host` is stamped in `serve_highlight`, which
+		// is where it has always been decided (#151).
+		take_snapshot(_highlight.snapshot, target, event_kind);
+		_highlight.filled = true;
+		// The same cancellation the overload above documents: a newer highlight
+		// arriving IS the abandonment of the older one.
+		_superseded.store(true, std::memory_order_relaxed);
+	}
+	_work.notify_one();
+}
+
 void shell_actor::stop() {
 	{
 		std::lock_guard lock(_mutex);
@@ -274,9 +291,16 @@ void shell_actor::stop() {
 // ---------------------------------------------------------------------------
 
 bool shell_actor::serve_one() {
-	execute_slot execute;
-	port_slot port;
-	highlight_slot highlight;
+	// SWAPPED OUT, NOT MOVED OUT. The three `_serving_*` members carry the
+	// previous round's storage into the slot they take from, so the strings the
+	// loop thread grew are still there for the next `post_*` to assign into -
+	// which is what the banner at the top of this file promises. `= slot{}` here
+	// freed them, once per keystroke on the `highlight` slot.
+	//
+	// WHICH ONE WAS TAKEN IS A VARIABLE NOW, because a retained member's `filled`
+	// is left over from the last round and can no longer answer the question.
+	enum class took : std::uint8_t { nothing, execute, port, highlight };
+	took what = took::nothing;
 
 	{
 		std::lock_guard lock(_mutex);
@@ -284,14 +308,21 @@ bool shell_actor::serve_one() {
 		// `port_call`, then `highlight`. A user who pressed Enter is not waiting
 		// behind a repaint of the line they just left.
 		if (_execute.filled) {
-			execute = std::move(_execute);
-			_execute = execute_slot{};
+			std::swap(_serving_execute, _execute);
+			_execute.filled = false;
+			what = took::execute;
 		} else if (_port.filled) {
-			port = std::move(_port);
-			_port = port_slot{};
+			std::swap(_serving_port, _port);
+			_port.filled = false;
+			what = took::port;
 		} else if (_highlight.filled) {
-			highlight = std::move(_highlight);
-			_highlight = highlight_slot{};
+			std::swap(_serving_highlight, _highlight);
+			_highlight.filled = false;
+			// The function pointer and its context go with `filled`: a slot that
+			// is not filled must not look like it names a reactor.
+			_highlight.fn = nullptr;
+			_highlight.userdata = nullptr;
+			what = took::highlight;
 			// Cleared as the work is TAKEN, not when it is posted: a supersede
 			// set by the post that handed us this item would otherwise cancel
 			// the item it was announcing.
@@ -302,12 +333,21 @@ bool shell_actor::serve_one() {
 		_busy = true;
 	}
 
-	if (execute.filled)
-		serve_execute(execute);
-	else if (port.filled)
-		serve_port_call(port);
-	else
-		serve_highlight(highlight);
+	// Outside the lock, and safe there because `_serving_*` are the SHELL
+	// THREAD's alone - nothing else in this file names them.
+	switch (what) {
+		case took::execute:
+			serve_execute(_serving_execute);
+			break;
+		case took::port:
+			serve_port_call(_serving_port);
+			break;
+		case took::highlight:
+			serve_highlight(_serving_highlight);
+			break;
+		case took::nothing:
+			break;
+	}
 
 	{
 		std::lock_guard lock(_mutex);
@@ -383,7 +423,7 @@ void shell_actor::serve_highlight(highlight_slot& job) {
 	// function's to remember per call site: the actor serves one shell, and this
 	// is that shell's host, on every token it mints.
 	job.snapshot.host = _host;
-	run_reactor_here(job.reactor, job.fn, job.userdata, std::move(job.snapshot), _superseded,
+	run_reactor_here(job.reactor, job.fn, job.userdata, job.snapshot, _superseded,
 	                 answer.batch);
 	answer.status = answer.batch.status;
 	LESH_LOG(log::level::debug, log::category::reactor,

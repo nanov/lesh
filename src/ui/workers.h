@@ -126,6 +126,14 @@ struct request_snapshot {
 // exist so that filling them in later is a change here and nowhere else.
 [[nodiscard]] request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind);
 
+// The same, INTO STORAGE THE CALLER ALREADY HAS. `into.buffer` is assigned
+// rather than replaced, so a snapshot taken into the same object twice allocates
+// only when the line grows past what that object already holds. `snapshot_of` is
+// this plus a fresh object, and the two agree field for field - `host` included,
+// which is reset rather than left as the caller found it.
+void take_snapshot(request_snapshot& into, const leshper::state& target,
+                   std::uint32_t event_kind);
+
 // ---------------------------------------------------------------------------
 // Pooled messages.
 // ---------------------------------------------------------------------------
@@ -282,6 +290,18 @@ public:
 	void submit(std::string_view key, request_snapshot snapshot,
 	            lesh_reactor_fn fn, void* userdata);
 
+	// The same, TAKING THE SNAPSHOT IN PLACE - and this is the overload the loop
+	// uses on every keystroke.
+	//
+	// The one above builds a `request_snapshot` at the call site and moves it
+	// into the slot, which frees the string the slot was holding: one malloc and
+	// one free per reactor per keystroke, for a line whose length barely changes.
+	// This one assigns straight into the slot's retained buffer, so a warm round
+	// reaches the heap only when the line outgrows what the slot already has.
+	// `AllocationTest.SubmittingAWarmReactorRoundCostsNoHeap` is the pin.
+	void submit(std::string_view key, const leshper::state& target, std::uint32_t event_kind,
+	            lesh_reactor_fn fn, void* userdata);
+
 	// Supersedes everything in flight and drops everything pending, without
 	// parking. What the loop does when the buffer has moved on but nobody is
 	// about to fork.
@@ -346,6 +366,12 @@ private:
 		buffer_pool arena;
 		char* arena_base;
 	};
+
+	// The slot for `key`, created on first use. `_mutex` HELD.
+	[[nodiscard]] slot& slot_for(std::string_view key);
+	// Marks `s` pending and makes it runnable. `_mutex` HELD, and the snapshot
+	// already written - the two submit overloads differ only in how it got there.
+	void arm(slot& s, lesh_reactor_fn fn, void* userdata);
 
 	void run(worker& me);
 	// `job` is consumed: the snapshot's buffer moves into the token rather than

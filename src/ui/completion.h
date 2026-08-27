@@ -160,8 +160,9 @@ public:
 // #94's `Completer` override point
 // ---------------------------------------------------------------------------
 
-// DECLARED IN read.h SINCE #134 as a forward declaration with the note
-// "completion and its pager are not this ticket's"; this is that type arriving.
+// DECLARED SINCE #134 in what is now `ui/session.h`, as a forward declaration
+// with the note "completion and its pager are not this ticket's"; this is that
+// type arriving.
 // The bundle field keeps its meaning: null means the session builds the default
 // one below, and a caller that supplies its own replaces the whole source trio -
 // which is the override point #94 asked for, one indirect call at Tab frequency.

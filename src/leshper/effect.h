@@ -1,6 +1,7 @@
 #pragma once
 
 #include "leshper/state.h"
+#include "substrate/inline_vector.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -211,12 +212,24 @@ using effect = std::variant<render_request, worker_request, spawn_request, line_
                             line_cancelled, end_of_file, recursive_edit_request, arm_timer,
                             disarm_timer>;
 
-// std::vector for now, and the hot path does not yet exist to measure it
-// against. N-2 wants hot-path allocation bounded and jitter-free; #100's rule is
-// that leshper's containers are decided from measured requirements rather than
-// chosen preemptively, and the measurement belongs with the N-1 latency gate,
-// which map #82 still carries as fog. A turn emits at most a handful of these,
-// so a small-buffer type is the obvious later answer - later.
-using effects = std::vector<effect>;
+// EIGHT INLINE, THEN THE HEAP (the reorg cleanup). This was a `std::vector`, and
+// since `step` returns it by value that was one malloc and one free per
+// keystroke for a list that is almost always two elements long.
+//
+// WHERE EIGHT COMES FROM. `loop_harness::invoke` emits at most FOUR for one
+// dispatch - a dismissal's repaint, the outcome the action asked for, and the
+// repaint plus worker request a mutation earns - and `run_binding` may dispatch
+// TWICE for one key, because an operator-pending verb runs after the motion that
+// gave it its region. Four times two is the most one keystroke can produce.
+//
+// AND WHY IT IS A FALLBACK RATHER THAN A CAP. There is no provable maximum for
+// `step` as a whole: injected input is drained inside the turn that produced it,
+// one dispatch per codepoint, and an action may inject from inside that drain -
+// so the count is bounded by what a binding chooses to inject, which is user
+// code. `inline_vector` spills to the heap there instead of dropping an effect
+// (which could lose a `line_accepted`) or asserting (which would make a legal
+// script a crash). `AllocationTest.AKeystrokeStepCostsNoHeapBeyondUndo` is the
+// pin on the ordinary case.
+using effects = inline_vector<effect, 8>;
 
 } // namespace lesh::leshper

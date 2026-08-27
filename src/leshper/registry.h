@@ -126,6 +126,14 @@ struct lesh_registry {
 	std::map<std::string, action_entry, std::less<>> actions;
 	std::map<std::string, reactor_entry, std::less<>> reactors;
 
+	// Bumped whenever `reactors` changes shape or content.
+	//
+	// FOR A HOST THAT CACHES THE TABLE. Notifying reactors is a per-keystroke
+	// walk, and a host that flattens this map into a vector to avoid walking a
+	// tree needs to know when its copy went stale. An integer compare is the
+	// whole protocol; the registry does not know or care who is watching.
+	std::uint64_t reactors_generation = 0;
+
 	// THE TIMER TABLE IS THE HOST'S NOW (#168). What was here was a declaration -
 	// `{id, interval_ms, action}` - which the driver walked on every turn to diff
 	// against its own list of due instants, so each side held half a scheduler and

@@ -8,6 +8,8 @@
 #include "substrate/arena.h"
 #include "substrate/measure.h"
 
+#include "ui_fakes.h"
+
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -20,13 +22,14 @@
 
 using namespace lesh::leshper;
 using namespace lesh::ui;
+using lesh::testing::superseding_source;
 
 // The autosuggester reactor and F-25's accepting actions (#133).
 //
 // Driven the way the loop will drive them, and by no other route: a state, the
 // harness fake, a batch read back, an action dispatched by NAME. Nothing here
-// calls into builtin_reactors.cpp or builtin_actions.cpp directly, because there
-// is no other entry point - both are a function pointer in a registry with a
+// calls into reactors.cpp or builtin_actions.cpp directly, because there is no
+// other entry point - both are a function pointer in a registry with a
 // `void*` beside it, exactly as a Lua reactor would be (A-11).
 //
 // The history is a VECTOR, never `~/.lesh_history` (#125): a unit test that read
@@ -96,30 +99,6 @@ struct suggest_fixture {
 			return "<none>";
 		return std::string(out, length);
 	}
-};
-
-// A history that supersedes the request part-way through its own walk, so the
-// cooperative poll has something to notice. The real trigger is the user typing
-// while a worker is thinking; here it is the second entry.
-class superseding_source final : public history_source {
-public:
-	superseding_source(loop_harness& loop, std::vector<std::string> entries)
-		: _loop(&loop), _entries(std::move(entries)) {}
-
-	void for_each_newest_first(
-		const std::function<bool(std::string_view)>& fn) const override {
-		std::size_t seen = 0;
-		for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
-			if (++seen == 2)
-				_loop->supersede();
-			if (!fn(*it))
-				return;
-		}
-	}
-
-private:
-	loop_harness* _loop;
-	std::vector<std::string> _entries;
 };
 
 // The glyphs of one laid-out row, concatenated - the layout suite's helper, kept

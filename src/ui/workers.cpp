@@ -42,10 +42,12 @@ std::uint64_t worker_thread_key() noexcept {
 
 buffer_pool* current_worker_arena() noexcept { return t_worker_arena; }
 
-request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind) {
-	request_snapshot taken;
-	taken.buffer.assign(target.buffer.text());
-	taken.cursor = target.cursor.byte_offset();
+void take_snapshot(request_snapshot& into, const leshper::state& target,
+                   std::uint32_t event_kind) {
+	// `assign` AND NOT `=`: the string keeps whatever capacity it arrived with,
+	// which is the whole point of the in-place form.
+	into.buffer.assign(target.buffer.text());
+	into.cursor = target.cursor.byte_offset();
 	// The derived region, exactly as `loop_harness::react` takes it (#116 landed
 	// the model after this function was written, and a snapshot that reported
 	// every selection as inactive would make #129's `selection_changed` fan-out
@@ -54,13 +56,25 @@ request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_k
 	// deactivation and the flag is the separate question.
 	{
 		const std::size_t anchor = target.selection_anchor().byte_offset();
-		const std::size_t head = taken.cursor;
-		taken.selection_start = anchor < head ? anchor : head;
-		taken.selection_end = anchor < head ? head : anchor;
-		taken.selection_active = target.selection_active();
+		const std::size_t head = into.cursor;
+		into.selection_start = anchor < head ? anchor : head;
+		into.selection_end = anchor < head ? head : anchor;
+		into.selection_active = target.selection_active();
 	}
-	taken.computed_against = target.gen;
-	taken.event_kind = event_kind;
+	into.computed_against = target.gen;
+	into.event_kind = event_kind;
+	// `host` IS RESET, so that this and `snapshot_of` produce the same value into
+	// a reused object as into a fresh one. Without it a slot could keep a host
+	// pointer a previous submit had set and hand it to a caller that meant null,
+	// which is the one field where "left over from last time" is not obviously
+	// wrong at the point of use. A submit that wants one sets it after (see the
+	// field's note, and `shell_actor::serve_highlight`).
+	into.host = nullptr;
+}
+
+request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind) {
+	request_snapshot taken;
+	take_snapshot(taken, target, event_kind);
 	return taken;
 }
 
@@ -310,20 +324,42 @@ void worker_pool::submit(std::string_view key, request_snapshot snapshot,
 		return;
 
 	std::lock_guard lock(_mutex);
+	slot& s = slot_for(key);
+	s.pending.snapshot = std::move(snapshot);
+	arm(s, fn, userdata);
+}
+
+void worker_pool::submit(std::string_view key, const leshper::state& target,
+                         std::uint32_t event_kind, lesh_reactor_fn fn, void* userdata) {
+	LESH_ASSERT(fn != nullptr);
+	if (fn == nullptr)
+		return;
+
+	std::lock_guard lock(_mutex);
+	slot& s = slot_for(key);
+	// STRAIGHT INTO THE SLOT'S OWN STORAGE. The snapshot is not built and then
+	// moved: it is written where it already lives, so the buffer the previous
+	// round left behind is reused rather than freed.
+	take_snapshot(s.pending.snapshot, target, event_kind);
+	arm(s, fn, userdata);
+}
+
+worker_pool::slot& worker_pool::slot_for(std::string_view key) {
 	auto found = _slots.find(key);
 	if (found == _slots.end()) {
 		found = _slots.try_emplace(std::string{key}).first;
 		found->second.name = found->first;
 	}
-	slot& s = found->second;
+	return found->second;
+}
 
+void worker_pool::arm(slot& s, lesh_reactor_fn fn, void* userdata) {
 	// Latest-wins. What was pending is DROPPED rather than queued behind - "if
 	// something is waiting then we drop it, as we need only the latest" - and
 	// what is in flight is told, through the poll the ABI already has, that
 	// nobody wants its answer any more.
 	if (s.pending.valid)
 		++_dropped;
-	s.pending.snapshot = std::move(snapshot);
 	s.pending.fn = fn;
 	s.pending.userdata = userdata;
 	s.pending.valid = true;
@@ -431,6 +467,11 @@ void worker_pool::run(worker& me) {
 
 	t_worker_arena = &me.arena;
 
+	// The scratch task this worker runs out of, declared ONCE. It carries the
+	// previous round's buffer, which is swapped back into the slot below so that
+	// neither side has to allocate a fresh one.
+	task job;
+
 	std::unique_lock lock(_mutex);
 	for (;;) {
 		// THE CHECK-IN. Everything a worker does between two passes through here
@@ -456,8 +497,14 @@ void worker_pool::run(worker& me) {
 		slot* const owner = _ready.front();
 		_ready.pop_front();
 		owner->queued = false;
-		task job = std::move(owner->pending);
-		owner->pending = task{};
+		// SWAPPED, NOT MOVED AWAY. `owner->pending = task{}` freed the string
+		// the slot had grown, so the next submit had to allocate one again. The
+		// scratch task holds last round's storage, and it goes back into the slot
+		// here for the next submit to assign into.
+		std::swap(job, owner->pending);
+		owner->pending.valid = false;
+		owner->pending.fn = nullptr;
+		owner->pending.userdata = nullptr;
 		owner->in_flight = true;
 		owner->superseded.store(false, std::memory_order_relaxed);
 		++_started;
@@ -517,6 +564,13 @@ void worker_pool::compute(task& job, slot& owner, leshper::reactor_batch& into) 
 	// Dead the moment the compute returns, exactly as on the loop thread.
 	token.call_token = 0;
 	token.owner_thread = 0;
+
+	// AND THE STORAGE GOES BACK. The token borrowed the snapshot's buffer by
+	// move so the bytes were not copied twice; handing it back here means the
+	// scratch task keeps a grown string for the next round instead of the
+	// token's destructor freeing it. Nothing points into it any more - a
+	// reactor's view of the buffer is valid for its call and no longer.
+	job.snapshot.buffer = std::move(token.buffer);
 }
 
 } // namespace lesh::ui

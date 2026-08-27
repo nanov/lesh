@@ -1,6 +1,8 @@
 #include "leshper/abi.h"
 #include "leshper/editor.h"
 #include "ui/loop.h"
+#include "ui/shell_actor.h"
+#include "ui/workers.h"
 #include "leshper/event.h"
 #include "leshper/keymap.h"
 #include "leshper/host.h"
@@ -307,7 +309,7 @@ TEST_F(AllocationTest, EvenLoggingOnFormatsWithoutTheHeap) {
 
 // --- The event loop (#129) -------------------------------------------------
 //
-// HERE RATHER THAN IN leshper_loop_tests.cpp, and the reason is the instrument:
+// HERE RATHER THAN IN ui_loop_tests.cpp, and the reason is the instrument:
 // ASan permits ONE malloc-hook pair per process, and this file claims it. A
 // second `__sanitizer_install_malloc_and_free_hooks` in another translation
 // unit does not fail loudly, it just never counts - which would be a green
@@ -316,7 +318,7 @@ TEST_F(AllocationTest, EvenLoggingOnFormatsWithoutTheHeap) {
 
 namespace {
 
-// A pipe standing in for a terminal, the way leshper_loop_tests.cpp drives the
+// A pipe standing in for a terminal, the way ui_loop_tests.cpp drives the
 // loop everywhere: never the process's own tty.
 class loop_over_a_pipe {
 public:
@@ -363,11 +365,11 @@ TEST_F(AllocationTest, AWarmIdleLoopTurnCostsNoHeap) {
 	// all members with capacity taken in the constructor, and this is what says
 	// so.
 	//
-	// It measures THE LOOP, not the editor. A keystroke turn still allocates,
-	// for reasons belonging to two other files: `step` returns `effects` by
-	// value (effect.h: the small-buffer answer waits on the N-1 latency gate map
-	// #82 carries as fog) and `apply_edit` records an undo entry. Widening this
-	// to a keystroke is that ticket's work, not something to fake here.
+	// It measures THE LOOP, not the editor. A keystroke turn that INSERTS still
+	// allocates, and for one reason now rather than two: `apply_edit` records an
+	// undo entry, which owns the replaced and inserted text (#173). The other
+	// reason - `step` returning `effects` by value as a `std::vector` - is gone;
+	// `AKeystrokeStepCostsNoHeapBeyondUndo` below is the number that replaced it.
 	loop_over_a_pipe driven;
 	for (int i = 0; i < 4; ++i)
 		driven.loop().turn(0);
@@ -425,6 +427,188 @@ TEST_F(AllocationTest, ATimerExpiryCostsNoHeap) {
 	EXPECT_EQ(counted, 0u) << "a timer expiry reached the heap";
 
 	EXPECT_EQ(lesh_timer_stop(&actions, id), LESH_OK);
+}
+
+// --- The shell thread's highlight round (the reorg cleanup) ----------------
+
+namespace {
+
+// A `shell_side` with nothing behind it: this test never accepts a line, and
+// `serve_highlight` is the only path it drives.
+class no_shell final : public ui::shell_side {
+public:
+	std::int32_t execute(std::string_view) override { return 0; }
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+// The highlighter's shape without the highlighter: one span over the line, which
+// is what makes the batch's vectors real rather than empty.
+std::int32_t one_span_reactor(lesh_request* request, void*) {
+	std::size_t length = 0;
+	lesh_request_buffer_length(request, &length);
+	if (length > 0)
+		lesh_emit_span(request, 0, length, LESH_STYLE_NONE + 1);
+	return LESH_OK;
+}
+
+} // namespace
+
+TEST_F(AllocationTest, AWarmShellThreadHighlightRoundCostsNoHeap) {
+	// THE ONE REACTOR EVERY SESSION RUNS. ADR-0009 puts the highlighter on the
+	// shell thread because it reads the alias, function and builtin tables, so
+	// this round trip - post, take, serve, reply, drain, recycle - happens once
+	// per keystroke for the whole life of a shell.
+	//
+	// It allocated twice per keystroke. `notify_reactors` built a
+	// `request_snapshot` with `snapshot_of` and MOVED it into the slot, freeing
+	// the buffer the slot held; and `serve_one` then moved the slot into a local
+	// and reset the member with `= highlight_slot{}`, freeing it again - which is
+	// what made `shell_actor.h`'s "their strings keep their capacity" untrue.
+	// `post_highlight` now assigns in place, `serve_one` SWAPS against a retained
+	// scratch slot, and `run_reactor_here` hands the buffer back when the reactor
+	// returns.
+	//
+	// ONE THREAD, DELIBERATELY. `serve_one` is what `run()` is written in terms
+	// of, so driving it here is the same path with no second thread inside the
+	// window - which is what lets a process-wide malloc counter mean "this round
+	// trip" rather than "this round trip and whatever a worker was doing".
+	//
+	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
+	// object) and every round uses the same one, so a zero means capacity was
+	// reused rather than never needed.
+	using namespace lesh::leshper;
+	log::shutdown();
+
+	state s;
+	apply_edit(s, position{}, position{},
+	           "git log --oneline --graph --decorate --all | head -40");
+
+	no_shell nothing_behind_it;
+	ui::shell_actor actor{nothing_behind_it, nullptr};
+	std::vector<ui::shell_message> inbox;
+
+	const auto round = [&] {
+		actor.post_highlight("highlighter", &one_span_reactor, nullptr, s,
+		                     LESH_EVENT_BUFFER_CHANGED);
+		actor.serve_one();
+		actor.replies().drain(inbox);
+		actor.replies().recycle(inbox);
+	};
+
+	// Warm: the slot's buffer, the message pool's spare list, the batch's span
+	// vector and the inbox all take their capacity in the first few rounds.
+	for (int i = 0; i < 4; ++i)
+		round();
+	ASSERT_EQ(actor.served(), 4u) << "the rounds below would be measuring nothing";
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 100; ++i)
+			round();
+	});
+	EXPECT_EQ(counted, 0u) << "a warm shell-thread highlight round reached the heap";
+	EXPECT_EQ(actor.served(), 104u);
+}
+
+// --- The keystroke path (the reorg cleanup) --------------------------------
+
+TEST_F(AllocationTest, AKeystrokeStepCostsNoHeapBeyondUndo) {
+	// `effects` USED TO BE A `std::vector`, and `step` returns it BY VALUE. So
+	// every key pressed cost one malloc and one free for a list that is almost
+	// always two elements long. It is `inline_vector<effect, 8>` now - eight
+	// being four per dispatch times the two dispatches an operator-pending verb
+	// takes - and this is the number that says so.
+	//
+	// A CURSOR MOTION AND NOT AN INSERT. An insertion still allocates, and not
+	// for the effect channel: `apply_edit` records an undo entry, which owns the
+	// replaced and inserted text. That is #173's, and folding it in here would
+	// make this test unable to fail for the reason it exists.
+	//
+	// The line is long enough that the motions have somewhere to go, and the pair
+	// of them returns the cursor to where it started, so the hundred rounds below
+	// are a hundred identical rounds rather than a walk off the end.
+	using namespace lesh::leshper;
+
+	state s;
+	apply_edit(s, position{}, position{}, "echo hello world");
+
+	// BACKWARD, AND ONLY BACKWARD. Every forward motion in the default table is
+	// one of #140's accept-suggestion-or-move actions, which reads the proposal
+	// store and allocates there - a real cost, and not this channel's. So the
+	// cursor is put back by assignment, which is two integers and costs nothing,
+	// and the KEY under measurement is `backward_char`: bound, dispatched,
+	// moving, and therefore emitting the `render_request` this counts the
+	// carriage of.
+	for (int i = 0; i < 8; ++i) {
+		s.cursor = s.buffer.end_position();
+		(void)step(s, key_event::of(named_key::left));
+	}
+
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 100; ++i) {
+			s.cursor = s.buffer.end_position();
+			(void)step(s, key_event::of(named_key::left));
+		}
+	});
+	EXPECT_EQ(counted, 0u) << "a cursor-motion keystroke reached the heap";
+}
+
+// --- The submit path (the reorg cleanup) -----------------------------------
+
+namespace {
+
+// A reactor that does nothing, so what is measured is the CHANNEL and not a
+// reactor's own work.
+std::int32_t idle_reactor(lesh_request*, void*) { return LESH_OK; }
+
+} // namespace
+
+TEST_F(AllocationTest, SubmittingAWarmReactorRoundCostsNoHeap) {
+	// THE HOST'S HALF OF FANNING A KEYSTROKE OUT, and it is zero.
+	//
+	// It was not. `notify_reactors` called `snapshot_of`, which built a fresh
+	// `request_snapshot` - one malloc for its buffer - and `submit` then MOVED it
+	// into the slot, freeing the buffer the slot was already holding. One malloc
+	// and one free per reactor per keystroke, for a line whose length changes by
+	// one byte. The slot is now filled IN PLACE (`take_snapshot`), and the worker
+	// SWAPS the task out and hands the storage back at the end of `compute`
+	// instead of moving it away and resetting the slot.
+	//
+	// THE ROUND TRIPS BEFORE THE WINDOW ARE THE POINT, not a warm-up formality:
+	// they are what proves the storage came back. If `compute` stopped returning
+	// the buffer, the slot would be empty here and the first submit below would
+	// allocate.
+	//
+	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
+	// object) and every submit uses the SAME line, so a zero means capacity was
+	// reused rather than never needed.
+	using namespace lesh::leshper;
+
+	state s;
+	apply_edit(s, position{}, position{},
+	           "git log --oneline --graph --decorate --all | head -40");
+
+	ui::worker_pool helpers{1};
+	std::vector<ui::completion> done;
+	for (int round = 0; round < 5; ++round) {
+		helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
+		ASSERT_GE(helpers.completions().wait_and_drain(done, 1), 1u);
+		for (ui::completion& one : done)
+			one.recycle();
+		done.clear();
+	}
+
+	// PARKED FOR THE WINDOW. A worker running inside it would be counting its
+	// own allocations, which are the compute's and not the submit's; parked, the
+	// only thing that moves is the slot.
+	helpers.park_all();
+	const size_t counted = mallocs_during([&] {
+		for (int i = 0; i < 100; ++i)
+			helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
+	});
+	helpers.resume();
+	EXPECT_EQ(counted, 0u) << "a warm submit reached the heap";
+
+	helpers.supersede_all();
 }
 
 // --- The reactor channel and the completion channel (#168 Phase B) ---------

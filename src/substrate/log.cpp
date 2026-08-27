@@ -500,7 +500,7 @@ bool configure(const settings& from, const options& with) {
 	uint64_t bits = from.enabled;
 
 	if (bits != 0) {
-		// #98, and there is no flag for it: while leshper owns the terminal the
+		// #98, and there is no flag for it: while the host owns the terminal the
 		// text sink is a file or it is nothing, because a stray write to fd 2
 		// corrupts the screen the user is reading the shell on. A non-interactive
 		// shell that set a level and named no file gets stderr, which is what

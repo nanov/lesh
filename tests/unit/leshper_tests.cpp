@@ -39,7 +39,7 @@ effects type(state& s, std::string_view text) {
 	effects all;
 	for (const char byte : text) {
 		effects one = step(s, key_event::of(static_cast<char32_t>(static_cast<unsigned char>(byte))));
-		all.insert(all.end(), one.begin(), one.end());
+		all.append(one.begin(), one.end());
 	}
 	return all;
 }

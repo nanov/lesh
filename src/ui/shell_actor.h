@@ -61,8 +61,18 @@
 // `recycle` hands them back with their vectors cleared but their capacity
 // intact, which is #126's `message_pool` idea with the ownership made local -
 // so a keystroke's highlight round trip allocates nothing once the session is
-// warm. The three slots are members and their strings keep their capacity for
-// the same reason.
+// warm.
+//
+// THE THREE SLOTS KEEP THEIR STRINGS, and this took three things rather than
+// the one this paragraph used to claim. The loop ASSIGNS into the slot instead
+// of building a snapshot and moving it in (`post_highlight`'s state overload);
+// `serve_one` SWAPS the slot against a retained `_serving_*` member instead of
+// moving it into a local and resetting the member; and `run_reactor_here` HANDS
+// THE BUFFER BACK when the reactor returns, instead of letting the token's
+// destructor free what it borrowed. Any one of the three left out and the round
+// allocates once per keystroke -
+// `AllocationTest.AWarmShellThreadHighlightRoundCostsNoHeap` fails for each of
+// them separately.
 
 #include "leshper/abi.h"
 #include "leshper/registry.h"
@@ -165,8 +175,6 @@ public:
 	// Empties `used` and keeps the storage for the next round trip.
 	void recycle(std::vector<shell_message>& used);
 
-	[[nodiscard]] bool empty() const;
-	[[nodiscard]] std::size_t size() const;
 	// Whether a wakeup byte is outstanding - exposed so the arming rule can be
 	// asserted directly rather than only through a poll that happens to agree.
 	[[nodiscard]] bool armed() const;
@@ -192,9 +200,10 @@ private:
 // into `shell_state` would make a shell a prerequisite for editing at all.
 //
 // TWO METHODS, and their narrowness is the decision. Everything else the shell
-// knows reaches leshper through `shell_knowledge` - stamped on the token for a
-// reactor, read directly by the completer - and never through a call. What is
-// here is only what has to BE a call, and the rule that decides it is that both
+// knows stays HOST-SIDE in `shell_knowledge` - stamped on the token for a
+// reactor, read directly by the completer - and never crosses to the editor as
+// itself; what crosses is `leshper::host`, the one door, and never a call. What
+// is here is only what has to BE a call, and the rule that decides it is that both
 // of these RUN CODE: they change the world, and the world is the shell's. #139
 // added a third for the completer's name list and #151 took it away again, once
 // the owner's reading of ADR-0009 made the direct read legal - which is the rule
@@ -283,6 +292,19 @@ public:
 	void post_highlight(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
 	                    request_snapshot snapshot);
 
+	// The same, TAKING THE SNAPSHOT IN PLACE - and this is the overload the loop
+	// uses on every keystroke.
+	//
+	// The highlighter is the DEFAULT reactor and the only one that runs here, so
+	// this is the per-keystroke allocation that mattered most: the one above
+	// builds a `request_snapshot` at the call site and moves it into the slot,
+	// freeing the string the slot was holding. This assigns into the slot's own
+	// buffer, which the swap in `serve_one` and the hand-back in
+	// `serve_highlight` keep alive across the round trip.
+	// `AllocationTest.AWarmShellThreadHighlightRoundCostsNoHeap` is the pin.
+	void post_highlight(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
+	                    const leshper::state& target, std::uint32_t event_kind);
+
 	// Asks `run` to return once it has finished what it is doing.
 	void stop();
 
@@ -331,6 +353,21 @@ private:
 	void serve_port_call(port_slot& job);
 	void serve_highlight(highlight_slot& job);
 
+	// WHAT `serve_one` IS SERVING OUT OF. SHELL THREAD ONLY: swapped with the
+	// posted slot under `_mutex` and then read outside it, which is safe because
+	// no other thread names these.
+	//
+	// Members rather than locals, and swapped rather than moved out of, for the
+	// reason the banner at the top of this file gives and only now delivers on:
+	// a slot's strings KEEP THEIR CAPACITY. `serve_one` used to move the posted
+	// slot into a local and reset the member with `= highlight_slot{}`, which
+	// freed the buffer the loop had grown - so the next `post_highlight`
+	// allocated one again, once per keystroke, for the one reactor every session
+	// runs. This is `worker_pool::run`'s scratch task, one layer over.
+	execute_slot _serving_execute;
+	port_slot _serving_port;
+	highlight_slot _serving_highlight;
+
 	shell_side* _shell;
 	// The executing shell's own door, stamped on every token served below.
 	const leshper::host* _host;
@@ -368,8 +405,15 @@ private:
 //
 // `superseded` is the flag the reactor's cooperative poll reads; it must outlive
 // the call.
+//
+// `snapshot` IS BORROWED AND GIVEN BACK, not consumed. Its buffer moves into the
+// token so the bytes are not copied twice, and moves back when the reactor
+// returns - so a caller that serves out of a long-lived slot keeps the string it
+// grew instead of watching the token's destructor free it. Nothing points into
+// it afterwards: a reactor's view of the buffer is valid for its call and no
+// longer. Every other field is read, not taken.
 void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
-                      request_snapshot snapshot, const std::atomic<bool>& superseded,
+                      request_snapshot& snapshot, const std::atomic<bool>& superseded,
                       leshper::reactor_batch& into);
 
 } // namespace lesh::ui

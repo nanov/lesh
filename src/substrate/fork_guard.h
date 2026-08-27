@@ -25,14 +25,14 @@
 //   consulted ONLY by debug assertions. It is deliberately not the mechanism
 //   any correctness decision rests on, because atfork handlers "may have not
 //   yet run" - fish's own comment, and the reason its signal handler compares
-//   `getpid()` to the main pid instead. The signal path in leshper's loop does
+//   `getpid()` to the main pid instead. The signal path in the host's loop does
 //   the same; this flag is for `assert_no_alloc_in_child()` and nothing else.
 //
 // WHY A HEADER IN THE SUBSTRATE. The exec lanes are the shell's - the executor
-// forks, and `lesh` does not link `lesh_leshper` - while the assertion at the
-// quiesce boundary is leshper's. Both sides need the same guard, and the
-// substrate is the one layer below both. It depends on POSIX and on
-// substrate/arena.h, and on nothing above itself.
+// forks, and those lanes never enter the editor - while the quiesce-boundary
+// assertion is the host's (`src/ui/workers.cpp`). Both sides need the same
+// guard, and the substrate is the one layer below both. It depends on POSIX and
+// on substrate/arena.h, and on nothing above itself.
 
 #include "substrate/arena.h"
 #include "substrate/assert.h"

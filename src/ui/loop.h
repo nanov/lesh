@@ -572,9 +572,6 @@ public:
 	void render();
 	// Forgets `previous`, so the next render repaints everything.
 	void invalidate() noexcept { _have_previous = false; }
-	[[nodiscard]] const leshper::layout& last_layout() const noexcept { return _previous; }
-	// The bytes the last render wrote - what a test asserts instead of a screen.
-	[[nodiscard]] std::string_view last_output() const noexcept { return _out; }
 
 	// --- What the loop learned -----------------------------------------------
 
@@ -612,6 +609,10 @@ private:
 	// today. Taken on the loop thread, at the top of a turn.
 	void drain_registry_effects();
 	void notify_reactors(std::uint32_t kinds);
+	// Rebuilds `_dispatch_table` from the registry's reactor map. Called only
+	// when the cheap staleness check in `notify_reactors` says the copy is out of
+	// date; the steady state never reaches it.
+	void refresh_dispatch_table();
 	void take_batch(leshper::reactor_batch& answer);
 	// Blocks in poll on the `shell` and `signal` topics only, until a message of
 	// `until` (and, for a port call, of `sequence`) arrives.
@@ -656,6 +657,13 @@ private:
 	// --- Reused storage. Every one of these is why a warm turn allocates. ---
 	std::string _read_buffer;
 	std::vector<leshper::event> _events;
+	// THE BATCH BEING WALKED, swapped out of `_events` (#162). `handle` on an
+	// accepted line blocks in `wait_on_shell`, and a shell message that arrives
+	// there pushes onto `_events` - which reallocated the vector the walk held a
+	// reference into. Swapping first means the push lands in an empty `_events`
+	// and is walked by the next pass instead. A member, so the capacity survives
+	// the turn and the steady state allocates nothing.
+	std::vector<leshper::event> _carried_events;
 	std::vector<leshper::event> _deferred;      // signals that arrived while executing
 	std::vector<int> _signal_numbers;
 	std::vector<completion> _completions;
@@ -663,6 +671,30 @@ private:
 	std::string _out;
 	std::string _accepted;
 	leshper::effects _carried;         // what the registry queued, taken per turn
+
+	// THE REACTOR TABLE, FLATTENED (the reorg cleanup). `notify_reactors` used to
+	// walk `registry::reactors` - a red-black tree - and string-compare
+	// `shell_thread_reactor` against every key, once per reactor per keystroke.
+	// This is the same table contiguous, with that comparison already made, and
+	// it is rebuilt only when the registry's `reactors_generation` moves (or the
+	// registry, or the shell-thread reactor's name, changes underneath it). The
+	// steady state is three scalar comparisons and a walk over a vector.
+	//
+	// `name` BORROWS the registry's map key, which is safe for the reason a
+	// std::map key is: nodes are stable, and the only thing that adds one bumps
+	// the generation that invalidates this.
+	struct reactor_dispatch {
+		std::string_view name;
+		lesh_reactor_fn fn = nullptr;
+		void* userdata = nullptr;
+		std::uint32_t event_mask = 0;
+		bool on_shell_thread = false;
+	};
+	std::vector<reactor_dispatch> _dispatch_table;
+	const leshper::registry* _dispatch_built_from = nullptr;
+	std::uint64_t _dispatch_generation = 0;
+	std::string _dispatch_shell_reactor;
+	bool _dispatch_valid = false;
 	std::array<struct pollfd, static_cast<std::size_t>(topic::count_)> _poll{};
 
 	// One armed timer, WHOLE (#168). The declaration - the action's name and the

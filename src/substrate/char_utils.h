@@ -1,7 +1,30 @@
 #pragma once
 #include <array>
+#include <string_view>
 
 namespace lesh {
+
+// snake_case: a lowercase letter, then lowercase letters, digits, underscores.
+//
+// Narrow on purpose, and ONE copy of it (the reorg cleanup). The names are what a
+// user types into a binding, what an rc file re-sources idempotently, and what a
+// prompt template names a module by; a name space that admits hyphens as well
+// would make `delete-backward-word` and `delete_backward_word` two actions that
+// look like one, which is the failure worth designing out rather than
+// documenting around. `leshper/registry.cpp` and `ui/prompt/prompt.cpp` each had
+// their own copy of this rule, which is one copy too many for a rule that must
+// not drift.
+[[nodiscard]] constexpr bool is_snake_case(std::string_view name) noexcept {
+	if (name.empty() || name[0] < 'a' || name[0] > 'z')
+		return false;
+	for (const char one : name) {
+		const bool ok = (one >= 'a' && one <= 'z') || (one >= '0' && one <= '9') || one == '_';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
 	class string_utils {
 	public:
 		static bool is_valid_var_name_first_char(const unsigned char c) {

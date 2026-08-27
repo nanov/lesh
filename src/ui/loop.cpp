@@ -9,8 +9,10 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
+#include <variant>
 
 namespace lesh::ui {
 namespace {
@@ -106,6 +108,25 @@ bool make_wakeup_pipe(int& read_fd, int& write_fd) noexcept {
 	write_fd = fds[1];
 	return true;
 }
+
+// The position of one alternative in `leshper::effect`, as a constant.
+//
+// So that `carry_out`'s switch labels are spelled as TYPES while the switch
+// itself is on `index()`: a reordered variant moves every label with it, where a
+// hand-written `case 4:` would quietly start meaning something else.
+template <typename Which, typename... Rest>
+constexpr std::size_t position_in(const std::variant<Rest...>*) noexcept {
+	constexpr bool matches[] = {std::is_same_v<Which, Rest>...};
+	for (std::size_t at = 0; at < sizeof...(Rest); ++at) {
+		if (matches[at])
+			return at;
+	}
+	return sizeof...(Rest);
+}
+
+template <typename Which>
+inline constexpr std::size_t effect_index =
+	position_in<Which>(static_cast<const leshper::effect*>(nullptr));
 
 // POLLIN AND POLLHUP TOGETHER, always. fish `fds.cpp`: "If a pipe is widowed
 // with no data, Linux sets POLLHUP but not POLLIN, so test for both." POLLERR
@@ -406,6 +427,7 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	// events per turn, one message per attached topic.
 	_read_buffer.reserve(4096);
 	_events.reserve(16);
+	_carried_events.reserve(16);
 	_deferred.reserve(8);
 	_signal_numbers.reserve(8);
 	_completions.reserve(8);
@@ -617,12 +639,25 @@ turn_result event_loop::turn(int timeout_ms) {
 	if (shell_at >= 0 && revents_of(_poll[static_cast<std::size_t>(shell_at)]) != 0)
 		drain_shell_topic(result);
 
-	for (const leshper::event& one : _events) {
-		handle(one, result);
+	// SWAPPED OUT BEFORE THE WALK, the way `drain_registry_effects` does it
+	// (#162). `handle` on an accepted line blocks in `wait_on_shell`, and a shell
+	// message arriving there pushes onto `_events`; a range-for over the vector
+	// being appended to reads freed memory the moment the push reallocates - a
+	// heap-use-after-free ASan catches, and any user with a background job can
+	// hit. The push lands in the emptied `_events` now and the outer pass picks
+	// it up, so nothing is dropped and nothing dangles.
+	while (!_events.empty()) {
+		_carried_events.clear();
+		_carried_events.swap(_events);
+		for (const leshper::event& one : _carried_events) {
+			handle(one, result);
+			if (_exiting)
+				break;
+		}
+		result.events += _carried_events.size();
 		if (_exiting)
 			break;
 	}
-	result.events = _events.size();
 
 	if (_needs_render && !_exiting) {
 		render();
@@ -908,57 +943,90 @@ void event_loop::handle(const leshper::event& incoming, turn_result& result) {
 }
 
 void event_loop::carry_out(const leshper::effects& produced) {
+	// A SWITCH ON THE VARIANT'S INDEX, not a chain of `holds_alternative`. The
+	// chain was nine sequential type comparisons for what is one jump table, on a
+	// path that runs per effect per keystroke. `effect_index` keeps the labels
+	// spelled as TYPES, so reordering the variant moves the labels with it rather
+	// than silently re-pointing them.
 	for (const leshper::effect& one : produced) {
-		if (std::holds_alternative<leshper::render_request>(one)) {
-			_needs_render = true;
-		} else if (std::holds_alternative<leshper::worker_request>(one)) {
-			// The fan-out already happened in `handle`, from the comparison -
-			// which is strictly more information than this effect carries, since
-			// it knows WHICH of the three kinds changed. Nothing to do.
-		} else if (const auto* spawn = std::get_if<leshper::spawn_request>(&one)) {
-			// #92's lane 2. The implementation is the shell side's (#134 wires
-			// it); what the loop owes is not to silently drop it.
-			LESH_LOG(log::level::warn, log::category::spawn,
-			         "spawn_request with no spawner attached: %s",
-			         spawn->argv.empty() ? "" : spawn->argv.front().c_str());
-		} else if (std::holds_alternative<leshper::line_accepted>(one)) {
-			accept_current_line();
-		} else if (std::holds_alternative<leshper::line_cancelled>(one)) {
-			// #98 decision 2: discard the buffer, paint the indicator, fresh
-			// prompt. `$?` = 130 and the user's INT trap are the SHELL's, and
-			// `finish_cancelled_line` is how they are asked for - the loop still
-			// does not own exit statuses, it owns the handoff.
-			if (_options.manage_terminal || _fds.output >= 0)
-				write_all(_fds.output, "^C\r\n");
-			apply_edit(_state, leshper::position{}, _state.buffer.end_position(), "");
-			_state.undo.break_coalescing();
-			// The same rule accept follows, on both halves of what was applied.
-			_state.marks.clear();
-			_state.proposals.clear();
-			_have_previous = false;
-			_needs_render = true;
-			finish_cancelled_line();
-		} else if (const auto* eof = std::get_if<leshper::end_of_file>(&one)) {
-			_exiting = true;
-			_exit_status = eof->status;
-		} else if (std::holds_alternative<leshper::recursive_edit_request>(one)) {
-			// F-18's recovery shape. Nothing in v1 nests reads, and inventing
-			// half of it here would be building the thing its ticket must.
-			LESH_LOG(log::level::warn, log::category::dispatch,
-			         "recursive_edit requested; not implemented in v1");
-		} else if (const auto* arm = std::get_if<leshper::arm_timer>(&one)) {
-			// Re-arming an id that is already here is not a thing the registry
-			// can produce - ids are minted once and never reused - so this is an
-			// append, and the due instant is put on at the moment the host hears
-			// about it.
-			_timers.push_back(timer_due{arm->id, arm->interval_ms, arm->action,
-			                            clock::now() + std::chrono::milliseconds(arm->interval_ms)});
-		} else if (const auto* disarm = std::get_if<leshper::disarm_timer>(&one)) {
-			_timers.erase(std::remove_if(_timers.begin(), _timers.end(),
-			                             [&](const timer_due& armed) {
-				                             return armed.id == disarm->id;
-			                             }),
-			              _timers.end());
+		switch (one.index()) {
+			case effect_index<leshper::render_request>:
+				_needs_render = true;
+				break;
+
+			case effect_index<leshper::worker_request>:
+				// The fan-out already happened in `handle`, from the comparison -
+				// which is strictly more information than this effect carries, since
+				// it knows WHICH of the three kinds changed. Nothing to do.
+				break;
+
+			case effect_index<leshper::spawn_request>: {
+				// #92's lane 2. The implementation is the shell side's (#134 wires
+				// it); what the loop owes is not to silently drop it.
+				const auto& spawn = std::get<leshper::spawn_request>(one);
+				LESH_LOG(log::level::warn, log::category::spawn,
+				         "spawn_request with no spawner attached: %s",
+				         spawn.argv.empty() ? "" : spawn.argv.front().c_str());
+				break;
+			}
+
+			case effect_index<leshper::line_accepted>:
+				accept_current_line();
+				break;
+
+			case effect_index<leshper::line_cancelled>:
+				// #98 decision 2: discard the buffer, paint the indicator, fresh
+				// prompt. `$?` = 130 and the user's INT trap are the SHELL's, and
+				// `finish_cancelled_line` is how they are asked for - the loop still
+				// does not own exit statuses, it owns the handoff.
+				if (_options.manage_terminal || _fds.output >= 0)
+					write_all(_fds.output, "^C\r\n");
+				apply_edit(_state, leshper::position{}, _state.buffer.end_position(), "");
+				_state.undo.break_coalescing();
+				// The same rule accept follows, on both halves of what was applied.
+				_state.marks.clear();
+				_state.proposals.clear();
+				_have_previous = false;
+				_needs_render = true;
+				finish_cancelled_line();
+				break;
+
+			case effect_index<leshper::end_of_file>:
+				_exiting = true;
+				_exit_status = std::get<leshper::end_of_file>(one).status;
+				break;
+
+			case effect_index<leshper::recursive_edit_request>:
+				// F-18's recovery shape. Nothing in v1 nests reads, and inventing
+				// half of it here would be building the thing its ticket must.
+				LESH_LOG(log::level::warn, log::category::dispatch,
+				         "recursive_edit requested; not implemented in v1");
+				break;
+
+			case effect_index<leshper::arm_timer>: {
+				// Re-arming an id that is already here is not a thing the registry
+				// can produce - ids are minted once and never reused - so this is an
+				// append, and the due instant is put on at the moment the host hears
+				// about it.
+				const auto& arm = std::get<leshper::arm_timer>(one);
+				_timers.push_back(
+					timer_due{arm.id, arm.interval_ms, arm.action,
+				              clock::now() + std::chrono::milliseconds(arm.interval_ms)});
+				break;
+			}
+
+			case effect_index<leshper::disarm_timer>: {
+				const std::uint64_t id = std::get<leshper::disarm_timer>(one).id;
+				_timers.erase(std::remove_if(_timers.begin(), _timers.end(),
+				                             [&](const timer_due& armed) {
+					                             return armed.id == id;
+				                             }),
+				              _timers.end());
+				break;
+			}
+
+			default:
+				break;
 		}
 	}
 }
@@ -975,19 +1043,47 @@ void event_loop::drain_registry_effects() {
 	carry_out(_carried);
 }
 
-void event_loop::notify_reactors(std::uint32_t kinds) {
-	if (_registry == nullptr)
+void event_loop::refresh_dispatch_table() {
+	_dispatch_table.clear();
+	if (_registry == nullptr) {
+		_dispatch_valid = false;
 		return;
+	}
 	for (const auto& [name, entry] : _registry->reactors) {
-		const std::uint32_t served = entry.event_mask & kinds;
-		if (served == 0)
-			continue;
-
 		// ADR-0009: the highlighter runs on the SHELL thread, because it reads
 		// the alias, function and builtin tables and shell state has exactly one
 		// owner. Everything else is state-free - history search, the
 		// autosuggester, path checks - and stays on the stateless helper pool.
-		if (_shell != nullptr && name == _options.shell_thread_reactor) {
+		// The comparison is made HERE, once per table change, rather than once
+		// per reactor per keystroke.
+		_dispatch_table.push_back(reactor_dispatch{
+			std::string_view{name}, entry.fn, entry.userdata, entry.event_mask,
+			name == _options.shell_thread_reactor});
+	}
+	_dispatch_built_from = _registry;
+	_dispatch_generation = _registry->reactors_generation;
+	_dispatch_shell_reactor = _options.shell_thread_reactor;
+	_dispatch_valid = true;
+}
+
+void event_loop::notify_reactors(std::uint32_t kinds) {
+	if (_registry == nullptr)
+		return;
+	// THE STALENESS CHECK IS THE STEADY STATE. Two scalar comparisons and one
+	// short string comparison, against a map walk plus a string comparison per
+	// entry - and the rebuild below runs only when a binding registers a reactor
+	// or the caller renames the shell-thread one.
+	if (!_dispatch_valid || _dispatch_built_from != _registry
+	    || _dispatch_generation != _registry->reactors_generation
+	    || _dispatch_shell_reactor != _options.shell_thread_reactor)
+		refresh_dispatch_table();
+
+	for (const reactor_dispatch& one : _dispatch_table) {
+		const std::uint32_t served = one.event_mask & kinds;
+		if (served == 0)
+			continue;
+
+		if (_shell != nullptr && one.on_shell_thread) {
 			// THE SNAPSHOT LEAVES `knowledge` NULL AND THAT IS RIGHT (#151). It
 			// is the SHELL's tables, and the actor - which serves exactly one
 			// shell - stamps them on the token it builds. The loop used to fill
@@ -995,12 +1091,11 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 			// shell's own state was, and the far side dropped it for a whole
 			// wave. What stays on `request_snapshot` is the helper pool's copy of
 			// the field, where null honestly means "no shell attached".
-			_shell->post_highlight(name, entry.fn, entry.userdata,
-			                       snapshot_of(_state, served));
+			_shell->post_highlight(one.name, one.fn, one.userdata, _state, served);
 			continue;
 		}
 		if (_helpers != nullptr)
-			_helpers->submit(name, snapshot_of(_state, served), entry.fn, entry.userdata);
+			_helpers->submit(one.name, _state, served, one.fn, one.userdata);
 	}
 }
 
