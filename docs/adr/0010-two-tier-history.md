@@ -87,6 +87,15 @@ payload = one Record as a standalone finished FlatBuffer
   continue. Payload bytes are never interpreted as delimiters — the resync is
   framing-only. Unknown `format_version` → skip that frame (its length is
   known). CRC32 is a hand-rolled table; no zlib.
+- Amended by #192: a length that does not fit the file is treated as a failed
+  header and resynced, not an unconditional stop — a flipped length byte in the
+  middle of the log must not hide the frames behind it; on a real truncation the
+  resync finds nothing and the outcome is the ADR's stop. The 9-byte header makes
+  every payload unaligned and FlatBuffers refuses an unaligned root (UBSan
+  agrees), so the reader copies each payload into aligned scratch before parsing
+  and rebases the yielded spans onto the caller's bytes. Accepted: the log is
+  read at startup and vacuum only and holds ~25 frames; the per-keystroke path is
+  the page-aligned mmap. Not worth a padded header.
 
 ### In memory
 
