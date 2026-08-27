@@ -156,6 +156,22 @@ public:
 		[[maybe_unused]] const ssize_t wrote = ::write(_master, bytes.data(), bytes.size());
 	}
 
+	// A window-size change, which is what dragging the window edge is (#185).
+	//
+	// THE IOCTL AND THE SIGNAL, both. Setting the master's winsize is what makes
+	// the shell's own `TIOCGWINSZ` answer the new size, and the driver raises
+	// SIGWINCH on the foreground group for it; the explicit `kill` after it is
+	// belt and braces, because a duplicate SIGWINCH costs one no-op resize event
+	// and a lost one would make this test hang on a budget instead of failing.
+	void resize(unsigned short columns, unsigned short rows = 24) const {
+		struct winsize size{};
+		size.ws_col = columns;
+		size.ws_row = rows;
+		::ioctl(_master, TIOCSWINSZ, &size);
+		if (_child > 0)
+			::kill(_child, SIGWINCH);
+	}
+
 	// Reads until `needle` has shown up `times` times or the budget runs out. A
 	// budget rather than a blocking read, because a test that hangs is worse than
 	// a test that fails and there is a whole shell on the other end of this
@@ -286,6 +302,27 @@ private:
 			pids.push_back(pid);
 	}
 	return pids;
+}
+
+// How many prompts the wire carries AFTER the last erase-to-end-of-screen (#185).
+//
+// THE BYTE STREAM IS ALL THIS HARNESS HAS - there is no terminal emulator on the
+// far side of the master, so "what is on screen" is not a question it can ask.
+// The erase is the next best thing and is exactly the claim being made: from
+// ESC[J onwards the shell has erased everything below the frame's top row and
+// repainted, so what follows is the whole of what a terminal would be showing.
+// More than one prompt in there is the defect - N resizes leaving N+1 copies.
+[[nodiscard]] std::size_t prompts_after_the_last_erase(std::string_view wire,
+                                                       std::string_view prompt) {
+	constexpr std::string_view erase = "\x1b[J";
+	const std::size_t last = wire.rfind(erase);
+	const std::string_view tail =
+		last == std::string_view::npos ? wire : wire.substr(last + erase.size());
+	std::size_t found = 0;
+	for (std::size_t at = tail.find(prompt); at != std::string_view::npos;
+	     at = tail.find(prompt, at + prompt.size()))
+		++found;
+	return found;
 }
 
 [[nodiscard]] bool a_newline_follows_the_last_prompt(std::string_view wire,
@@ -1386,4 +1423,34 @@ TEST(UiPty, AnExtensionBuiltinIsRunnableInAnInteractiveShellWithNoPath) {
 	EXPECT_TRUE(shell.wait_for(kRunnable))
 		<< "`ls` did not paint as a builtin with the option on by default; saw: "
 		<< shell.seen();
+}
+
+TEST(UiPty, ResizingTwiceMidLineLeavesOneCopyOfThePromptAndNotThree) {
+	// #185, END TO END. The bug was a copy of the prompt and the buffer left
+	// behind by every resize: the repaint started from where the cursor was -
+	// the end of the buffer - instead of from the top of the frame the terminal
+	// was showing, and nothing erased the old rows. Two resizes made three
+	// copies, which is what the screenshots on the ticket show.
+	scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	// LONGER THAN THE PTY IS WIDE (120), so the frame is more than one row and
+	// the walk back up to its top is a real one rather than a no-op. Typed as
+	// one write: the editor coalesces it into one edit and one repaint.
+	shell.type(std::string(130, 'a'));
+	ASSERT_TRUE(shell.wait_for("aaaaaaaaaa"));
+
+	// NARROWER, THEN WIDER. Each repaint re-emits the prompt, so the count on
+	// the wire going up by one is how this waits for the resize to have been
+	// rendered rather than sleeping for it.
+	const std::size_t before = shell.count_of(kPrompt);
+	shell.resize(60);
+	ASSERT_TRUE(shell.wait_for(kPrompt, before + 1)) << shell.seen();
+	shell.resize(100);
+	ASSERT_TRUE(shell.wait_for(kPrompt, before + 2)) << shell.seen();
+
+	EXPECT_EQ(prompts_after_the_last_erase(shell.seen(), kPrompt), 1u)
+		<< "the resize repaint appended a frame instead of replacing one";
 }

@@ -400,6 +400,28 @@ struct loop_options {
 	// the tests that drive it over a plain pipe, where there is nothing to own.
 	bool manage_terminal = true;
 
+	// WHAT THE TERMINAL DID TO THE FRAME ALREADY ON SCREEN WHEN IT WAS RESIZED
+	// (#185, F-38). A repaint has to walk back up to that frame's top row before
+	// it erases and redraws, and how far up that is depends on the terminal:
+	//
+	//   true  - a REFLOWING terminal rewrapped the frame's soft-wrapped rows at
+	//           the new width, so the frame's top is now
+	//           `lay_out(previous input, NEW width).screen.cursor().row` rows
+	//           above the cursor. iTerm2, kitty, WezTerm, VTE (GNOME Terminal,
+	//           Tilix), Windows Terminal and tmux's own panes all do this.
+	//   false - a NON-REFLOWING terminal left the rows where they were, so the
+	//           frame's top is `_previous.screen.cursor().row` rows above the
+	//           cursor - the count from BEFORE the resize. xterm and macOS
+	//           Terminal.app.
+	//
+	// Reflow is the default because it is what the terminals people use do, and
+	// because #97 forbids asking the terminal anything at start-up - there is no
+	// capability that answers this, so it is a setting rather than a probe. A
+	// wrong answer costs one frame's worth of stale rows above the repaint, not
+	// a corrupted screen: `\r` plus ESC[J still leave the terminal in a state
+	// the next frame is painted correctly into.
+	bool assume_reflow = true;
+
 	// The paste rule (#128's trap 4, fish's `read_normal_chars`): keep reading
 	// while a zero-timeout poll says the fd is still readable, so a paste is one
 	// edit and one repaint while a typed character paints now. The cap keeps a
@@ -621,6 +643,13 @@ private:
 	void handle_shell_message(shell_message& answer);
 	void refresh_size_from_terminal();
 
+	// How far above the cursor the top of the frame the terminal is showing sits
+	// (#185). `loop_options::assume_reflow` picks the model; the reflowing one
+	// re-lays `_previous_input` at the current size and reads the cursor row off
+	// it. Only ever asked on the repaint path, which is a resize and not a
+	// keystroke, so the layout it mints is not on N-1's hot path.
+	[[nodiscard]] leshper::cursor_placement frame_top_above_cursor();
+
 	loop_fds _fds;
 	loop_options _options;
 
@@ -631,6 +660,33 @@ private:
 	leshper::blitter _blitter;
 	leshper::layout _previous;
 	bool _have_previous = false;
+
+	// THE PREVIOUS FRAME'S INPUT, kept beside the previous frame itself (#185).
+	//
+	// `_previous` says what was painted at the OLD width, and after a resize
+	// that is no longer what the terminal is showing - a reflowing terminal has
+	// rewrapped it. Re-laying the same input at the new width is the only way to
+	// ask where that frame's top row has moved to, and re-laying needs the input
+	// rather than the picture. Only the part `lay_out` reads from an owner is
+	// here: `marks`, `theme` and `pager` are borrowed pointers into state that
+	// has since moved on, and none of the three changes the GEOMETRY the start
+	// row is read off - a span colours a cell, it does not move it.
+	//
+	// OWNING STRINGS, ASSIGNED IN PLACE. `layout_input` borrows views into the
+	// editor's buffer and the caller's prompt, which are both gone by the time a
+	// resize arrives. Assigning into strings that keep their capacity is what
+	// stops N-2's per-render allocation pin from growing a term: the repaint
+	// path is not per-keystroke, but this retention is.
+	struct retained_input {
+		std::string prompt;
+		std::string continuation;
+		std::string buffer;
+		leshper::position cursor;
+		grapheme::width_policy width{};
+		leshper::style prompt_pen{};
+		leshper::style text_pen{};
+	};
+	retained_input _previous_input;
 
 	// What a span's interned semantic id looks like (#124, #141). Held by the
 	// loop rather than by the state, for the reason #118 kept the registries

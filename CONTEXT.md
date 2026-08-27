@@ -503,7 +503,13 @@ effect should have carried.
 
 **Surface** _[lesh]_:
 The grid of styled cells leshper renders into. A blitter turns surfaces into
-terminal output; tests assert cell grids, never escape sequences.
+terminal output; tests assert cell grids, never escape sequences. A repaint
+REPLACES the frame on screen rather than appending one (#185): it walks up to
+that frame's top row, erases from there down, and paints — and how far up that
+is is the **host's** answer, because after a resize a reflowing terminal has
+rewrapped the frame and the surface that was painted no longer describes it.
+_Avoid_: treating the cursor at repaint time as being at the surface's origin;
+that is true only of the first paint of a read.
 
 **Grapheme cluster** _[lesh]_:
 What a user calls a character: the unit the cursor rests on, one Backspace deletes,
@@ -558,8 +564,11 @@ concurrent collection for it — one owner makes both unnecessary (ADR-0009).
 The **host's** spawned thread — `src/ui/loop.cpp`, not leshper's (#168): owns
 editor state and the tty while editing, waits in `poll` on its topics, blocks
 across execution, and drops any shell-thread message whose generation is not
-current. That it is a thread at all is the host's private choice; the editor it
-drives is told nothing about it.
+current. It keeps the previous frame's INPUT beside the previous frame, so that
+a resize can re-lay it at the new size and answer where the terminal has moved
+that frame's top row to (#185; `loop_options::assume_reflow` picks the model).
+That it is a thread at all is the host's private choice; the editor it drives is
+told nothing about it.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,
