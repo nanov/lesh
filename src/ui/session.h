@@ -58,7 +58,18 @@ namespace lesh::ui::prompt {
 class engine;
 }
 
+namespace lesh::ui::history {
+class history;
+}
+
 namespace lesh::ui {
+
+// ONE NAME FOR THE STORE, and it exists to dodge a lookup, not to add a
+// vocabulary. `provider_bundle` below has a member called `history` - the read
+// side, #125's seam - and a member declaration inside that struct that said
+// `history::history` would find the MEMBER first and fail. The alias is
+// resolved out here, where `history` is unambiguously the namespace.
+using history_recorder = history::history;
 
 // ---------------------------------------------------------------------------
 // The four providers (#94, A-5).
@@ -214,11 +225,23 @@ struct provider_bundle {
 
 	// The OTHER half of #94's `HistoryStore`, and the only non-const member here.
 	// `history_source` above is the read side, which is all the searcher and the
-	// autosuggester ever need; appending an accepted line is the shell's, on the
+	// autosuggester ever need; recording an accepted line is the shell's, on the
 	// shell thread, and it is a different verb with a different owner. Null means
 	// nothing is recorded - F-17's `vared`, and every test that must not write to
-	// the developer's own `~/.lesh_history`.
-	runtime::history_store* store = nullptr;
+	// the user's own history.
+	//
+	// USUALLY THE SAME OBJECT AS `history` ABOVE (#193): `ui::history::history`
+	// IS a `history_source`, so the bundle points at one object twice, once per
+	// verb. They are two fields and not one because the read side is an override
+	// point - a user-supplied provider serves the searcher exactly as the
+	// built-in one does (A-13) - and the write side is not: nothing but this
+	// shell records this shell's commands.
+	//
+	// #113's `runtime::history_store` used to be this field's type. It is still
+	// in the tree and still tested (ADR-0010 §Placement keeps it as the
+	// historical implementation), and nothing wires it any more; `~/.lesh_history`
+	// is neither written nor read by a running lesh.
+	history_recorder* recorder = nullptr;
 };
 
 // ---------------------------------------------------------------------------

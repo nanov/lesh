@@ -5,6 +5,7 @@
 #include "leshper/registry.h"
 #include "ui/completion.h"
 #include "ui/editor_host.h"
+#include "ui/history/history.h"
 #include "ui/loop.h"
 #include "ui/prompt/prompt.h"
 #include "ui/reactors.h"
@@ -851,20 +852,37 @@ std::int32_t session::execute(std::string_view line) {
 	_last_duration_ms = 0;
 
 	if (!line.empty()) {
-		// F-34 and #113: the entry goes in with its newlines, before it runs, so
-		// a command that ends the session is still in the history. A blank line
-		// is not history in any shell.
-		if (_providers.store != nullptr
-		    && line.find_first_not_of(" \t\n") != std::string_view::npos)
-			(void)_providers.store->append(line);
+		// F-34 and ADR-0010 §Recording: the entry goes in with its newlines,
+		// BEFORE it runs, so a command that ends the session is still in the
+		// history - and as PENDING, so nothing can read it until it has an exit
+		// status. Empty, whitespace-only and leading-space lines are the store's
+		// rules and not this call site's; `add` answers `rejected` for the first
+		// two, which is what `recorded` below carries.
+		//
+		// THE LOGICAL `$PWD`, from the shell's own variable rather than
+		// `getcwd`. A directory reached through a symlink is the path the user
+		// typed, and a history that silently resolved it would be recording
+		// somewhere they have never been.
+		bool recorded = false;
+		if (_providers.recorder != nullptr) {
+			std::string_view pwd;
+			if (!_state.lookup(std::string_view{"PWD"}, pwd))
+				pwd = {};
+			recorded = _providers.recorder->add(line, pwd) != history::add_status::rejected;
+		}
 
 		// AROUND `run_input` AND NOTHING ELSE, on the monotonic clock. Wall time is
 		// what a user means by "how long did that take", and it is measured here
 		// because this thread is the only side that knows when the command began
 		// and when it ended - the loop was parked for the whole of it.
 		const auto began = std::chrono::steady_clock::now();
-		(void)_executor.run_input(line);
+		const int status = _executor.run_input(line);
 		const auto elapsed = std::chrono::steady_clock::now() - began;
+
+		// AFTER THE WAIT, which is the point of the split: this is where the
+		// exit code exists, and it is where the frame reaches the log.
+		if (recorded)
+			_providers.recorder->resolve_pending(status);
 		_last_duration_ms = static_cast<std::uint64_t>(
 			std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
 	}
@@ -1070,6 +1088,17 @@ int session::run(std::string_view rc_path) {
 	// Joins. The terminal is already restored: `event_loop::run` leaves the read
 	// before it returns, which is the path every exit takes.
 	_loop.stop();
+
+	// HISTORY, ON THE WAY OUT (ADR-0010 §Vacuum: "`save()` on interactive exit
+	// flushes unwritten items to the log and does not vacuum"). After the join,
+	// so this thread is the only one left and the flush cannot race a walk;
+	// before the EXIT trap, because the trap's commands are run through the
+	// executor and never reach `execute`, so there is nothing of theirs to wait
+	// for. A failure costs the last few commands their place on disk and is not
+	// worth refusing to exit over - `unwritable_items()` is what a caller that
+	// wants to complain would read.
+	if (_providers.recorder != nullptr)
+		(void)_providers.recorder->save();
 
 	// The EXIT trap, deferred all session, runs exactly once and here.
 	return _executor.finish(_state.last_status());

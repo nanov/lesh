@@ -5,6 +5,7 @@
 #include "runtime/builtins.h"
 #include "runtime/history_store.h"
 #include "runtime/shell_state.h"
+#include "ui/history/history.h"
 #include "ui/session.h"
 
 #include "interactive_signal_guard.h"
@@ -158,6 +159,83 @@ TEST(UiSessionHistory, AMissingFileIsAnEmptyHistoryAndNotAnError) {
 		return true;
 	});
 	EXPECT_EQ(seen, 0u);
+}
+
+// ===========================================================================
+// The two-tier history in the bundle (#193, ADR-0010)
+//
+// The session itself is a pty test (`ui_pty_tests.cpp` drives the real binary
+// through `execute` and back out again). What CAN be tested here is the shape
+// `main.cpp` assembles and `session::execute` relies on: one object, entered
+// twice, once per verb - and the invariant that makes that safe, which is that
+// the read side is the same `history_source` the searcher already speaks to.
+// ===========================================================================
+
+TEST(UiSessionHistory, TheBundleCarriesOneStoreUnderBothVerbs) {
+	lesh::ui::history::history store;
+	provider_bundle providers;
+	providers.history = &store;
+	providers.recorder = &store;
+
+	// What `session::execute` does, in the order it does it: add before the
+	// run, resolve after the wait.
+	ASSERT_NE(providers.recorder->add("echo hi", "/some/where"),
+	          lesh::ui::history::add_status::rejected);
+	// And nothing can read it in between.
+	std::size_t seen = 0;
+	providers.history->for_each_newest_first([&seen](std::string_view) {
+		++seen;
+		return true;
+	});
+	EXPECT_EQ(seen, 0u);
+
+	providers.recorder->resolve_pending(0);
+	std::vector<std::string> entries;
+	providers.history->for_each_newest_first([&entries](std::string_view entry) {
+		entries.emplace_back(entry);
+		return true;
+	});
+	EXPECT_EQ(entries, (std::vector<std::string>{"echo hi"}));
+}
+
+TEST(UiSessionHistory, ANullRecorderIsAShellThatRemembersNothing) {
+	// F-17's `vared`, and a non-interactive shell: `main` builds no store when
+	// there is no data directory, and the bundle says so with a null. The read
+	// side is then an empty `vector_history_source` rather than a null pointer
+	// every call site has to remember to check.
+	const vector_history_source empty;
+	provider_bundle providers;
+	providers.history = &empty;
+	EXPECT_EQ(providers.recorder, nullptr);
+
+	std::size_t seen = 0;
+	providers.history->for_each_newest_first([&seen](std::string_view) {
+		++seen;
+		return true;
+	});
+	EXPECT_EQ(seen, 0u);
+}
+
+TEST(UiSessionHistory, TheRecordedDirectoryIsTheShellsLogicalPwd) {
+	// `session::execute` reads `$PWD` out of the shell rather than calling
+	// `getcwd`, because a directory reached through a symlink is the path the
+	// user typed. This is that read, against the same accessor the session uses.
+	lesh::runtime::shell_state state;
+	ASSERT_TRUE(state.set("PWD", "/logical/path"));
+	std::string_view pwd;
+	ASSERT_TRUE(state.lookup(std::string_view{"PWD"}, pwd));
+
+	lesh::ui::history::history store;
+	ASSERT_NE(store.add("echo hi", pwd), lesh::ui::history::add_status::rejected);
+	store.resolve_pending(0);
+
+	std::string recorded;
+	store.for_each_merged_newest_first([&recorded](const lesh::ui::history::merged_entry& one) {
+		recorded.assign(reinterpret_cast<const char*>(one.what.cwd.data()),
+		                one.what.cwd.size());
+		return false;
+	});
+	EXPECT_EQ(recorded, "/logical/path");
 }
 
 // ===========================================================================

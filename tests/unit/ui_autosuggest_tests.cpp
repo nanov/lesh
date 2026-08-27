@@ -1,4 +1,5 @@
 #include "leshper/abi.h"
+#include "ui/history/history.h"
 #include "ui/history_search.h"
 #include "ui/reactors.h"
 #include "leshper/layout.h"
@@ -311,6 +312,74 @@ TEST(UiAutosuggest, TheComputePathTakesNothingFromTheHeap) {
 	const std::vector<reactor_batch> again =
 		fixture.loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 	EXPECT_EQ(counters.heap_allocations, heap_before);
+	EXPECT_EQ(again.size(), 1u);
+}
+
+TEST(UiAutosuggest, TheSuggestionComesOutOfTheRealStoreToo) {
+	// #193 put a real two-tier store behind this seam. The vector source above
+	// is the only thing most of this file needs, but "the autosuggester works
+	// against the thing `main` actually wires" is not something a vector can be
+	// asked.
+	lesh::ui::history::history store;
+	for (const char* entry : {"git log --oneline", "git status --short"}) {
+		ASSERT_NE(store.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
+		store.resolve_pending(0);
+	}
+
+	registry reg;
+	loop_harness loop{reg};
+	owned_autosuggester self{&store};
+	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
+
+	const lesh::leshper::state s = suggest_fixture::line("git s");
+	std::vector<reactor_batch> batches = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
+	ASSERT_EQ(batches.size(), 1u);
+	ASSERT_EQ(batches[0].proposals.size(), 1u);
+	EXPECT_EQ(batches[0].proposals[0].bytes, "git status --short");
+}
+
+TEST(UiAutosuggest, TheComputePathTakesNothingFromTheHeapOverTheRealStore) {
+	// THE SAME RULE, ON THE SOURCE THAT SHIPS (#193). The test above this one
+	// holds a vector to #90's instrument; a vector has nothing that could
+	// allocate, so it can only prove the reactor's own path is clean. The real
+	// store's merge walk has two things that could: the snapshot it takes and
+	// the dedup table it deduplicates with. Both are shaped so they do not - the
+	// view is taken by refcount, and the table is thread-local scratch the
+	// second walk reuses - and this is the assertion that says so.
+	//
+	// TWO INSTRUMENTS, because neither can see the other's allocations. The
+	// arena counter is #90's and watches the reactor's snapshot; `scratch_growths`
+	// is the store's own and watches the dedup table, which is a `std::vector`
+	// the arena counter would never notice.
+	lesh::ui::history::history store;
+	for (int i = 0; i < 64; ++i) {
+		const std::string entry = "git status --short --branch " + std::to_string(i);
+		ASSERT_NE(store.add(entry, "/tmp"), lesh::ui::history::add_status::rejected);
+		store.resolve_pending(0);
+	}
+
+	registry reg;
+	loop_harness loop{reg};
+	owned_autosuggester self{&store};
+	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
+
+	std::string line;
+	while (line.size() < 4096)
+		line += "git status --short --branch ";
+	line.resize(4096);
+	const lesh::leshper::state s = suggest_fixture::line(line);
+
+	// Warm once: the first walk is where a lazily-grown arena, or a dedup table
+	// that has never been used on this thread, would grow.
+	std::vector<reactor_batch> warm = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
+	ASSERT_EQ(warm.size(), 1u);
+
+	auto& counters = lesh::metrics::allocations();
+	const std::size_t heap_before = counters.heap_allocations;
+	const std::size_t growths_before = lesh::ui::history::history::scratch_growths();
+	const std::vector<reactor_batch> again = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
+	EXPECT_EQ(counters.heap_allocations, heap_before);
+	EXPECT_EQ(lesh::ui::history::history::scratch_growths(), growths_before);
 	EXPECT_EQ(again.size(), 1u);
 }
 

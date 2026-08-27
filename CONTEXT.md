@@ -259,8 +259,10 @@ terminal, the timers, the workers, the shell handoff, and the session that runs
 an interactive shell to its end; it drives leshper by sending **events** and
 performing **effects**, and by nothing else. It also holds every piece of
 KNOWLEDGE the editing experience needs (#168 Phase B): the highlighter and the
-autosuggester reactors (`ui/reactors.h`), the history searcher and its store
-adapters (`ui/history_search.h`, `history_store_source`), the completion sources
+autosuggester reactors (`ui/reactors.h`), the history searcher (`ui/history_search.h`)
+and the two-tier history store itself (`ui/history/`, ADR-0010 — #113's
+`runtime::history_store` and its `history_store_source` adapter stay in the tree
+as the historical implementation and are wired to nothing), the completion sources
 and the token-finding lex behind Tab (`ui/completion.h`), the shell's own tables
 (`ui/shell_knowledge.h`, `shell_state_knowledge` over shell state), and the one
 object that fills leshper's one door (`ui/editor_host.h` — `leshper::host`). The
