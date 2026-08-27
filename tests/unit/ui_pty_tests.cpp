@@ -312,17 +312,44 @@ private:
 // ESC[J onwards the shell has erased everything below the frame's top row and
 // repainted, so what follows is the whole of what a terminal would be showing.
 // More than one prompt in there is the defect - N resizes leaving N+1 copies.
-[[nodiscard]] std::size_t prompts_after_the_last_erase(std::string_view wire,
-                                                       std::string_view prompt) {
+[[nodiscard]] std::string_view after_the_last_erase(std::string_view wire) {
 	constexpr std::string_view erase = "\x1b[J";
 	const std::size_t last = wire.rfind(erase);
-	const std::string_view tail =
-		last == std::string_view::npos ? wire : wire.substr(last + erase.size());
+	return last == std::string_view::npos ? wire : wire.substr(last + erase.size());
+}
+
+[[nodiscard]] std::size_t occurrences(std::string_view haystack, std::string_view needle) {
 	std::size_t found = 0;
-	for (std::size_t at = tail.find(prompt); at != std::string_view::npos;
-	     at = tail.find(prompt, at + prompt.size()))
+	for (std::size_t at = haystack.find(needle); at != std::string_view::npos;
+	     at = haystack.find(needle, at + needle.size()))
 		++found;
 	return found;
+}
+
+[[nodiscard]] std::size_t prompts_after_the_last_erase(std::string_view wire,
+                                                       std::string_view prompt) {
+	return occurrences(after_the_last_erase(wire), prompt);
+}
+
+// The longest PREFIX of the prompt that shows up in the tail more often than the
+// whole prompt does - which is to say the longest clipped copy of it (#189).
+//
+// A fragment is what a shrink used to leave behind: each row of the frame was a
+// hard line to the terminal, so it clipped every one of them at the new width
+// and `lesh-test>aaa...` became `lesh-tes` somewhere above the live prompt.
+// Counting prefixes rather than searching for one particular truncation is what
+// makes this indifferent to WHERE the clip fell.
+[[nodiscard]] std::size_t longest_clipped_prompt_after_the_last_erase(
+	std::string_view wire, std::string_view prompt) {
+	const std::string_view tail = after_the_last_erase(wire);
+	const std::size_t whole = occurrences(tail, prompt);
+	// Four bytes is short enough to catch a clip anywhere in a ten-byte prompt
+	// and long enough that `lesh` on its own - a word a session might print for
+	// any number of reasons - is not mistaken for one.
+	for (std::size_t length = prompt.size(); length >= 4; --length)
+		if (occurrences(tail, prompt.substr(0, length)) > whole)
+			return length;
+	return 0;
 }
 
 [[nodiscard]] bool a_newline_follows_the_last_prompt(std::string_view wire,
@@ -1423,6 +1450,85 @@ TEST(UiPty, AnExtensionBuiltinIsRunnableInAnInteractiveShellWithNoPath) {
 	EXPECT_TRUE(shell.wait_for(kRunnable))
 		<< "`ls` did not paint as a builtin with the option on by default; saw: "
 		<< shell.seen();
+}
+
+// #189: growing the window after shrinking it. The wire is the only thing this
+// harness has, so what these two assert is the pair of shapes the defect made -
+// a second whole prompt (the frame appended rather than replaced, #185) and a
+// clipped one (each row painted as a hard line, so the terminal truncated them
+// separately on the way down and never rejoined them on the way up).
+
+TEST(UiPty, GrowingAfterShrinkingLeavesOneCopyOfThePrompt) {
+	// THE CASE #185's PTY TEST DID NOT END ON. It resized down and then part of
+	// the way back up, and stopped there; the screenshots on #189 are of the
+	// last leg - back to the width the line was typed at, where the previous
+	// frame's top row stayed behind because the terminal had never joined it to
+	// the row below it.
+	scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type(std::string(130, 'a'));
+	ASSERT_TRUE(shell.wait_for("aaaaaaaaaa"));
+
+	const std::size_t before = shell.count_of(kPrompt);
+	shell.resize(60);
+	ASSERT_TRUE(shell.wait_for(kPrompt, before + 1)) << shell.seen();
+	shell.resize(120);
+	ASSERT_TRUE(shell.wait_for(kPrompt, before + 2)) << shell.seen();
+
+	EXPECT_EQ(prompts_after_the_last_erase(shell.seen(), kPrompt), 1u)
+		<< "the grow left a second copy of the prompt on screen";
+	EXPECT_EQ(longest_clipped_prompt_after_the_last_erase(shell.seen(), kPrompt), 0u)
+		<< "a clipped fragment of the prompt survived the shrink";
+	// AND THE SHAPE OF THE PAINT, which is the part of #189 a byte stream CAN
+	// answer. A hundred and forty cells at a hundred and twenty columns is two
+	// rows and the second is a soft wrap of the first, so a vertical move in the
+	// repaint is a soft row painted as a hard line - the defect itself, before
+	// the terminal has had a chance to show it.
+	EXPECT_EQ(occurrences(after_the_last_erase(shell.seen()), "\x1b[1B"), 0u)
+		<< "the repaint moved between two soft-wrapped rows";
+}
+
+TEST(UiPty, ADragOfTenSizesLeavesOneCopyOfThePrompt) {
+	// A DRAG, which is what a user actually does: a burst of SIGWINCHes, most of
+	// them landing while the repaint for the previous one is still going out.
+	// Every intermediate width is a different wrap of the same line, so this is
+	// the write-through and the walk-up being asked to agree fourteen times in a
+	// row rather than once.
+	scratch_home home{kRc};
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt));
+
+	shell.type(std::string(130, 'a'));
+	ASSERT_TRUE(shell.wait_for("aaaaaaaaaa"));
+
+	// Down and back up. The master is drained between steps - `wait_for` on a
+	// needle that cannot occur reads for its whole budget and gives up - because
+	// nothing else is reading it and a full pty buffer would stall the shell
+	// mid-drag, which is a hang and not a failure.
+	constexpr std::string_view never = "\x01\x02";
+	for (const unsigned short columns :
+	     {110, 100, 90, 80, 70, 60, 50, 60, 70, 80, 90, 100, 110}) {
+		shell.resize(columns);
+		(void)shell.wait_for(never, 1, std::chrono::milliseconds{20});
+	}
+
+	// And the last step on its own, so there is something to wait FOR: every
+	// repaint re-emits the prompt, so the count going up is the drag having
+	// been rendered rather than a sleep hoping it was.
+	const std::size_t before = shell.count_of(kPrompt);
+	shell.resize(120);
+	ASSERT_TRUE(shell.wait_for(kPrompt, before + 1)) << shell.seen();
+
+	EXPECT_EQ(prompts_after_the_last_erase(shell.seen(), kPrompt), 1u)
+		<< "the drag left more than one copy of the prompt on screen";
+	EXPECT_EQ(longest_clipped_prompt_after_the_last_erase(shell.seen(), kPrompt), 0u)
+		<< "a clipped fragment of the prompt survived the drag";
+	EXPECT_EQ(occurrences(after_the_last_erase(shell.seen()), "\x1b[1B"), 0u)
+		<< "the repaint moved between two soft-wrapped rows";
 }
 
 TEST(UiPty, ResizingTwiceMidLineLeavesOneCopyOfThePromptAndNotThree) {

@@ -28,6 +28,30 @@ void append_uint(std::string& out, unsigned value) {
 // local of one call and not a member of the blitter. A member would be a
 // second model of the terminal living beside the caller's `previous` surface,
 // and two models of one terminal is how a renderer ends up with a `s_reset`.
+//
+// THE RIGHT EDGE, which is most of what this class is about (#112, #189).
+// Writing a glyph into the last column does NOT move the cursor to the next
+// row; it leaves the terminal in PENDING WRAP, holding the cursor on the last
+// column and the decision until the next glyph arrives. Three rules follow,
+// and each of them is a bug somebody else already had:
+//
+//   1. MOVING resolves the ambiguity with `\r`, always. After it the cursor is
+//      at column zero of THIS row whatever the terminal was thinking, and the
+//      row above stays a HARD line - a line of its own, which a resize will not
+//      rewrap. `move_to` and `move_to_frame_top` are the two movers.
+//
+//   2. WRITING THROUGH the wrap is how a SOFT row is reached, and the only way:
+//      the next glyph, emitted with no positioning at all, lands at column zero
+//      of the next row AND tells the terminal the two rows are one logical line.
+//      `wrap_through` is that - it emits nothing and only says where the next
+//      `put` will land. Anything else here, `\r` included, cancels the wrap and
+//      makes the soft row hard, which is the defect #189 is about.
+//
+//   3. ERASING WHILE A WRAP IS PENDING IS FORBIDDEN. The cursor is still ON the
+//      last column, so `ESC[K` eats the glyph just written (fish's screen.rs,
+//      zsh's "clearing eol would be evil") and `ESC[J` eats it and the rows
+//      below (fish #6951). There is nothing between the cursor and the end of
+//      that line to erase anyway, so the erase is skipped rather than reordered.
 class emitter {
 public:
 	emitter(std::string& out, const cluster_pool& pool, terminal_capabilities caps,
@@ -81,10 +105,38 @@ public:
 		}
 	}
 
+	// Whether the terminal is holding a pending wrap at the end of `row` - the
+	// last glyph emitted landed in that row's last column, and the next one will
+	// fall through to the row below it.
+	[[nodiscard]] bool pending_wrap_at(std::uint16_t row) const noexcept {
+		return _wrap_pending && _row == row;
+	}
+
+	// WRITE THROUGH THE WRAP (#189), and note that it emits nothing: the next
+	// `put` IS the move. The terminal is holding a pending wrap, so the glyph
+	// that comes next lands at column zero of `row` on its own - and, unlike
+	// every `\r`-led move, leaves the row above marked as SOFT-WRAPPED, which is
+	// what makes the terminal's picture of the frame agree with the layout's
+	// when the window is resized.
+	//
+	// The caller owes one glyph after this. Erasing instead would erase the row
+	// ABOVE (see the class comment, rule 3), and moving instead would cancel the
+	// wrap - either way the write-through is off by a row.
+	void wrap_through(std::uint16_t row) {
+		LESH_ASSERT(_wrap_pending && static_cast<std::uint16_t>(_row + 1) == row);
+		_row = row;
+		_column = 0;
+		_wrap_pending = false;
+	}
+
 	// Erase from the cursor to the end of the line. The pen goes back to
 	// default first: with background-colour erase, ESC[K paints the erased span
 	// in whatever background is in force, and the span is meant to be blank.
 	void clear_to_end_of_line() {
+		// Class comment, rule 3: the span is empty and the erase would eat the
+		// last column instead.
+		if (_wrap_pending)
+			return;
 		reset_pen();
 		_out.append("\x1b[K");
 	}
@@ -93,6 +145,16 @@ public:
 	// background-colour erase would paint the span in whatever background is in
 	// force, and the span is meant to be blank.
 	void clear_to_end_of_screen() {
+		// Rule 3 again, and here the erase cannot simply be skipped - it is the
+		// whole point of the call - so the wrap is resolved first. `paint_from`,
+		// the only caller today, has just done that in `move_to_frame_top`; the
+		// rule is in the code rather than in that call's comment because an
+		// erase reached with a wrap pending is fish #6951 and costs a row.
+		if (_wrap_pending) {
+			_out.push_back('\r');
+			_column = 0;
+			_wrap_pending = false;
+		}
 		reset_pen();
 		_out.append("\x1b[J");
 	}
@@ -316,6 +378,14 @@ void blitter::emit(const surface* previous, const cursor_placement* from,
 	// frame and the surface we painted no longer describes it. Null - which is
 	// `paint`, the first paint of a read - means the cursor really is at the
 	// origin and there is nothing below it that is ours to erase.
+	//
+	// AND THE FRAME IT PAINTS IS SHAPED THE WAY THE TERMINAL SHAPES ONE (#189):
+	// a row the layout produced by soft-wrapping is written THROUGH the right
+	// edge, so the terminal joins it to the row above as one logical line and
+	// reflows the pair exactly as `frame_top_above_cursor` assumes it will. A
+	// row that begins after a hard newline is still positioned to. Before this,
+	// every row was a hard line to the terminal: a shrink clipped each one
+	// separately and left fragments, and a grow never rejoined them.
 	const bool repaint = previous == nullptr || previous->columns() != desired.columns()
 	                  || previous->rows() != desired.rows();
 
@@ -329,6 +399,30 @@ void blitter::emit(const surface* previous, const cursor_placement* from,
 
 	const std::uint16_t columns = desired.columns();
 	for (std::uint16_t row = 0; row < desired.rows() && columns > 0; ++row) {
+		// DOES THE ROW BELOW CONTINUE THIS ONE THROUGH THE WRAP (#189)? Then
+		// this row is written out to its LAST COLUMN - trailing blanks and all,
+		// and with no `ESC[K` - because that last glyph is the only thing that
+		// makes the terminal wrap, and a wrap is the only thing that makes the
+		// two rows one logical line to it.
+		//
+		// A soft row is nearly always full by construction; the exception is the
+		// row that wrapped because a two-column cluster would have straddled the
+		// edge, which leaves one blank column behind. That blank is written as a
+		// space - it is what the layout says is in that cell, and the alternative
+		// is emitting half a wide glyph, which #97's floor cannot express.
+		//
+		// REPAINTS ONLY. The diff path positions absolutely (see below).
+		//
+		// NEVER PAST THE FRAME'S LAST ROW, which is what keeps the bottom-right
+		// corner safe: there is no row below it to write through to, so the last
+		// row keeps the ordinary "last cell, then `\r`" ending and the terminal
+		// is never handed the glyph that would scroll the screen. That the
+		// frame's last row may also be the SCREEN's last row costs nothing for
+		// the same reason.
+		const bool wrapped_into_by_next =
+			repaint && row + 1 < desired.rows()
+			&& !desired.row_starts_hard_line(static_cast<std::uint16_t>(row + 1));
+
 		int first = -1;
 		int last = -1;
 		if (repaint) {
@@ -363,10 +457,39 @@ void blitter::emit(const surface* previous, const cursor_placement* from,
 		                             == blank_cell)
 			--blank_tail;
 
-		const bool clear_tail = static_cast<int>(blank_tail) <= last;
-		const int run_end = clear_tail ? std::max(first, static_cast<int>(blank_tail)) : last + 1;
+		bool clear_tail = static_cast<int>(blank_tail) <= last;
+		int run_end = clear_tail ? std::max(first, static_cast<int>(blank_tail)) : last + 1;
+		if (wrapped_into_by_next) {
+			clear_tail = false;
+			run_end = columns;
+		}
 
-		terminal.move_to(row, static_cast<std::uint16_t>(first));
+		// HOW THIS ROW IS REACHED (#189): by writing through the wrap the row
+		// above left pending, when this row is a soft continuation of it and the
+		// write starts at column zero - or, in every other case, by positioning.
+		//
+		// THE DIFF PATH GETS HERE TOO, and deliberately. `pending_wrap_at` is a
+		// fact about the bytes already emitted, not about the surface: it is true
+		// only when this update happened to rewrite the row above right up to its
+		// last column, and then writing through is what keeps a rewrite from
+		// turning a soft row hard. When it did NOT rewrite that last column the
+		// terminal's own wrap flag was never disturbed, and `move_to` is free to
+		// position - which is why the diff path needs no forcing of its own.
+		const bool through_the_wrap =
+			row > 0 && first == 0
+			&& !desired.row_starts_hard_line(row)
+			&& terminal.pending_wrap_at(static_cast<std::uint16_t>(row - 1));
+		if (through_the_wrap) {
+			terminal.wrap_through(row);
+			// The write-through owes the terminal a glyph: it is the glyph that
+			// performs the move. A row with nothing to write - the empty row a
+			// buffer ending at the right edge puts the cursor on - pays with the
+			// blank in its first column, and only then may the tail be erased.
+			if (run_end == first)
+				run_end = first + 1;
+		} else {
+			terminal.move_to(row, static_cast<std::uint16_t>(first));
+		}
 		for (int column = first; column < run_end; ++column) {
 			const cell& one = desired.at(row, static_cast<std::uint16_t>(column));
 			if (one.glyph.is_continuation())

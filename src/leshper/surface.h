@@ -279,11 +279,37 @@ public:
 
 	// Resizes and clears. Deliberately not "resizes and preserves": F-38 owns
 	// what a resize does to content, and a half-answer here would be the thing
-	// its ticket has to unpick.
+	// its ticket has to unpick. Every row comes back HARD - see below.
 	void resize(std::uint16_t columns, std::uint16_t rows);
 
-	// Every cell back to `blank_cell`. The cursor placement is left alone.
+	// Every cell back to `blank_cell`, and every row back to hard: the content
+	// that justified a soft wrap is what has just been erased. The cursor
+	// placement is left alone.
 	void clear();
+
+	// WHICH KIND OF LINE A ROW BEGINS (#189), and the one thing on this grid
+	// that is about the terminal rather than about the picture.
+	//
+	// A row is HARD when the layout started it deliberately - row zero, and
+	// every row after a U+000A in the buffer. It is SOFT when the layout only
+	// started it because the row above ran out of columns. The two look
+	// identical as cells and are NOT the same line to a terminal: a soft row is
+	// the continuation of one logical line, which the terminal will rewrap on a
+	// resize, and a hard row is a line of its own, which it will not. The
+	// blitter reaches a soft row by writing through the right edge and a hard
+	// row by positioning to it, so that the terminal's idea of the frame and
+	// ours agree; before #189 every row was written as a hard one and a resize
+	// left clipped fragments behind.
+	//
+	// DEFAULTS TO HARD, always, so a surface nobody laid out - a test's
+	// hand-built grid, the pager's own picture - paints exactly as it did
+	// before this existed. `lay_out` is the only thing that says otherwise.
+	//
+	// NOT part of `operator==`: two surfaces with the same cells and cursor
+	// show the same picture, which is what the differ and N-3's cell-grid tests
+	// compare. This is how the picture was arrived at, not what it looks like.
+	[[nodiscard]] bool row_starts_hard_line(std::uint16_t row) const noexcept;
+	void set_row_starts_hard_line(std::uint16_t row, bool starts) noexcept;
 
 	[[nodiscard]] const cell& at(std::uint16_t row, std::uint16_t column) const noexcept;
 	[[nodiscard]] cell& at(std::uint16_t row, std::uint16_t column) noexcept;
@@ -333,6 +359,11 @@ private:
 	std::uint16_t _rows = 0;
 	cursor_placement _cursor;
 	std::vector<cell> _cells;
+	// One bit per row, and a `vector<bool>` for once on purpose: a terminal's
+	// height is tens of rows, so the whole thing is a word or two beside a
+	// `_cells` that is already thousands of cells. It is sized by `resize`,
+	// which is the only place either container allocates.
+	std::vector<bool> _hard_rows;
 };
 
 } // namespace lesh::leshper

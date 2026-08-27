@@ -356,6 +356,82 @@ TEST(LeshperLayout, ALogicalLineWrapsAndTheNextStillStartsALine) {
 }
 
 // ---------------------------------------------------------------------------
+// What kind of line a row begins (#189). The blitter reaches a soft row by
+// writing through the right edge and a hard row by positioning to it, so that
+// the terminal's idea of the frame and this one agree across a resize - and the
+// only place the two can be told apart is here, in the walk that made them.
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::vector<bool> hard_rows_of(const surface& screen) {
+	std::vector<bool> answer;
+	for (std::uint16_t row = 0; row < screen.rows(); ++row)
+		answer.push_back(screen.row_starts_hard_line(row));
+	return answer;
+}
+
+TEST(LeshperLayout, AWrappedRowIsSoftAndARowAfterANewlineIsHard) {
+	cluster_pool pool;
+	layout_input in = sized(4, 6);
+	in.continuation = "> ";
+	in.buffer = "abcdef\nz";
+	in.cursor = at(8);
+
+	const layout made = lay_out(pool, in);
+	// Row zero always hard - it is the top of the frame, and nothing above it
+	// wrapped into it. Row one is where `abcdef` ran out of columns. Row two is
+	// where the newline is.
+	EXPECT_EQ(hard_rows_of(made.screen), (std::vector<bool>{true, false, true}));
+}
+
+TEST(LeshperLayout, TheEmptyRowThePhantomColumnPushesTheCursorOntoIsSoft) {
+	// It exists only because the row above filled, which is exactly what a soft
+	// wrap is - and it matters, because painting it as a hard row is what left
+	// the previous frame's top row behind when the window grew.
+	cluster_pool pool;
+	layout_input in = sized(4, 4);
+	in.buffer = "abcd";
+	in.cursor = at(4);
+
+	const layout made = lay_out(pool, in);
+	ASSERT_EQ(made.screen.rows(), 2);
+	EXPECT_EQ(hard_rows_of(made.screen), (std::vector<bool>{true, false}));
+}
+
+TEST(LeshperLayout, ANewlineAtExactlyTheRightEdgeStartsAHardRowAndNotASoftOne) {
+	// The ambiguity decision 3 accepts, answered for the blitter: the end of a
+	// full line and the start of the next are the same cell, and the cursor's
+	// own move onto the next row calls it soft before the newline is read. The
+	// newline is the later and truer word on it.
+	cluster_pool pool;
+	layout_input in = sized(4, 4);
+	in.continuation = "> ";
+	in.buffer = "abcd\nz";
+	in.cursor = at(4);
+
+	const layout made = lay_out(pool, in);
+	ASSERT_EQ(made.screen.rows(), 2);
+	EXPECT_EQ(hard_rows_of(made.screen), (std::vector<bool>{true, true}));
+}
+
+TEST(LeshperLayout, TheTopRowOfAWindowedViewIsHardWhateverItContinues) {
+	// A scrolled view's first row IS a continuation of content above it, but the
+	// frame does not contain that content: the blitter positions the cursor to
+	// the frame's top row, and there is no wrap on screen for it to write
+	// through. Row zero is hard by construction, and only the rows below it can
+	// be reached through a wrap.
+	cluster_pool pool;
+	layout_input in = sized(4, 2);
+	in.buffer = "abcdefghijkl";
+	in.cursor = at(12);
+
+	const layout made = lay_out(pool, in);
+	ASSERT_TRUE(made.scrolled());
+	ASSERT_EQ(made.screen.rows(), 2);
+	EXPECT_GT(made.first_visible_row, 0);
+	EXPECT_EQ(hard_rows_of(made.screen), (std::vector<bool>{true, false}));
+}
+
+// ---------------------------------------------------------------------------
 // The cursor (decision 3).
 // ---------------------------------------------------------------------------
 

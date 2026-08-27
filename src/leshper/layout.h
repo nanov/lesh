@@ -40,6 +40,14 @@ namespace lesh::leshper {
 //      the user typed. A soft-wrapped continuation gets NO secondary prompt: it
 //      is not a new logical line, and F-36 is about logical lines.
 //
+//      AND IT IS RECORDED, per row, in `surface::row_starts_hard_line` (#189).
+//      Cells alone cannot tell a wrap from a newline - a hard line that happens
+//      to fill the width looks identical - and the two are PAINTED differently:
+//      the blitter reaches a soft row by writing through the right edge, so the
+//      terminal holds the pair as one logical line and rewraps it on a resize
+//      exactly as this function does at the new width. Only the walk below knows
+//      which of `reserve` and `break_line` started a row, so only it can say.
+//
 //   2. MULTI-LINE BUFFERS (F-2). A line-break cluster in the buffer - U+000A,
 //      or a CR LF pair, which UAX #29 makes one cluster - ends the logical line
 //      and the next one starts at column 0 with `continuation` drawn at its

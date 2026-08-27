@@ -1189,6 +1189,12 @@ leshper::cursor_placement event_loop::frame_top_above_cursor() {
 	// newlines survive this for free - `lay_out` starts a new row at one either
 	// way - which is why the answer is a re-layout rather than arithmetic on the
 	// old row count.
+	//
+	// AND THE FRAME IT REWRAPPED IS THE ONE WE PAINTED (#189): the blitter writes
+	// a soft-wrapped row through the right edge, so the terminal holds those rows
+	// as one logical line and rewraps them exactly as this re-layout does. While
+	// it did not - while every row was painted as a hard line - this count was
+	// right about a frame nobody had drawn.
 	leshper::layout_input was;
 	was.prompt = _previous_input.prompt;
 	was.continuation = _previous_input.continuation;
