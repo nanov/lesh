@@ -15,7 +15,9 @@
 //      reported, and the same block must BE reported once that stack is gone.
 //      The research note calls the first one "the single most likely way fibers
 //      break the gate on CI"; the second one is what makes a green gate mean
-//      something rather than meaning LSan was not looking;
+//      something rather than meaning LSan was not looking. It DOES break the
+//      gate on Darwin, and #202 found out why #198 thought otherwise - see the
+//      negative control below and the note in `src/fiber/scheduler.cpp`;
 //   5. GROUPS - parking a SET with one bit, and the two ordering decisions
 //      `scheduler.h` records: a resumed group's queued wakes replay in WAKE
 //      order, and a group parked mid-tick loses its own remaining slices while
@@ -1088,6 +1090,18 @@ TEST(FiberLsan, ABlockHeldOnlyByAParkedFiberStackIsNotReported) {
 	// fails at exit with a 500 KB leak - which is the finding, not a bug to
 	// suppress.
 	//
+	// AND THAT IS WHAT IT FOUND, one step later than #198 thought (#202). #198
+	// recorded "Darwin's LSan root set does cover the anonymous mapping"; it does
+	// NOT. What made this pass then was minicoro's ASan defect - it left the
+	// THREAD's recorded stack bounds pointing at the fiber's stack after a yield,
+	// so the leak check scanned the fiber stack as if it were the thread's and
+	// found the block. `scheduler.cpp` corrects those bounds now, because
+	// `__asan_handle_no_return` needs them right, and this test went red the moment
+	// it did. It passes again because `scheduler::spawn` registers every live fiber
+	// stack as an LSan ROOT REGION - the documented interface, and tracing rather
+	// than suppressing, so what a parked frame points at stays honestly reachable.
+	// See the LeakSanitizer note at the top of `src/fiber/scheduler.cpp`.
+	//
 	// Nothing here is freed and nothing is destroyed, on purpose.
 	static lsan_probe probe;
 	auto* const survivor = new (g_survivor_storage) scheduler();
@@ -1108,8 +1122,10 @@ TEST(FiberLsanPositiveControl, DISABLED_DroppedBlockIsReported) {
 	// rather than meaning LSan was asleep. Same allocation, same fiber frame -
 	// and then the scheduler is destroyed while the fiber is still parked, which
 	// unmaps the stack WITHOUT unwinding it (v1 has no cancellation by
-	// destruction). The only pointer to the block goes with the mapping, so the
-	// process now leaks 500 KB and must exit non-zero.
+	// destruction). The only pointer to the block goes with the mapping - and so
+	// does the stack's registration as an LSan root region (#202), which is why
+	// this stays a leak now that a LIVE fiber stack is traced - so the process
+	// leaks 500 KB and must exit non-zero.
 	//
 	// DISABLED_ so the ordinary suite does not run it. `fiber_lsan_positive_control`
 	// in CMakeLists.txt runs exactly this one test with WILL_FAIL TRUE: the case

@@ -111,6 +111,59 @@ void back_on_the_host_stack(const void* bottom, std::size_t size) noexcept {
 	__sanitizer_start_switch_fiber(&saved, bottom, size);
 	__sanitizer_finish_switch_fiber(saved, nullptr, nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// LeakSanitizer AND A PARKED FIBER'S STACK (#202)
+// ---------------------------------------------------------------------------
+//
+// A FIBER'S STACK IS A LEAK-SCAN ROOT, AND IT HAS TO BE SAID OUT LOUD.
+//
+// LeakSanitizer's root set is the thread stacks, the registers, the globals and
+// the TLS. A fiber's stack is none of those: it is an anonymous `mmap` this file
+// made, and nothing in LSan knows a coroutine exists. So a heap block whose only
+// pointer is a local in a parked fiber's frame - which is EVERY reactor's
+// snapshot buffer while it is mid-compute, since `run_reactor_here` moves the
+// string into the token - is unreachable as far as LSan can tell, and reported.
+//
+// #198 CONCLUDED THE OPPOSITE, and the reason it looked that way is the ASan
+// defect above. `FiberLsan.ABlockHeldOnlyByAParkedFiberStackIsNotReported`
+// passed on Darwin because minicoro left ASan's record of the THREAD's stack
+// pointing at the fiber's stack after the yield - so the leak check scanned the
+// fiber stack as if it were the thread's, and found the block. Correcting the
+// bounds so that `__asan_handle_no_return` works removed that accident, the
+// negative control went red, and what it had been proving was that a bug was
+// still there. The research note called this "the single most likely way fibers
+// break the gate on CI", and it was right about the shape and wrong about only
+// the platform.
+//
+// The fix is the documented interface, not a suppression: every live fiber stack
+// is registered as an LSan ROOT REGION, so blocks held from it are TRACED - which
+// keeps them, and everything they in turn point at, honestly reachable. An
+// `__lsan_ignore_object` on the block would have hidden one allocation and left
+// its graph unreachable; a suppression would have hidden the whole class. And the
+// registration is UNDONE when the stack is unmapped, which is what keeps
+// `FiberLsanPositiveControl` meaningful: a scheduler destroyed with a fiber still
+// parked really does lose whatever that stack owned, and LSan must still say so.
+//
+// Whole-stack rather than up-to-the-stack-pointer, which is what ASan itself does
+// for every thread but the current one: the cost is that a pointer in a dead
+// frame keeps a block alive, so a leak can be missed. The alternative is reading
+// a suspended coroutine's saved stack pointer out of the vendored struct, which
+// would be a second thing to re-verify at every re-vendor for a sharpness the
+// gate does not need.
+extern "C" void __lsan_register_root_region(const void* begin, std::size_t size);
+extern "C" void __lsan_unregister_root_region(const void* begin, std::size_t size);
+
+void watch_stack_for_leaks(const stack_extents& where, bool watching) noexcept {
+	if (where.stack_base == nullptr || where.stack_size == 0)
+		return;
+	if (watching)
+		__lsan_register_root_region(where.stack_base, where.stack_size);
+	else
+		__lsan_unregister_root_region(where.stack_base, where.stack_size);
+}
+#else
+void watch_stack_for_leaks(const stack_extents&, bool) noexcept {}
 #endif
 
 } // namespace
@@ -127,6 +180,10 @@ fiber::fiber(scheduler& on, entry_fn fn, void* userdata, const char* name,
 fiber::~fiber() {
 	if (_co == nullptr)
 		return;
+	// The stack stops being a leak-scan root the moment it stops existing. See the
+	// LeakSanitizer note above: this is what keeps a fiber destroyed mid-compute a
+	// REPORTED leak rather than a silently traced one.
+	watch_stack_for_leaks(extents_of(*_co), false);
 	// A parked fiber's stack is unmapped here WITHOUT unwinding it: see the
 	// header's "there is no cancellation in v1". `mco_destroy` accepts a
 	// suspended coroutine, which is exactly what a parked fiber is.
@@ -179,6 +236,10 @@ fiber& scheduler::spawn(entry_fn fn, void* userdata, const char* name, std::uint
 	mco_coro* co = nullptr;
 	must(mco_create(&co, &desc), "create", born->_name);
 	verify_guard_placement(*co);
+	// This stack is a leak-scan root for as long as it exists (see the
+	// LeakSanitizer note above). Registered before the first slice, because a fiber
+	// can allocate on its very first one.
+	watch_stack_for_leaks(extents_of(*co), true);
 	born->_co = co;
 
 	LESH_LOG(log::level::debug, log::category::worker,
@@ -253,6 +314,7 @@ void scheduler::run_one_slice(fiber& f) {
 	if (mco_status(f._co) == MCO_DEAD) {
 		// Reap now rather than at scheduler destruction: the stack is half a
 		// megabyte of mapping and the fiber object is four words.
+		watch_stack_for_leaks(extents_of(*f._co), false);
 		must(mco_destroy(f._co), "destroy", f._name);
 		f._co = nullptr;
 		f._state = fiber_state::finished;

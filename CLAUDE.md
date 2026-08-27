@@ -101,7 +101,11 @@ else while nothing above it linked `lesh_fiber`; `event_loop` owns a
 the sweeps, exactly as a `src/ui/` change does. `Fiber*` alone (tens of
 milliseconds, including two `fork()`ed guard-page cases) is still the right
 iteration loop, and it is still where the LeakSanitizer control for parked fiber
-stacks lives - which means something only under `ctest --preset debug`.
+stacks lives - which means something only under `ctest --preset debug`. **A green
+`lesh_tests` is not a green gate**: LSan runs at process EXIT, so the leak a
+fiber's stack holds shows up after the last `[ PASSED ]` line and only `ctest`
+turns it into a red case. #202 found exactly that - 1915/1915 green, the process
+leaking 512 KB.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered
