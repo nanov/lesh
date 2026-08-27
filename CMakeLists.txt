@@ -508,6 +508,7 @@ add_executable(lesh_tests
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp
 	tests/unit/expander_tests.cpp
+	tests/unit/fiber_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
 	tests/unit/prompt_builtin_tests.cpp
@@ -516,7 +517,10 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-target_link_libraries(lesh_tests PRIVATE lesh_leshnici gtest_main)
+# `lesh_fiber` is named here explicitly because nothing else in the tree links
+# it yet (#198): the tests and the compass are its only consumers until step 1
+# puts the scheduler inside `event_loop`.
+target_link_libraries(lesh_tests PRIVATE lesh_leshnici lesh_fiber gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale
 # expectation (#108).
@@ -540,6 +544,35 @@ target_compile_definitions(lesh_tests PRIVATE LESH_BINARY="$<TARGET_FILE:lesh>")
 add_dependencies(lesh_tests lesh)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
+
+# THE LSan POSITIVE CONTROL (#198). `FiberLsan.ABlockHeldOnlyByAParkedFiberStackIsNotReported`
+# asserts that LeakSanitizer does NOT report a block reachable only from a parked
+# fiber's mmap'd stack - and a negative assertion about a detector is worthless
+# unless something proves the detector was awake. This is that something: the
+# same allocation, on the same kind of fiber frame, with the stack unmapped
+# underneath it, run in a process of its own.
+#
+# WILL_FAIL inverts the verdict, so the case passes when the process exits
+# non-zero (LSan reported the leak) and FAILS when the process exits clean. The
+# day LSan stops seeing this shape - a sanitizer upgrade, a platform change, a
+# stray `detect_leaks=0` - this case goes red on an otherwise green gate, which
+# is the only way the negative control's silence keeps meaning anything.
+#
+# Debug only: there is no LeakSanitizer in the other configurations, so the
+# process would exit 0 and WILL_FAIL would report a failure that is really just
+# "you are not running the gate".
+#
+# The test itself is DISABLED_ in the binary, so the ordinary `lesh_tests` run
+# does not deliberately leak 500 KB; only this case runs it, by name.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+	add_test(NAME fiber_lsan_positive_control
+		COMMAND lesh_tests
+			--gtest_also_run_disabled_tests
+			--gtest_filter=FiberLsanPositiveControl.DISABLED_DroppedBlockIsReported)
+	set_tests_properties(fiber_lsan_positive_control PROPERTIES
+		WILL_FAIL TRUE
+		ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1")
+endif()
 
 # Differential conformance: every snippet in tests/spec runs through lesh and
 # through a reference shell, and stdout plus exit status must match. dash is
