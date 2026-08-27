@@ -41,7 +41,6 @@ x .d88"               z`    ^%    .uef^"
 #include "runtime/shell_state.h"
 #include "substrate/log.h"
 #include "syntax/parser.h"
-#include "ui/history/history.h"
 #include "ui/session.h"
 
 namespace {
@@ -140,49 +139,18 @@ int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
 	logging.floor = "ansi+256+paste";
 	(void)lesh::log::configure_from_environment(logging);
 
-	// The four providers (#94). Owned HERE, so they outlive the session that
-	// borrows them and are freed before main returns (ADR-0007).
+	// THE PROVIDERS (#94). `syntax` and `prompt` are SHELL FACTS the session
+	// reads, so they are built here from the state and lent to it, outliving
+	// the session that borrows them (ADR-0007). History is NOT one of them: it
+	// is editor state and nothing else, and `run_interactive_shell` builds and
+	// owns the real store itself when the two history verbs are left null
+	// (#193, ADR-0010). The completer is #94's fourth provider and v1 has none.
 	const lesh::ui::shell_syntax_layer syntax;
 	const lesh::ui::shell_prompt_source prompt{state};
-
-	// THE TWO-TIER HISTORY (#193, ADR-0010), built here and nowhere else.
-	//
-	// #101's decision is unchanged and is still made by NOT BUILDING ONE: a
-	// non-interactive shell touches no history, and this function is the
-	// interactive path. No `$XDG_DATA_HOME` and no `$HOME` means no directory
-	// and no store, which reads back as an empty history rather than as an
-	// error.
-	//
-	// OPENED BEFORE THE SESSION TAKES THE TERMINAL, which is what makes the one
-	// warning it can print legal (#98 forbids a diagnostic over a live edit
-	// line). Every way `open` can go wrong is a field of the report and a
-	// session that runs with less - a history file somebody else wrote costs
-	// Tier 1 and is never touched; a directory that cannot be created costs the
-	// disk entirely and the session still remembers its own commands.
-	//
-	// #113's `runtime::history_store` and `~/.lesh_history` are wired to
-	// nothing from here on. The class stays in the tree, compiling and tested,
-	// as the historical implementation (ADR-0010 §Placement); no lesh writes
-	// that file any more, and nothing imports it.
-	std::optional<lesh::ui::history::history> history;
-	if (const std::optional<std::string> dir =
-	        lesh::ui::history::history::default_data_directory()) {
-		history.emplace();
-		(void)history->open(*dir);
-	}
-	const lesh::ui::vector_history_source empty_history;
 
 	lesh::ui::provider_bundle providers;
 	providers.syntax = &syntax;
 	providers.prompt = &prompt;
-	// ONE OBJECT, TWO VERBS: the read side is the `history_source` it already
-	// is, and the write side is the same pointer under the other name.
-	providers.history = history.has_value()
-		? static_cast<const lesh::ui::history_source*>(&*history)
-		: static_cast<const lesh::ui::history_source*>(&empty_history);
-	providers.recorder = history.has_value() ? &*history : nullptr;
-	// The completer is #94's fourth provider and v1 has none. Null, and the
-	// bundle says so.
 	providers.completion = nullptr;
 
 	// WHICH rc, decided here; WHEN it runs is the session's (#101 decision 3).

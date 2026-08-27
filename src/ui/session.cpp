@@ -1126,12 +1126,53 @@ int session::run(std::string_view rc_path) {
 } // namespace
 
 int run_interactive_shell(runtime::shell_state& state, buffer_pool& pool,
-                          const provider_bundle& providers, int in, int out,
+                          const provider_bundle& given, int in, int out,
                           std::string_view rc_path,
                           prompt_extension_installer install_extensions) {
-	LESH_ASSERT(providers.syntax != nullptr);
+	LESH_ASSERT(given.syntax != nullptr);
+	LESH_ASSERT(given.prompt != nullptr);
+
+	// THE TWO-TIER HISTORY (#193, ADR-0010) IS THE UI'S OWN. `syntax` and
+	// `prompt` are shell facts the caller lends; history is nothing but editor
+	// state - its data directory, its two files, its watch descriptor, its save
+	// on the way out - so `main.cpp` does not build one and does not know how.
+	// A caller that INJECTS a `history` (the tests, with a `vector_history_source`
+	// or a store of their own) is left alone; a caller that leaves both verbs null
+	// gets the real store, built here, outliving the session that borrows it and
+	// freed before this function returns (ADR-0007).
+	//
+	// #101's decision is unchanged and is still made by NOT BUILDING ONE: only
+	// the interactive path reaches this function. No `$XDG_DATA_HOME` and no
+	// `$HOME` means no directory and no store, which reads back as an empty
+	// history rather than as an error.
+	//
+	// OPENED BEFORE THE SESSION TAKES THE TERMINAL, which is what makes the one
+	// warning `open` can print legal (#98 forbids a diagnostic over a live edit
+	// line). Every way `open` can go wrong is a field of the report and a session
+	// that runs with less - a history file somebody else wrote costs Tier 1 and
+	// is never touched; a directory that cannot be created costs the disk entirely
+	// and the session still remembers its own commands.
+	//
+	// #113's `runtime::history_store` and `~/.lesh_history` are wired to nothing
+	// from here on. The class stays in the tree, compiling and tested, as the
+	// historical implementation (ADR-0010 §Placement).
+	std::optional<history::history> own_history;
+	const vector_history_source empty_history;
+	provider_bundle providers = given;
+	if (providers.history == nullptr && providers.recorder == nullptr) {
+		if (const std::optional<std::string> dir = history::history::default_data_directory()) {
+			own_history.emplace();
+			(void)own_history->open(*dir);
+		}
+		// ONE OBJECT, TWO VERBS: the read side is the `history_source` it already
+		// is, and the write side is the same pointer under the other name.
+		providers.history = own_history.has_value()
+			? static_cast<const history_source*>(&*own_history)
+			: static_cast<const history_source*>(&empty_history);
+		providers.recorder = own_history.has_value() ? &*own_history : nullptr;
+	}
 	LESH_ASSERT(providers.history != nullptr);
-	LESH_ASSERT(providers.prompt != nullptr);
+
 	session interactive{state, pool, providers, in, out, install_extensions};
 	return interactive.run(rc_path);
 }

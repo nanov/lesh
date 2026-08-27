@@ -30,7 +30,8 @@
 // rather than returned to a caller that is, by then, parked in
 // `shell_actor::run`. What survives unchanged is the part #94 was actually
 // about: the bundle. `run_interactive_shell` takes one, the four providers are
-// named types, and #102's `vared` passes a different bundle to the nested read
+// named types (history is filled in by the ui itself when left null - it is
+// editor state, not a shell fact, #193), and #102's `vared` passes a different bundle to the nested read
 // the second comment on #134 describes - which is where the literal call-shaped
 // `read` arrives, because a nested read genuinely does return to its caller.
 //
