@@ -46,6 +46,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace lesh::fiber;
@@ -622,6 +623,58 @@ TEST(FiberSlot, AStaleTokenAndADefaultTokenBothReadSuperseded) {
 }
 
 // ---------------------------------------------------------------------------
+// The message may not point into the sender's own fiber stack (#203)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A static one, so the bytes outlive every stack in the process.
+constexpr std::string_view kBorrowedFromNobody = "a line nobody's frame owns";
+
+void send_a_view_of_something_that_outlives_me(scheduler& /*on*/, void* userdata) {
+	auto* const inbox = static_cast<slot<std::string_view>*>(userdata);
+	inbox->send(kBorrowedFromNobody);
+}
+
+} // namespace
+
+TEST(FiberSlot, AViewOfBytesTheSenderDoesNotOwnIsFine) {
+	// The negative control, and it is the whole point of the trait being narrow:
+	// a view is not suspect because it is a view, it is suspect because of WHERE
+	// it points. This one points at a string literal.
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	sched.spawn(&send_a_view_of_something_that_outlives_me, &inbox, "sender");
+	EXPECT_FALSE(sched.tick());
+	EXPECT_FALSE(inbox.empty());
+}
+
+TEST(FiberSlot, TheHostMaySendAViewOfItsOwnStack) {
+	// The host's stack outlives every fiber on it - the loop is the sole resumer
+	// and a fiber never runs while the frame that sent to it has returned - so
+	// the check is about the RUNNING FIBER's stack and nothing else. `event_loop`
+	// sends from exactly here.
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	char frame[32] = "typed at the prompt";
+	inbox.send(std::string_view{frame, 19});
+	EXPECT_FALSE(inbox.empty());
+}
+
+TEST(FiberSlot, AnOwningMessageIsNotInspectedAtAll) {
+	// `std::string` has `data()` and `size()` and is NOT trivially copyable, so
+	// the trait leaves it alone - which it must, because a short string's `data()`
+	// points inside the object, i.e. at the sender's own frame, while the bytes
+	// are moved into the slot and are perfectly safe. This test is that reasoning
+	// written down: it would fail if the trait ever widened to "has data()".
+	scheduler sched;
+	slot<std::string> inbox{sched};
+	std::string tiny = "short";
+	inbox.send(std::move(tiny));
+	EXPECT_FALSE(inbox.empty());
+}
+
+// ---------------------------------------------------------------------------
 // Groups: parking a SET with one bit (#200)
 // ---------------------------------------------------------------------------
 //
@@ -951,6 +1004,21 @@ void park_the_group_the_running_fiber_is_in() {
 	(void)sched.tick();
 }
 
+void send_a_view_of_my_own_stack(scheduler& /*on*/, void* userdata) {
+	auto* const inbox = static_cast<slot<std::string_view>*>(userdata);
+	// `volatile` so the frame is real storage and not something the optimizer
+	// folds into the literal it was copied from.
+	volatile char frame[64] = "a line that dies at the next switch";
+	inbox->send(std::string_view{const_cast<const char*>(frame), 35});
+}
+
+void send_a_message_pointing_into_my_own_stack() {
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	sched.spawn(&send_a_view_of_my_own_stack, &inbox, "sender");
+	(void)sched.tick();
+}
+
 void spawn_into_a_ninth_group() {
 	scheduler sched;
 	std::string log;
@@ -973,6 +1041,16 @@ TEST(FiberGroupsDeathTest, AFiberCannotParkTheGroupItIsRunningIn) {
 	// group" - held by the narrowest assert that holds it.
 	EXPECT_DEATH(park_the_group_the_running_fiber_is_in(),
 	             "a fiber cannot park the group it is running in");
+}
+
+TEST(FiberSlotDeathTest, AMessagePointingIntoTheSendersOwnStackIsRefused) {
+	// coost's `on_stack` check, and the reason it earns its keep: this send is
+	// legal C++, the slot holds the view happily, and the bug appears in whatever
+	// reads it after the sender's next yield - on one machine and not another,
+	// because it depends on what ran next. The assert moves the failure to the
+	// line that did the wrong thing.
+	EXPECT_DEATH(send_a_message_pointing_into_my_own_stack(),
+	             "a message may not point into the sending fiber's own stack");
 }
 
 TEST(FiberGroupsDeathTest, ThereAreEightGroupsAndNoMore) {
