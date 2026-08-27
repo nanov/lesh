@@ -179,6 +179,8 @@ add_library(lesh_runtime STATIC
 	src/runtime/arithmetic.h
 	src/runtime/builtins.cpp
 	src/runtime/builtins.h
+	src/runtime/cooperation.cpp
+	src/runtime/cooperation.h
 	src/runtime/executor.cpp
 	src/runtime/executor.h
 	src/runtime/expander.cpp
@@ -463,6 +465,7 @@ add_executable(lesh_tests
 	tests/unit/arithmetic_tests.cpp
 	tests/unit/builtin_registry_tests.cpp
 	tests/unit/cd_tests.cpp
+	tests/unit/cooperation_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_selection_tests.cpp
