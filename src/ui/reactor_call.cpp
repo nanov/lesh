@@ -9,10 +9,10 @@
 namespace lesh::ui {
 namespace {
 
-// The third copy of registry.cpp's thread key, and the comment workers.cpp
-// carries applies verbatim: the two must agree or every accessor on the token
-// would refuse, so `run_reactor_here` asserts `token_is_live` on a token it has
-// just built rather than trusting that they still do.
+// The SECOND copy of registry.cpp's thread key (it was the third until #202 took
+// the pool's with it): the two must agree or every accessor on the token would
+// refuse, so `run_reactor_here` asserts `token_is_live` on a token it has just
+// built rather than trusting that they still do.
 std::uint64_t this_thread_key() noexcept {
 	const std::uint64_t key =
 		static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
@@ -21,9 +21,45 @@ std::uint64_t this_thread_key() noexcept {
 
 } // namespace
 
+void take_snapshot(request_snapshot& into, const leshper::state& target,
+                   std::uint32_t event_kind) {
+	// `assign` AND NOT `=`: the string keeps whatever capacity it arrived with,
+	// which is the whole point of the in-place form.
+	into.buffer.assign(target.buffer.text());
+	into.cursor = target.cursor.byte_offset();
+	// The derived region, exactly as `loop_harness::react` takes it (#116 landed
+	// the model after this function was written, and a snapshot that reported
+	// every selection as inactive would make #129's `selection_changed` fan-out
+	// wake reactors with nothing to look at). Reported even when inactive, on
+	// the reasoning `lesh_selection_get` gives: the anchor outlives
+	// deactivation and the flag is the separate question.
+	{
+		const std::size_t anchor = target.selection_anchor().byte_offset();
+		const std::size_t head = into.cursor;
+		into.selection_start = anchor < head ? anchor : head;
+		into.selection_end = anchor < head ? head : anchor;
+		into.selection_active = target.selection_active();
+	}
+	into.computed_against = target.gen;
+	into.event_kind = event_kind;
+	// `host` IS RESET, so that this and `snapshot_of` produce the same value into
+	// a reused object as into a fresh one. Without it a reactor's snapshot could
+	// keep a host pointer a previous notification had set and hand it to a caller
+	// that meant null, which is the one field where "left over from last time" is
+	// not obviously wrong at the point of use. A caller that wants one sets it
+	// after (see the field's note, and `event_loop::notify_reactors`).
+	into.host = nullptr;
+}
+
+request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind) {
+	request_snapshot taken;
+	take_snapshot(taken, target, event_kind);
+	return taken;
+}
+
 void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userdata,
                       request_snapshot& snapshot, const std::atomic<bool>& superseded,
-                      leshper::reactor_batch& into) {
+                      leshper::reactor_batch& into, reactor_cooperation cooperate) {
 	LESH_ASSERT(fn != nullptr);
 
 	into.reactor.assign(reactor);
@@ -52,6 +88,11 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	// here is that the copy is now COMPLETE.
 	token.host = snapshot.host;
 	token.superseded = &superseded;
+	// WHO THE CANCELLATION POLL YIELDS TO (#202). Empty for every caller that is
+	// not a fiber, which is what makes the poll cost exactly the atomic load it
+	// always cost off a fiber.
+	token.cooperate = cooperate.yield;
+	token.cooperate_userdata = cooperate.userdata;
 	token.spans = &into.spans;
 	token.texts = &into.texts;
 	token.proposals = &into.proposals;
@@ -68,9 +109,10 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 
 	token.call_token = 0;
 	token.owner_thread = 0;
-	// AND THE STORAGE GOES BACK, exactly as `worker_pool::compute` hands it back
-	// to its scratch task. Without this the token's destructor would free a
-	// buffer the caller is about to want again.
+	// AND THE STORAGE GOES BACK. Without this the token's destructor would free a
+	// buffer the caller is about to want again - which is the whole reason the
+	// snapshot is borrowed rather than consumed, and the reason a warm keystroke
+	// reaches the heap not at all.
 	snapshot.buffer = std::move(token.buffer);
 }
 

@@ -42,42 +42,6 @@ std::uint64_t worker_thread_key() noexcept {
 
 buffer_pool* current_worker_arena() noexcept { return t_worker_arena; }
 
-void take_snapshot(request_snapshot& into, const leshper::state& target,
-                   std::uint32_t event_kind) {
-	// `assign` AND NOT `=`: the string keeps whatever capacity it arrived with,
-	// which is the whole point of the in-place form.
-	into.buffer.assign(target.buffer.text());
-	into.cursor = target.cursor.byte_offset();
-	// The derived region, exactly as `loop_harness::react` takes it (#116 landed
-	// the model after this function was written, and a snapshot that reported
-	// every selection as inactive would make #129's `selection_changed` fan-out
-	// wake reactors with nothing to look at). Reported even when inactive, on
-	// the reasoning `lesh_selection_get` gives: the anchor outlives
-	// deactivation and the flag is the separate question.
-	{
-		const std::size_t anchor = target.selection_anchor().byte_offset();
-		const std::size_t head = into.cursor;
-		into.selection_start = anchor < head ? anchor : head;
-		into.selection_end = anchor < head ? head : anchor;
-		into.selection_active = target.selection_active();
-	}
-	into.computed_against = target.gen;
-	into.event_kind = event_kind;
-	// `host` IS RESET, so that this and `snapshot_of` produce the same value into
-	// a reused object as into a fresh one. Without it a slot could keep a host
-	// pointer a previous submit had set and hand it to a caller that meant null,
-	// which is the one field where "left over from last time" is not obviously
-	// wrong at the point of use. A submit that wants one sets it after (see the
-	// field's note, and `event_loop::run_shell_reactor_here`).
-	into.host = nullptr;
-}
-
-request_snapshot snapshot_of(const leshper::state& target, std::uint32_t event_kind) {
-	request_snapshot taken;
-	take_snapshot(taken, target, event_kind);
-	return taken;
-}
-
 // ---------------------------------------------------------------------------
 // Pooled messages
 // ---------------------------------------------------------------------------
