@@ -1,6 +1,6 @@
 #pragma once
 
-// The event loop: `poll(2)`, five topics, and quiesce (#129; #128's resolution;
+// The event loop: `poll(2)`, six topics, and quiesce (#129; #128's resolution;
 // architecture spec §4 and §4.1; ADR-0009).
 //
 // THE HOST'S, AND IN `src/ui/` SINCE #168. This file drives leshper; it is not
@@ -20,7 +20,7 @@
 // the last of those specifically, because XNU doubles its slack and #115
 // measured the 2:1 timer gap that came of it.
 //
-// TOPICS ARE THE VOCABULARY (the owner's word). Five of them, and the fd is
+// TOPICS ARE THE VOCABULARY (the owner's word). Six of them, and the fd is
 // each one's implementation detail:
 //
 //   `tty`     bytes from the terminal, decoded by #111's `input_decoder`.
@@ -33,9 +33,17 @@
 //             monotonic clock, and `lesh_timer_start` is the public door.
 //   `shell`   ADR-0009's wakeup pipe from the shell thread, drained the same
 //             way the worker topic is.
+//   `watch`   §8's `fd-readable` hook, and the sixth topic (#195). A descriptor
+//             somebody else owns plus a callback the loop runs ON THE LOOP
+//             THREAD when it is readable. Its one user is the history's
+//             directory watch (ADR-0010 §Locking and staleness), which is
+//             `inotify` on Linux and a `kqueue` on macOS, and which the loop
+//             deliberately knows nothing about: what it holds is an int and a
+//             function pointer.
 //
-// §8's `fd-readable` configuration hook is one more topic when it arrives, and
-// that is what "topic" buys over "a list of descriptors".
+// THAT IS WHAT "TOPIC" BOUGHT over "a list of descriptors": the sixth arrived as
+// two members and three lines in `turn`, and nothing that reasons about the tty
+// or the workers had to learn it exists.
 //
 // A TURN: poll -> drain the topics into events -> `editor.step` each -> if
 // anything changed, `lay_out` -> `blit.update(previous, desired)` -> write. The
@@ -358,6 +366,7 @@ enum class topic : std::uint8_t {
 	worker,
 	timer,
 	shell,
+	watch,
 	count_,
 };
 
@@ -487,6 +496,31 @@ public:
 	void attach_registry(leshper::registry& reg) noexcept;
 	void attach_shell(shell_actor& shell) noexcept;
 	void attach_signals(signal_hub& hub) noexcept;
+
+	// THE `watch` TOPIC (#195), which is §8's fd-readable hook and is one
+	// attachment like the four above.
+	//
+	// A FUNCTION POINTER AND A `void*`, NOT A `std::function`, and it is the
+	// same trade #93's reactor tuple makes: a `std::function` built from a
+	// capturing lambda heap-allocates at the attachment site and hides an
+	// indirect call behind a type nothing here can name. The one call site is a
+	// captureless lambda plus the owner's address, which is three lines there
+	// and no allocation anywhere.
+	//
+	// `on_readable` RUNS ON THE LOOP THREAD, inside the turn, and is responsible
+	// for CONSUMING what made the fd readable - the same rule the worker topic
+	// has, and for the same reason: a hook that leaves its descriptor readable
+	// turns the poll into a spin. It must not block; the history's drain is a
+	// non-blocking read, a `stat` and a pointer swap.
+	//
+	// The descriptor is BORROWED. The loop never closes it and never reads it;
+	// whoever attached it owns it and must detach before it dies.
+	void attach_watch(int fd, void (*on_readable)(void* userdata),
+	                  void* userdata) noexcept;
+	void detach_watch() noexcept;
+	[[nodiscard]] int watch_fd() const noexcept { return _watch_fd; }
+	// Times the `watch` topic's hook has been run. A test waits on this.
+	[[nodiscard]] std::size_t watch_drains() const noexcept { return _watch_drains; }
 
 	// THERE IS NO `attach_shell_knowledge` (#151). #135 had one: the loop held
 	// the session's `shell_knowledge*` and put it on the snapshot of the
@@ -629,6 +663,7 @@ private:
 	void drain_signal_topic(turn_result& result);
 	void drain_worker_topic(turn_result& result);
 	void drain_shell_topic(turn_result& result);
+	void drain_watch_topic(turn_result& result);
 	void fire_timers(leshper::input_instant now, turn_result& result);
 
 	void handle(const leshper::event& incoming, turn_result& result);
@@ -780,6 +815,15 @@ private:
 		clock::time_point due{};
 	};
 	std::vector<timer_due> _timers;
+
+	// The `watch` topic (#195). Borrowed, and -1 means the topic does not exist
+	// this session - which is the ordinary state of every test that does not
+	// attach one, and of a shell whose data directory would not give out a
+	// notification descriptor.
+	int _watch_fd = -1;
+	void (*_watch_hook)(void*) = nullptr;
+	void* _watch_userdata = nullptr;
+	std::size_t _watch_drains = 0;
 
 	unsigned _resizes_seen = 0;
 	std::size_t _park_depth = 0;

@@ -364,6 +364,9 @@ open_report history::open(const std::string& directory) {
 		::close(_log_fd);
 		_log_fd = -1;
 	}
+	// A reload owed to the file the PREVIOUS `open` mapped is not owed to this
+	// one: `map_tier1` below re-establishes both the mapping and its id.
+	_reload_needed = false;
 
 	if (!make_directories(directory, 0700)) {
 		out.directory_unusable = true;
@@ -373,35 +376,19 @@ open_report history::open(const std::string& directory) {
 	_data_path = directory + "/history.data";
 	_log_path = directory + "/history.new.log";
 
+	// --- Remoteness, BEFORE anything opens or locks (#195) -------------------
+	//
+	// ADR-0010: "Never lock and never mmap when the data dir is remote." Both
+	// halves are decided here, once, because a directory does not change
+	// filesystems under a running shell - and because the lock verbs take a
+	// descriptor and no path, so the answer has to be somewhere they can see it.
+	_remote = is_remote(directory);
+	set_data_directory_remote(_remote);
+	out.directory_remote = _remote;
+
 	// --- Tier 1 -------------------------------------------------------------
-	auto mapped = std::make_shared<mapped_blob>();
-	switch (mapped->open(_data_path)) {
-	case blob_status::ok:
-		out.tier1_mapped = true;
-		// `const` from here on: a view hands this to workers, and nothing above
-		// this line will ever call a non-const member on it again.
-		_blob = std::move(mapped);
-		break;
-	case blob_status::io_error:
-		// A missing file is a first run and not a problem (`blob.h` says so in
-		// as many words). Any other errno costs Tier 1 and nothing else: the
-		// session runs on the log plus memory, exactly as it does before the
-		// first vacuum has ever written a blob.
-		break;
-	case blob_status::unknown_identifier:
-		// ADR-0010: NEVER DESTROY IT. A future lesh's file, or somebody else's.
-		_tier1_untouchable = true;
-		warn_once("is not a lesh history file");
-		break;
-	case blob_status::corrupt:
-		// Ours, and the Verifier refused it. #194 decides whether a vacuum may
-		// rebuild one of these; until it does, the conservative treatment is
-		// the same one an unknown identifier gets, for the same reason - a file
-		// nobody has decided about is a file nobody may overwrite.
-		_tier1_untouchable = true;
-		warn_once("did not verify");
-		break;
-	}
+	map_tier1();
+	out.tier1_mapped = _blob != nullptr;
 	out.tier1_untouchable = _tier1_untouchable;
 
 	// --- Tier 2, read ---------------------------------------------------------
@@ -435,8 +422,110 @@ open_report history::open(const std::string& directory) {
 	_log_fd = ::open(_log_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
 	out.log_writable = _log_fd >= 0;
 
+	// --- The directory watch (#195, fish #3565) -------------------------------
+	//
+	// LAST, and after the log has been created, so that this session's own two
+	// files are already there and the first notification is somebody else's.
+	// A failure is a degradation `open_report` names and nothing more.
+	out.watching = _watch.open(directory);
+
 	publish();
 	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1's mapping
+// ---------------------------------------------------------------------------
+
+void history::map_tier1() {
+	// THE ID FIRST. See `_data_id`'s declaration: taking it before the open is
+	// what makes a race here cost a wasted remap rather than a permanently stale
+	// mapping.
+	_data_id = file_id_of_path(_data_path);
+
+	auto mapped = std::make_shared<mapped_blob>();
+	// THE ONE BRANCH IN THE WHOLE SUBSYSTEM ON WHERE THE FILE LIVES (fish PR
+	// #5097). Everything downstream - the view, the merge walk, the searcher -
+	// reads `records()` and cannot tell which of these ran.
+	const blob_status status =
+		_remote ? mapped->open_copied(_data_path) : mapped->open(_data_path);
+
+	_tier1_untouchable = false;
+	_blob.reset();
+	switch (status) {
+	case blob_status::ok:
+		// `const` from here on: a view hands this to workers, and nothing above
+		// this line will ever call a non-const member on it again.
+		_blob = std::move(mapped);
+		break;
+	case blob_status::io_error:
+		// A missing file is a first run and not a problem (`blob.h` says so in
+		// as many words). Any other errno costs Tier 1 and nothing else: the
+		// session runs on the log plus memory, exactly as it does before the
+		// first vacuum has ever written a blob.
+		break;
+	case blob_status::unknown_identifier:
+		// ADR-0010: NEVER DESTROY IT. A future lesh's file, or somebody else's.
+		_tier1_untouchable = true;
+		warn_once("is not a lesh history file");
+		break;
+	case blob_status::corrupt:
+		// Ours, and the Verifier refused it. #194 decides whether a vacuum may
+		// rebuild one of these; until it does, the conservative treatment is
+		// the same one an unknown identifier gets, for the same reason - a file
+		// nobody has decided about is a file nobody may overwrite.
+		_tier1_untouchable = true;
+		warn_once("did not verify");
+		break;
+	}
+}
+
+void history::reload_tier1() {
+	// CLEARED FIRST, unconditionally. A reload that failed - the file is gone
+	// again, or the new one does not verify - has still incorporated everything
+	// there was to incorporate, and leaving the flag up would re-run it on every
+	// `publish` for the rest of the session.
+	_reload_needed = false;
+	if (_data_path.empty())
+		return;
+	++_reloads;
+	map_tier1();
+	// THE LOG IS NOT RE-READ, and that is ADR-0010's wording rather than an
+	// omission: "the next view build re-maps, re-verifies, re-caches the id".
+	// The frames this session read at `open` are the same commands the vacuum
+	// just folded into the blob, and the merge walk's dedup puts the log's copy
+	// first, so the result is identical either way. Re-reading would also pull
+	// in a sibling's UNVACUUMED frames, which is a different feature.
+}
+
+void history::note_tier1_identity() {
+	// PLAIN `==` AND NOT `file_id_equal`, and the difference is the point. The
+	// helper refuses to call two failed `stat`s a match, which is what a TOCTOU
+	// check needs; here two failures mean "there was no `history.data` before
+	// and there is none now", which is a first run and is emphatically not a
+	// change to reload for.
+	if (file_id_of_path(_data_path) != _data_id)
+		_reload_needed = true;
+}
+
+void history::incorporate_external_changes() {
+	if (!_reload_needed)
+		return;
+	// `publish` is what consumes the flag - see its declaration.
+	publish();
+}
+
+void history::drain_watch() {
+	// CONSUME FIRST, whatever we decide afterwards. An undrained notification
+	// leaves the descriptor readable and turns the loop's `poll` into a spin.
+	if (!_watch.drain())
+		return;
+	note_tier1_identity();
+	// STRAIGHT AWAY, on this thread, rather than at the next mutation. A session
+	// that only reads has no next mutation - that IS fish #3565 - so the whole
+	// point of the watch is that the new view is up before the next keystroke
+	// asks for one.
+	incorporate_external_changes();
 }
 
 void history::warn_once(const char* what) {
@@ -545,7 +634,68 @@ void history::resolve_pending(std::int32_t exit_code) {
 	publish();
 }
 
+int history::open_locked_log() {
+	if (_log_path.empty())
+		return -1;
+
+	// ADR-0010's loop, and fish's `save_internal_via_appending`: open the PATH,
+	// lock what we got, and then ask whether the thing we locked is still the
+	// thing at that path. A vacuum between the `open` and the `flock` would
+	// otherwise have us appending, under a lock nobody else respects, to an
+	// inode that has already been unlinked.
+	//
+	// 1024 TRIES, which is fish's `max_save_tries` order of magnitude and is a
+	// bound rather than an expectation: the loop terminates on the first attempt
+	// in every run that is not racing a vacuum in the same millisecond.
+	constexpr int k_max_tries = 1024;
+	for (int attempt = 0; attempt < k_max_tries; ++attempt) {
+		// O_CREAT, unlike fish, because a vacuum here may have unlinked the log
+		// after folding it into the blob - and a shell that then wrote through
+		// its session-long descriptor would be writing into an orphan.
+		const int fd =
+			::open(_log_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
+		if (fd < 0)
+			return -1;
+
+		// FALSE IS NOT A FAILURE (`locking.h`): the process may have given up on
+		// locking, or the directory may be remote. The append proceeds either
+		// way - the frame is one `writev` and POSIX makes that atomic against
+		// other appenders, which is why the lock is an optimisation against
+		// interleaved ORDER and not a correctness requirement.
+		(void)lock_exclusive(fd);
+
+		if (file_id_equal(file_id_of_path(_log_path), file_id_of_fd(fd)))
+			return fd;
+
+		unlock(fd);
+		::close(fd);
+	}
+	return -1;
+}
+
 bool history::flush() {
+	// NOTHING TO WRITE MEANS NO SYSCALLS. `save()` and `resolve_pending` both
+	// call this unconditionally, and without the early-out an `exit` typed at a
+	// prompt would open and lock the log to write nothing.
+	// The cursor's own item decides it: the loop below stops at the first
+	// pending one, so if the item AT the cursor is pending (or there is none),
+	// there is nothing behind it either.
+	if (_first_unwritten >= _new_items.size() || _new_items[_first_unwritten]->pending)
+		return true;
+
+	// THE APPEND-PATH IDENTITY CHECK (ADR-0010: "If the fd's id differs from the
+	// cached id, another session vacuumed -> `reload_needed`"). One `stat` per
+	// command line, on the path where a syscall is free - never per read, which
+	// is the rule the whole two-tier design exists to keep.
+	note_tier1_identity();
+
+	// A FRESH, LOCKED DESCRIPTOR PER FLUSH, released by the close below. The
+	// session's own `_log_fd` stays open as the answer to "is the log writable
+	// at all" (`open_report::log_writable`, and the `_unwritable` accounting
+	// below), and is the fallback when the dance could not be completed.
+	const int locked_fd = open_locked_log();
+	const int write_fd = locked_fd >= 0 ? locked_fd : _log_fd;
+
 	bool complete = true;
 	while (_first_unwritten < _new_items.size()) {
 		const item& one = *_new_items[_first_unwritten];
@@ -555,7 +705,7 @@ bool history::flush() {
 			break;
 
 		if (one.mode == persist_mode::disk) {
-			if (_log_fd < 0) {
+			if (write_fd < 0) {
 				// NOWHERE TO WRITE, and the cursor advances anyway. Holding it
 				// back would make every later command retry a write that cannot
 				// succeed - there is no path in this milestone that opens a log
@@ -571,7 +721,7 @@ bool history::flush() {
 					.exit_code = one.exit_code,
 					.session_id = one.session_id,
 				};
-				if (_appender.append(_log_fd, framed) != append_status::ok) {
+				if (_appender.append(write_fd, framed) != append_status::ok) {
 					// A full disk, or a frame that will not fit a u32 length.
 					// Counted and stepped over for the reason above; `log.h` is
 					// explicit that a short write must NOT be finished with a
@@ -585,6 +735,14 @@ bool history::flush() {
 		// `memory` and `ephemeral` items step the cursor without being written,
 		// which is the whole of what those modes mean on this path.
 		++_first_unwritten;
+	}
+
+	if (locked_fd >= 0) {
+		// The close would release the lock on its own; the explicit `unlock`
+		// says so at the point a reader is looking, and costs one syscall on a
+		// path that just did four.
+		unlock(locked_fd);
+		::close(locked_fd);
 	}
 	return complete;
 }
@@ -608,6 +766,12 @@ bool history::save() {
 // ---------------------------------------------------------------------------
 
 void history::publish() {
+	// THE RELOAD, CONSUMED HERE AND NOWHERE ELSE (#195). Every route to a stale
+	// mapping - the watch's drain, the append path's id check - sets one flag,
+	// and the one place that builds a view is the one place that clears it.
+	if (_reload_needed)
+		reload_tier1();
+
 	auto fresh = std::make_shared<view>();
 	fresh->own.reserve(_new_items.size());
 	// NEWEST FIRST, PENDING EXCLUDED. Both are the walk's contract, and doing

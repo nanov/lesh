@@ -1,9 +1,11 @@
 #include "ui/history/blob.h"
 
 #include "ui/history/history_generated.h"
+#include "ui/history/locking.h"
 
 #include <cerrno>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -32,6 +34,11 @@ constexpr std::uint32_t k_verifier_max_tables = 4u * 256u * 1024u;
 // shorter cannot be asked the question at all.
 constexpr std::size_t k_identifier_end = 8;
 
+// What a finished buffer's first byte must be aligned to: the widest scalar in
+// `history.fbs`, which is `uint64`. `mmap` gives a page and is therefore free;
+// #195's heap fallback has to ask for it, and this is the number it asks for.
+constexpr std::size_t k_blob_alignment = 8;
+
 [[nodiscard]] std::span<const std::byte> bytes_of(
 	const ::flatbuffers::Vector<std::uint8_t>* vector) noexcept {
 	if (vector == nullptr)
@@ -40,6 +47,58 @@ constexpr std::size_t k_identifier_end = 8;
 }
 
 using record_vector = ::flatbuffers::Vector<::flatbuffers::Offset<fb::Record>>;
+
+// THE SHARED LOCK, held for exactly as long as the size and the bytes are being
+// read (#195; ADR-0010: "mapping Tier 1 takes `LOCK_SH` only long enough to get
+// a consistent size"; fish takes the same lock around the same window).
+//
+// RAII because `open_impl` has seven exits and six of them are failures, and a
+// history file left locked by an error path would be a shell that hangs the next
+// terminal's vacuum. Taking the lock may be REFUSED - the process has given up,
+// or the directory is remote - and that is not a failure: the constructor
+// records what happened and the destructor undoes only what was done.
+class shared_lock_guard {
+public:
+	explicit shared_lock_guard(int fd) noexcept : _fd(lock_shared(fd) ? fd : -1) {}
+	~shared_lock_guard() {
+		if (_fd >= 0)
+			unlock(_fd);
+	}
+
+	shared_lock_guard(const shared_lock_guard&) = delete;
+	shared_lock_guard& operator=(const shared_lock_guard&) = delete;
+
+private:
+	int _fd = -1;
+};
+
+// A descriptor that closes itself, so that the lock above is always released
+// while its descriptor is still open.
+//
+// THAT ORDERING IS THE WHOLE REASON THIS TYPE EXISTS, and it is not a nicety: an
+// `flock(LOCK_UN)` on a descriptor that has already been closed is at best
+// `EBADF` and at worst an unlock of whatever some other thread opened into the
+// same slot in between. Nesting the lock guard inside this one's scope makes
+// "unlock, then close" the destruction order rather than a rule each exit path
+// has to remember.
+class fd_guard {
+public:
+	explicit fd_guard(int fd) noexcept : _fd(fd) {}
+	~fd_guard() {
+		if (_fd >= 0)
+			::close(_fd);
+	}
+
+	fd_guard(const fd_guard&) = delete;
+	fd_guard& operator=(const fd_guard&) = delete;
+
+	[[nodiscard]] int get() const noexcept { return _fd; }
+	// Hands ownership to the caller; the destructor then does nothing.
+	[[nodiscard]] int release() noexcept { return std::exchange(_fd, -1); }
+
+private:
+	int _fd = -1;
+};
 
 } // namespace
 
@@ -240,6 +299,7 @@ mapped_blob::mapped_blob(mapped_blob&& other) noexcept
 	: _fd(std::exchange(other._fd, -1)),
 	  _data(std::exchange(other._data, nullptr)),
 	  _size(std::exchange(other._size, 0)),
+	  _owns_buffer(std::exchange(other._owns_buffer, false)),
 	  _records(std::exchange(other._records, nullptr)),
 	  _count(std::exchange(other._count, 0)),
 	  _error(std::exchange(other._error, 0)) {}
@@ -250,6 +310,7 @@ mapped_blob& mapped_blob::operator=(mapped_blob&& other) noexcept {
 		_fd = std::exchange(other._fd, -1);
 		_data = std::exchange(other._data, nullptr);
 		_size = std::exchange(other._size, 0);
+		_owns_buffer = std::exchange(other._owns_buffer, false);
 		_records = std::exchange(other._records, nullptr);
 		_count = std::exchange(other._count, 0);
 		_error = std::exchange(other._error, 0);
@@ -259,9 +320,17 @@ mapped_blob& mapped_blob::operator=(mapped_blob&& other) noexcept {
 
 void mapped_blob::close() noexcept {
 	if (_data != nullptr) {
-		// The mapping is read-only and `munmap` does not modify it; the cast
-		// is the POSIX signature's, not a licence to write.
-		::munmap(const_cast<void*>(_data), _size);
+		if (_owns_buffer) {
+			// #195's remote fallback. Allocated with the matching aligned
+			// `operator new` below; the size and the alignment are both part of
+			// the sized-delete contract and both have to match.
+			::operator delete(const_cast<void*>(_data), _size,
+			                  std::align_val_t{k_blob_alignment});
+		} else {
+			// The mapping is read-only and `munmap` does not modify it; the cast
+			// is the POSIX signature's, not a licence to write.
+			::munmap(const_cast<void*>(_data), _size);
+		}
 		_data = nullptr;
 	}
 	if (_fd >= 0) {
@@ -269,11 +338,18 @@ void mapped_blob::close() noexcept {
 		_fd = -1;
 	}
 	_size = 0;
+	_owns_buffer = false;
 	_records = nullptr;
 	_count = 0;
 }
 
-blob_status mapped_blob::open(const std::string& path) {
+blob_status mapped_blob::open(const std::string& path) { return open_impl(path, false); }
+
+blob_status mapped_blob::open_copied(const std::string& path) {
+	return open_impl(path, true);
+}
+
+blob_status mapped_blob::open_impl(const std::string& path, bool copy) {
 	// Whatever happens next, the old mapping goes: a caller that re-opens after
 	// a vacuum must not be left holding the pre-vacuum file because the new one
 	// failed to verify.
@@ -283,55 +359,110 @@ blob_status mapped_blob::open(const std::string& path) {
 	// O_CLOEXEC IS NOT OPTIONAL HERE. This is a shell: it forks and execs on
 	// every command line, and a history descriptor inherited by every child is
 	// both a leak and a way for a child to read the user's history by accident.
-	const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-	if (fd < 0) {
+	//
+	// OWNED BY A GUARD until the last line of this function, which is the only
+	// place the object takes it over. Every failure below is then a plain
+	// `return`, and the descriptor and the shared lock go back in the right
+	// order without any of them saying so.
+	fd_guard owned{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+	if (owned.get() < 0) {
 		_error = errno;
 		return blob_status::io_error;
 	}
 
-	struct ::stat info {};
-	if (::fstat(fd, &info) != 0) {
-		_error = errno;
-		::close(fd);
-		return blob_status::io_error;
-	}
-	if (!S_ISREG(info.st_mode)) {
-		// A directory or a device where `history.data` should be. Not ours to
-		// interpret and certainly not ours to map.
-		_error = EINVAL;
-		::close(fd);
-		return blob_status::io_error;
-	}
+	// THE BYTES ARE TAKEN UNDER THE SHARED LOCK and the verification is not
+	// (#195; ADR-0010: "only long enough to get a consistent size"). A verifier
+	// pass over 25 MB is not a window another shell's vacuum should have to wait
+	// out, and it does not need to: once the mapping exists, the inode it points
+	// at cannot be modified by anyone - a writer renames a new file over the
+	// name, it never writes through the old one.
+	{
+		const shared_lock_guard reading{owned.get()};
 
-	const auto size = static_cast<std::size_t>(info.st_size);
+		struct ::stat info {};
+		if (::fstat(owned.get(), &info) != 0) {
+			_error = errno;
+			return blob_status::io_error;
+		}
+		if (!S_ISREG(info.st_mode)) {
+			// A directory or a device where `history.data` should be. Not ours
+			// to interpret and certainly not ours to map.
+			_error = EINVAL;
+			return blob_status::io_error;
+		}
 
-	// AN EMPTY FILE IS AN EMPTY HISTORY. `O_CREAT` in the append path makes a
-	// zero-byte `history.data` the ordinary state of a shell that has never
-	// vacuumed, and `mmap` of zero bytes is `EINVAL` anyway. Keep the
-	// descriptor - #195 wants it for `file_id_t` - and report zero records.
-	if (size == 0) {
-		_fd = fd;
-		return blob_status::ok;
+		const auto size = static_cast<std::size_t>(info.st_size);
+
+		// AN EMPTY FILE IS AN EMPTY HISTORY. `O_CREAT` in the append path makes
+		// a zero-byte `history.data` the ordinary state of a shell that has
+		// never vacuumed, and `mmap` of zero bytes is `EINVAL` anyway. Keep the
+		// descriptor - #195 uses it for `file_id_t` - and report zero records.
+		if (size == 0) {
+			_fd = owned.release();
+			return blob_status::ok;
+		}
+
+		// Too short to carry an identifier at all. Not mapped, not verified, and
+		// above all NOT DESTROYED: whatever those bytes are, they are not a blob
+		// we wrote, and the conservative treatment of "not ours" is the right
+		// one.
+		if (size < k_identifier_end)
+			return blob_status::unknown_identifier;
+
+		if (copy) {
+			// THE REMOTE FALLBACK. Eight-byte alignment is FlatBuffers'
+			// requirement on the root (`uint64` is the widest scalar in
+			// `history.fbs`), and it is what `mmap` gave for free; a plain
+			// `new std::byte[]` would satisfy it on both platforms this builds
+			// for and would be relying on `__STDCPP_DEFAULT_NEW_ALIGNMENT__` to
+			// keep doing so, where the aligned form says the requirement out
+			// loud and UBSan checks it.
+			void* const buffer = ::operator new(
+				size, std::align_val_t{k_blob_alignment}, std::nothrow);
+			if (buffer == nullptr) {
+				_error = ENOMEM;
+				return blob_status::io_error;
+			}
+			std::size_t filled = 0;
+			while (filled < size) {
+				const ::ssize_t got = ::read(
+					owned.get(), static_cast<std::byte*>(buffer) + filled,
+					size - filled);
+				if (got < 0) {
+					if (errno == EINTR)
+						continue;
+					_error = errno;
+					::operator delete(buffer, size,
+					                  std::align_val_t{k_blob_alignment});
+					return blob_status::io_error;
+				}
+				if (got == 0)
+					break;
+				filled += static_cast<std::size_t>(got);
+			}
+			// A FILE THAT SHRANK BETWEEN THE `fstat` AND THE READS is a file
+			// somebody replaced under us - which over NFS is the ordinary case
+			// this whole path exists for. The short buffer is verified like any
+			// other: the Verifier refuses a truncated blob and the caller gets
+			// `corrupt`, never a read off the end of uninitialised bytes.
+			_data = buffer;
+			_size = filled;
+			_owns_buffer = true;
+			if (filled < k_identifier_end) {
+				close();
+				return blob_status::unknown_identifier;
+			}
+		} else {
+			void* const mapping =
+				::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, owned.get(), 0);
+			if (mapping == MAP_FAILED) {
+				_error = errno;
+				return blob_status::io_error;
+			}
+			_data = mapping;
+			_size = size;
+		}
 	}
-
-	// Too short to carry an identifier at all. Not mapped, not verified, and
-	// above all NOT DESTROYED: whatever those bytes are, they are not a blob we
-	// wrote, and the conservative treatment of "not ours" is the right one.
-	if (size < k_identifier_end) {
-		::close(fd);
-		return blob_status::unknown_identifier;
-	}
-
-	void* const mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (mapping == MAP_FAILED) {
-		_error = errno;
-		::close(fd);
-		return blob_status::io_error;
-	}
-
-	_fd = fd;
-	_data = mapping;
-	_size = size;
 
 	// THE IDENTIFIER FIRST, and separately from the Verifier. `VerifyBuffer`
 	// checks it too, but folds the answer into one boolean - and the two
@@ -360,6 +491,10 @@ blob_status mapped_blob::open(const std::string& path) {
 		_records = records;
 		_count = records->size();
 	}
+	// LAST, and only here: everything above this line could still fail, and a
+	// descriptor the object had already adopted would be closed by `close()` on
+	// one path and by the guard on another.
+	_fd = owned.release();
 	return blob_status::ok;
 }
 

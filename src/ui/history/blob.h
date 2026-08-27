@@ -30,11 +30,18 @@
 // dedup, the 256 Ki cap, the temp-and-`rename` dance - is #194; this file is the
 // serializer it will call and knows nothing about where the records came from or
 // what order they deserve. Staleness - `file_id_t`, the directory watch, the
-// remote-filesystem heap fallback - is #195. In particular there is NO locking
-// here: `mapped_blob::open` takes no `flock`, because a writer never truncates
+// remote-filesystem heap fallback - is #195, and it left exactly two marks on
+// this file: `open_copied` below, and one `LOCK_SH` inside `open`.
+//
+// THAT LOCK IS THE SMALLEST ONE IN THE SUBSYSTEM and it is worth saying what it
+// is not for. It is held across the `fstat` and the `mmap`/`read` and no longer
+// (ADR-0010: "only long enough to get a consistent size"), and it is refused
+// outright on a remote directory or once the process has given up locking - all
+// of which is `locking.h`'s business, not this file's. What it does NOT protect
+// against is a stale mapping, because nothing has to: a writer never truncates
 // or modifies `history.data` in place (it renames a new file over it), so the
-// worst a concurrent vacuum can do to a mapping is make it stale, which is a
-// state #195 detects and never one that faults.
+// worst a concurrent vacuum can do to a mapping is make it out of date, which
+// #195 detects elsewhere and which never faults.
 //
 // ADR-0007: `mapped_blob`'s destructor `munmap`s and closes. Every other member
 // of both types is a self-freeing standard container or a `unique_ptr`, so the
@@ -348,7 +355,31 @@ public:
 	// like a corruption.
 	blob_status open(const std::string& path);
 
-	// Releases the mapping and the descriptor. Idempotent.
+	// THE REMOTE-FILESYSTEM FALLBACK (#195, ADR-0010: "Never lock and never
+	// `mmap` when the data dir is remote ... read Tier 1 into a heap buffer
+	// instead"; fish PR #5097).
+	//
+	// Identical to `open` in every way a caller can observe - same statuses,
+	// same one Verifier pass, same `records()` view, same borrowed spans, same
+	// lifetime rule - except that the bytes come from `read(2)` into a heap
+	// buffer rather than from `mmap`. NOTHING ABOVE THIS LINE BRANCHES ON WHICH
+	// ONE WAS USED, which is the point: the merge walk, the searcher and the
+	// autosuggester are pointer arithmetic over `records()` either way, and the
+	// difference is one decision at `open` time instead of a condition on the
+	// per-keystroke path.
+	//
+	// WHY NFS CANNOT BE MAPPED. The local-filesystem argument for `mmap` is that
+	// a vacuum renames a new inode over the old one, so the pages a stale mapping
+	// points at stay alive until the last reference goes. Across NFS the server
+	// has no idea this client holds a mapping: it drops the file, and the next
+	// page fault on it is a SIGBUS in a shell that did nothing wrong. A copy
+	// cannot fault.
+	//
+	// THE PRICE IS THE COPY, once per (re)map, of a file capped at 256 Ki
+	// records - and it is paid only where the alternative is a crash.
+	blob_status open_copied(const std::string& path);
+
+	// Releases the mapping - or the buffer - and the descriptor. Idempotent.
 	void close() noexcept;
 
 	// The errno from the syscall that failed, when the last `open` answered
@@ -371,18 +402,26 @@ private:
 	// they are not in this header. Undefined for `index >= _count`.
 	[[nodiscard]] record record_at(std::size_t index) const noexcept;
 
+	// The whole of `open` and `open_copied`; `copy` chooses `read` over `mmap`
+	// and nothing else differs. One body, so the identifier check, the Verifier
+	// pass and the empty-file rule cannot drift apart between the two doors.
+	blob_status open_impl(const std::string& path, bool copy);
+
 	// Held open for the life of the mapping, not closed after `mmap`. ADR-0007
 	// scores leaks by the count at exit and not by descriptor lifetime, and
 	// #195 wants this fd to `fstat` for its `file_id_t` without reopening the
 	// path and racing a vacuum.
 	int _fd = -1;
-	// The mapping. `_size` is its length; both are null/zero for an empty file,
+	// The bytes. `_size` is their length; both are null/zero for an empty file,
 	// which is mapped not at all - `mmap` of zero bytes is `EINVAL`.
-	// #195's remote-filesystem fallback reads into a heap buffer instead of
-	// mapping; when it lands, these two describe that buffer and `close`
-	// learns which kind it is holding.
+	//
+	// EITHER A MAPPING OR A HEAP BUFFER (#195's remote fallback, `open_copied`
+	// above), and `_owns_buffer` is which. Everything that reads them is
+	// identical for the two; only `close` cares, because one is `munmap`ped and
+	// the other is freed.
 	const void* _data = nullptr;
 	std::size_t _size = 0;
+	bool _owns_buffer = false;
 	// The verified `HistoryFile`'s record vector, as `blob.cpp` knows it.
 	// Null when there are no records; `_count` is the authority.
 	const void* _records = nullptr;
