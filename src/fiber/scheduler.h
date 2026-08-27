@@ -63,7 +63,9 @@
 // for. `wake(f)` for a member is queued instead of applied, and `resume_group`
 // replays the queue.
 //
-// TWO DECISIONS #200 LEFT TO THIS FILE, both taken as the ticket recommended:
+// TWO DECISIONS #200 LEFT TO THIS FILE - the first exactly as the ticket
+// recommended, the second as far as the ticket's own other requirements leave
+// room for:
 //
 //   1. REPLAYED WAKES RUN IN WAKE ORDER, NOT SPAWN ORDER. "Replay in arrival
 //      order" is the record's determinism promise, and a promise nothing can
