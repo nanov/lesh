@@ -21,9 +21,12 @@
 // bug. The schema says `[ubyte]` (`history.fbs`) and this file says
 // `std::span<const std::byte>` for the same reason, all the way up.
 //
-// WHAT IS NOT HERE, AND WHERE IT IS. The append log and its torn-tail resync are
-// Tier 2 (#192). The in-memory deque, the merge walk and the `history_source`
-// implementation are #193. The vacuum that PRODUCES a `history.data` - the LRU
+// WHAT IS NOT HERE, AND WHERE IT IS. The append log's framing, its CRC and its
+// torn-tail resync are Tier 2 (`log.h`, #192); what this file lends Tier 2 is
+// `record_writer` and `record_reader` below, the two halves of one record as a
+// standalone buffer, because that is the payload and payloads are FlatBuffers'
+// business rather than framing's. The in-memory deque, the merge walk and the
+// `history_source` implementation are #193. The vacuum that PRODUCES a `history.data` - the LRU
 // dedup, the 256 Ki cap, the temp-and-`rename` dance - is #194; this file is the
 // serializer it will call and knows nothing about where the records came from or
 // what order they deserve. Staleness - `file_id_t`, the directory watch, the
@@ -125,7 +128,113 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Reading
+// Writing ONE record - the Tier 2 payload
+// ---------------------------------------------------------------------------
+
+// Serializes one record as a STANDALONE finished FlatBuffer.
+//
+// This is what a Tier 2 log frame carries (`log.h`, #192; ADR-0010 §Tier 2 says
+// it in one line: "payload = one Record as a standalone finished FlatBuffer").
+// It lives HERE and not in `log.h` for the same reason the pimpl above exists:
+// `log.h` would otherwise have to see flatbuffers in order to say what a
+// payload is, and then so would everything that includes it. `log.cpp` includes
+// this header and no generated one, and the framing layer never learns what is
+// inside the bytes it frames.
+//
+// NOT `blob_writer` WITH A RANGE OF ONE. A `history.data` is rooted at a
+// `HistoryFile` and carries the "SHH1" identifier; a frame payload is rooted at
+// a bare `Record` and carries no identifier at all, because the frame header
+// already said how long the bytes are and checksummed them, and four more per
+// append buys nothing.
+//
+// WHICH MEANS THE TWO BUFFERS ARE NOT SELF-DESCRIBING APART, and it is worth
+// being exact about that rather than comfortable. FlatBuffers tables are
+// structurally permissive: hand a whole `history.data` to `record_reader` and
+// it VERIFIES - the vector of records reads as a vector of `ubyte`, the absent
+// fields read as their defaults - and you get a nonsense record rather than a
+// refusal. Nothing bounds-checks its way out of that; what keeps it from ever
+// happening is that the only way into `record_reader` is through a frame whose
+// length and CRC already matched, and a blob is not a frame. The identifier is
+// for FILES, which somebody can hand us by accident; a payload is reached by
+// exactly one path.
+//
+// REUSED ACROSS BUILDS, like `blob_writer`, because an append happens once per
+// command line: the builder grows its buffer once instead of per command.
+class record_writer {
+public:
+	record_writer();
+	~record_writer();
+
+	record_writer(const record_writer&) = delete;
+	record_writer& operator=(const record_writer&) = delete;
+	record_writer(record_writer&&) noexcept;
+	record_writer& operator=(record_writer&&) noexcept;
+
+	// Serializes `one` and returns the finished buffer. The span is BORROWED
+	// from this writer and is invalidated by the next `build` and by
+	// destruction - and `one`'s own spans need only outlive this call.
+	std::span<const std::byte> build(const record& one);
+
+	// The buffer the last `build` produced; empty before the first one.
+	[[nodiscard]] std::span<const std::byte> bytes() const noexcept;
+
+private:
+	struct impl;
+	std::unique_ptr<impl> _impl;
+};
+
+// ---------------------------------------------------------------------------
+// Reading ONE record - the Tier 2 payload
+// ---------------------------------------------------------------------------
+
+// Verifies a standalone finished `Record` and unpacks it, leaving its bytes
+// where they lie.
+//
+// FALSE MEANS "DO NOT TRUST THESE BYTES", and it is the whole of what stands
+// between a log frame whose CRC agrees by coincidence and a read off the end of
+// the caller's buffer. #192's reader runs this on every frame it is about to
+// yield and treats false exactly as it treats a CRC mismatch: the frame never
+// happened, resync. A Verifier pass PER PAYLOAD here, unlike Tier 1's one pass
+// per mapping, because a frame is a few hundred bytes and there is no mapping
+// to amortise the pass over.
+//
+// A CLASS, AND THE REASON IS ALIGNMENT. FlatBuffers requires the buffer's first
+// byte to be aligned to the widest scalar in the schema - `uint64`, so eight -
+// and a Tier 2 frame payload starts NINE bytes into a file, which is aligned to
+// nothing. The vendored runtime is half-prepared for that (`ReadScalar` carries
+// `no_sanitize("alignment")` precisely so an odd address is survivable) and
+// half not: `GetMutableRoot` and `Vector::length_` are plain dereferences, and
+// UBSan says so on the first frame. So `read` copies the payload into an
+// eight-aligned scratch, parses THERE, and then rebases the two borrowed spans
+// back onto the caller's bytes by their offset - which is exact, because the
+// scratch is a byte-for-byte copy. The scratch is a member so a walk over a log
+// grows one buffer instead of one per frame.
+//
+// THE OUTPUT STILL BORROWS THE CALLER'S BYTES, not the scratch. That is the
+// point of the rebase and it is what lets #193 and #194 walk a log without
+// materialising a string per frame; a record read here outlives the next `read`
+// exactly as long as the buffer it was read from does.
+class record_reader {
+public:
+	record_reader();
+	~record_reader();
+
+	record_reader(const record_reader&) = delete;
+	record_reader& operator=(const record_reader&) = delete;
+	record_reader(record_reader&&) noexcept;
+	record_reader& operator=(record_reader&&) noexcept;
+
+	// Verifies `payload` and fills `out`, whose `cmd` and `cwd` then point INTO
+	// `payload`. `out` is left untouched when this answers false.
+	[[nodiscard]] bool read(std::span<const std::byte> payload, record& out);
+
+private:
+	struct impl;
+	std::unique_ptr<impl> _impl;
+};
+
+// ---------------------------------------------------------------------------
+// Reading a whole blob
 // ---------------------------------------------------------------------------
 
 class mapped_blob;

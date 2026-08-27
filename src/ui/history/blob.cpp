@@ -106,7 +106,132 @@ std::span<const std::byte> blob_writer::bytes() const noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Reading
+// Writing ONE record - the Tier 2 payload
+// ---------------------------------------------------------------------------
+
+// One builder and nothing else. A single record has no vector of offsets to
+// stage, so unlike `blob_writer::impl` there is no scratch beside it.
+struct record_writer::impl {
+	::flatbuffers::FlatBufferBuilder builder;
+};
+
+record_writer::record_writer() : _impl(std::make_unique<impl>()) {}
+record_writer::~record_writer() = default;
+record_writer::record_writer(record_writer&&) noexcept = default;
+record_writer& record_writer::operator=(record_writer&&) noexcept = default;
+
+std::span<const std::byte> record_writer::build(const record& one) {
+	auto& builder = _impl->builder;
+	builder.Clear();
+
+	// Children before the table, as in `blob_writer::build`: FlatBuffers builds
+	// bottom-up and creating a vector while a table is open is an assertion.
+	const auto cmd = builder.CreateVector(
+		reinterpret_cast<const std::uint8_t*>(one.cmd.data()), one.cmd.size());
+	const auto cwd = one.cwd.empty()
+		? ::flatbuffers::Offset<::flatbuffers::Vector<std::uint8_t>>()
+		: builder.CreateVector(
+			reinterpret_cast<const std::uint8_t*>(one.cwd.data()), one.cwd.size());
+
+	// PLAIN `Finish`, deliberately: no file identifier. "SHH1" answers "is this
+	// file ours" for `history.data`, which is a file somebody may hand us by
+	// accident; a frame payload is never met on its own - it is reached only
+	// through a frame header whose length and CRC already vouched for it - and
+	// four bytes per append to re-answer a question nobody asks is four bytes
+	// per append. `record_reader` therefore verifies with a null identifier, and
+	// the ROOT TYPE is what keeps the two buffers from being confused.
+	builder.Finish(fb::CreateRecord(builder, cmd, one.when, cwd, one.exit_code,
+	                                one.session_id));
+	return bytes();
+}
+
+std::span<const std::byte> record_writer::bytes() const noexcept {
+	const auto& builder = _impl->builder;
+	if (builder.GetSize() == 0)
+		return {};
+	return {reinterpret_cast<const std::byte*>(builder.GetBufferPointer()),
+	        builder.GetSize()};
+}
+
+// ---------------------------------------------------------------------------
+// Reading ONE record - the Tier 2 payload
+// ---------------------------------------------------------------------------
+
+struct record_reader::impl {
+	// EIGHT-ALIGNED BY CONSTRUCTION. `std::allocator<std::byte>` goes through
+	// plain `operator new`, whose result is aligned for every type with
+	// fundamental alignment - sixteen bytes on both platforms we build for, and
+	// never less than the eight `uint64` needs. `resize` inside the existing
+	// capacity keeps the same allocation, so the guarantee survives reuse.
+	std::vector<std::byte> aligned;
+};
+
+record_reader::record_reader() : _impl(std::make_unique<impl>()) {}
+record_reader::~record_reader() = default;
+record_reader::record_reader(record_reader&&) noexcept = default;
+record_reader& record_reader::operator=(record_reader&&) noexcept = default;
+
+bool record_reader::read(std::span<const std::byte> payload, record& out) {
+	// Below the smallest buffer FlatBuffers can produce there is nothing the
+	// Verifier could accept, and asking first keeps a null `data()` out of the
+	// `reinterpret_cast` below. Parenthesised because the macro expands to a
+	// sum of `sizeof`s.
+	if (payload.size() < (FLATBUFFERS_MIN_BUFFER_SIZE))
+		return false;
+
+	// THE COPY, and `blob.h` argues for it at length: a frame payload begins
+	// nine bytes into a file, FlatBuffers wants its buffer eight-aligned, and
+	// two places in the vendored runtime dereference through a typed pointer
+	// without the `no_sanitize("alignment")` that `ReadScalar` carries. This is
+	// the read path of a startup and of a vacuum - not of a keystroke, which
+	// reads Tier 1's mapping and is page-aligned by `mmap` - so a memcpy of a
+	// few hundred bytes per frame buys correctness at a price nothing measures.
+	auto& aligned = _impl->aligned;
+	aligned.resize(payload.size());
+	std::memcpy(aligned.data(), payload.data(), payload.size());
+
+	::flatbuffers::Verifier::Options options;
+	options.max_tables = k_verifier_max_tables;
+	::flatbuffers::Verifier verifier(
+		reinterpret_cast<const std::uint8_t*>(aligned.data()), aligned.size(), options);
+	// A NULL IDENTIFIER, and the root type doing the work. A `history.data`
+	// handed here fails: its root is a `HistoryFile`, whose only field is a
+	// vector, and reading that vtable as a `Record`'s does not survive the pass.
+	if (!verifier.VerifyBuffer<fb::Record>(nullptr))
+		return false;
+
+	const fb::Record* const one =
+		::flatbuffers::GetRoot<fb::Record>(aligned.data());
+	if (one == nullptr)
+		return false;
+
+	// REBASED, not copied. Every byte of the scratch is the byte at the same
+	// offset of `payload`, so a pointer into one is an offset into the other;
+	// the spans that go out therefore point at the CALLER's bytes and the
+	// scratch is free to be overwritten by the next frame. `cmd` is `(required)`
+	// in the schema, so the pass above already refused a buffer without it.
+	const auto* const base = aligned.data();
+	const auto rebased =
+		[base, payload](const ::flatbuffers::Vector<std::uint8_t>* vector)
+		-> std::span<const std::byte> {
+		if (vector == nullptr)
+			return {};
+		const auto* const at = reinterpret_cast<const std::byte*>(vector->data());
+		return payload.subspan(static_cast<std::size_t>(at - base), vector->size());
+	};
+
+	out = record{
+		.cmd = rebased(one->cmd()),
+		.when = one->when(),
+		.cwd = rebased(one->cwd()),
+		.exit_code = one->exit_code(),
+		.session_id = one->session_id(),
+	};
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Reading a whole blob
 // ---------------------------------------------------------------------------
 
 mapped_blob::~mapped_blob() { close(); }
