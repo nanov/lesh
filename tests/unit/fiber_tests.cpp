@@ -1,6 +1,7 @@
-// `Fiber*` - the step-0 probe for #82's fiber consolidation (#198).
+// `Fiber*` - the step-0 probe for #82's fiber consolidation (#198), plus
+// scheduler groups (#200).
 //
-// Four things are on trial here, and only the first is ordinary unit testing:
+// Five things are on trial here, and only the first is ordinary unit testing:
 //
 //   1. the switcher and the scheduler do what they say - spawn, yield, park,
 //      wake, finish, in a deterministic order;
@@ -14,7 +15,12 @@
 //      reported, and the same block must BE reported once that stack is gone.
 //      The research note calls the first one "the single most likely way fibers
 //      break the gate on CI"; the second one is what makes a green gate mean
-//      something rather than meaning LSan was not looking.
+//      something rather than meaning LSan was not looking;
+//   5. GROUPS - parking a SET with one bit, and the two ordering decisions
+//      `scheduler.h` records: a resumed group's queued wakes replay in WAKE
+//      order, and a group parked mid-tick loses its own remaining slices while
+//      the rest of the tick's snapshot finishes. Both are promises about
+//      determinism, so both have to be observable or they are not promises.
 //
 // Everything here runs under `ctest --preset debug`, i.e. under
 // ASan/UBSan/LSan. That is deliberate: a guard-page test that only runs in
@@ -612,6 +618,368 @@ TEST(FiberSlot, AStaleTokenAndADefaultTokenBothReadSuperseded) {
 	inbox.send(2);
 	EXPECT_TRUE(first.superseded()) << "a token from an earlier recv never comes back";
 }
+
+// ---------------------------------------------------------------------------
+// Groups: parking a SET with one bit (#200)
+// ---------------------------------------------------------------------------
+//
+// Five behaviours, and two of them are the decisions `scheduler.h` records:
+// replayed wakes run in WAKE order (not spawn order), and a group parked
+// mid-tick takes effect at once for its own members while the rest of the
+// snapshot finishes. The tests are how those two stop being prose.
+
+namespace {
+
+struct group_state {
+	char id = '?';
+	std::string* log = nullptr;
+};
+
+// Logs its id on every slice, then PARKS. Nothing but a wake - direct, or
+// replayed by `resume_group` - gives it another slice, so the log is the exact
+// order the scheduler handed slices out.
+void logs_then_parks(scheduler& on, void* userdata) {
+	auto* const me = static_cast<group_state*>(userdata);
+	for (;;) {
+		me->log->push_back(me->id);
+		on.park();
+	}
+}
+
+// Logs its id on every slice and YIELDS, so it is perpetually runnable and the
+// only thing that can stop it is its group's bit.
+void logs_then_yields(scheduler& on, void* userdata) {
+	auto* const me = static_cast<group_state*>(userdata);
+	for (;;) {
+		me->log->push_back(me->id);
+		on.yield();
+	}
+}
+
+struct group_parker_state {
+	std::uint8_t target = 0;
+	std::string* log = nullptr;
+	int parks = 0;
+};
+
+// Parks somebody ELSE's group, from inside its own slice - the shape the
+// grilling record's phase writer has ("the execution fiber on return"). Once,
+// then it gets out of the way and logs nothing more.
+void parks_another_group_once(scheduler& on, void* userdata) {
+	auto* const me = static_cast<group_parker_state*>(userdata);
+	me->log->push_back('P');
+	on.park_group(me->target);
+	++me->parks;
+	for (;;)
+		on.yield();
+}
+
+} // namespace
+
+TEST(FiberGroups, AParkedGroupIsNotRunnableAndATickSkipsIt) {
+	scheduler sched;
+	std::string log;
+	group_state host{'a', &log};
+	group_state reactor{'R', &log};
+	sched.spawn(&logs_then_yields, &host, "a", 0);
+	sched.spawn(&logs_then_yields, &reactor, "R", 1);
+
+	EXPECT_FALSE(sched.group_parked(0));
+	EXPECT_FALSE(sched.group_parked(1));
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "aR");
+
+	sched.park_group(1);
+	EXPECT_TRUE(sched.group_parked(1));
+	EXPECT_FALSE(sched.group_parked(0));
+	EXPECT_TRUE(sched.runnable()) << "group 0 still is";
+	EXPECT_FALSE(sched.runnable(group_mask_of(1))) << "group 1 is not runnable while parked";
+
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "aRa") << "only group 0 got a slice";
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "aRaa");
+
+	// Both verbs are idempotent, so a host deriving group bits from a phase can
+	// write the same bits twice without bookkeeping.
+	sched.park_group(1);
+	EXPECT_TRUE(sched.group_parked(1));
+	EXPECT_EQ(sched.resume_group(0), 0u) << "group 0 was never parked";
+
+	EXPECT_EQ(sched.resume_group(1), 0u) << "it yielded rather than parked: no wake was queued";
+	EXPECT_FALSE(sched.group_parked(1));
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "aRaaaR") << "and its place in the arrival order never moved";
+}
+
+TEST(FiberGroups, SpawningIntoAParkedGroupWaitsForTheResumeWithNoQueuedWake) {
+	scheduler sched;
+	std::string log;
+	group_state reactor{'R', &log};
+
+	sched.park_group(1);
+	const fiber& f = sched.spawn(&logs_then_yields, &reactor, "R", 1);
+	EXPECT_TRUE(f.ready()) << "ready, and nonetheless not runnable";
+	EXPECT_EQ(f.group(), 1u);
+	EXPECT_FALSE(sched.runnable());
+
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(log.empty());
+	EXPECT_EQ(sched.queued_wakes(), 0u) << "it has never parked, so there is nothing to replay";
+
+	EXPECT_EQ(sched.resume_group(1), 0u);
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "R");
+}
+
+TEST(FiberGroups, WakesQueuedWhileParkedReplayInArrivalOrder) {
+	// DECISION 1, and the reason it had to reach the tick at all: "replay in
+	// arrival order" is the record's determinism promise, and a promise nothing
+	// can observe is not one.
+	scheduler sched;
+	std::string log;
+	group_state one{'1', &log};
+	group_state two{'2', &log};
+	group_state three{'3', &log};
+	fiber& f1 = sched.spawn(&logs_then_parks, &one, "1", 1);
+	fiber& f2 = sched.spawn(&logs_then_parks, &two, "2", 1);
+	fiber& f3 = sched.spawn(&logs_then_parks, &three, "3", 1);
+
+	EXPECT_FALSE(sched.tick()) << "each logged once and parked";
+	EXPECT_EQ(log, "123") << "spawn order, because none of them had ever parked";
+	ASSERT_TRUE(f1.parked());
+	ASSERT_TRUE(f2.parked());
+	ASSERT_TRUE(f3.parked());
+
+	sched.park_group(1);
+
+	// Woken in an order deliberately unlike spawn order.
+	sched.wake(f3);
+	sched.wake(f1);
+	sched.wake(f2);
+	EXPECT_EQ(sched.queued_wakes(1), 3u);
+	EXPECT_EQ(sched.queued_wakes(), 3u);
+	EXPECT_TRUE(f1.parked()) << "queued, not applied";
+	EXPECT_FALSE(sched.runnable());
+	EXPECT_FALSE(sched.tick()) << "a tick of a parked group is a tick of nothing";
+	EXPECT_EQ(log, "123");
+
+	// A repeat wake is a level and not an edge: it must not move f3 to the back.
+	sched.wake(f3);
+	EXPECT_EQ(sched.queued_wakes(1), 3u);
+
+	EXPECT_EQ(sched.resume_group(1), 3u);
+	EXPECT_EQ(sched.queued_wakes(), 0u);
+	EXPECT_TRUE(sched.runnable());
+
+	EXPECT_FALSE(sched.tick()) << "each ran once and parked again";
+	EXPECT_EQ(log, "123312") << "WAKE order, not spawn order - which would have been 123";
+}
+
+TEST(FiberGroups, EachResumeReplaysOnlyItsOwnGroupAndTheRestKeepTheirPlaces) {
+	// One queue for the whole scheduler, so a wake's position is its arrival
+	// among ALL wakes - and another group's resume neither steals it nor
+	// reorders it.
+	scheduler sched;
+	std::string log;
+	group_state a{'a', &log};
+	group_state b{'b', &log};
+	group_state c{'c', &log};
+	fiber& fa = sched.spawn(&logs_then_parks, &a, "a", 1);
+	fiber& fb = sched.spawn(&logs_then_parks, &b, "b", 2);
+	fiber& fc = sched.spawn(&logs_then_parks, &c, "c", 1);
+
+	EXPECT_FALSE(sched.tick());
+	EXPECT_EQ(log, "abc");
+
+	sched.park_group(1);
+	sched.park_group(2);
+	sched.wake(fc);
+	sched.wake(fb);
+	sched.wake(fa);
+	EXPECT_EQ(sched.queued_wakes(), 3u);
+	EXPECT_EQ(sched.queued_wakes(1), 2u);
+	EXPECT_EQ(sched.queued_wakes(2), 1u);
+
+	EXPECT_EQ(sched.resume_group(1), 2u);
+	EXPECT_EQ(sched.queued_wakes(), 1u) << "b's wake is still group 2's business";
+	EXPECT_EQ(sched.queued_wakes(2), 1u);
+	EXPECT_FALSE(sched.tick());
+	EXPECT_EQ(log, "abcca") << "c before a: group 1's two wakes, in arrival order";
+
+	EXPECT_EQ(sched.resume_group(2), 1u);
+	EXPECT_EQ(sched.queued_wakes(), 0u);
+	EXPECT_FALSE(sched.tick());
+	EXPECT_EQ(log, "abccab");
+}
+
+TEST(FiberGroups, AMaskedTickRunsOnlyTheMaskedGroups) {
+	// What lets step 1's host run "emitters" and "observers" as different sets
+	// in the two positions of its loop.
+	scheduler sched;
+	std::string log;
+	group_state emitter{'E', &log};
+	group_state observer{'O', &log};
+	group_state ungrouped{'U', &log};
+	sched.spawn(&logs_then_yields, &emitter, "E", 1);
+	sched.spawn(&logs_then_yields, &observer, "O", 2);
+	sched.spawn(&logs_then_yields, &ungrouped, "U", 0);
+
+	EXPECT_TRUE(sched.tick(group_mask_of(1)));
+	EXPECT_EQ(log, "E");
+	EXPECT_TRUE(sched.tick(group_mask_of(2)));
+	EXPECT_EQ(log, "EO");
+
+	EXPECT_TRUE(sched.tick(static_cast<std::uint8_t>(group_mask_of(1) | group_mask_of(2))));
+	EXPECT_EQ(log, "EOEO") << "both masked groups, in arrival order";
+
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "EOEOEOU") << "tick() is tick(all_groups)";
+
+	// A masked tick reports on ITS mask: group 3 holds nothing, so it runs
+	// nothing and says nothing is runnable, while the scheduler as a whole is.
+	EXPECT_FALSE(sched.tick(group_mask_of(3)));
+	EXPECT_EQ(log, "EOEOEOU");
+	EXPECT_TRUE(sched.runnable());
+
+	// A parked group is absent from a mask that names it, which is the property
+	// that makes the two mechanisms composable rather than redundant.
+	sched.park_group(1);
+	EXPECT_FALSE(sched.tick(group_mask_of(1)));
+	EXPECT_EQ(log, "EOEOEOU");
+	EXPECT_TRUE(sched.tick(static_cast<std::uint8_t>(group_mask_of(1) | group_mask_of(2))));
+	EXPECT_EQ(log, "EOEOEOUO");
+}
+
+TEST(FiberGroups, AGroupParkedByAFiberMidTickDoesNotStopTheRestOfTheSnapshot) {
+	// DECISION 2. The snapshot bounds WHICH fibers may run and in WHAT order; it
+	// never promised that each of them WILL. So the park lands at once for its
+	// own members - `r2` never gets the slice its snapshot entry reserved - and
+	// everything else in the snapshot finishes, `h` included.
+	scheduler sched;
+	std::string log;
+	group_state r1{'x', &log};
+	group_parker_state parker{1, &log, 0};
+	group_state r2{'y', &log};
+	group_state h{'h', &log};
+
+	const fiber& f1 = sched.spawn(&logs_then_yields, &r1, "r1", 1);
+	sched.spawn(&parks_another_group_once, &parker, "parker", 0);
+	const fiber& f2 = sched.spawn(&logs_then_yields, &r2, "r2", 1);
+	const fiber& fh = sched.spawn(&logs_then_yields, &h, "h", 0);
+
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(parker.parks, 1);
+	EXPECT_TRUE(sched.group_parked(1));
+	EXPECT_EQ(log, "xPh")
+		<< "the tick did not bail out: 'h' sits after the parker in the snapshot and ran";
+	EXPECT_EQ(f1.slices(), 1u) << "group 1's earlier member had already had its slice";
+	EXPECT_EQ(f2.slices(), 0u) << "and its later one is skipped the moment the bit is set";
+	EXPECT_EQ(fh.slices(), 1u);
+
+	// Nothing was queued: neither reactor ever parked, so there is nothing to
+	// replay - the park cost group 1 exactly the slices it was not runnable for.
+	EXPECT_EQ(sched.resume_group(1), 0u);
+	EXPECT_TRUE(sched.tick());
+	EXPECT_EQ(log, "xPhxyh") << "arrival order is unchanged: r1, parker (silent now), r2, h";
+	EXPECT_EQ(f2.slices(), 1u);
+}
+
+TEST(FiberGroups, ASendToAParkedGroupsReceiverQueuesTheWakeAndKeepsTheValue) {
+	// `slot.h` did not change for #200 and did not need to: `send` calls `wake`,
+	// and whether a wake schedules or queues is the scheduler's business alone.
+	scheduler sched;
+	slot<int> inbox{sched};
+	receiver_state state;
+	state.inbox = &inbox;
+
+	fiber& r = sched.spawn(&receive_once, &state, "receiver", 1);
+	EXPECT_FALSE(sched.tick());
+	ASSERT_TRUE(r.parked());
+	EXPECT_TRUE(inbox.has_waiter());
+
+	sched.park_group(1);
+	inbox.send(7);
+	EXPECT_TRUE(r.parked()) << "the wake was queued, not applied";
+	EXPECT_EQ(sched.queued_wakes(1), 1u);
+	EXPECT_FALSE(sched.runnable());
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(state.delivered.empty());
+	EXPECT_FALSE(inbox.empty()) << "and the value waited in the slot the whole time";
+
+	EXPECT_EQ(sched.resume_group(1), 1u);
+	EXPECT_FALSE(sched.tick());
+	EXPECT_EQ(state.delivered, std::vector<int>{7});
+	EXPECT_TRUE(r.finished());
+}
+
+#ifdef LESH_ENABLE_ASSERTS
+
+namespace {
+
+// THE FATAL ACTS LIVE IN FUNCTIONS, not inline in `EXPECT_DEATH`. The
+// preprocessor groups by parentheses only, so a braced block containing a
+// brace-initialiser reads as extra macro arguments and does not compile - which
+// is why the watchdog death test above has no commas in it either.
+//
+// They live INSIDE the `#ifdef` for the release build's sake: with the asserts
+// compiled out there is no death test to call them, and `-Wunused-function` is
+// an error.
+
+void slice_a_fiber_whose_group_is_parked() {
+	scheduler sched;
+	std::string log;
+	group_state reactor{'R', &log};
+	fiber& f = sched.spawn(&logs_then_yields, &reactor, "R", 1);
+	sched.park_group(1);
+	sched.run_one_slice(f);
+}
+
+void parks_its_own_group(scheduler& on, void* userdata) {
+	auto* const me = static_cast<group_parker_state*>(userdata);
+	on.park_group(me->target);
+	on.park();
+}
+
+void park_the_group_the_running_fiber_is_in() {
+	scheduler sched;
+	std::string log;
+	group_parker_state its_own{1, &log, 0};
+	sched.spawn(&parks_its_own_group, &its_own, "its-own", 1);
+	(void)sched.tick();
+}
+
+void spawn_into_a_ninth_group() {
+	scheduler sched;
+	std::string log;
+	group_state stray{'?', &log};
+	sched.spawn(&logs_then_yields, &stray, "stray", group_count);
+}
+
+} // namespace
+
+TEST(FiberGroupsDeathTest, AnExplicitSliceOfAParkedGroupFiberAsserts) {
+	// `run_one_slice` is the host's other door - step 1 uses it for the "reactors
+	// before and after the UI part" ordering - and it must not be a way round the
+	// bit. This assert is also why decision 2 could only go one way.
+	EXPECT_DEATH(slice_a_fiber_whose_group_is_parked(),
+	             "a fiber in a parked group is not runnable");
+}
+
+TEST(FiberGroupsDeathTest, AFiberCannotParkTheGroupItIsRunningIn) {
+	// The ticket's invariant - "a fiber that was mid-slice cannot be in a parked
+	// group" - held by the narrowest assert that holds it.
+	EXPECT_DEATH(park_the_group_the_running_fiber_is_in(),
+	             "a fiber cannot park the group it is running in");
+}
+
+TEST(FiberGroupsDeathTest, ThereAreEightGroupsAndNoMore) {
+	EXPECT_EQ(group_count, 8u);
+	EXPECT_EQ(all_groups, 0xffu);
+	EXPECT_DEATH(spawn_into_a_ninth_group(), "up to 8 groups");
+}
+
+#endif // LESH_ENABLE_ASSERTS
 
 // ---------------------------------------------------------------------------
 // The debug watchdog
