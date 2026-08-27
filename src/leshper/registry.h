@@ -178,10 +178,11 @@ struct lesh_registry {
 	// handed is the smallest thing that reaches the driver, and it keeps the ABI
 	// signature frozen (abi.h grows additively or not at all).
 	//
-	// LOOP-THREAD-ORDERED, not synchronised, exactly as the timer table it
-	// replaces was: the shell thread touches this only while the driver is parked
-	// in `wait_on_shell`, which is ADR-0008's "the registry is the loop's" holding
-	// rather than being bent.
+	// LOOP-ORDERED, not synchronised, exactly as the timer table it replaces was:
+	// the shell side touches this only from inside the `execute` the driver
+	// called, which is ADR-0008's "the registry is the loop's" holding rather than
+	// being bent. It was a second thread and a `wait_on_shell` until #201; the
+	// ordering argument is the one that mattered and it is unchanged.
 	lesh::leshper::effects pending;
 
 	// Interned style names. Index 0 is LESH_STYLE_NONE and is never a name.

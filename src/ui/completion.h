@@ -12,14 +12,15 @@
 // come from `shell_knowledge::enumerate`, called RIGHT HERE on the loop thread -
 // one copy per Tab per domain. The directory walk runs here too.
 //
-// READING THE SHELL'S TABLES FROM THE LOOP THREAD IS ADR-0009's OWN RULE (#151),
-// not an exception to it: the loop reads shell state while nothing executes, and
+// READING THE SHELL'S TABLES FROM AN ACTION IS ADR-0009's OWN RULE (#151), not
+// an exception to it: the loop reads shell state while nothing executes, and
 // nothing can execute while the loop is inside an action, because `execute` and
-// `port_call` are the only writers and the loop is the thread that requests each
-// and then blocks until it is done. #139 shipped this as a round trip through a
-// fourth slot on `shell_actor` and a `name_source` interface in front of it;
-// #151 deleted both, because the copy is the same copy either way and the
-// protocol was the part that could be got wrong.
+// `port_call` are the only writers and the loop is what calls each of them (and
+// blocked for the whole of each while they were messages, before #201). #139
+// shipped this as a round trip through a fourth slot on `shell_actor` and a
+// `name_source` interface in front of it; #151 deleted both, because the copy is
+// the same copy either way and the protocol was the part that could be got
+// wrong.
 //
 // SYNCHRONOUS, AND THAT IS THE OWNER-APPROVED DEVIATION FROM F-31. F-31 wants
 // candidates streamed from a worker so a cold directory cannot block. §6.9 defers

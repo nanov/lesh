@@ -758,19 +758,20 @@ void session::fill_prompt_facts() {
 	fill_wall_clock(_prompt_facts);
 
 	// LEGAL HERE AND NOWHERE ELSE. `lookup` reads `shell_state`, so the door is
-	// open only while this thread owns it; the tick path shuts it again.
+	// open only on the shell's own path out of a command; the tick path shuts it
+	// again.
 	_prompt_facts.getvar = &session::prompt_variable;
 	_prompt_facts.getvar_ctx = &_state;
 }
 
 void session::refresh_prompt() {
-	// WRITTEN FROM THE SHELL THREAD, and safe because of WHEN. This runs inside
-	// `execute`, and the loop is blocked in `wait_on_shell`'s poll for the reply
-	// this execution is about to post - it renders nothing and reads no option
-	// until then. The happens-before edge is the channel's mutex: the shell posts
-	// under it and the loop drains under it, so the write below is visible to
-	// every read that follows the reply. ADR-0009 in one line: the shell owns its
-	// state, and leshper reads it at a moment the shell chose.
+	// WRITTEN FROM THE SHELL SIDE, and safe because of WHEN. This runs inside
+	// `execute`, which since #201 is a call the loop made - so the loop is inside
+	// this call, renders nothing and reads no option until it returns. There is
+	// no happens-before to argue about any more (it used to be the reply
+	// channel's mutex); there is one thread and a return. ADR-0009 in one line:
+	// the shell owns its state, and leshper reads it at a moment the shell
+	// chose.
 	//
 	// THE SAME SENTENCE COVERS THE ENGINE, whose header says loop-thread only.
 	// "Loop-thread only" there means "one thread at a time and no locking", and
@@ -830,12 +831,13 @@ void session::refresh_prompt() {
 }
 
 void session::reconcile_prompt_timer() {
-	// TWO CALLERS, TWO THREADS, AND NEITHER NEEDS A LOCK (ADR-0009). The shell
-	// thread calls this from `refresh_prompt`, in the window where the loop is
-	// blocked in `wait_on_shell` waiting for the reply; the loop thread calls it
-	// from `prompt_tick`, where it IS the loop. There is no third caller, and the
-	// two windows cannot overlap - which is what makes the registry's
-	// "loop-thread only" rule (ADR-0008) hold here rather than be bent.
+	// TWO CALLERS, ONE THREAD, AND NO LOCK (ADR-0009, #201). The shell side calls
+	// this from `refresh_prompt`, inside the `execute` the loop is waiting in; the
+	// loop calls it from `prompt_tick`, where it IS the loop. There is no third
+	// caller and the two windows cannot overlap - which is what makes the
+	// registry's "the registry is the loop's" rule (ADR-0008) hold here rather
+	// than be bent. It held for the same reason across two threads; now it is
+	// arithmetic.
 	leshper::registry& actions = context_of(_loop.editor()).actions();
 
 	const std::uint64_t desired =

@@ -284,10 +284,11 @@ public:
 	// history has mapped - reloads and publishes, so the very next walk sees the
 	// other terminal's commands.
 	//
-	// LOOP THREAD, like every other mutation (ADR-0009). It cannot race `add` or
-	// `resolve_pending`: those run on the SHELL thread, and for the whole of the
-	// time they do, the loop thread is blocked in `wait_on_shell`, which polls
-	// the `shell` and `signal` topics and no others.
+	// THE LOOP'S, like every other mutation (ADR-0009). It cannot race `add` or
+	// `resolve_pending`: those run inside `shell_side::execute`, which since #201
+	// is a call the loop makes - so the loop is in that call for the whole of it
+	// and polls nothing while it is (it was blocked in `wait_on_shell` on the
+	// `shell` and `signal` topics before, which is the same window).
 	//
 	// A SPURIOUS WAKE IS THE COMMON CASE and costs one `stat`: the watch is on
 	// the DIRECTORY (it has to be - a `rename` over a file never fires on that

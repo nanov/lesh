@@ -54,10 +54,10 @@ namespace lesh::ui {
 // `LESH_ASSERT` compiles out in release.
 class shell_state_knowledge final : public shell_knowledge {
 public:
-	// `writing` is the flag `shell_actor` raises around the two writers. Null -
-	// the default - means "unchecked", which is what every adapter built over a
-	// state that no actor is serving gets, and what the tests that own their own
-	// `shell_state` want.
+	// `writing` is the flag the loop raises around the two writers (`shell_actor`
+	// did until #201). Null - the default - means "unchecked", which is what every
+	// adapter built over a state no loop is driving gets, and what the tests that
+	// own their own `shell_state` want.
 	explicit shell_state_knowledge(const runtime::shell_state& state,
 	                               const shell_writing_flag* writing = nullptr) noexcept
 		: _state(&state), _writing(writing) {}

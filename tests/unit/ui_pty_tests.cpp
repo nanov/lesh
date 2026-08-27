@@ -1512,8 +1512,9 @@ TEST(UiPty, TheDefaultRightArrowAcceptsTheSuggestionAndTheLineRuns) {
 
 TEST(UiPty, ABuiltinWithNoBinaryBehindItPaintsAsRunnable) {
 	// THE DEFECT #151 FIXED, and the only shape of test that could see it. The
-	// highlighter runs on the shell thread (ADR-0009) and its token is built by
-	// `shell_actor`; that build copied every field of the snapshot except
+	// highlighter runs where shell state is owned (ADR-0009) and its token was
+	// built by `shell_actor`, on the far side of a thread; that build copied every
+	// field of the snapshot except
 	// `knowledge`, so the verb fell back to `environment_knowledge` - empty
 	// tables, `getenv("PATH")` - and every name that is ONLY a builtin resolved
 	// unknown. `cd` hid it on macOS, which ships `/usr/bin/cd`. `exit` and `bind`
