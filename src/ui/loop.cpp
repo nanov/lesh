@@ -1393,7 +1393,11 @@ void event_loop::finish_cancelled_line() {
 	assert_quiesced();
 	{
 		const shell_writing_flag::scope writing{_writing};
-		(void)_shell->execute(std::string_view{});
+		// THE STATUS IS KEPT, as it was when this went through the `execute` slot
+		// and `wait_on_shell` recorded every `execute_done` it matched: a cancel
+		// reports 130 (#98 decision 3), and the loop's copy of `$?` is what a test
+		// reads to see that it did.
+		_exit_status = _shell->execute(std::string_view{});
 	}
 	resume_after_execution();
 }
