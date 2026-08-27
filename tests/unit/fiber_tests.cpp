@@ -674,12 +674,6 @@ void parks_another_group_once(scheduler& on, void* userdata) {
 		on.yield();
 }
 
-void parks_its_own_group(scheduler& on, void* userdata) {
-	auto* const me = static_cast<group_parker_state*>(userdata);
-	on.park_group(me->target);
-	on.park();
-}
-
 } // namespace
 
 TEST(FiberGroups, AParkedGroupIsNotRunnableAndATickSkipsIt) {
@@ -927,6 +921,10 @@ namespace {
 // preprocessor groups by parentheses only, so a braced block containing a
 // brace-initialiser reads as extra macro arguments and does not compile - which
 // is why the watchdog death test above has no commas in it either.
+//
+// They live INSIDE the `#ifdef` for the release build's sake: with the asserts
+// compiled out there is no death test to call them, and `-Wunused-function` is
+// an error.
 
 void slice_a_fiber_whose_group_is_parked() {
 	scheduler sched;
@@ -935,6 +933,12 @@ void slice_a_fiber_whose_group_is_parked() {
 	fiber& f = sched.spawn(&logs_then_yields, &reactor, "R", 1);
 	sched.park_group(1);
 	sched.run_one_slice(f);
+}
+
+void parks_its_own_group(scheduler& on, void* userdata) {
+	auto* const me = static_cast<group_parker_state*>(userdata);
+	on.park_group(me->target);
+	on.park();
 }
 
 void park_the_group_the_running_fiber_is_in() {
