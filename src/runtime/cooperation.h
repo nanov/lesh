@@ -33,11 +33,13 @@ public:
 
 	// THE COMMAND BOUNDARY, and in v1 the only verb.
 	//
-	// Called once per command, immediately after `run_pending_traps()` at each of
-	// that function's call sites - the same two places, in the same order, because
-	// they are the same event: the shell has finished a command and has not yet
-	// started the next one. After the traps rather than before, so a host that
-	// eventually renders something sees the state a trap body left behind.
+	// Called once per command, beside each of `run_pending_traps()`'s two call
+	// sites and always after it: the command loop in `run_command_list`, and
+	// `interrupt_at_prompt`, where a cancelled line is a boundary with no command
+	// in it. AFTER the traps rather than before, because a trap body is itself
+	// commands and what the host is told about is the state they left behind - and
+	// in `interrupt_at_prompt` last rather than adjacent, for the same reason:
+	// what settles `$?` there runs after the traps do.
 	//
 	// `noexcept`, because the boundary is inside the executor's command loop and a
 	// host throwing out of it would unwind the shell through code that expects to
