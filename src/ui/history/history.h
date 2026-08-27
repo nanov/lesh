@@ -349,6 +349,14 @@ public:
 	// every shipping call; the hook is copied into each `vacuum_request`.
 	void set_vacuum_hook(std::function<void(vacuum_step)> hook);
 
+	// TEST-ONLY (#196). The `vacuum_request::cap` this history's rewrites carry,
+	// which `vacuum.h` already documents as a knob that exists so a test can
+	// reach the edge: honestly filling `k_history_save_max` is a 256 Ki-record,
+	// ~25 MB rewrite - a benchmark, not a unit test - and the eviction path is
+	// the one part of the merge that only runs there. Defaults to the ADR's
+	// constant and no shipping call passes anything.
+	void set_vacuum_cap(std::size_t cap) noexcept { _vacuum_cap = cap; }
+
 	// --- The read seam (#125's `history_source`) -----------------------------
 
 	// The merge walk, newest first, deduplicated on `cmd` bytes: this session's
@@ -535,6 +543,9 @@ private:
 	bool _automatic_vacuum = true;
 	// Test-only, and empty in every shipping build - see `set_vacuum_hook`.
 	std::function<void(vacuum_step)> _vacuum_hook;
+	// Test-only, and `k_history_save_max` in every shipping build - see
+	// `set_vacuum_cap`.
+	std::size_t _vacuum_cap = k_history_save_max;
 
 	// --- The one thing both threads touch ------------------------------------
 
@@ -544,5 +555,31 @@ private:
 	// option. Never null after construction.
 	std::shared_ptr<const view> _view;
 };
+
+// ---------------------------------------------------------------------------
+// The clock, for tests only (#196)
+// ---------------------------------------------------------------------------
+
+// `locking.h` opens this namespace too; both halves of it are the same promise
+// - nothing outside `tests/unit/` calls any of it.
+namespace test_hooks {
+
+// Makes `add` stamp `when` with `seconds` instead of reading the clock.
+//
+// THE PROPERTY TESTS NEED CONTROLLED TIME AND NOT FAST TIME. `when` is unix
+// SECONDS (ADR-0010 §Tier 1), so a test that let the clock run would stamp
+// every item in a run with the same value and could never tell "the tie-break
+// is the tier order" from "nothing was ever compared"; one that could only
+// advance the clock could never produce a tie at all. A number the test moves
+// by nought or one per command gives it both, which is also what a real second
+// of resolution gives a real user typing at a real prompt.
+//
+// PROCESS-WIDE, like every other hook in this namespace, and it stays set until
+// `clear_now_override()`: a fixture's `TearDown` has to clear it or the next
+// suite records its history in 1970.
+void set_now_override(std::uint64_t seconds) noexcept;
+void clear_now_override() noexcept;
+
+} // namespace test_hooks
 
 } // namespace lesh::ui::history
