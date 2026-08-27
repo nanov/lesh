@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/cooperation.h"
 #include "runtime/expander.h"
 #include "runtime/signals.h"
 #include "syntax/parser.h"
@@ -637,6 +638,32 @@ public:
 	}
 	[[nodiscard]] prompt_console* prompts() const noexcept { return _prompt_console; }
 
+	// --- cooperation (#199, step 1a of #145) -----------------------------------
+	//
+	// WHOEVER IS HOSTING THIS SHELL, and the third thing installed on the consoles'
+	// terms above with ONE difference that decides the shape: it is NEVER NULL. See
+	// runtime/cooperation.h for why - "nobody is waiting for a command boundary" is
+	// a behaviour with an empty body, not an absence to be null-checked at a call
+	// site inside the command loop.
+	//
+	// NON-OWNING and per-shell, like the consoles: the interactive wiring site owns
+	// the host and lends this view of it for the life of the session. A shell nobody
+	// installed anything on - `lesh -c`, a script, a unit test - keeps
+	// `noop_cooperation()`, which has static storage duration and nothing to free.
+	//
+	// A REFERENCE parameter rather than a pointer, so there is no spelling for
+	// installing null. Taking it away again is `set_cooperation(noop_cooperation())`
+	// and reads as what it is.
+	//
+	// ONE QUESTION LEFT FOR THE ONE-THREAD TICKET, recorded here because this is
+	// where it will be asked: a forked child inherits this pointer, and
+	// `enter_subshell` above clears `_tty_fd` for exactly that kind of reason. It
+	// cannot matter yet - the only implementation is the no-op - but the moment a
+	// host is installed, a child calling into its parent's scheduler is a question
+	// somebody has to answer rather than inherit by omission.
+	void set_cooperation(runtime::cooperation& host) noexcept { _cooperation = &host; }
+	[[nodiscard]] runtime::cooperation& cooperation() const noexcept { return *_cooperation; }
+
 	// --- extension builtins (#165) ---------------------------------------------
 	//
 	// THE SECOND BUILTIN TABLE, and the first restructuring of `src/runtime/`
@@ -738,6 +765,9 @@ private:
 	// which is what a prompt-configuration builtin will answer "no line editor"
 	// from, exactly as `bind` does today.
 	prompt_console* _prompt_console = nullptr;
+	// Non-owning; see set_cooperation. NEVER NULL - the static no-op is what a
+	// shell nobody hosts cooperates with, so the runtime has no null check for it.
+	runtime::cooperation* _cooperation = &noop_cooperation();
 	// Non-owning; see set_extension_builtins. A view of a `constexpr` array with
 	// static storage duration, held as a pointer and a count rather than a
 	// `std::span` member so that `extension_builtin` may stay incomplete here.

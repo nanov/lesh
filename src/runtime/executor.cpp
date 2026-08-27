@@ -820,6 +820,12 @@ void tree_walking_executor::interrupt_at_prompt() {
 	if (_flow == control_flow::interrupted)
 		_flow = control_flow::normal;
 	_state.set_last_status(128 + SIGINT);
+	// A CANCELLED LINE IS A BOUNDARY TOO (#199): no command ran, but the shell is
+	// between commands and about to read again, which is the whole of what the
+	// host is told. LAST, not beside the `run_pending_traps` above, because the
+	// two lines after it are what settle `$?` - a host that renders a prompt at a
+	// boundary would otherwise read a status this function is still fixing up.
+	_state.cooperation().on_command_boundary();
 }
 
 // A REGULAR file and nothing else. POSIX confines the rule to a seekable input,
@@ -1039,6 +1045,19 @@ int tree_walking_executor::run_command_list(const tree& t, node_index list,
 		status = run_node(t, t.child_of(self, i));
 		_state.set_last_status(status);
 		run_pending_traps();
+		// THE COMMAND BOUNDARY (#199, step 1a of #145). One call per command, here
+		// because this is THE command loop - the shell's own input, an `eval`, a
+		// `.`, a trap body, a command substitution and every compound body in the
+		// language all run their commands through it, so a loop body's iterations
+		// and a `;` list's commands are boundaries by construction rather than by a
+		// second call site somebody has to remember. AFTER the traps: a trap body
+		// is itself commands, and what the host is told about is the state they
+		// left behind.
+		//
+		// Before the `_exit_requested` and interrupt tests below, and deliberately:
+		// the command finished, which is the fact being reported. What the shell
+		// does next is the next statement's business.
+		_state.cooperation().on_command_boundary();
 		// The status is re-read rather than kept: when a TRAP BODY exited, the
 		// status the shell leaves with is the body's and not this command's.
 		if (_exit_requested) {
