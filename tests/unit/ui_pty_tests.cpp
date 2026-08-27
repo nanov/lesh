@@ -1,4 +1,4 @@
-#include "runtime/history_store.h"
+#include "ui/history/history.h"
 
 #include "temp_path.h"
 
@@ -8,6 +8,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
@@ -40,9 +41,12 @@
 // harness's. Exec'ing is also the more honest test: main.cpp's floor check, its
 // rc lookup and its logging setup are all on the path this drives.
 //
-// `$HOME` IS THE TEMP DIRECTORY, always. The shell reads `~/.leshrc` and writes
-// `~/.lesh_history`, and a test that read the developer's own rc would pass
-// differently on every machine and append to a history they use.
+// `$HOME` IS THE TEMP DIRECTORY, always - and `$XDG_DATA_HOME` is UNSET, which
+// since #193 is the other half of the same rule. The shell reads `~/.leshrc` and
+// writes `$XDG_DATA_HOME/lesh/`, defaulting to `~/.local/share/lesh/`; a test
+// that read the developer's own rc would pass differently on every machine, and
+// one that inherited their `$XDG_DATA_HOME` would append to the history they
+// use even with `$HOME` redirected.
 //
 // WHAT #151 ADDED: the highlighter, through the real seam. A unit test can only
 // assert that a token WITH an adapter answers correctly; the defect #151 fixed
@@ -74,7 +78,9 @@ public:
 	}
 
 	[[nodiscard]] const std::string& path() const { return _dir.dir(); }
-	[[nodiscard]] std::string history_path() const { return _dir.file(".lesh_history"); }
+	// Where #193's two-tier history lands under this `$HOME`, given that the
+	// child unsets `$XDG_DATA_HOME`.
+	[[nodiscard]] std::string history_dir() const { return _dir.file(".local/share/lesh"); }
 
 private:
 	lesh::testing::temp_path _dir;
@@ -117,6 +123,9 @@ public:
 			// blit's own test.
 			::setenv("COLORTERM", "truecolor", 1);
 			::unsetenv("ENV");
+			// The redirected `$HOME` only reaches the history if nothing names a
+			// data directory outright (#193, ADR-0010 §Placement).
+			::unsetenv("XDG_DATA_HOME");
 			::unsetenv("LESH_LOG");
 			::unsetenv("LESH_LOG_FILE");
 			// AND `$PWD`, so the shell's LOGICAL working directory is its physical
@@ -539,6 +548,10 @@ TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 		ASSERT_TRUE(shell.wait_for(kPrompt));
 		shell.type("echo remembered\r");
 		ASSERT_TRUE(shell.wait_for("remembered"));
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+		// A command that FAILS, because the exit status is the thing #193's split
+		// between `add` and `resolve_pending` exists to capture.
+		shell.type("false\r");
 		// Ctrl-D at an empty prompt: `end_of_file`, which exits only when there is
 		// nothing typed.
 		ASSERT_TRUE(shell.wait_for(kPrompt, 2));
@@ -546,11 +559,60 @@ TEST(UiPty, AnAcceptedLineIsRecordedInTheHistory) {
 		EXPECT_TRUE(shell.reap().has_value()) << "Ctrl-D did not end the session";
 	}
 
-	lesh::runtime::history_store store{home.history_path()};
+	// THE WIRING, END TO END (#193). A second store opened over the same data
+	// directory is a RESTART: it reads `history.new.log` the way the next shell
+	// would, so what this asserts on is what the user's next session will see.
+	lesh::ui::history::history store;
+	const lesh::ui::history::open_report report = store.open(home.history_dir());
+	ASSERT_FALSE(report.directory_unusable);
+	ASSERT_GT(report.log_frames, 0u) << "nothing was written to the history log";
+
 	std::vector<std::string> entries;
-	store.for_each_newest_first([&](std::string_view entry) { entries.emplace_back(entry); });
-	ASSERT_FALSE(entries.empty()) << "nothing was written to ~/.lesh_history";
-	EXPECT_EQ(entries.front(), "echo remembered");
+	std::vector<std::int32_t> statuses;
+	store.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
+		entries.emplace_back(reinterpret_cast<const char*>(one.what.cmd.data()),
+		                     one.what.cmd.size());
+		statuses.push_back(one.what.exit_code);
+		return true;
+	});
+	ASSERT_FALSE(entries.empty());
+	// Newest first, and the exit status came back through `resolve_pending` -
+	// which is the half of the recording that only exists because `session::execute`
+	// splits the add from the resolve around the wait.
+	EXPECT_EQ(entries.front(), "false");
+	EXPECT_EQ(statuses.front(), 1);
+	ASSERT_GE(entries.size(), 2u);
+	EXPECT_EQ(entries[1], "echo remembered");
+	EXPECT_EQ(statuses[1], 0);
+}
+
+TEST(UiPty, ALeadingSpaceKeepsACommandOutOfTheHistoryFile) {
+	// fish's privacy rule, through the real binary (#193, ADR-0010 §In memory).
+	// The unit tests prove the store never writes an ephemeral item; this proves
+	// the shell hands it to the store as one.
+	const scratch_home home{kRc};
+	{
+		shell_on_a_pty shell{home};
+		ASSERT_TRUE(shell.alive());
+		ASSERT_TRUE(shell.wait_for(kPrompt));
+		shell.type(" echo secret\r");
+		ASSERT_TRUE(shell.wait_for("secret"));
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+		shell.type("echo ordinary\r");
+		ASSERT_TRUE(shell.wait_for("ordinary"));
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2));
+		shell.type("\x04");
+		EXPECT_TRUE(shell.reap().has_value()) << "Ctrl-D did not end the session";
+	}
+
+	lesh::ui::history::history store;
+	ASSERT_FALSE(store.open(home.history_dir()).directory_unusable);
+	std::vector<std::string> entries;
+	store.for_each_newest_first([&](std::string_view entry) {
+		entries.emplace_back(entry);
+		return true;
+	});
+	EXPECT_EQ(entries, (std::vector<std::string>{"echo ordinary"}));
 }
 
 TEST(UiPty, ControlCCancelsTheLineAndLeavesTheStatusAt130) {
