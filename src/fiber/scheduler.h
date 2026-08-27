@@ -335,6 +335,13 @@ private:
 	// entry per fiber and `wake` can stay `noexcept` without allocating.
 	std::vector<fiber*> _pending_wakes;
 	fiber* _current = nullptr;
+	// WHAT ASan THINKS THIS THREAD'S STACK IS, read once before the first slice.
+	// The vendored library does not tell ASan the thread is back on its own stack
+	// when a coroutine yields to something that is not a coroutine - which is every
+	// yield lesh takes - so `run_one_slice` says so itself. Always null and unused
+	// without ASan; see the note at the top of scheduler.cpp.
+	const void* _host_stack_bottom = nullptr;
+	std::size_t _host_stack_size = 0;
 	std::size_t _overruns = 0;
 	std::uint8_t _parked_groups = 0;
 	std::uint64_t _next_ready_at = 0;   // stamps `fiber::_ready_at`; see decision 1

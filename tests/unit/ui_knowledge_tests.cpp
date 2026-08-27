@@ -9,7 +9,7 @@
 #include "ui/loop.h"
 #include "ui/shell_side.h"
 #include "ui/shell_state_knowledge.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 
 #include "temp_path.h"
 #include "ui_fakes.h"

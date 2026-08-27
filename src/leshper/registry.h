@@ -61,9 +61,10 @@ struct reactor_batch;
 // names instead of a second sweep of the filesystem.
 //
 // FIXED AND INLINE, which is a departure from #130's "memoized in the request's
-// arena" and stronger than it: a token minted on the loop thread has no arena at
-// all (`current_worker_arena()` is null off a worker, which is every test that
-// drives a reactor through `loop_harness`), and an array inside the token
+// arena" and stronger than it: no token has a per-request arena at all any more
+// (the pool that handed one out went with #202; the highlighter carries its own,
+// and a reactor reached through `loop_harness` never had one), and an array
+// inside the token
 // allocates nothing anywhere rather than allocating cheaply in one of the two
 // places. Its life is exactly the request's, which is what "per request" asked
 // for.

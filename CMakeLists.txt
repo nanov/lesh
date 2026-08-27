@@ -115,9 +115,9 @@ enable_testing()
 #
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
 #
-# `lesh_fiber` (#198) hangs off `lesh_substrate` BESIDE `lesh_leshper` and is
-# named by nothing above it yet - `lesh_tests` and `lesh_bench` are its only
-# consumers until step 1 of #145 puts the scheduler inside `event_loop`.
+# `lesh_fiber` (#198) hangs off `lesh_substrate` BESIDE `lesh_leshper`, and since
+# #202 `lesh_ui` links it: `event_loop` owns the scheduler and every reactor is a
+# fiber in it. `lesh_bench` names it too.
 #
 # THE EDITOR HANGS OFF THE SUBSTRATE AND NOTHING ELSE, since #168 Phase B. It
 # used to link `lesh_syntax` for the highlighter's parse and the completer's lex;
@@ -378,10 +378,12 @@ add_library(lesh_ui STATIC
 	src/ui/shell_side.h
 	src/ui/shell_state_knowledge.h
 	src/ui/tty.cpp
-	src/ui/tty.h
-	src/ui/workers.cpp
-	src/ui/workers.h)
-target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
+	src/ui/tty.h)
+# `lesh_fiber` since #202: `event_loop` owns a `fiber::scheduler` and gives every
+# registered reactor a fiber in it, so the target that was named by nothing above
+# `lesh_substrate` is now named by the host. PUBLIC because `ui/loop.h` includes
+# `fiber/scheduler.h` and every consumer of the loop compiles it.
+target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime lesh_fiber)
 # The vendored FlatBuffers runtime (#191, ADR-0010): Tier 1 of the history is
 # one mmap'd FlatBuffer, and `src/ui/history/blob.cpp` plus the committed
 # `history_generated.h` are the only files in the tree that include it.
@@ -489,7 +491,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/ui_proposal_tests.cpp
 	tests/unit/ui_loop_tests.cpp
-	tests/unit/ui_workers_tests.cpp
+	tests/unit/ui_reactor_fiber_tests.cpp
 	tests/unit/args_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
@@ -521,9 +523,10 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
-# `lesh_fiber` is named here explicitly because nothing else in the tree links
-# it yet (#198): the tests and the compass are its only consumers until step 1
-# puts the scheduler inside `event_loop`.
+# `lesh_fiber` is still named here explicitly: `lesh_ui` links it since #202, so
+# this is redundant rather than load-bearing - and it is kept, because the fiber
+# suite is the one consumer that must keep building if the host ever stops
+# needing the scheduler.
 target_link_libraries(lesh_tests PRIVATE lesh_leshnici lesh_fiber gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale

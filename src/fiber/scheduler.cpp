@@ -24,6 +24,95 @@ void must(mco_result res, const char* what, const char* who) {
 	std::abort();
 }
 
+// ---------------------------------------------------------------------------
+// ASan AND THE STACK THE HOST COMES BACK TO (#202)
+// ---------------------------------------------------------------------------
+//
+// A DEFECT IN THE VENDORED LIBRARY'S ASan INTEGRATION, worked around from this
+// side rather than by patching `minicoro.h` - #198 chose to keep that file
+// `curl | shasum`-verifiable, and this is exactly the kind of thing that keeps
+// being worth what it costs.
+//
+// The shape of it. ASan tracks ONE current stack per thread, told to it by
+// `__sanitizer_start_switch_fiber` (announce, on the old stack) and
+// `__sanitizer_finish_switch_fiber` (commit, on the new one). minicoro's
+// `_mco_prepare_jumpin` announces the switch INTO the coroutine and
+// `_mco_prepare_jumpout` commits it - and then announces the switch BACK only
+// `if(prev_co)`, i.e. only when the thing being returned to is another
+// coroutine. When a coroutine yields to a plain function - which under #145's
+// pinned rule ("no fiber call stack": the host is the sole resumer and every
+// yield returns to the host) is EVERY yield lesh takes - nothing tells ASan the
+// thread is back on its own stack. Its recorded bounds stay the fiber's from the
+// first yield onward.
+//
+// What that costs, and why it is not cosmetic: `__asan_handle_no_return` - which
+// clang emits before every `noreturn` call, so before every `_exit` in a forked
+// child, every `abort` and every throw - unpoisons the stack from the current
+// frame to the recorded top. With the bounds wrong it declines, printing
+// "ASan is ignoring requested __asan_handle_no_return ... False positive error
+// reports may follow", and the poison it did not clear is a use-after-scope
+// report waiting for whoever next reuses those bytes. `UiReactorFiber`'s fork
+// test is where it showed up first, because a forked child is a `_exit`.
+//
+// The fix is one round trip after every resume: announce a switch back to the
+// host's own bounds and commit it. The fake stack is saved and restored across
+// the pair (`detect_stack_use_after_return` keeps one there when it is on), so
+// this corrects the bounds and touches nothing else. Compiled out entirely
+// without ASan, and it is deliberately the same feature test `minicoro.h` uses -
+// two different answers to "is this an ASan build" would be worse than none.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define LESH_FIBER_ASAN 1
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#  define LESH_FIBER_ASAN 1
+#endif
+
+#if LESH_FIBER_ASAN
+extern "C" void __sanitizer_start_switch_fiber(void** fake_stack_save, const void* bottom,
+                                               std::size_t size);
+extern "C" void __sanitizer_finish_switch_fiber(void* fake_stack_save,
+                                                const void** bottom_old,
+                                                std::size_t* size_old);
+
+// What ASan currently believes this thread's stack is - asked of ASan itself
+// rather than computed from `pthread_get_stackaddr_np`, so there is one source of
+// truth and no second platform table to drift.
+//
+// The mechanism is the round trip: `start` records a pending switch and `finish`
+// commits it AND reports the bounds it is leaving. So a pair that announces a
+// switch to a throwaway region and immediately commits it hands back the bounds
+// we wanted to read, and the second pair puts them straight back. Called once per
+// scheduler, BEFORE any fiber has run, which is the one moment ASan's answer is
+// certainly the host's.
+void read_host_stack(const void*& bottom, std::size_t& size) noexcept {
+	void* saved = nullptr;
+	const void* asked = nullptr;
+	std::size_t asked_size = 0;
+	char here = 0;
+	__sanitizer_start_switch_fiber(&saved, &here, sizeof(here));
+	__sanitizer_finish_switch_fiber(saved, &asked, &asked_size);
+	bottom = asked;
+	size = asked_size;
+	// And back, before anything can touch the stack ASan now thinks is one byte
+	// wide.
+	saved = nullptr;
+	__sanitizer_start_switch_fiber(&saved, bottom, size);
+	__sanitizer_finish_switch_fiber(saved, nullptr, nullptr);
+}
+
+// ASan is on the host's stack again. Idempotent, and safe whether or not the
+// bounds were already right.
+void back_on_the_host_stack(const void* bottom, std::size_t size) noexcept {
+	if (bottom == nullptr || size == 0)
+		return;
+	void* saved = nullptr;
+	__sanitizer_start_switch_fiber(&saved, bottom, size);
+	__sanitizer_finish_switch_fiber(saved, nullptr, nullptr);
+}
+#endif
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -118,7 +207,18 @@ void scheduler::run_one_slice(fiber& f) {
 	const auto started = std::chrono::steady_clock::now();
 #endif
 
+#if LESH_FIBER_ASAN
+	if (_host_stack_bottom == nullptr)
+		read_host_stack(_host_stack_bottom, _host_stack_size);
+#endif
+
 	const mco_result res = mco_resume(f._co);
+
+#if LESH_FIBER_ASAN
+	// FIRST THING AFTER THE RESUME, before the watchdog's clock read and before
+	// anything else touches this stack: see the ASan note at the top of this file.
+	back_on_the_host_stack(_host_stack_bottom, _host_stack_size);
+#endif
 
 #ifndef NDEBUG
 	// THE WATCHDOG. A slice that runs 50 ms without yielding is the thing this

@@ -12,7 +12,6 @@
 #include "ui/shell_side.h"
 #include "ui/shell_state_knowledge.h"
 #include "ui/tty.h"
-#include "ui/workers.h"
 #include "runtime/builtins.h"
 #include "runtime/executor.h"
 #include "runtime/history_store.h"
@@ -334,9 +333,10 @@ void fill_wall_clock(prompt_facts& into) noexcept {
 // the shell owns `shell_state` and the loop owns editor state and the terminal,
 // and they take turns rather than taking locks.
 //
-// ONE OBJECT, so that ADR-0007 is answered by its destructor: the helper pool,
-// the loop, the two reactor contexts, the signal hub and the four adapters all
-// die together and in the reverse order they were built. Nothing
+// ONE OBJECT, so that ADR-0007 is answered by its destructor: the loop (and with
+// it the scheduler and both reactor fibers), the two reactor contexts, the signal
+// hub and the four adapters all die together and in the reverse order they were
+// built. Nothing
 // here is a global and nothing is leaked on any exit path, which is what lets
 // the leak gate expect zero.
 class session final : public shell_side {
@@ -444,7 +444,12 @@ private:
 
 	owned_highlighter _highlighter;
 	owned_autosuggester _autosuggester;
-	worker_pool _helpers;
+	// THERE IS NO WORKER POOL (#202). The four helper threads, their arenas, their
+	// latest-wins slots and the completion queue that carried their answers back
+	// are gone: both reactors are fibers in the loop's own scheduler, so this
+	// process has one thread. What the two contexts above still own is what they
+	// always owned - the highlighter's parse arena and the autosuggester's history
+	// source - and the loop is what runs them.
 	signal_hub _signals;
 	// DECLARED BEFORE THE LOOP: the registry the loop owns holds a borrowed
 	// pointer to this engine (see the constructor), and members die in reverse -
@@ -595,7 +600,6 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	_state.set_prompt_console(&*_prompt_console);
 
 	_loop.attach_registry(context.actions());
-	_loop.attach_helpers(_helpers);
 	// THE SHELL, AND WHAT IT KNOWS, AND THE TRIPWIRE, in one call (#201). All
 	// three used to be `shell_actor`'s constructor arguments; the loop is what
 	// calls `execute` and `port_call` now, so the loop is what holds them.
@@ -1122,7 +1126,8 @@ int session::run(std::string_view rc_path) {
 
 	// HISTORY, ON THE WAY OUT (ADR-0010 §Vacuum: "`save()` on interactive exit
 	// flushes unwritten items to the log and does not vacuum"). After the read,
-	// so the helpers are parked and the flush cannot race a walk;
+	// so nothing is walking the history any more - the autosuggester's fiber is
+	// parked on its slot and the loop that would resume it has returned;
 	// before the EXIT trap, because the trap's commands are run through the
 	// executor and never reach `execute`, so there is nothing of theirs to wait
 	// for. A failure costs the last few commands their place on disk and is not
