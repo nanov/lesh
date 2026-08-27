@@ -179,7 +179,8 @@ link failure, not a review comment. Two rules are load-bearing and worth saying
 out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
 shapes; the host fills them in over shell state), and `lesh_ui` is the ONE
 library that links both halves. The editor/host line runs between the last two:
-`loop`, `tty`, `workers` and the shell handoff are `src/ui/` (#168 Phase A), so
+`loop`, `tty`, the reactor fibers and the shell handoff are `src/ui/` (#168
+Phase A; #202), so
 nothing under `src/leshper/` holds a thread, a descriptor or a clock; the
 highlighter, the autosuggester, the history search and the completion sources are
 `src/ui/` too (#168 Phase B), so **`lesh_leshper` links `lesh_substrate` and
@@ -255,7 +256,7 @@ _Avoid_: front end, dialect.
 Two senses, and both are in use. The layer as a whole is everything an
 interactive shell has that `lesh -c` does not — leshper, prompts, rendering.
 `src/ui/` is the narrower thing: the **host**. It owns the poll loop, the
-terminal, the timers, the workers, the shell handoff, and the session that runs
+terminal, the timers, the reactor fibers, the shell handoff, and the session that runs
 an interactive shell to its end; it drives leshper by sending **events** and
 performing **effects**, and by nothing else. It also holds every piece of
 KNOWLEDGE the editing experience needs (#168 Phase B): the highlighter and the
@@ -397,7 +398,8 @@ adding a mode is registering keymaps and actions.
 
 **Reactor** _[lesh]_:
 A subscriber to editor state-change events that computes derived state —
-decorations and proposals — asynchronously on a worker. Never mutates buffer,
+decorations and proposals — on a **fiber** of its own, sliced by the loop
+(#202; it was a helper thread until then). Never mutates buffer,
 cursor or selection. The highlighter and the autosuggester are reactors, and both
 are the **host**'s (`src/ui/reactors.cpp`, #168 Phase B) because what they compute
 is knowledge; they reach the editor through the ABI, the way a Lua reactor would.
@@ -460,7 +462,7 @@ empty so a copied **state** compares and costs the same as the original.
 
 **Host** _[lesh]_:
 Whatever drives the editor — `src/ui/` in the shell, a fake in a test. It owns
-the loop, the terminal, the timers, the workers and the shell handoff; it owns
+the loop, the terminal, the timers, the reactor fibers and the shell handoff; it owns
 **everything the editor is not allowed to know** — the shell's tables, the
 history, the syntax, the completion sources, the reactors that use them; and it
 sends **events** in and performs the **effects** that come back. The editor never
@@ -468,8 +470,8 @@ calls it except through the one interface it declares for exactly that,
 `leshper::host` (`host.h`): a borrowed pointer on the registry, answering
 `lesh_request_command_kind` and carrying out `want_completion`. A question raised
 there is an **effect** value and its answer is an **event** value, the same
-vocabulary the deferred half uses, so a question that moves to a worker later is
-a change on the host's side and nowhere else.
+vocabulary the deferred half uses, so a question that moves off the host's own
+stack later is a change on the host's side and nowhere else.
 _Avoid_: calling the host "leshper", or a driver "the editor"; a second interface
 between the two — there is one door and it is `leshper::host`.
 
@@ -548,18 +550,51 @@ A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
 **Topic** _[lesh]_:
-A source of loop events — `tty`, `signal`, `worker`, `timer`, `watch`. The loop polls
+A source of loop events — `tty`, `signal`, `timer`, `watch`. Four since #202,
+which took the `worker` topic with the pool that wrote to it. The loop polls
 topics and drains each into events; a topic's file descriptor or deadline
 is its implementation detail. A plugin's fd-readable hook is one more topic.
 _Avoid_: naming the fd; the topic is what the editor sees.
 
 **Quiesce** _[lesh]_:
-Parking every worker at a known-idle point, holding no lock, before the
-fork — the only thing that makes `fork()` safe in a threaded shell, since the
-child inherits every other thread's held locks frozen.
-Resumed after the command is reaped. Needed because lesh runs shell code in
-forked children (subshells); fish, which only ever execs, does not park and
-relies on the child touching nothing before exec — lesh does both.
+Handing the terminal back and parking the **emitters** group before the fork,
+plus superseding whatever those fibers had in flight. It used to be parking every
+WORKER THREAD at a known-idle point holding no lock — the only thing that made
+`fork()` safe in a threaded shell, since the child inherits every other thread's
+held locks frozen — and #202 made that structural instead: a lesh process has one
+thread, so a fork here is taken from a single-threaded moment by construction.
+What parking still buys is F-22's rule, that nothing computes for a line which
+has already run and nothing it computed is applied. Resumed after the command is
+reaped.
+
+**Fiber** _[lesh]_:
+A stackful coroutine in the loop's own `fiber::scheduler` (`src/fiber/`, #198;
+minicoro under `third_party/`). Long-lived and never called: it parks on a
+channel, the host is the only thing that resumes it, and every yield returns to
+the host — there is no fiber call stack (#145). Since #202 every **reactor** has
+one, in the `emitters` **group**, and a turn gives each runnable one a slice
+before and after the UI part.
+_Avoid_: a fiber per event; calling a fiber; resuming one from inside another.
+
+**Group** _[lesh]_:
+A scheduler tag, eight of them, that parks a SET of fibers with one bit (#200).
+`emitters = 0` are the per-line reactors — the highlighter and the autosuggester,
+superseded on every edit and parked at accept; `observers = 1` is reserved for the
+session-lived kind (history persistence, telemetry) and has no members yet. Which
+groups are runnable is derived from the **phase** and never written beside it.
+
+**Phase** _[lesh]_:
+Where an interactive session is: `editing`, `executing`, `boundary`
+(`ui/loop.h`, #202). Written at exactly two places — `quiesce()`, which is the
+accept path's park, and `resume_after_execution()`, which runs when `execute`
+returns — and the emitters group's bit is written FROM it.
+
+**Slot** _[lesh]_:
+A capacity-one conflating channel, `fiber::slot<T>` (`src/fiber/slot.h`, #198).
+The UI writes into one per reactor and OVERWRITE IS CANCELLATION: every send bumps
+a counter that supersedes every outstanding token, which the reactor reads at its
+next cancellation poll. The only channel v1 has; an ordered `queue<T,N>` arrives
+with its first customer, which is the `observers` group.
 
 **Shell side** _[lesh]_:
 The one owner of shell state — `shell_side::execute` and `port_call` over the
@@ -569,8 +604,9 @@ main THREAD serving three latest-wins slots (`execute`, `port_call`,
 `highlight`) until #201 deleted them: the loop calls the two verbs, so the
 serialization is a call stack rather than a channel. Everything else in the
 process is stateless or owns only editor state.
-_Avoid_: reading shell state from a helper thread; a definitions version or
-concurrent collection for it — one owner makes both unnecessary (ADR-0009).
+_Avoid_: reading shell state from another thread; a definitions version or
+concurrent collection for it — one owner makes both unnecessary (ADR-0009). There
+is no other thread to read from since #202.
 
 **Loop** _[lesh]_:
 The **host's** poll loop — `src/ui/loop.cpp`, not leshper's (#168): owns editor

@@ -72,7 +72,9 @@ side runs the sweeps. Their suites are `LeshniciBuiltins*` and
 readers and belong in the same filter.
 **`src/ui/` is NOT exempt** - the host is the interactive path itself, and
 `UiPty` execs the real `lesh` binary, so a change there can move both. Its
-suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiWorkers`, `UiKnowledge*`,
+suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiReactorFiber` - which was
+`UiWorkers` until #202 replaced the helper pool with one fiber per reactor -,
+`UiKnowledge*`,
 `UiLoopProposals`, and since #168 Phase B `UiHighlight`, `UiAutosuggest`,
 `UiHistorySearch`, `UiComplete*`, `UiCommandKind`, `UiReactorTheme`, `UiPty` -
 which was `LeshperPty` and is renamed for the same rule: a suite that execs the
@@ -90,18 +92,16 @@ exemption still leans on:
 `lesh_leshper` links `lesh_substrate` and nothing else, so a `src/leshper/` change
 provably cannot reach syntax, the runtime or a file descriptor.
 
-**`src/fiber/` is exempt, on `lesh_leshper`'s exact argument** (#198). `lesh_fiber`
-links `lesh_substrate` AND NOTHING ELSE - no syntax, no runtime, no ui - so a
-change under `src/fiber/` provably cannot reach the parser, the executor or a
-file descriptor, and as of step 0 no shipped binary even links the target: the
-consumers are `lesh_tests` and `lesh_bench`. Iterate with
-`./build/debug/lesh_tests --gtest_filter='Fiber*'` (tens of milliseconds,
-including two `fork()`ed guard-page cases). Two things the exemption does NOT
-cover. The full sanitized gate still runs at merge - `Fiber*` is where the
-LeakSanitizer control for parked fiber stacks lives, and `ctest --preset debug`
-is the only place it means anything; and the exemption expires the moment step 1
-of #145 puts a scheduler inside `event_loop`, because from then on a
-`src/fiber/` change is reached by `src/ui/`, which is not exempt.
+**`src/fiber/` IS NO LONGER EXEMPT, and #198 said this is when it would stop**
+(#202). The exemption rested on `lesh_fiber` linking `lesh_substrate` and nothing
+else while nothing above it linked `lesh_fiber`; `event_loop` owns a
+`fiber::scheduler` now and `lesh_ui` links the target, so a change under
+`src/fiber/` is reached by `src/ui/`, which is the interactive path itself. A
+`src/fiber/` change therefore runs `--gtest_filter='Ui*:Leshper*:Fiber*'` and then
+the sweeps, exactly as a `src/ui/` change does. `Fiber*` alone (tens of
+milliseconds, including two `fork()`ed guard-page cases) is still the right
+iteration loop, and it is still where the LeakSanitizer control for parked fiber
+stacks lives - which means something only under `ctest --preset debug`.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered
