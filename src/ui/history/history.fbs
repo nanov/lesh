@@ -1,0 +1,39 @@
+// Tier 1 of the two-tier history: `history.data`, one finished FlatBuffer
+// (ADR-0010 §Tier 1). #191.
+//
+// THE SCHEMA IS THE FILE FORMAT. Everything below is a wire decision, so read
+// ADR-0010 before changing a line of it; the only edits that are safe on an
+// existing `history.data` are the ones FlatBuffers itself calls safe - APPEND a
+// field at the end of a table, never reorder, never remove, never retype.
+//
+// `table` and not `struct`: schema evolution beats one vtable hop at 10^4-10^5
+// records. `[ubyte]` and not `string`: a command line is bytes, and a shell
+// that cannot recall a command because it was not UTF-8 is a shell with a bug.
+// Records are stored NEWEST FIRST - `records[0]` is the most recent - because
+// the dominant query is "scan recent, prefix match, stop at the first hit".
+//
+// The one thing here the ADR's snippet does not spell out is the namespace,
+// which is a code-generation detail and not a wire one: a FlatBuffers namespace
+// renames generated C++ symbols and changes no byte of the buffer. It is
+// declared because without it `history_generated.h` would put `Record` and
+// `HistoryFile` in the GLOBAL namespace of a header that `lesh_ui`,
+// `lesh_leshnici` and the header self-containment target all compile.
+
+namespace lesh.ui.history.fb;
+
+// "Shell History, Header 1" - the four bytes at offset 4 of `history.data`.
+// A file that does not carry it is never destroyed and never parsed; see
+// `mapped_blob::open_result::unknown_identifier`.
+file_identifier "SHH1";
+
+table Record {
+	cmd:        [ubyte] (required);  // raw bytes, not string: command lines are not UTF-8
+	when:       uint64;              // unix seconds
+	cwd:        [ubyte];             // logical $PWD bytes at add time
+	exit_code:  int32;
+	session_id: uint64;              // low 64 bits of the session's uuidv7
+}
+
+table HistoryFile { records: [Record]; }
+
+root_type HistoryFile;
