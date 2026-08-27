@@ -35,7 +35,7 @@ namespace lesh::ui {
 
 // `shell_state`, read through the one window leshper is allowed.
 //
-// NO VERSION, NO LOCK, NO COPY - ADR-0009. The shell is the main thread and owns
+// NO VERSION, NO LOCK, NO COPY - ADR-0011. The shell is the main thread and owns
 // `shell_state`; a highlight, a port call that writes state and an execution are
 // serialized on it, so a view into the state's own storage cannot be invalidated
 // while the call that took it is running. #130's copy-on-write definitions
@@ -45,8 +45,8 @@ namespace lesh::ui {
 // The state must outlive this adapter, which must outlive every request token
 // that points at it.
 //
-// AND IT IS WHERE ADR-0009 IS CHECKED (#151). Every method below opens with
-// `assert_readable`, which fails if the shell thread is inside `execute` or
+// AND IT IS WHERE ADR-0011 IS CHECKED (#151). Every method below opens with
+// `assert_readable`, which fails if the shell side is inside `execute` or
 // `port_call` - the two verbs that can WRITE the state this reads. The check
 // belongs here rather than in the base class because this is the adapter over
 // the REAL state: a fake over a map has nothing a running command could change,
@@ -54,8 +54,8 @@ namespace lesh::ui {
 // `LESH_ASSERT` compiles out in release.
 class shell_state_knowledge final : public shell_knowledge {
 public:
-	// `writing` is the flag the loop raises around the two writers (`shell_actor`
-	// did until #201). Null - the default - means "unchecked", which is what every
+	// `writing` is the flag the loop raises around the two writers (it was
+	// `shell_actor` that raised it, until #201). Null - the default - means "unchecked", which is what every
 	// adapter built over a state no loop is driving gets, and what the tests that
 	// own their own `shell_state` want.
 	explicit shell_state_knowledge(const runtime::shell_state& state,
@@ -95,7 +95,7 @@ public:
 	}
 
 	// The enumeration read (#139, spec 6.9). Copies, because the answer is about
-	// to cross to the loop thread - see the comment on the base class.
+	// to outlive the window it was read in - see the comment on the base class.
 	//
 	// ONE TABLE PER DOMAIN AND NO MERGING, so a candidate keeps the fact that
 	// decides its marker. Builtins come from the same `kBuiltinRegistry`
@@ -140,13 +140,13 @@ public:
 	}
 
 private:
-	// ADR-0009 in one line, and the reason the rest of this file may borrow.
+	// ADR-0011 in one line, and the reason the rest of this file may borrow.
 	//
-	// NOT A GUARD ON THE CALLER'S THREAD - it says nothing about WHO is reading,
-	// only that the one writer is not writing. That is the whole invariant: the
-	// highlighter reads on the shell thread between slots, the completer reads on
-	// the loop thread while the loop is not blocked on an execution, and either
-	// is safe exactly when this is false.
+	// NOT A GUARD ON THE CALLER - it says nothing about WHO is reading, only that
+	// the one writer is not writing. That is the whole invariant: the highlighter
+	// reads inside a slice the loop gave it, the completer reads inside an action
+	// the loop dispatched, and neither of those is inside `execute` - so either is
+	// safe exactly when this is false.
 	void assert_readable() const noexcept {
 		// The discard is for RELEASE, where `LESH_ASSERT` expands to nothing and
 		// the flag is a member nobody reads. Keeping the member in both builds

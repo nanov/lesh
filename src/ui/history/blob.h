@@ -358,9 +358,9 @@ enum class blob_status : std::uint8_t {
 // local filesystem - the inode it maps is unlinked, not truncated.
 //
 // NOT THREAD-SAFE TO MUTATE, entirely safe to READ from anywhere. `open` and
-// `close` run on the loop thread; `records()` and everything it yields are
-// const and touch no shared state, which is what lets #193 hand a refcounted
-// handle to a stateless worker (ADR-0009).
+// `close` are the owning side's; `records()` and everything it yields are const
+// and touch no shared state, which is what lets #193 hand a refcounted handle to
+// a walk that outlives the mutation next to it (ADR-0011).
 class mapped_blob {
 public:
 	mapped_blob() = default;

@@ -31,8 +31,8 @@ namespace {
 std::atomic<bool> g_abandoned{false};
 std::atomic<bool> g_data_dir_remote{false};
 
-// The test seam. Atomics rather than plain bools because the loop thread reads
-// them, and a test that sets one from the main thread would otherwise be a race
+// The test seam. Atomics rather than plain bools because a test may set one from
+// a thread of its own while the shell reads it, which would otherwise be a race
 // TSan is right about even though nothing real depends on the ordering.
 std::atomic<double> g_lock_duration_override{-1.0};
 std::atomic<int> g_remoteness_override{-1};

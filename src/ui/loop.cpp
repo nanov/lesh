@@ -1710,7 +1710,7 @@ void event_loop::run() {
 
 void event_loop::request_stop() noexcept {
 	// A FLAG AND NOTHING ELSE (#201). It used to ring the signal topic's pipe as
-	// well, because the caller was the shell thread and the loop was asleep in a
+	// well, because the caller was the shell's thread and the loop was asleep in a
 	// `poll` that had to be woken. Every caller is this thread now - `end_of_file`
 	// and the hangup from inside a turn, an `exit` from inside the `execute` this
 	// loop called - and a poll that is not running needs no wakeup. `run`'s

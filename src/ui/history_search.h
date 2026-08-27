@@ -28,7 +28,7 @@
 //   directly when it wants the ranges (see below).
 //
 //   `history_search_compute` is the PROVIDER face - a `lesh_reactor_fn`,
-//   running on a worker against a request token it did not mint, emitting
+//   running inside a reactor's slice against a request token it did not mint, emitting
 //   through `lesh_propose` and polling the supersede flag between entries.
 //   It includes `abi.h` and nothing else from leshper, the same discipline
 //   `builtin_actions.cpp` is held to, so the searcher reaches the loop by
@@ -119,7 +119,7 @@ private:
 // so an incremental search that reruns on every keystroke settles into zero
 // further heap allocation instead of allocating three vectors per character.
 // It is NOT thread-safe and is not meant to be: one search, one searcher, on
-// the worker that is running it (see `history_search_compute`).
+// the stack of whatever is running it (see `history_search_compute`).
 //
 // ADR-0007: every member is a self-freeing standard container. Nothing here
 // needs an explicit teardown for the leak gate to expect zero.
@@ -266,8 +266,8 @@ private:
 // The registration-time context `history_search_compute` reads.
 //
 // IMMUTABLE for the duration of a request, and deliberately holding no scratch:
-// the loop thread fills this in once and workers only read it, so the searcher
-// itself is built on the worker's stack per compute. That costs the searcher's
+// the wiring site fills this in once and a compute only reads it, so the searcher
+// itself is built on the computing stack per request. That costs the searcher's
 // first allocations once per request - at recall frequency, which is what
 // §6.2's hot-path rule permits an override point - and buys that two requests
 // in flight cannot share a scratch buffer.
@@ -301,8 +301,8 @@ struct history_search_provider {
 // Emits one `lesh_propose` per match as it is found - streaming (F-31), so the
 // loop can show the first screenful while the walk is still running and a stale
 // stream dies mid-flight - and polls `lesh_request_superseded` between entries.
-// Answers LESH_ERR_SUPERSEDED when the poll noticed, which is a courtesy to the
-// worker and not a correctness mechanism: the loop drops a stale batch anyway.
+// Answers LESH_ERR_SUPERSEDED when the poll noticed, which is a courtesy and not
+// a correctness mechanism: the loop drops a stale batch anyway.
 std::int32_t history_search_compute(lesh_request* request, void* userdata);
 
 } // namespace lesh::ui

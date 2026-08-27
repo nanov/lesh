@@ -52,8 +52,8 @@
  * LESH_ERR_INVAL, the same rule a required struct pointer would get.
  *
  * THREADING, and it is not advisory. Registration and every configuration verb
- * run on the loop thread. A module's call and its context live wherever the
- * render does. Handles are valid only for the duration of the call that received
+ * run in the loop, on the one thread the interactive shell has. A module's call
+ * and its context live wherever the render does. Handles are valid only for the duration of the call that received
  * them; stashing one is undefined behaviour, asserted in debug builds.
  */
 
