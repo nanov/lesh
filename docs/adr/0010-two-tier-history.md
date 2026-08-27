@@ -252,7 +252,19 @@ zero at exit", not "no long-lived descriptors").
 
 `remove`, `clear`, `clear_session` and the vacuum's deletion set; a
 `history` builtin; an option to disable leading-space privacy; cross-machine
-sync. No SQL-style queries ever — filtering by cwd/exit code is a linear scan.
+sync.
+
+Host-owned builtins (`history`, and `fc`, which operates on history only an
+interactive shell has) are defined in `src/ui/`, not the runtime, and reach
+the executor through the `extension_builtin` table with two additions: a
+per-entry `always_on` flag (not gated by `set -o leshnici`) and a typed host
+slot on `shell_state` — `set_host(host_context*)` + `template <class T> T&
+host()` — so the runtime compiles once and names no ui type, while the builtin
+body gets a typed handle. Templating `shell_state` itself on a host context was
+considered and rejected: it doubles the runtime's codegen and breaks the
+"non-interactive is the same object code" property the sweeps rely on.
+Deferred until the fiber move, after which a builtin mutating the store runs on
+the one thread the store lives on and needs no further argument. No SQL-style queries ever — filtering by cwd/exit code is a linear scan.
 
 ## Consequences
 
