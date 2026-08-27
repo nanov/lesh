@@ -257,6 +257,49 @@ int main() {
 #endif
 	}
 
+	// Command-boundary cost. THE OTHER HALF OF THE COOPERATIVE DESIGN'S PRICE
+	// (#199, step 1a of #145): the runtime calls
+	// `cooperation::on_command_boundary()` once per command at the same place it
+	// polls for pending traps, so the cheapest command there is - a loop body of
+	// one arithmetic assignment - carries one indirect call to an empty function
+	// per iteration. A tight `while` loop is the worst case the shell has: the
+	// boundary work is a fixed cost per command, so the shorter the command the
+	// larger its share.
+	//
+	// Measured through `run_input`, not through `run`, because `run_input` is what
+	// the script path and the interactive path both call, and it is where the
+	// per-command read/execute alternation lives.
+	//
+	// Three passes over 100000 iterations rather than many passes over few: the
+	// number wanted is nanoseconds per ITERATION, and a loop this long buries the
+	// parse and the pool setup around it.
+	// TWO SPELLINGS OF THE SAME LOOP, and the gap between them is not the seam's.
+	// `[ $i -lt 100000 ]` is the shape #199 named, and it is ~20x the cost of
+	// `test $i -lt 100000` on this machine, almost all of it SYSTEM time: `[` and
+	// `]` hold pattern characters, so each iteration attempts pathname expansion
+	// on two words that cannot match anything (the bracket expression is
+	// unterminated) and pays an opendir/readdir/closedir for each. Both are
+	// reported so a reader is not left thinking a command boundary costs 20
+	// microseconds - it costs about one, and the `test` row is the one with the
+	// resolution to see a change in it.
+	std::printf("\ncommand-boundary cost (while loop through run_input)\n");
+	{
+		constexpr size_t kLoopIterations = 100000;
+		const struct { const char* name; const char* source; } loops[] = {
+			{"[ ... ] condition", "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done"},
+			{"test ... condition", "i=0; while test $i -lt 100000; do i=$((i+1)); done"},
+		};
+		for (const auto& loop : loops) {
+			buffer_pool pool{BUFFER_POOL_SIZE};
+			runtime::shell_state state;
+			runtime::tree_walking_executor exec{pool, state};
+			const double ns =
+				time_ns(3, [&] { benchmark_sink += exec.run_input(loop.source, false); });
+			std::printf("  %-40s %12.0f ns (%.0f ns per iteration)\n", loop.name, ns,
+			            ns / static_cast<double>(kLoopIterations));
+		}
+	}
+
 	std::printf("\n");
 	return 0;
 }
