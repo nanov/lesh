@@ -26,6 +26,7 @@ namespace lesh::leshper {
 //   ESC [ n A / B      up / down n rows
 //   ESC [ n C          right n columns
 //   ESC [ K            erase from the cursor to the end of the line
+//   ESC [ J            erase from the cursor to the end of the screen
 //   ESC [ ... m        SGR: the seven attributes and the two colours
 //   ESC [ ? 25 h / l   cursor visibility
 //
@@ -90,6 +91,11 @@ struct terminal_capabilities {
 //   cursor is at the surface's own origin - row 0, column 0 - and the pen is
 //   default; what the terminal shows is unknown, so every row is rewritten.
 //
+//   `paint_from` is `paint` for the OTHER repaint, the one where the terminal
+//   is still showing a frame: the cursor is `start` rows below that frame's top
+//   row, and the caller says how many. It walks back up there, erases what was
+//   below, and then paints exactly as `paint` does.
+//
 //   On exit the terminal shows exactly `desired`, its cursor is at
 //   `desired.cursor()`, and its pen is default again.
 //
@@ -117,14 +123,39 @@ public:
 
 	// Every row, unconditionally. The repaint half of F-37's "full repaint only
 	// on resize or explicit request".
+	//
+	// THE FIRST PAINT OF A READ, and only that: the contract above says the
+	// cursor is already at the surface's origin, which is true of a prompt the
+	// shell has just started drawing and false of every later repaint. It emits
+	// no ESC[J, because there is nothing below it that is ours to erase.
 	[[nodiscard]] std::string paint(const surface& desired) const;
 	void paint_into(const surface& desired, std::string& out) const;
+
+	// The repaint that REPLACES a frame instead of appending one (#185, F-38).
+	//
+	// `start` is where the terminal's cursor is IN THE FRAME IT IS SHOWING -
+	// which, after a resize, is that frame as the terminal has since reflowed
+	// it, and the caller is the only side that can know it. Emits `\r`, then
+	// ESC[<start.row>A when the row is not already zero, then ESC[J to erase the
+	// old frame's rows from there down, then the whole of `desired` from row 0.
+	//
+	// Only `start.row` is read. The column is not: `\r` goes to column zero
+	// whatever it was, which is also the one sequence that resolves a pending
+	// wrap, and a frame's top row starts at column zero by construction.
+	void paint_from(const cursor_placement& start, const surface& desired,
+	                std::string& out) const;
 
 private:
 	// The `_into` forms are the primitives and the returning forms wrap them:
 	// N-2 wants hot-path allocation bounded and jitter-free, and the loop that
 	// calls this every keystroke keeps one buffer and reuses it.
-	void emit(const surface* previous, const surface& desired, std::string& out) const;
+	// `previous` null is a repaint; `from` non-null is a repaint that has a frame
+	// to replace rather than a blank origin to paint at. The two are independent
+	// only in principle - `paint_from` is the one caller that passes a `from` -
+	// but keeping them separate parameters is what keeps the diff path's start
+	// (`previous->cursor()`) out of the repaint path's arithmetic.
+	void emit(const surface* previous, const cursor_placement* from, const surface& desired,
+	          std::string& out) const;
 
 	const cluster_pool* _pool;
 	terminal_capabilities _caps;

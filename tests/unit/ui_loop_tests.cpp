@@ -1071,6 +1071,109 @@ TEST(UiLoopRender, AResizeForcesAFullRepaint) {
 	EXPECT_FALSE(tty.painted().empty());
 }
 
+// #185: a resize used to paint the new frame from wherever the cursor was - the
+// end of the buffer - so every resize left one more copy of the prompt on
+// screen. The repaint now walks up to the top of the frame the terminal is
+// SHOWING, erases from there down, and paints. How far up that is is the whole
+// question, and these four are its cases.
+//
+// THE ASSERTION IS THE PREFIX AND NOT THE WHOLE PAINT. What follows the erase is
+// `paint`'s business and `LeshperBlitter` pins it byte for byte; what belongs to
+// the loop is the count of rows, because only the loop knows what the terminal
+// did to the old frame.
+
+TEST(UiLoopRender, AResizeRepaintsFromTheTopOfTheReflowedFrame) {
+	fake_tty tty;
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.enter_read();
+	// `> ` plus sixty cells is one row at eighty columns and two at forty, and
+	// the cursor sits at the end of it either way - so a reflowing terminal has
+	// put the frame's top one row above the cursor.
+	tty.type(std::string(60, 'a'));
+	loop.turn(50);
+	ASSERT_EQ(buffer_of(loop).size(), 60u);
+	(void)tty.painted();
+
+	loop.editor().columns = 40;
+	loop.render();
+	const std::string narrower = tty.painted();
+	EXPECT_TRUE(narrower.starts_with("\r\x1b[1A\x1b[J"))
+		<< "expected a walk up one row and an erase, got: " << narrower.substr(0, 16);
+
+	// And back. The same input at eighty columns is one row again, so the cursor
+	// is already on the frame's top row and there is no walk to do - only the
+	// erase, which is what stops the two-row frame from outliving the one-row one.
+	loop.editor().columns = 80;
+	loop.render();
+	const std::string wider = tty.painted();
+	EXPECT_TRUE(wider.starts_with("\r\x1b[J"))
+		<< "expected an erase with no cursor-up, got: " << wider.substr(0, 16);
+	EXPECT_FALSE(wider.starts_with("\r\x1b[1A"));
+}
+
+TEST(UiLoopRender, RowsAfterAHardNewlineDoNotMergeIntoTheOneBeforeThem) {
+	// The reason the start row is a RE-LAYOUT and not arithmetic on the old row
+	// count. Sixty-two cells and twelve cells are two rows at eighty columns; if
+	// the reflow model simply rewrapped seventy-four cells it would make two rows
+	// at forty as well, and the repaint would land one row short of the frame's
+	// top. `lay_out` starts a new row at a U+000A at either width, so the answer
+	// is three rows and the walk is two.
+	loop_options options = pipe_options();
+	options.continuation = "..";
+	fake_tty tty;
+	event_loop loop{tty.fds(), options};
+	loop.enter_read();
+
+	state& s = loop.editor();
+	s.buffer.replace(s.buffer.begin_position(), s.buffer.begin_position(),
+	                 std::string(60, 'a') + "\n" + std::string(10, 'b'));
+	s.cursor = s.buffer.end_position();
+	s.gen.bump();
+	loop.render();
+	(void)tty.painted();
+
+	loop.editor().columns = 40;
+	loop.render();
+	const std::string narrower = tty.painted();
+	EXPECT_TRUE(narrower.starts_with("\r\x1b[2A\x1b[J"))
+		<< "expected a walk up two rows, got: " << narrower.substr(0, 16);
+}
+
+TEST(UiLoopRender, ATerminalThatDoesNotReflowKeepsTheRowCountItAlreadyHad) {
+	// xterm and Terminal.app leave the rows where they were, so the frame's top
+	// is as far up as the picture we painted says - the count from BEFORE the
+	// resize, which for a one-row frame is no rows at all.
+	loop_options options = pipe_options();
+	options.assume_reflow = false;
+	fake_tty tty;
+	event_loop loop{tty.fds(), options};
+	loop.enter_read();
+	tty.type(std::string(60, 'a'));
+	loop.turn(50);
+	ASSERT_EQ(buffer_of(loop).size(), 60u);
+	(void)tty.painted();
+
+	loop.editor().columns = 40;
+	loop.render();
+	const std::string narrower = tty.painted();
+	EXPECT_TRUE(narrower.starts_with("\r\x1b[J"))
+		<< "expected the unreflowed row count, got: " << narrower.substr(0, 16);
+	EXPECT_FALSE(narrower.starts_with("\r\x1b[1A"));
+}
+
+TEST(UiLoopRender, TheFirstPaintOfAReadErasesNothing) {
+	// The other half of the contract: with no previous frame the cursor really is
+	// at the surface's origin and the rows below it are not ours. An ESC[J here
+	// would erase whatever the last command printed.
+	fake_tty tty;
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.enter_read();
+	loop.render();
+	const std::string first = tty.painted();
+	EXPECT_FALSE(first.empty());
+	EXPECT_EQ(first.find("\x1b[J"), std::string::npos) << first;
+}
+
 // ===========================================================================
 // The thread (#134's two calls)
 // ===========================================================================

@@ -89,6 +89,35 @@ public:
 		_out.append("\x1b[K");
 	}
 
+	// Erase from the cursor to the end of the SCREEN, and for ESC[K's reason:
+	// background-colour erase would paint the span in whatever background is in
+	// force, and the span is meant to be blank.
+	void clear_to_end_of_screen() {
+		reset_pen();
+		_out.append("\x1b[J");
+	}
+
+	// Up to the top-left of the frame the terminal is showing, from wherever the
+	// last frame left the cursor (#185). Not `move_to`: that one moves within
+	// the surface being emitted, whose row zero is where this lands, so it has
+	// nothing to say about a frame that is not on screen yet.
+	//
+	// `\r` UNCONDITIONALLY, before the count. It is the only sequence that
+	// resolves the pending-wrap ambiguity a glyph in the last column leaves
+	// behind, and after a resize the terminal's own reflow means even the
+	// column this class thinks it is in is not knowable from here.
+	void move_to_frame_top(std::uint16_t rows_above) {
+		_out.push_back('\r');
+		_column = 0;
+		_wrap_pending = false;
+		if (rows_above > 0) {
+			_out.append("\x1b[");
+			append_uint(_out, rows_above);
+			_out.push_back('A');
+		}
+		_row = 0;
+	}
+
 	void reset_pen() {
 		if (_pen == style{})
 			return;
@@ -271,17 +300,32 @@ std::uint8_t quantize_to_256(std::uint8_t r, std::uint8_t g, std::uint8_t b) noe
 // The diff
 // ---------------------------------------------------------------------------
 
-void blitter::emit(const surface* previous, const surface& desired, std::string& out) const {
+void blitter::emit(const surface* previous, const cursor_placement* from,
+                   const surface& desired, std::string& out) const {
 	// A size change is a repaint. fish computes a whole new layout on resize
 	// rather than diffing across one, and for the same reason: the two grids
 	// stop being comparable cell by cell, and answering what a row means at a
 	// different width is F-38's reflow, not the differ's.
+	//
+	// A REPAINT REPLACES A FRAME; IT DOES NOT APPEND ONE (#185). The cursor is
+	// not at the origin of anything - it is wherever the last frame left it, at
+	// the end of the buffer - so painting from there put a second copy of the
+	// prompt below the first, once per resize. `from` is the caller's answer to
+	// "how far above me does the frame I am replacing start", which only the
+	// caller can know, because after a resize the terminal has reflowed that
+	// frame and the surface we painted no longer describes it. Null - which is
+	// `paint`, the first paint of a read - means the cursor really is at the
+	// origin and there is nothing below it that is ours to erase.
 	const bool repaint = previous == nullptr || previous->columns() != desired.columns()
 	                  || previous->rows() != desired.rows();
 
 	const cursor_placement start =
 		repaint ? cursor_placement{} : previous->cursor();
 	emitter terminal{out, *_pool, _caps, start, desired.columns()};
+	if (from != nullptr) {
+		terminal.move_to_frame_top(from->row);
+		terminal.clear_to_end_of_screen();
+	}
 
 	const std::uint16_t columns = desired.columns();
 	for (std::uint16_t row = 0; row < desired.rows() && columns > 0; ++row) {
@@ -345,23 +389,28 @@ void blitter::emit(const surface* previous, const surface& desired, std::string&
 
 void blitter::update_into(const surface& previous, const surface& desired,
                           std::string& out) const {
-	emit(&previous, desired, out);
+	emit(&previous, nullptr, desired, out);
 }
 
 std::string blitter::update(const surface& previous, const surface& desired) const {
 	std::string out;
-	emit(&previous, desired, out);
+	emit(&previous, nullptr, desired, out);
 	return out;
 }
 
 void blitter::paint_into(const surface& desired, std::string& out) const {
-	emit(nullptr, desired, out);
+	emit(nullptr, nullptr, desired, out);
 }
 
 std::string blitter::paint(const surface& desired) const {
 	std::string out;
-	emit(nullptr, desired, out);
+	emit(nullptr, nullptr, desired, out);
 	return out;
+}
+
+void blitter::paint_from(const cursor_placement& start, const surface& desired,
+                         std::string& out) const {
+	emit(nullptr, &start, desired, out);
 }
 
 } // namespace lesh::leshper

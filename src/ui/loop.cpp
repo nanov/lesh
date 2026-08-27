@@ -1128,10 +1128,27 @@ void event_loop::render() {
 	leshper::layout desired = lay_out(_pool, in);
 
 	_out.clear();
-	if (_have_previous && can_diff(_previous, desired))
+	if (_have_previous && can_diff(_previous, desired)) {
 		_blitter.update_into(_previous.screen, desired.screen, _out);
-	else
+	} else if (_have_previous) {
+		// A REPAINT WITH A FRAME STILL ON SCREEN (#185, F-38): a resize, which is
+		// the only thing that reaches here with a previous frame - `can_diff`
+		// answers no exactly when the sizes differ, and every path that leaves
+		// the screen showing something that is not ours drops `_have_previous`
+		// instead. So there is a frame to REPLACE, and painting from where the
+		// cursor happens to be is what put a second copy of the prompt below the
+		// first, once per resize.
+		const leshper::cursor_placement top = frame_top_above_cursor();
+		LESH_LOG(log::level::debug, log::category::render,
+		         "repaint: the frame's top is %u row(s) up (%s)",
+		         static_cast<unsigned>(top.row),
+		         _options.assume_reflow ? "reflowed" : "unreflowed");
+		_blitter.paint_from(top, desired.screen, _out);
+	} else {
+		// The first paint of a read: the cursor IS at the surface's origin,
+		// because the shell has just written the newline that put it there.
 		_blitter.paint_into(desired.screen, _out);
+	}
 
 	if (!_out.empty() && _fds.output >= 0) {
 		// #98: the redraw goes out through the loop, like every other byte the
@@ -1145,7 +1162,44 @@ void event_loop::render() {
 
 	_previous = std::move(desired);
 	_have_previous = true;
+	// The input beside the picture, so the next repaint can ask where the
+	// terminal has since moved this frame's top row to (#185). `assign` into
+	// strings that already have the capacity, which is what keeps the per-render
+	// cost the constant `ALoopRepaintCostsAConstantThatDoesNotGrow` pins.
+	_previous_input.prompt.assign(in.prompt);
+	_previous_input.continuation.assign(in.continuation);
+	_previous_input.buffer.assign(in.buffer);
+	_previous_input.cursor = in.cursor;
+	_previous_input.width = in.width;
+	_previous_input.prompt_pen = in.prompt_pen;
+	_previous_input.text_pen = in.text_pen;
 	LESH_LOG_TRACE(log::category::render, "rendered %zu bytes", _out.size());
+}
+
+leshper::cursor_placement event_loop::frame_top_above_cursor() {
+	// A NON-REFLOWING TERMINAL LEFT THE ROWS WHERE THEY WERE, so the frame's top
+	// is as many rows up as it was before the resize - which is what the picture
+	// we painted already says.
+	if (!_options.assume_reflow)
+		return _previous.screen.cursor();
+
+	// A REFLOWING ONE REWRAPPED THEM, and the honest answer is the same input
+	// laid out at the size the terminal is now: the row the cursor lands on IS
+	// how far below that frame's top row the terminal's cursor now sits. Hard
+	// newlines survive this for free - `lay_out` starts a new row at one either
+	// way - which is why the answer is a re-layout rather than arithmetic on the
+	// old row count.
+	leshper::layout_input was;
+	was.prompt = _previous_input.prompt;
+	was.continuation = _previous_input.continuation;
+	was.buffer = _previous_input.buffer;
+	was.cursor = _previous_input.cursor;
+	was.width = _previous_input.width;
+	was.prompt_pen = _previous_input.prompt_pen;
+	was.text_pen = _previous_input.text_pen;
+	was.columns = _state.columns;
+	was.rows = _state.rows;
+	return lay_out(_pool, was).screen.cursor();
 }
 
 // ---------------------------------------------------------------------------

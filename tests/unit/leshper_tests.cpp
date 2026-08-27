@@ -1579,6 +1579,44 @@ TEST(LeshperBlitter, PaintWritesEveryRowAndClearsTheRest) {
 	EXPECT_EQ(blitter{pool}.paint(painted), "hi\x1b[K\r\x1b[1B\x1b[K\x1b[1A");
 }
 
+TEST(LeshperBlitter, PaintFromWalksUpToTheFramesTopAndErasesWhatWasBelowIt) {
+	// #185: a repaint with a frame still on screen REPLACES it. The cursor is
+	// wherever the last frame left it - `start.row` rows below that frame's top -
+	// so the sequence is `\r`, up, erase, and only then the paint.
+	//
+	// THE PAINT ITSELF IS TAKEN FROM `paint` RATHER THAN SPELLED OUT: the two
+	// must agree byte for byte, because after the move the emitter is in exactly
+	// the state `paint` starts in - row 0, column 0, no pending wrap, pen
+	// default. Writing the escapes out by hand here would let them drift apart
+	// and still pass.
+	cluster_pool pool;
+	surface painted{4, 2};
+	painted.write(pool, 0, 0, "hi", style{});
+	const std::string body = blitter{pool}.paint(painted);
+
+	std::string out;
+	blitter{pool}.paint_from(cursor_placement{0, 0}, painted, out);
+	EXPECT_EQ(out, "\r\x1b[J" + body) << "already on the top row: no cursor-up at all";
+
+	out.clear();
+	blitter{pool}.paint_from(cursor_placement{1, 3}, painted, out);
+	EXPECT_EQ(out, "\r\x1b[1A\x1b[J" + body) << "one row up, and the column is \\r's business";
+
+	out.clear();
+	blitter{pool}.paint_from(cursor_placement{3, 0}, painted, out);
+	EXPECT_EQ(out, "\r\x1b[3A\x1b[J" + body);
+}
+
+TEST(LeshperBlitter, PaintFromAppendsLikeEveryOtherIntoForm) {
+	cluster_pool pool;
+	surface painted{4, 1};
+	painted.write(pool, 0, 0, "hi", style{});
+
+	std::string out = "keep:";
+	blitter{pool}.paint_from(cursor_placement{2, 0}, painted, out);
+	EXPECT_TRUE(out.starts_with("keep:\r\x1b[2A\x1b[J"));
+}
+
 TEST(LeshperBlitter, TheIntoFormAppendsSoTheLoopCanReuseOneBuffer) {
 	// N-2: the hot path keeps one buffer. The returning forms are the
 	// convenience, not the primitive.
