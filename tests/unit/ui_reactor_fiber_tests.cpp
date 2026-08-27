@@ -583,7 +583,9 @@ TEST(UiReactorFiber, AfterResumeTheNextLinesFirstSendIsReceived) {
 	EXPECT_GE(d.loop.applied_batches(), 1u);
 }
 
-TEST(UiReactorFiber, QuiesceNestsAndAssertsAllThreeHalves) {
+TEST(UiReactorFiber, QuiesceIsIdempotentAndTakesThePhaseWithIt) {
+	// The phase half of the same #203 change: one bit, and the phase is written
+	// from it rather than counted alongside it.
 	driven d;
 	d.start();
 
@@ -593,11 +595,9 @@ TEST(UiReactorFiber, QuiesceNestsAndAssertsAllThreeHalves) {
 	EXPECT_EQ(d.loop.session_phase(), phase::executing);
 	d.loop.assert_quiesced();
 	d.loop.quiesce();
+	EXPECT_EQ(d.loop.session_phase(), phase::executing) << "a second park changes nothing";
 	d.loop.assert_quiesced();
 
-	d.loop.resume_after_execution();
-	EXPECT_TRUE(d.loop.quiesced()) << "two parks need two resumes";
-	EXPECT_EQ(d.loop.session_phase(), phase::executing);
 	d.loop.resume_after_execution();
 	EXPECT_FALSE(d.loop.quiesced());
 	EXPECT_EQ(d.loop.session_phase(), phase::editing);

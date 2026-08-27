@@ -34,7 +34,7 @@
 //
 // WHY A HEADER IN THE SUBSTRATE. The exec lanes are the shell's - the executor
 // forks, and those lanes never enter the editor - while the quiesce-boundary
-// assertion is the host's (`src/ui/workers.cpp`). Both sides need the same
+// assertion is the host's (`src/ui/loop.cpp`). Both sides need the same
 // guard, and the substrate is the one layer below both. It depends on POSIX and
 // on substrate/arena.h, and on nothing above itself.
 

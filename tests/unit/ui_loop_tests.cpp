@@ -929,12 +929,17 @@ TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	// The line is finished and the editor is fresh, in one edit so undo does not
 	// walk back into a command that has already run.
 	EXPECT_EQ(buffer_of(loop), "");
-	// Parking NESTS and resume released it: the group is runnable again.
+	// And the resume released it: the group is runnable again.
 	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_FALSE(loop.quiesced());
 }
 
-TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
+TEST(UiLoopQuiesce, QuiesceIsIdempotentAndOneResumeUndoesIt) {
+	// #203: the depth counter is a bit. Two parks used to need two resumes, which
+	// was #91's apparatus for a set of threads that could each ask for one; the
+	// two callers are `accept_current_line` and `finish_cancelled_line` and
+	// neither is reachable from inside the other, so what a second call means now
+	// is "nothing to do".
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.enter_read();
@@ -943,12 +948,11 @@ TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
 	EXPECT_TRUE(loop.quiesced());
 	loop.assert_quiesced();
 	loop.quiesce();
+	EXPECT_TRUE(loop.quiesced()) << "a second park is a no-op, not a second park";
 	loop.assert_quiesced();
 
 	loop.resume_after_execution();
-	EXPECT_TRUE(loop.quiesced()) << "two parks need two resumes";
-	loop.resume_after_execution();
-	EXPECT_FALSE(loop.quiesced());
+	EXPECT_FALSE(loop.quiesced()) << "one resume undoes both calls";
 	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
 }
 
