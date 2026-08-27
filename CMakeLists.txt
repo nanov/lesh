@@ -115,6 +115,10 @@ enable_testing()
 #
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
 #
+# `lesh_fiber` (#198) hangs off `lesh_substrate` BESIDE `lesh_leshper` and is
+# named by nothing above it yet - `lesh_tests` and `lesh_bench` are its only
+# consumers until step 1 of #145 puts the scheduler inside `event_loop`.
+#
 # THE EDITOR HANGS OFF THE SUBSTRATE AND NOTHING ELSE, since #168 Phase B. It
 # used to link `lesh_syntax` for the highlighter's parse and the completer's lex;
 # both moved to `lesh_ui` with the rest of the knowledge, and a `syntax/` include
@@ -264,6 +268,45 @@ add_library(lesh_leshper STATIC
 	src/leshper/text.h
 	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_substrate)
+
+# fiber: stackful cooperative fibers - the switcher, guard-page stacks, an
+# instantiable scheduler and the one channel type v1 needs (#198, part of #82).
+#
+# BESIDE lesh_leshper, NOT ABOVE IT, and for the same reason: it links
+# lesh_substrate AND NOTHING ELSE. That is the whole sweep-exemption argument for
+# `Fiber*`, made enforceable the way every other rule here is - this target does
+# not link lesh_syntax, lesh_runtime or lesh_ui, so a fiber that reached for a
+# parse tree, a shell variable or a file descriptor would fail to link rather
+# than fail review. What it depends on is assertions, the logger and libc.
+#
+# NOTHING LINKS IT YET. Step 0 is the probe and the scaffold: `lesh_tests` runs
+# `Fiber*` and `lesh_bench` times a switch, and the shell binary does not name
+# this target at all. Step 1 (#145) is what puts the scheduler inside
+# `event_loop` and makes the reactors fibers; until then no shipped behaviour
+# depends on a single line here.
+#
+# The vendored switcher is PRIVATE: `src/fiber/minicoro.cpp` is the one
+# translation unit that compiles minicoro, and no header above it names an
+# `mco_*` type - `stack.h` and `scheduler.h` forward-declare `struct mco_coro`
+# and stop there. SYSTEM plus `-w` on that one source keeps the vendoring promise
+# at the top of this file: somebody else's single-header library is neither held
+# to our warning policy nor allowed to fail a `-Werror` release build. It IS
+# instrumented, deliberately and unlike the other vendored trees - minicoro's
+# `__sanitizer_*_switch_fiber` annotations are compiled in from
+# `__has_feature(address_sanitizer)`, so a TU built without `-fsanitize=address`
+# would hand ASan no fiber annotations at all and the gate would be measuring
+# nothing.
+add_library(lesh_fiber STATIC
+	src/fiber/minicoro.cpp
+	src/fiber/scheduler.cpp
+	src/fiber/scheduler.h
+	src/fiber/slot.h
+	src/fiber/stack.cpp
+	src/fiber/stack.h)
+target_link_libraries(lesh_fiber PUBLIC lesh_substrate)
+target_include_directories(lesh_fiber SYSTEM PRIVATE
+	"${PROJECT_SOURCE_DIR}/third_party/minicoro")
+set_source_files_properties(src/fiber/minicoro.cpp PROPERTIES COMPILE_OPTIONS "-w")
 
 
 # ui: THE HOST. The session that runs an interactive shell, the loop that drives
@@ -512,6 +555,7 @@ file(GLOB_RECURSE LESH_PUBLIC_HEADERS
 	RELATIVE ${PROJECT_SOURCE_DIR}/src
 	${PROJECT_SOURCE_DIR}/src/substrate/*.h
 	${PROJECT_SOURCE_DIR}/src/syntax/*.h
+	${PROJECT_SOURCE_DIR}/src/fiber/*.h
 	${PROJECT_SOURCE_DIR}/src/leshper/*.h
 	${PROJECT_SOURCE_DIR}/src/leshnici/*.h
 	${PROJECT_SOURCE_DIR}/src/runtime/*.h
@@ -527,7 +571,7 @@ foreach(header ${LESH_PUBLIC_HEADERS})
 	list(APPEND SELF_CONTAINMENT_SOURCES ${generated})
 endforeach()
 add_library(lesh_header_self_containment OBJECT ${SELF_CONTAINMENT_SOURCES})
-target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici)
+target_link_libraries(lesh_header_self_containment PRIVATE lesh_leshnici lesh_fiber)
 
 # The committed src/substrate/unicode_tables.h must be exactly what the
 # generator emits from the vendored UCD (#108). The 766 conformance cases prove
