@@ -17,13 +17,21 @@
 // Run:    ./build/bench/tools/lesh_bench
 
 #include "fiber/scheduler.h"
+#include "leshper/registry.h"
 #include "runtime/executor.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
 #include "substrate/grapheme.h"
 #include "syntax/lexer.h"
 #include "syntax/parser.h"
+#include "ui/history_search.h"
+#include "ui/loop.h"
+#include "ui/reactors.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -81,6 +89,64 @@ void yield_forever(fiber::scheduler& on, void* /*userdata*/) {
 	for (;;)
 		on.yield();
 }
+
+// ---------------------------------------------------------------------------
+// THE AUTOSUGGESTER'S WORST CASE (#206), and the harness it needs
+// ---------------------------------------------------------------------------
+//
+// A history whose entries share no prefix with what is typed, so the walk runs
+// to the end: no strict extension is ever found, `max_matches` is zero, and
+// every one of the entries is examined. That is the shape #202 measured at 6x
+// under ASan and the one this section re-measures in release.
+//
+// The history is deliberately ordinary lines rather than one repeated string:
+// `match_entry` in prefix mode compares the first bytes, so entries that all
+// begin with the same character would measure a different comparison than a
+// real history does.
+ui::vector_history_source novel_history(std::size_t entries) {
+	std::vector<std::string> lines;
+	lines.reserve(entries);
+	static const char* const shapes[] = {
+		"git commit -m \"work on %zu\"", "ls -la /usr/share/doc/%zu",
+		"cat file%zu.txt | grep pattern | wc -l", "make -j8 target%zu",
+		"echo hello world %zu", "grep -rn needle src/%zu",
+	};
+	char line[128];
+	for (std::size_t i = 0; i < entries; ++i) {
+		std::snprintf(line, sizeof(line), shapes[i % 6], i);
+		lines.emplace_back(line);
+	}
+	return ui::vector_history_source{std::move(lines)};
+}
+
+// The host, over a pipe, with the real autosuggester on its real fiber. The
+// output goes to /dev/null rather than to a pipe nobody drains: a render per
+// keystroke fills a 64 KB pipe long before the measurement is over.
+struct driven_loop {
+	driven_loop() {
+		std::ignore = ::pipe(_in);
+		::fcntl(_in[0], F_SETFL, O_NONBLOCK);
+		_null = ::open("/dev/null", O_WRONLY);
+		options.manage_terminal = false;
+		options.prompt = "> ";
+	}
+	~driven_loop() {
+		for (int fd : {_in[0], _in[1], _null})
+			if (fd >= 0)
+				::close(fd);
+	}
+	driven_loop(const driven_loop&) = delete;
+	driven_loop& operator=(const driven_loop&) = delete;
+
+	[[nodiscard]] ui::loop_fds fds() const { return ui::loop_fds{_in[0], _null}; }
+	void type(std::string_view bytes) const {
+		std::ignore = ::write(_in[1], bytes.data(), bytes.size());
+	}
+
+	ui::loop_options options;
+	int _in[2]{-1, -1};
+	int _null = -1;
+};
 
 } // namespace
 
@@ -255,6 +321,104 @@ int main() {
 		std::printf("  (Debug/RelWithDebInfo: instrumented and watchdogged - "
 		            "read the release number)\n");
 #endif
+	}
+
+	// THE COOPERATIVE WALK'S PRICE (#206). The switch above is the cheapest part
+	// of a yield; the yield the shell actually takes goes back to the HOST, which
+	// polls the terminal before it comes back. So the three rows below are the
+	// three layers of one yield, each measured on its own:
+	//
+	//   run_one_slice   host -> fiber -> host                     (the row above)
+	//   tick            + the snapshot, the sort and `runnable`
+	//   turn(0)         + poll(2), the drains, the render check
+	//
+	// and the fourth pair is what they add up to on the reactor that takes the
+	// longest walk in the shell: the autosuggester, on a history whose entries the
+	// typed prefix never extends.
+	std::printf("\ncooperative yield, layer by layer (#206)\n");
+	{
+		fiber::scheduler sched;
+		std::ignore = sched.spawn(&yield_forever, nullptr, "bench");
+		const double tick_ns = time_ns(1000000, [&] { benchmark_sink += sched.tick() ? 1 : 0; });
+		std::printf("  %-40s %12.1f ns\n", "tick() with one yielding fiber", tick_ns);
+
+		driven_loop host;
+		leshper::registry reg;
+		ui::event_loop loop{host.fds(), host.options};
+		loop.attach_registry(reg);
+		loop.enter_read();
+		const double idle_ns = time_ns(200000, [&] { benchmark_sink += loop.turn(0).events; });
+		std::printf("  %-40s %12.1f ns\n", "turn(0), nothing to do", idle_ns);
+	}
+
+	std::printf("\nautosuggester walk (%d entries, prefix nothing extends)\n", 5000);
+	{
+		constexpr std::size_t kEntries = 5000;
+		const ui::vector_history_source source = novel_history(kEntries);
+
+		// THE FLOOR: the same walk with no host under it. `history_search::run`
+		// with no cancel poll is the work the shell would do if a compute could
+		// never be interrupted, and it is what the 1.5x acceptance is 1.5x OF.
+		ui::history_search::options search;
+		search.search = ui::history_search::mode::prefix;
+		search.max_matches = 0;
+		search.max_ranges = 0;
+		const double bare_ns = time_ns(200, [&] {
+			ui::history_search searcher{search};
+			const auto walked = searcher.run("zqx", source, {}, {});
+			benchmark_sink += static_cast<int>(walked.entries_examined);
+		});
+		std::printf("  %-40s %12.1f us (%.1f ns/entry)\n", "no yields, searcher alone",
+		            bare_ns / 1000.0, bare_ns / static_cast<double>(kEntries));
+
+		// AND THROUGH THE HOST, which is the shell's real number: every keystroke
+		// is one full walk, and every cancellation poll on the way is a yield.
+		driven_loop host;
+		leshper::registry reg;
+		ui::owned_autosuggester sugg{&source};
+		ui::event_loop loop{host.fds(), host.options};
+		loop.attach_registry(reg);
+		std::ignore = ui::register_autosuggester(reg, sugg.get());
+		loop.enter_read();
+
+		// AND THE GAP BETWEEN TERMINAL POLLS, which is the keystroke latency this
+		// ticket is about. A key that arrives just after one poll waits for the next
+		// one, so the interval between consecutive turns IS the latency a walk in
+		// flight adds - measured here rather than over a pty, where 60 us of kernel
+		// and interpreter sit on top of a number whose budget is 100.
+		constexpr std::size_t kKeystrokes = 40;
+		std::vector<double> gaps;
+		gaps.reserve(1u << 19);
+		const auto started = steady_clock::now();
+		for (std::size_t k = 0; k < kKeystrokes; ++k) {
+			const std::size_t before = loop.reactor_computes("autosuggester");
+			host.type("z");
+			auto last = steady_clock::now();
+			while (loop.reactor_computes("autosuggester") == before
+			       || loop.reactors().runnable(ui::group_mask(ui::fiber_group::emitters))) {
+				benchmark_sink += loop.turn(0).events;
+				const auto now = steady_clock::now();
+				gaps.push_back(static_cast<double>(
+					duration_cast<nanoseconds>(now - last).count()));
+				last = now;
+			}
+		}
+		const double per_walk_ns =
+			static_cast<double>(duration_cast<nanoseconds>(steady_clock::now() - started).count())
+			/ static_cast<double>(kKeystrokes);
+		std::printf("  %-40s %12.1f us (%.1f ns/entry, %.2fx)\n", "through the loop, one walk",
+		            per_walk_ns / 1000.0, per_walk_ns / static_cast<double>(kEntries),
+		            per_walk_ns / bare_ns);
+		std::printf("  %-40s %12zu slices, %zu yields\n", "for that last walk",
+		            loop.reactor_slices("autosuggester"), loop.reactor_yields("autosuggester"));
+		std::sort(gaps.begin(), gaps.end());
+		const auto at = [&gaps](double p) {
+			return gaps.empty() ? 0.0 : gaps[static_cast<std::size_t>(
+				static_cast<double>(gaps.size() - 1) * p)];
+		};
+		std::printf("  %-40s p50 %.2f us  p95 %.2f us  max %.2f us\n",
+		            "keystroke wait (gap between polls)", at(0.5) / 1000.0,
+		            at(0.95) / 1000.0, gaps.empty() ? 0.0 : gaps.back() / 1000.0);
 	}
 
 	// Command-boundary cost. THE OTHER HALF OF THE COOPERATIVE DESIGN'S PRICE
