@@ -48,8 +48,8 @@ public:
 	// return a status.
 	//
 	// v1 WAS A NO-OP FOR EVERYONE and still is for every non-interactive shell.
-	// Phase 2 of #145 adds `await_readable(fd)` beside `wait_child` below, at
-	// which point `vared`'s nested read becomes a nested await. Neither was
+	// Phase 2 of #145 added `wait_child` (#208) and `await_readable` (#209) below,
+	// and the next of them is `vared`'s nested read as a nested await. None was
 	// declared before it had a caller.
 	virtual void on_command_boundary() noexcept = 0;
 
@@ -77,6 +77,41 @@ public:
 	// `noexcept`, for the reason `on_command_boundary` is: this is called from
 	// inside the executor, which expects to return a status rather than to unwind.
 	virtual pid_t wait_child(pid_t pid, int flags, int* status) noexcept = 0;
+
+	// THE INPUT WAIT, AND THE THIRD VERB (#209, phase 2b of #145).
+	//
+	// "I am about to block in `::read(fd, ...)`; whoever is hosting me may use the
+	// thread until there is something there." Said BEFORE the read and never
+	// INSTEAD of it: this verb moves no bytes, reports no error and answers
+	// nothing. The read that follows is the same read it always was, which is what
+	// keeps every byte of `read`'s POSIX behaviour - the escapes, the field
+	// splitting, "no more of the input than the line it needs" - on one side of
+	// the seam and out of the host's reach.
+	//
+	// THE NO-OP IMPLEMENTATION IS EMPTY, which is why - like `wait_child`'s
+	// `::waitpid` - this verb moves no behaviour when it is introduced: a script,
+	// `lesh -c`, a unit test and every forked child return from here immediately
+	// and block in the read exactly as they always did. Only an interactive host
+	// answers differently, and even it only when there is a fiber to park - see
+	// `ui::event_loop::await_readable`.
+	//
+	// WHAT "READABLE" HAS TO MEAN for the read after it not to block: at least one
+	// byte, or end of file. A regular file is always readable, so `read x < file`
+	// returns from here at once; a pipe or a tty reports POLLIN for a byte and
+	// POLLHUP for a writer that has gone, and the one-byte read that follows
+	// either answer completes without waiting. A descriptor the host cannot ask
+	// about at all - `read x 0<&-`, whose fd 0 is closed - is treated as READY
+	// rather than waited on, because the read is then the thing with the right
+	// answer (EBADF, which `read` reports as end of input) and a wait would be for
+	// ever.
+	//
+	// AND NOTHING IS PROMISED ABOUT SIGNALS. A signal arriving while the caller
+	// waits here does not end the wait - exactly as `SA_RESTART` means it does not
+	// end the blocking read the no-op takes. The host may well WAKE for it; what
+	// it must not do is return to a caller whose read would then block.
+	//
+	// `noexcept`, for the reason the two verbs above are.
+	virtual void await_readable(int fd) noexcept = 0;
 };
 
 // The non-interactive answer, and the default every `shell_state` starts with.

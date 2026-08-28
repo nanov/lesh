@@ -20,6 +20,12 @@ public:
 	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
 		return ::waitpid(pid, status, flags);
 	}
+
+	// AND THIS ONE *IS* EMPTY (#209). Cooperating with nobody about a descriptor
+	// is having nothing to say before the read; the `::read` that follows blocks,
+	// which is what every shell in this tree did before #209 and what every
+	// non-interactive one still does. One indirect call to a `return`.
+	void await_readable(int) noexcept override {}
 };
 
 } // namespace
