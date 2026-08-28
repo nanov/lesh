@@ -259,7 +259,16 @@ TEST(UiAutosuggest, ItDoesNotSubscribeToCursorMoves) {
 
 TEST(UiAutosuggest, ASupersededWalkGivesUpAndSaysSo) {
 	suggest_fixture fixture;
-	const superseding_source source{fixture.loop, {"git status", "git log", "git diff"}};
+	// LONGER THAN THE WALK'S POLL STRIDE (#206). The source supersedes as it hands
+	// out its second entry and the walk notices at its next cancellation poll,
+	// which is `history_search::poll_every` entries in - so the three-entry history
+	// this test used to carry would now run to the end and prove nothing. What is
+	// asserted is unchanged: a walk superseded mid-flight gives up and says so.
+	std::vector<std::string> entries;
+	entries.reserve(history_search::poll_every + 2);
+	for (std::size_t i = 0; i < history_search::poll_every + 2; ++i)
+		entries.push_back("git status " + std::to_string(i));
+	const superseding_source source{fixture.loop, std::move(entries)};
 	owned_autosuggester self{&source};
 	// Registration REPLACES (#93), so this is the fixture's autosuggester with a
 	// different history behind it - and the flag the source raises is the one the

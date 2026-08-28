@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/select.h>
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
@@ -138,6 +139,63 @@ constexpr short kReadable = POLLIN | POLLHUP | POLLERR;
 
 constexpr short revents_of(const struct pollfd& one) noexcept {
 	return static_cast<short>(one.revents & kReadable);
+}
+
+// A ZERO TIMEOUT IS A QUESTION, NOT A WAIT - AND `poll` ANSWERS IT SLOWLY (#206).
+//
+// Measured on the dev machine, release, arm64 macOS, one non-readable pipe:
+//
+//   poll(fds, n, 0)     nothing ready      8.1 - 8.7 us
+//   poll(fds, n, 0)     a byte waiting     0.34 us
+//   poll(nullptr, 0, 0) nothing to ask     7.5 us
+//   select(..., {0,0})  either way         0.18 - 0.28 us
+//   read() -> EAGAIN                       0.17 us
+//
+// XNU's `poll` takes a "nothing is ready, so wait - for zero nanoseconds" path
+// through the scheduler that `select` fast-paths and it does not; `poll` with
+// NO DESCRIPTORS AT ALL costs the same 7.5 us, which is what makes it the wait
+// and not the scan. Thirty times, for identical semantics.
+//
+// It is the whole price of a cooperative yield. A reactor that yields hands the
+// thread back to `turn`, which asks the terminal what arrived before it comes
+// back - so 8 us of kernel sat on top of a 12 ns switch and a 21 ns tick, and
+// the autosuggester's 5000-entry walk paid it 2500 times. #202's "a yield is one
+// extra loop turn whose poll(0) finds nothing - about 1 us" was the right shape
+// and the wrong platform constant.
+//
+// So the zero-timeout case asks `select` and every other case keeps `poll`,
+// where a wait's cost is the wait and poll's larger descriptor space is worth
+// having. `select` cannot name a descriptor at or above `FD_SETSIZE` - writing
+// one into an `fd_set` is a write past the end of the object - so a loop handed
+// one falls back rather than corrupting its own stack.
+//
+// The two readiness bits `select` does not have are not bits this loop reads:
+// a hung-up or errored descriptor selects as READABLE, and `revents_of` folds
+// POLLHUP and POLLERR into "go and drain it" anyway, which is exactly what the
+// drains then do - `drain_tty` calls a zero-length read a hangup.
+int ready_now(struct pollfd* fds, int count, int timeout_ms) noexcept {
+	if (timeout_ms != 0)
+		return ::poll(fds, static_cast<nfds_t>(count), timeout_ms);
+
+	fd_set readable;
+	FD_ZERO(&readable);
+	int highest = -1;
+	for (int i = 0; i < count; ++i) {
+		const int fd = fds[static_cast<std::size_t>(i)].fd;
+		if (fd < 0 || fd >= FD_SETSIZE)
+			return ::poll(fds, static_cast<nfds_t>(count), 0);
+		FD_SET(fd, &readable);
+		if (fd > highest)
+			highest = fd;
+	}
+
+	struct timeval right_now{};
+	const int ready = ::select(highest + 1, &readable, nullptr, nullptr, &right_now);
+	for (int i = 0; i < count; ++i) {
+		struct pollfd& one = fds[static_cast<std::size_t>(i)];
+		one.revents = ready > 0 && FD_ISSET(one.fd, &readable) ? POLLIN : 0;
+	}
+	return ready;
 }
 
 } // namespace
@@ -706,7 +764,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	if (timeout_ms != 0 && _sched.runnable(group_mask(fiber_group::emitters)))
 		timeout_ms = 0;
 
-	const int ready = ::poll(_poll.data(), static_cast<nfds_t>(at), timeout_ms);
+	const int ready = ready_now(_poll.data(), at, timeout_ms);
 	if (ready < 0) {
 		if (errno != EINTR) {
 			// #128's trap 1: a non-EINTR poll error is the terminal having gone,
@@ -815,10 +873,14 @@ void event_loop::drain_tty(leshper::input_instant now, turn_result& result) {
 			// ZERO-TIMEOUT poll says the fd is still readable, so a paste is one
 			// edit and one repaint while a typed character paints now. The poll
 			// is what makes it "while there is more", not "up to N bytes".
+			// AND THIS ONE IS ON THE KEYSTROKE PATH (#206): a single typed
+			// character is one read that gets it and one readiness check that
+			// finds nothing more, so the 8 us `poll` costs when nothing is ready
+			// was being paid once per keystroke as well as once per yield.
 			struct pollfd again{};
 			again.fd = _fds.input;
 			again.events = POLLIN;
-			if (::poll(&again, 1, 0) == 1 && (again.revents & kReadable) != 0)
+			if (ready_now(&again, 1, 0) == 1 && (again.revents & kReadable) != 0)
 				continue;
 			break;
 		}

@@ -11,4 +11,9 @@ add_executable(lesh_bench bench.cpp)
 # cooperative scheduler on the host thread is only affordable if a switch is
 # cheap next to the work between switches - and "cheap" has to be a number
 # measured on this machine rather than one quoted from a research note.
-target_link_libraries(lesh_bench PRIVATE lesh_runtime lesh_syntax lesh_fiber)
+# `lesh_ui` since #206: the cooperative walk's price is a property of the HOST -
+# a yield goes back to `event_loop::turn`, which polls the terminal before it
+# comes back - so the number can only be measured with the real loop, the real
+# autosuggester and the real fiber under it. `lesh_ui` links `lesh_runtime` and
+# `lesh_leshper` itself, so this is a superset of what was already here.
+target_link_libraries(lesh_bench PRIVATE lesh_ui lesh_runtime lesh_syntax lesh_fiber)
