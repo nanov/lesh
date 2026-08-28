@@ -604,6 +604,11 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				// Quoting suppresses pathname expansion: `echo "*.txt"` must print
 				// *.txt, not a filename. So a field is only glob-eligible when a
 				// metacharacter arrived from unquoted text.
+				//
+				// ELIGIBLE, not a pattern. This sees one segment, and a bracket
+				// expression can open in one and close in another - `[a$x` with x=`]`
+				// globs - so the segment test stays generous on purpose and
+				// expand_pathnames decides on the assembled word (#204).
 				if (ctx.split && has_pattern_characters(body))
 					_field_globbable = true;
 				// Backslash removal is part of quote removal, and which bytes a
