@@ -1940,7 +1940,7 @@ TEST(UiLoopExecution, BothModesRunTheLineWaitForTheChildAndReportItsStatus) {
 			<< name_of(how) << ": and `editing` again on the way out";
 		// AND THE WAITER TABLE IS EMPTY AGAIN. An entry left behind would be a
 		// pointer into a frame that has returned.
-		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		loop.leave_read();
 		hub.uninstall();
@@ -1982,7 +1982,7 @@ TEST(UiLoopExecution, TheExecutionFiberIsNeverAbandonedWhenThePollFailsMidComman
 	EXPECT_EQ(*status, 9);
 	EXPECT_EQ(shell.reaped, shell.awaited) << "and the child was reaped, not orphaned";
 	EXPECT_TRUE(WIFEXITED(shell.wait_status));
-	EXPECT_EQ(loop.awaited_children(), 0u) << "the waiter table is empty again";
+	EXPECT_EQ(loop.awaited(), 0u) << "the waiter table is empty again";
 
 	// AND THE FIBER IS BACK ON ITS INBOX, which is the assertion `~event_loop`
 	// carries and the whole of what the leak gate is about to check.
@@ -2417,7 +2417,7 @@ TEST(UiLoopExecution, WithNoSIGCHLDToWakeItTheWaitIsTakenInline) {
 	// ONE SLICE, because the wait never parked: the fiber ran the whole command in
 	// the slice it was given.
 	EXPECT_EQ(loop.execution_slices(), 1u);
-	EXPECT_EQ(loop.awaited_children(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2470,7 +2470,7 @@ TEST(UiLoopExecution, ACancelledLineTakesTheSameDoorAsAnAcceptedOne) {
 		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
 		EXPECT_EQ(loop.exit_status(), 9) << name_of(how) << ": the status is kept";
 		EXPECT_EQ(loop.session_phase(), phase::editing) << name_of(how);
-		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 		if (how == execution_mode::on_a_fiber)
 			EXPECT_GE(loop.execution_slices(), 2u);
 
@@ -2512,7 +2512,7 @@ TEST(UiLoopExecution, APortCallNeverParksBecauseThereIsNoFiberUnderIt) {
 	EXPECT_EQ(WEXITSTATUS(status), 5);
 	EXPECT_EQ(loop.execution_slices(), slices)
 		<< "the execution fiber was not resumed for a wait that was not its own";
-	EXPECT_EQ(loop.awaited_children(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2602,7 +2602,7 @@ TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
 		loop.enter_read();
 
 		// EMPTY BEFORE, so the count afterwards is evidence rather than a constant.
-		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		(void)loop.accept_current_line();
 
@@ -2610,7 +2610,7 @@ TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
 		EXPECT_EQ(shell.got, 'x') << name_of(how);
 		// AND THE TABLE IS EMPTY AGAIN. An entry left behind would be a pointer
 		// into a frame that has returned.
-		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		if (how == execution_mode::on_a_fiber) {
 			EXPECT_TRUE(shell.on_a_fiber_inside) << "`execute` ran on a fiber";
@@ -2668,7 +2668,7 @@ TEST(UiLoopExecution, ADescriptorThatIsREADYALREADYNeverParks) {
 	EXPECT_EQ(shell.got, 'x');
 	EXPECT_EQ(loop.execution_slices(), 1u)
 		<< "a descriptor that was readable already cost a park";
-	EXPECT_EQ(loop.awaited_fds(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2730,7 +2730,7 @@ TEST(UiLoopExecution, ARegularFileIsAlwaysReadableAndAClosedOneIsNeverWaitedOn) 
 		(void)loop.accept_current_line();
 
 		const char* which = a_file ? "a regular file" : "a closed descriptor";
-		EXPECT_EQ(loop.awaited_fds(), 0u) << which;
+		EXPECT_EQ(loop.awaited(), 0u) << which;
 		EXPECT_EQ(loop.execution_slices(), 1u) << which << ": it parked";
 		if (a_file) {
 			EXPECT_EQ(shell.got, 'f') << "the file's first byte";
@@ -2836,7 +2836,7 @@ TEST(UiLoopExecution, AwaitingTheTTYPUTSITBACKInThePollSetWithoutMakingItATopic)
 
 	EXPECT_EQ(shell.read_answer, 1) << "the command's own read did not get the byte";
 	EXPECT_EQ(shell.got, 'k');
-	EXPECT_EQ(loop.awaited_fds(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 	EXPECT_TRUE(buffer_of(loop).empty())
 		<< "the loop decoded a keystroke that belonged to the command: "
 		<< buffer_of(loop);

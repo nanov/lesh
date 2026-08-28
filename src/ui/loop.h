@@ -816,8 +816,8 @@ public:
 	//
 	//   nobody to park (inline mode, an action's `port_call`, the EXIT trap after
 	//   `run()` has returned) -> a blocking `::waitpid`, exactly as before;
-	//   on the execution fiber -> the waiter goes into `_child_waits`, the fiber
-	//   parks, and the SIGCHLD wake reaps it.
+	//   on the execution fiber -> the waiter goes into `_awaits`, the fiber parks,
+	//   and the SIGCHLD wake reaps it.
 	//
 	// ONLY AWAITED PIDS ARE EVER REAPED, never `-1`: a background child stays a
 	// zombie until `wait` asks for it, exactly as today, so no job-control
@@ -832,7 +832,7 @@ public:
 	// frame, and this function is five lines because of it.
 	//
 	//   nobody to park -> nothing at all; the caller's `::read` blocks as today;
-	//   on the execution fiber -> the fd goes into `_fd_waits`, it joins the poll
+	//   on the execution fiber -> the fd goes into `_awaits`, it joins the poll
 	//   set for exactly as long as the wait lasts, the fiber parks, and the
 	//   readiness wakes it.
 	//
@@ -904,13 +904,13 @@ public:
 	// `turn` answer -1 with EBADF instead - which is what a terminal that has gone
 	// away looks like from here. Zero, the default, is every shell.
 	void fail_next_polls(int n) noexcept { _fail_polls = n; }
-	// Slices the execution fiber has been given, and children currently awaited.
-	// Both are counters a test reads; neither decides anything.
+	// Slices the execution fiber has been given, and waits outstanding right now -
+	// a child's or a descriptor's, because since #211 §1.1 there is one table and
+	// it does not distinguish. Both are counters a test reads; neither decides
+	// anything, and a table that is not empty when a wait is over is a pointer
+	// into a frame that has returned.
 	[[nodiscard]] std::size_t execution_slices() const noexcept;
-	[[nodiscard]] std::size_t awaited_children() const noexcept { return _child_waits.size(); }
-	// Descriptors currently awaited (#209), on the same terms: a counter a test
-	// reads, and a table that has to be empty again when the wait is over.
-	[[nodiscard]] std::size_t awaited_fds() const noexcept { return _fd_wait_count; }
+	[[nodiscard]] std::size_t awaited() const noexcept { return _await_count; }
 	[[nodiscard]] const fiber::scheduler& reactors() const noexcept { return _sched; }
 	// Fibers spawned, which is one per reactor the dispatch table has ever held.
 	[[nodiscard]] std::size_t reactor_fibers() const noexcept { return _lanes.size(); }
@@ -1007,54 +1007,50 @@ private:
 	// A static member for the reason `reactor_body` is one: `fiber::entry_fn` is a
 	// plain function pointer and a `void*`.
 	static void execution_body(fiber::scheduler& on, void* userdata);
-	// Every awaited child that has something to report, reaped and its waiter
-	// woken. Run when the poll comes back - the SIGCHLD byte is what made it come
-	// back - and once more from inside `await_child`'s enlist, which is how a
-	// child that finished before anybody asked is noticed without a wake.
-	void reap_awaited_children() noexcept;
-
-	// ONE OUTSTANDING WAIT, ON THE WAITING FIBER'S OWN STACK. The `child_wait` is
-	// a local in `await_child`'s frame and the table holds its address, which is
-	// safe for precisely the length of the wait: the fiber is parked, so the frame
-	// is frozen, and the entry is removed before `complete` lets it run again.
-	// (This is coost's `io_event` shape, and it is the reason the table needs no
-	// allocation and no ownership rule.)
-	struct child_wait {
-		pid_t pid = -1;
-		int flags = 0;
-		int* status = nullptr;   // the executor's own `wait_status`
-		fiber::await_slot slot;
-	};
-
-	// THE SAME SHAPE FOR A DESCRIPTOR (#209), and deliberately the same shape:
-	// an entry on the awaiting fiber's frame, alive for exactly the length of the
-	// wait, removed before `complete` lets the fiber run again. There is no
-	// `events` field because there is one interest - readable - and building the
-	// writable and the timeout cases before phase 2 has a customer for them would
-	// be inventing a `select` nobody has asked for.
-	struct fd_wait {
+	// ONE OUTSTANDING WAIT, ON THE WAITING FIBER'S OWN STACK - AND ONE TABLE FOR
+	// EVERY KIND OF WAIT (#208, #209; made one by #211 §1.1). The entry is a local
+	// in `await_child`'s or `await_readable`'s frame and the table holds its
+	// address, which is safe for precisely the length of the wait: the fiber is
+	// parked, so the frame is frozen, and the entry is removed before `complete`
+	// lets it run again. (coost's `io_event` shape, and the reason the table needs
+	// no allocation and no ownership rule.)
+	//
+	// WHAT IS BEING WAITED FOR LIVES IN THE CALLER'S OWN FRAME AND NOT HERE: a
+	// pid, its flags and the executor's `wait_status`; or a descriptor. What this
+	// loop keeps is a function that answers "has it happened, and with what" and
+	// the `void*` to ask it about - the same trade `lesh_reactor_fn` and the
+	// `watch` topic already make. It is what kept the second verb from being a
+	// second table, a second servicer, a second accessor and a second guard in
+	// `turn`, and it is what keeps the third from being those things either.
+	struct awaiter {
+		bool (*ready)(void* self, std::intptr_t& answer) noexcept = nullptr;
+		void* self = nullptr;
+		// The descriptor this wait needs in the turn's poll set, or -1 for a wait
+		// whose wake arrives some other way - a child's does, as the SIGCHLD byte
+		// on the signal topic.
 		int fd = -1;
 		fiber::await_slot slot;
 	};
 
-	// Every awaited descriptor that is ready, its waiter removed and woken. Run
-	// when the poll comes back and once more from inside `await_readable`'s
-	// enlist, which is how a descriptor that was ALREADY readable - a regular
-	// file, always; a pipe with the line still in it, usually - never parks at
-	// all. Exactly `reap_awaited_children`'s two call sites, for exactly its
-	// reason.
-	void wake_readable_fds() noexcept;
+	// One entry into the table, and the probe that follows it. The `enlist` half of
+	// both verbs, so the capacity check and the ask-once are written once.
+	void enlist(awaiter& waiting) noexcept;
 
-	// A FIXED CAPACITY AND AN ASSERT, because `await_readable` is reached through
-	// a `noexcept` verb and must not allocate on the way (`_child_waits` buys the
-	// same property with a `reserve` at construction; an inline array buys it
-	// without a heap block at all). FOUR, where one is what today's shapes can
-	// produce: the execution fiber awaits one descriptor at a time and nothing
-	// else awaits any. The three spare are for the nested read `vared` will want
-	// and the providers phase 2 will add; an overflow asserts and then DEGRADES
-	// to the no-op - the caller's `::read` blocks, which is what it did before
-	// this ticket - rather than writing past the end of the table.
-	static constexpr std::size_t kMaxFdWaits = 4;
+	// Every outstanding wait asked whether it is over, and every one that is
+	// removed and its waiter woken. Run when the poll comes back - whatever made
+	// it come back - and once more from inside each verb's own `enlist`, which is
+	// how a thing that has ALREADY happened is noticed without a wake: the child
+	// that exited turns ago, the regular file that is always readable.
+	void service_awaits() noexcept;
+
+	// A FIXED CAPACITY AND AN ASSERT, because both verbs are reached through a
+	// `noexcept` interface and must not allocate on the way. EIGHT, where one is
+	// what today's shapes can produce: the execution fiber waits for one thing at
+	// a time and nothing else waits at all. The spare are for the nested read
+	// `vared` will want and the providers phase 2 will add; an overflow asserts and
+	// then DEGRADES to the no-op - the caller blocks, which is what it did before
+	// either verb existed - rather than writing past the end of the table.
+	static constexpr std::size_t kMaxAwaits = 8;
 
 	// How far above the cursor the top of the frame the terminal is showing sits
 	// (#185). `loop_options::assume_reflow` picks the model; the reflowing one
@@ -1190,9 +1186,9 @@ private:
 	std::string _dispatch_shell_reactor;
 	bool _dispatch_valid = false;
 	// THE TOPICS AND THE INTERESTS SHARE ONE ARRAY (#209). A turn's poll set is
-	// the fixed topics plus whatever `_fd_waits` holds, so the array is sized for
-	// both and `turn` fills as many of its slots as this turn happens to need.
-	std::array<struct pollfd, static_cast<std::size_t>(topic::count_) + kMaxFdWaits>
+	// the fixed topics plus whatever descriptors `_awaits` names, so the array is
+	// sized for both and `turn` fills as many of its slots as this turn needs.
+	std::array<struct pollfd, static_cast<std::size_t>(topic::count_) + kMaxAwaits>
 		_poll{};
 
 	// One armed timer, WHOLE (#168). The declaration - the action's name and the
@@ -1265,19 +1261,13 @@ private:
 	// because the host cannot park.
 	fiber::slot<std::string> _exec_inbox{_sched};
 	fiber::slot<std::int32_t> _exec_done{_sched};
-	// Who is waiting for which child. Pointers into the awaiting fibers' own
-	// frames - see `child_wait` - and reserved at construction so that
-	// `await_child`, which is reached through a `noexcept` verb, does not
-	// allocate. One entry is all today's shapes can produce: the execution fiber
-	// waits for one child at a time and nothing else waits at all.
-	std::vector<child_wait*> _child_waits;
-	// AND WHO IS WAITING FOR WHICH DESCRIPTOR (#209). The same pointers-into-
-	// frames rule, in a fixed array rather than a vector because this one is
-	// reached through a `noexcept` verb with no constructor to reserve in and
-	// there is nothing here a heap block would buy. Nearly always empty, which is
-	// the fast path: a turn with no interests builds the poll set it always built.
-	std::array<fd_wait*, kMaxFdWaits> _fd_waits{};
-	std::size_t _fd_wait_count = 0;
+	// WHO IS WAITING FOR WHAT. Pointers into the awaiting fibers' own frames - see
+	// `awaiter` - in a fixed array, because both verbs are reached through a
+	// `noexcept` interface with no constructor to reserve in. Nearly always empty,
+	// which is the fast path: a turn with nothing outstanding builds the poll set
+	// it always built and asks nobody anything.
+	std::array<awaiter*, kMaxAwaits> _awaits{};
+	std::size_t _await_count = 0;
 
 	// THE POLL HAS FAILED AND A COMMAND IS STILL RUNNING (#211 §4.1). Set once,
 	// never cleared: the turns that follow keep only the signal topic - the

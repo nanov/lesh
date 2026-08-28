@@ -567,10 +567,6 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	_signal_numbers.reserve(8);
 	_out.reserve(4096);
 	_accepted.reserve(256);
-	// RESERVED, because `await_child` is reached through a `noexcept` verb and
-	// must not allocate. Eight is far past what any shape today can produce -
-	// there is one execution fiber and it waits for one child at a time.
-	_child_waits.reserve(8);
 
 	install_fork_child_detection();
 }
@@ -823,8 +819,9 @@ turn_result event_loop::turn(int timeout_ms) {
 	// THIS IS ALSO HOW THE TTY GETS BACK IN WHILE A COMMAND RUNS. The topic above
 	// is out during `executing` (#208) and `await_readable(0)` from the `read`
 	// builtin puts the same descriptor here instead - polled, never drained.
-	for (std::size_t i = 0; i < _fd_wait_count; ++i)
-		(void)poll_on(_fd_waits[i]->fd);
+	for (std::size_t i = 0; i < _await_count; ++i)
+		if (_awaits[i]->fd >= 0)
+			(void)poll_on(_awaits[i]->fd);
 	// AND A POLL THAT HAS ALREADY FAILED KEEPS ONLY THE SIGNAL TOPIC (#211 §4.1).
 	// One of the descriptors in the set has gone and the kernel does not say which;
 	// the self-pipe is this process's own, and the SIGCHLD byte on it is the one
@@ -905,19 +902,13 @@ turn_result event_loop::turn(int timeout_ms) {
 	if (signal_at >= 0
 	    && (ready < 0 || revents_of(_poll[static_cast<std::size_t>(signal_at)]) != 0))
 		drain_signal_topic(result);
-	// THE FOREGROUND WAIT'S OTHER HALF (#208). The SIGCHLD byte is what made the
-	// poll come back; this is where the awaited children are reaped and their
-	// fibers woken. Guarded on the table rather than on the phase, so a wait taken
-	// from anywhere else would be served the same way, and costing one
-	// `waitpid(WNOHANG)` per outstanding wait per wake.
-	if (!_child_waits.empty())
-		reap_awaited_children();
-	// AND THE INPUT WAIT'S OTHER HALF (#209), on exactly the same terms: guarded
-	// on the table rather than on the phase, so a wait taken from anywhere would
-	// be served the same way, and costing one zero-timeout `select` per
-	// outstanding wait per wake.
-	if (_fd_wait_count != 0)
-		wake_readable_fds();
+	// EVERY WAIT'S OTHER HALF (#208, #209, one function since #211 §1.1). Whatever
+	// made the poll come back - the SIGCHLD byte, a descriptor - this is where the
+	// waits that are over are removed and their fibers woken. Guarded on the table
+	// rather than on the phase, so a wait taken from anywhere is served the same
+	// way, and costing one probe per outstanding wait per wake.
+	if (_await_count != 0)
+		service_awaits();
 	// AND NO TIMERS WHILE A COMMAND RUNS. A timer expiring here would dispatch an
 	// action into an editor that has no terminal; the arming survives, and the
 	// first turn after `resume_after_execution` fires whatever is due.
@@ -1972,6 +1963,75 @@ std::int32_t event_loop::run_the_line(std::string_view line) {
 	return _exec_done.try_recv().value_or(0);
 }
 
+namespace {
+
+// WHAT A FOREGROUND WAIT KEEPS ON THE WAITING FIBER'S OWN FRAME (#208; §1.1).
+// `waitpid`'s three arguments, and nothing the loop has to learn: the table
+// holds the address of one of these and a function that reads it.
+struct child_frame {
+	pid_t pid = -1;
+	int flags = 0;
+	int* status = nullptr;   // the executor's own `wait_status`
+};
+
+// ONLY AWAITED PIDS, NEVER `-1`. A background child stays a zombie until `wait`
+// asks for it, exactly as it did before #208, so nothing about job control moved
+// there and nothing moves here.
+//
+// WNOHANG ON TOP OF THE CALL SITE'S OWN FLAGS, which is what keeps `WUNTRACED`
+// meaning what it means: a foreground command stopped by Ctrl-Z reports here
+// exactly as it reported to the blocking wait, and the executor's stop path runs
+// unchanged.
+//
+// `> 0` is an exit or a stop; `< 0` is ECHILD, which is `waitpid`'s own answer
+// and the one the blocking call would have returned. Either is the end of the
+// wait; only `0` - still running - is not.
+bool child_is_done(void* self, std::intptr_t& answer) noexcept {
+	auto& waiting = *static_cast<child_frame*>(self);
+	for (;;) {
+		int status = 0;
+		const pid_t got = ::waitpid(waiting.pid, &status, waiting.flags | WNOHANG);
+		if (got == 0)
+			return false;
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (waiting.status != nullptr)
+			*waiting.status = status;
+		answer = got;
+		return true;
+	}
+}
+
+// THE INTEREST IS ASKED PER WAITER rather than read off the turn's `revents`
+// (#209): one zero-timeout `select` per outstanding wait per wake, 0.2 us on this
+// platform (see `ready_now`), and it buys ONE probe with the two call sites the
+// table has - the turn, and the verb's own `enlist`, which has no poll set to
+// read. Mapping poll slots back to entries would have been the same work plus an
+// index that goes stale the moment an entry is removed.
+//
+// EVERYTHING THAT IS NOT "NOTHING THERE YET" MEANS GO AND READ IT, deliberately.
+// `ready > 0` is POLLIN, or a POLLHUP/POLLERR that `revents_of` has always folded
+// into "go and drain it", or a POLLNVAL from a descriptor that is not open;
+// `ready < 0` is a poll that refuses the set at all. In every one of those the
+// caller's `::read` is the thing with the right answer - a byte, end of file, or
+// EBADF, which `read` reports as end of input - and a wait would be for ever.
+bool fd_is_readable(void* self, std::intptr_t& answer) noexcept {
+	for (;;) {
+		struct pollfd one{};
+		one.fd = *static_cast<const int*>(self);
+		one.events = POLLIN;
+		const int ready = ready_now(&one, 1, 0);
+		if (ready == 0)
+			return false;
+		if (ready < 0 && errno == EINTR)
+			continue;
+		answer = 1;
+		return true;
+	}
+}
+
+} // namespace
+
 pid_t event_loop::await_child(pid_t pid, int flags, int* status) noexcept {
 	// NO SIGCHLD, NO WAKE - so do the thing that always worked (#208).
 	//
@@ -1986,52 +2046,14 @@ pid_t event_loop::await_child(pid_t pid, int flags, int* status) noexcept {
 	if (_signals == nullptr || !_signals->catches(SIGCHLD))
 		return ::waitpid(pid, status, flags);
 
-	child_wait waiting;
-	waiting.pid = pid;
-	waiting.flags = flags;
-	waiting.status = status;
+	child_frame frame{pid, flags, status};
+	awaiter waiting{&child_is_done, &frame, -1, {}};
 	return static_cast<pid_t>(_sched.block_or_park(
 		waiting.slot,
 		// No fiber to park: an action's `port_call`, the EXIT trap after `run()`
 		// has returned, or `execution_mode::inline_`.
 		[&] { return ::waitpid(pid, status, flags); },
-		[&] {
-			_child_waits.push_back(&waiting);
-			// AND ASK ONCE, RIGHT NOW. The child may already be a zombie - `sleep
-			// 0.1 & wait` is the ordinary shape - and the SIGCHLD that said so may
-			// have been drained turns ago. `reap_awaited_children` completes the
-			// slot in that case, and `block_or_park` then never parks.
-			reap_awaited_children();
-		}));
-}
-
-void event_loop::reap_awaited_children() noexcept {
-	// ONLY AWAITED PIDS, NEVER `-1`. A background child stays a zombie until
-	// `wait` asks for it, exactly as it did before this ticket, so nothing about
-	// job control moves here - the "the shell notices mid-command" upgrade is a
-	// later ticket built on this seam and not a side effect of it.
-	//
-	// WNOHANG ON TOP OF THE CALL SITE'S OWN FLAGS, which is what keeps `WUNTRACED`
-	// meaning what it means: a foreground command stopped by Ctrl-Z reports here
-	// exactly as it reported to the blocking wait, and the executor's stop path
-	// runs unchanged.
-	for (std::size_t i = 0; i < _child_waits.size();) {
-		child_wait& waiting = *_child_waits[i];
-		int wait_status = 0;
-		const pid_t got = ::waitpid(waiting.pid, &wait_status, waiting.flags | WNOHANG);
-		if (got == 0)
-			{ ++i; continue; }              // still running: leave it enlisted
-		if (got < 0 && errno == EINTR)
-			continue;                       // ask again for the same waiter
-		// `> 0` is an exit or a stop; `< 0` is ECHILD, which is `waitpid`'s own
-		// answer and the one the blocking call would have returned. Either way the
-		// wait is over, so the entry goes before the waiter is woken - a woken
-		// fiber may enlist again on its very next statement.
-		if (waiting.status != nullptr)
-			*waiting.status = wait_status;
-		_child_waits.erase(_child_waits.begin() + static_cast<std::ptrdiff_t>(i));
-		waiting.slot.complete(got);
-	}
+		[&] { enlist(waiting); }));
 }
 
 void event_loop::await_readable(int fd) noexcept {
@@ -2040,64 +2062,50 @@ void event_loop::await_readable(int fd) noexcept {
 	if (fd < 0)
 		return;
 
-	fd_wait waiting;
-	waiting.fd = fd;
+	int descriptor = fd;
+	awaiter waiting{&fd_is_readable, &descriptor, fd, {}};
 	(void)_sched.block_or_park(
 		waiting.slot,
 		// NO FIBER TO PARK, so there is nothing to say: `execution_mode::inline_`,
 		// an action's `port_call`, a `read` in the EXIT trap after `run()` has
 		// returned. The caller's `::read` blocks on this stack, exactly as it did
-		// before this ticket - which is the same answer the no-op cooperation
-		// gives every non-interactive shell.
+		// before #209 - which is the same answer the no-op cooperation gives every
+		// non-interactive shell.
 		[] { return 0; },
-		[&] {
-			// THE ONE PLACE THE FIXED CAPACITY IS CHECKED, and an overflow degrades
-			// rather than corrupts: no entry means no park, which means the blocking
-			// read above. Unreachable with today's shapes - one waiter, one fd.
-			if (_fd_wait_count >= kMaxFdWaits) {
-				LESH_ASSERT(false && "more descriptors awaited than the table can hold");
-				waiting.slot.complete(0);
-				return;
-			}
-			_fd_waits[_fd_wait_count++] = &waiting;
-			// AND ASK ONCE, RIGHT NOW - `await_child`'s move, for `await_child`'s
-			// reason. A regular file is always readable and a pipe usually has the
-			// rest of the line already in it, so the common `read` never parks at
-			// all and never reaches a poll: `wake_readable_fds` completes the slot
-			// here and `block_or_park`'s loop returns without a switch.
-			wake_readable_fds();
-		});
+		[&] { enlist(waiting); });
 }
 
-void event_loop::wake_readable_fds() noexcept {
-	// ASKED PER WAITER RATHER THAN READ OFF THE TURN'S `revents`, which is what
-	// lets this be one function with the two call sites `reap_awaited_children`
-	// has - the enlist probe has no poll set to read - and costs a `select` with
-	// a zero timeout per outstanding wait per wake (0.2 us; see `ready_now`).
-	for (std::size_t i = 0; i < _fd_wait_count;) {
-		struct pollfd one{};
-		one.fd = _fd_waits[i]->fd;
-		one.events = POLLIN;
-		const int ready = ready_now(&one, 1, 0);
-		if (ready == 0)
-			{ ++i; continue; }              // nothing there yet: leave it enlisted
-		if (ready < 0 && errno == EINTR)
-			continue;                       // ask again for the same waiter
-		// EVERYTHING ELSE MEANS "GO AND READ IT", and deliberately so. `ready > 0`
-		// is POLLIN, or a POLLHUP/POLLERR that `revents_of` has always folded into
-		// "go and drain it", or a POLLNVAL from a descriptor that is not open;
-		// `ready < 0` is a poll that refuses the set at all. In every one of those
-		// the caller's `::read` is the thing with the right answer - a byte, end of
-		// file, or EBADF, which `read` reports as end of input - and a wait would
-		// be for ever.
-		fd_wait* const waiting = _fd_waits[i];
-		// The entry goes BEFORE the waiter is woken, for `reap_awaited_children`'s
-		// reason: a woken fiber enlists again on its very next statement, which for
-		// this verb is the next byte of the same line.
-		for (std::size_t at = i + 1; at < _fd_wait_count; ++at)
-			_fd_waits[at - 1] = _fd_waits[at];
-		--_fd_wait_count;
-		waiting->slot.complete(1);
+void event_loop::enlist(awaiter& waiting) noexcept {
+	// THE ONE PLACE THE FIXED CAPACITY IS CHECKED, and an overflow degrades rather
+	// than corrupts: no entry means no park, which means the blocking call the
+	// `run_blocking` branch would have taken. Unreachable with today's shapes -
+	// one waiter, one thing waited for.
+	if (_await_count >= kMaxAwaits) {
+		LESH_ASSERT(false && "more waits outstanding than the table can hold");
+		waiting.slot.complete(0);
+		return;
+	}
+	_awaits[_await_count++] = &waiting;
+	// AND ASK ONCE, RIGHT NOW. The thing may have happened already - `sleep 0.1 &
+	// wait` finds a zombie whose SIGCHLD was drained turns ago, and a regular file
+	// is always readable - in which case `service_awaits` completes the slot here
+	// and `block_or_park`'s loop returns without ever parking.
+	service_awaits();
+}
+
+void event_loop::service_awaits() noexcept {
+	for (std::size_t i = 0; i < _await_count;) {
+		awaiter& waiting = *_awaits[i];
+		std::intptr_t answer = 0;
+		if (!waiting.ready(waiting.self, answer))
+			{ ++i; continue; }             // not yet: leave it enlisted
+		// THE ENTRY GOES BEFORE THE WAITER IS WOKEN, because a woken fiber may
+		// enlist again on its very next statement - which for `await_readable` is
+		// the next byte of the same line.
+		for (std::size_t at = i + 1; at < _await_count; ++at)
+			_awaits[at - 1] = _awaits[at];
+		--_await_count;
+		waiting.slot.complete(answer);
 	}
 }
 
