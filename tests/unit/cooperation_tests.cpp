@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -35,7 +36,21 @@ class counting_cooperation final : public cooperation {
 public:
 	void on_command_boundary() noexcept override { ++calls; }
 
+	// AND IT REALLY WAITS (#208). A double that answered without reaping would
+	// leave the executor reading an uninitialised status and the shell full of
+	// zombies, so what is counted is the CALL and what is done is exactly what the
+	// no-op does. The flags are recorded per call, because "WUNTRACED exactly
+	// where the file has it today" is the half of this seam a regression would
+	// silently break: without it a Ctrl-Z'd foreground command never returns.
+	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
+		++waits;
+		flags_seen.push_back(flags);
+		return ::waitpid(pid, status, flags);
+	}
+
 	std::size_t calls = 0;
+	std::size_t waits = 0;
+	std::vector<int> flags_seen;
 };
 
 class CooperationTest : public ::testing::Test {
@@ -61,6 +76,16 @@ protected:
 		state.set_cooperation(host);
 		(void)run(src);
 		return host.calls;
+	}
+
+	// The other counter, over the same door. Returns the flags of every wait the
+	// snippet made, in order, so a test can assert both how many and which.
+	std::vector<int> waits(std::string_view src) {
+		host.waits = 0;
+		host.flags_seen.clear();
+		state.set_cooperation(host);
+		(void)run(src);
+		return host.flags_seen;
 	}
 };
 
@@ -169,6 +194,75 @@ TEST_F(CooperationTest, EvalRunsBoundariesOfItsOwn) {
 }
 
 // ---------------------------------------------------------------------------
+// THE FOREGROUND WAIT (#208, phase 2a of #145)
+// ---------------------------------------------------------------------------
+//
+// Same discipline as the boundary above: what is asserted is WHERE the runtime
+// asks and WITH WHICH FLAGS, because those are the contract a host builds a
+// park on. The counts are derived from the file - one `reap` per foreground
+// child, one per `wait` operand - rather than recorded from a run.
+//
+// `/bin/echo` AND `/bin/cat` rather than the builtins of the same name, because
+// a builtin does not fork and therefore never reaches a wait at all. That is
+// itself the first assertion.
+
+// A builtin runs in this process. No fork, no child, no wait - which is what
+// makes "one wait per foreground EXTERNAL" the sentence it is.
+TEST_F(CooperationTest, ABuiltinNeverReachesTheWait) {
+	EXPECT_TRUE(waits(":\n:\n:\n").empty());
+}
+
+// THE ONE WAIT CTRL-Z CAN REACH, and the only reason `WUNTRACED` is in this file
+// at all (#161): #159 handed the terminal to this child and reset its SIGTSTP to
+// the default, so a plain wait would never return for a stopped command.
+TEST_F(CooperationTest, AForegroundExternalIsOneWaitWithWUNTRACED) {
+	EXPECT_EQ(waits("/bin/echo a >/dev/null\n"), (std::vector<int>{WUNTRACED}));
+}
+
+// Every stage of a foreground pipeline is a foreground child, so every stage is
+// a `WUNTRACED` wait - which is what lets Ctrl-Z stop `sleep 30 | cat` rather
+// than only its head.
+TEST_F(CooperationTest, EveryPipelineStageIsAWaitWithWUNTRACED) {
+	EXPECT_EQ(waits("/bin/echo a | /bin/cat >/dev/null\n"),
+	          (std::vector<int>{WUNTRACED, WUNTRACED}));
+}
+
+// A `( )` the shell is waiting on is a foreground job and reaps like one (#158
+// decision 5). ONE wait here and not two: the command inside the subshell is
+// waited for by the SUBSHELL, whose `enter_subshell` put the no-op back, so its
+// wait never reaches this host.
+TEST_F(CooperationTest, AForegroundSubshellIsOneWaitWithWUNTRACED) {
+	EXPECT_EQ(waits("( /bin/echo a >/dev/null )\n"), (std::vector<int>{WUNTRACED}));
+}
+
+// NO `WUNTRACED` HERE, and #161 gives the reason: a command substitution never
+// receives the terminal (#158 decision 3 forbids it by name), so Ctrl-Z cannot
+// reach this child and a stop has no status the enclosing expansion could be
+// finished with.
+TEST_F(CooperationTest, ACommandSubstitutionWaitsWithoutWUNTRACED) {
+	EXPECT_EQ(waits("x=$(/bin/echo hi)\n"), (std::vector<int>{0}));
+}
+
+// ONE PER OPERAND, and no `WUNTRACED` in either form of `wait`: XCU `wait` waits
+// for TERMINATION, and a stopped background job has not terminated (#161).
+TEST_F(CooperationTest, OneWaitPerWaitOperandAndNeverWUNTRACED) {
+	// Two `&` children - which are not waited for at the `&` - and then one
+	// `wait` per known child in the no-operand form.
+	EXPECT_EQ(waits("/bin/echo a >/dev/null &\n/bin/echo b >/dev/null &\nwait\n"),
+	          (std::vector<int>{0, 0}));
+}
+
+// The seam is never null and the default is `::waitpid`, so a shell that
+// installed no host still runs externals correctly. Asserted through the STATUS,
+// because a `reap` that answered without reaping would leave `$?` reading an
+// uninitialised `wait_status`.
+TEST_F(CooperationTest, TheNoOpWaitIsWaitpidAndTheStatusIsRight) {
+	EXPECT_EQ(&state.cooperation(), &noop_cooperation());
+	EXPECT_EQ(run("/bin/sh -c 'exit 3'\n"), 3);
+	EXPECT_EQ(run("/bin/sh -c 'exit 0'\n"), 0);
+}
+
+// ---------------------------------------------------------------------------
 // A FORKED CHILD COOPERATES WITH NOBODY (#202, answering #199's open question)
 // ---------------------------------------------------------------------------
 
@@ -208,6 +302,12 @@ class reporting_cooperation final : public cooperation {
 public:
 	explicit reporting_cooperation(int write_fd, pid_t owner) noexcept
 		: _fd(write_fd), _owner(owner) {}
+
+	// See `counting_cooperation`: the double really reaps, so what it proves is
+	// about the seam and not about a stub.
+	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
+		return ::waitpid(pid, status, flags);
+	}
 
 	void on_command_boundary() noexcept override {
 		const char who = ::getpid() == _owner ? 'P' : 'C';

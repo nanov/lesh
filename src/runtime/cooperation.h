@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/types.h>
+
 namespace lesh::runtime {
 
 // WHAT THE RUNTIME WANTS OF WHATEVER IS HOSTING IT (#199, step 1a of #145).
@@ -45,11 +47,36 @@ public:
 	// host throwing out of it would unwind the shell through code that expects to
 	// return a status.
 	//
-	// v1 IS A NO-OP FOR EVERYONE: nothing installs an implementation yet (the
-	// one-thread ticket does). Phase 2 of #145 adds `wait_child(pid)` and
-	// `await_readable(fd)` here, at which point `vared`'s nested read becomes a
-	// nested await. Neither is declared before it has a caller.
+	// v1 WAS A NO-OP FOR EVERYONE and still is for every non-interactive shell.
+	// Phase 2 of #145 adds `await_readable(fd)` beside `wait_child` below, at
+	// which point `vared`'s nested read becomes a nested await. Neither was
+	// declared before it had a caller.
 	virtual void on_command_boundary() noexcept = 0;
+
+	// THE FOREGROUND WAIT, AND THE SECOND VERB (#208, phase 2a of #145).
+	//
+	// `::waitpid(pid, status, flags)`, said as a question rather than as a
+	// syscall. The executor has exactly one wait - `tree_walking_executor::reap`,
+	// which every one of its seven former `waitpid` sites now goes through - and
+	// what it means is "I have nothing to do until this child does something;
+	// whoever is hosting me may use the thread until then".
+	//
+	// THE NO-OP IMPLEMENTATION *IS* `::waitpid`, which is the whole reason this
+	// verb can be introduced without moving a single behaviour: `lesh -c`, a
+	// script, a unit test and a forked child call through one indirect call into
+	// the identical syscall with the identical arguments. Only an interactive
+	// host answers differently, and even it answers differently only when there
+	// is a fiber to park - see `ui::event_loop::await_child`.
+	//
+	// THE ARGUMENTS ARE `waitpid`'s, IN `waitpid`'s ORDER OF MEANING but with the
+	// flags beside the pid, because at every call site the flags are a property of
+	// the WAIT (`WUNTRACED` where Ctrl-Z can reach it, nothing where it cannot)
+	// and the status is the out-parameter. The answer is `waitpid`'s answer: the
+	// pid, or -1 when there is no such child.
+	//
+	// `noexcept`, for the reason `on_command_boundary` is: this is called from
+	// inside the executor, which expects to return a status rather than to unwind.
+	virtual pid_t wait_child(pid_t pid, int flags, int* status) noexcept = 0;
 };
 
 // The non-interactive answer, and the default every `shell_state` starts with.
