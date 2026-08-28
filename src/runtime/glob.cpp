@@ -57,7 +57,12 @@ void expand_component(const std::string& dir, std::string_view component,
 
 bool expand_pathnames(buffer_pool& pool, std::string_view word,
                       arena_array<std::string_view>& out) {
-	if (!has_pattern_characters(word))
+	// POSIX 2.13.1's bracket rule is applied HERE rather than at the expander's
+	// segment gate, because it is a question about the whole word: an unterminated
+	// `[` is an ordinary character, and this is the first place the assembled word
+	// exists to be asked about. Returning false is the observable that says no
+	// directory was opened - it is the statement before the walk.
+	if (!is_pattern(word))
 		return false;
 
 	const bool absolute = !word.empty() && word[0] == '/';
@@ -74,7 +79,10 @@ bool expand_pathnames(buffer_pool& pool, std::string_view word,
 		if (!component.empty()) {
 			std::vector<std::string> next;
 			for (const auto& dir : current) {
-				if (has_pattern_characters(component)) {
+				// The same question again, per component: `[a/b]` holds a `[`
+				// and a `]`, but a bracket expression cannot span a `/`, so
+				// neither component is a pattern and neither is scanned.
+				if (is_pattern(component)) {
 					expand_component(dir, component, is_last, next);
 				} else {
 					// A literal component: extend without a directory scan - a

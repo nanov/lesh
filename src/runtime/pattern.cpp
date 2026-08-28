@@ -1,6 +1,7 @@
 #include "runtime/pattern.h"
 
 #include <cstddef>
+#include <tuple>
 
 namespace lesh::runtime {
 
@@ -244,6 +245,58 @@ bool has_pattern_characters(std::string_view text) noexcept {
 			continue;
 		}
 		if (text[i] == '*' || text[i] == '?' || text[i] == '[')
+			return true;
+	}
+	return false;
+}
+
+bool is_pattern(std::string_view word) noexcept {
+	size_t last_close = std::string_view::npos;
+	bool looked_for_close = false;
+
+	for (size_t i = 0; i < word.size(); ++i) {
+		if (word[i] == '\\') {
+			++i;  // escaped: not a metacharacter
+			continue;
+		}
+		if (word[i] == '*' || word[i] == '?')
+			return true;
+		// A `]` is never a metacharacter on its own, so it is not tested for here
+		// at all - only reached as the terminator of a `[` found below.
+		if (word[i] != '[')
+			continue;
+
+		// Located once, on the first `[` and never for a word without one, so the
+		// overwhelming majority of words still cost exactly the loop above. It is
+		// also what keeps `[[[[[[...` linear: with no `]` anywhere to the right,
+		// no bracket can close, and none of them is scanned to the end of the word
+		// to find that out one at a time.
+		if (!looked_for_close) {
+			for (size_t j = 0; j < word.size(); ++j) {
+				if (word[j] == '\\')
+					++j;
+				else if (word[j] == ']')
+					last_close = j;
+			}
+			looked_for_close = true;
+		}
+		if (last_close == std::string_view::npos || i >= last_close)
+			continue;
+
+		// Asked of the MATCHER rather than decided here. "Does this bracket close"
+		// is a question about bracket grammar - `[]a]` holds a literal `]`, and the
+		// `]` inside `[[:alpha:]]` terminates the class rather than the expression -
+		// and a second opinion about that grammar is exactly what #23 exists to
+		// prevent. The subject byte cannot change the answer: match_bracket reads it
+		// only to decide whether the expression MATCHED.
+		//
+		// Every `[` is tried, not just the first, because the matcher re-reads from
+		// the byte after one that opened nothing: `[[:alpha:]` is a literal `[`
+		// followed by a character class, and so is a pattern after all.
+		size_t past = i;
+		bool well_formed = true;
+		std::ignore = match_bracket(word, past, '\0', well_formed);
+		if (well_formed)
 			return true;
 	}
 	return false;

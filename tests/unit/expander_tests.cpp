@@ -2,8 +2,11 @@
 
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <map>
 #include <string>
 #include <tuple>
@@ -1262,4 +1265,47 @@ TEST_F(ExpanderTest, DollarSingleQuoteIsLiteralInsideDoubleQuotes) {
 	// zsh alike, and the same rule that makes `echo "it's"` print `it's`.
 	EXPECT_EQ(expand("echo \"$'a\\nb'\""),
 	          (std::vector<std::string>{"echo", "$'a\\nb'"}));
+}
+
+// --- POSIX 2.13.1's bracket rule at the field level (#204) -------------------
+
+TEST_F(ExpanderTest, AnUnterminatedBracketIsAnOrdinaryCharacterInAField) {
+	// The word names itself, and - the point of #204 - reaches that answer without
+	// a directory scan. `[ $i -lt 1 ]` is two such words per loop iteration.
+	EXPECT_EQ(expand("echo ["), (std::vector<std::string>{"echo", "["}));
+	EXPECT_EQ(expand("echo ]"), (std::vector<std::string>{"echo", "]"}));
+	EXPECT_EQ(expand("echo [abc"), (std::vector<std::string>{"echo", "[abc"}));
+	EXPECT_EQ(expand("echo a[b"), (std::vector<std::string>{"echo", "a[b"}));
+	EXPECT_EQ(expand("echo []"), (std::vector<std::string>{"echo", "[]"}));
+	EXPECT_EQ(expand("echo [ $i -lt 1 ]"),
+	          (std::vector<std::string>{"echo", "[", "-lt", "1", "]"}));
+}
+
+TEST_F(ExpanderTest, QuotingABracketIsUnchangedByTheRule) {
+	// `\[` and `"["` were literal before the rule and are literal after it - by a
+	// different mechanism, which is why both spellings are pinned here: quoting
+	// never sets the glob-eligible flag at all, so the rule is never consulted.
+	EXPECT_EQ(expand("echo \\[a\\]"), (std::vector<std::string>{"echo", "[a]"}));
+	EXPECT_EQ(expand("echo \"[a]\""), (std::vector<std::string>{"echo", "[a]"}));
+	EXPECT_EQ(expand("echo '[a]'"), (std::vector<std::string>{"echo", "[a]"}));
+}
+
+TEST_F(ExpanderTest, ABracketExpressionMayBeASSEMBLEDFromSeveralSegments) {
+	// The reason the strict test lives at the WALK and not at the segment gate. A
+	// segment test strict enough to reject `[a` on its own would refuse this word
+	// pathname expansion entirely, and `[a]` is a perfectly good pattern once the
+	// value of $x has arrived.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a", "b"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+	params.vars["x"] = "]";
+
+	EXPECT_EQ(expand("echo " + scratch.file("[a$x")),
+	          (std::vector<std::string>{"echo", scratch.file("a")}));
+	// ...and the same word without the closing half is literal, in the same
+	// directory, so this is the rule and not an unreachable scratch tree.
+	EXPECT_EQ(expand("echo " + scratch.file("[a")),
+	          (std::vector<std::string>{"echo", scratch.file("[a")}));
 }

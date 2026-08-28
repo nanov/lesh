@@ -26,10 +26,31 @@ namespace lesh::runtime {
 [[nodiscard]] bool pattern_match(std::string_view pattern, std::string_view text,
                                  bool period_is_special = false) noexcept;
 
-// True when the pattern contains an unquoted metacharacter. A word without one
-// expands to itself, so this is the cheap test that avoids a directory scan for
-// the overwhelming majority of words.
+// True when this FRAGMENT of a word contributes an unquoted metacharacter.
+//
+// A cheap over-approximation, and deliberately so: the expander asks it of one
+// SEGMENT at a time, to decide whether the field being assembled is eligible for
+// pathname expansion at all. It cannot be the final answer, because a bracket
+// expression may open in one segment and close in another - `[a$x` with x=`]` is
+// a live bracket expression, and a segment test strict enough to reject `[a` on
+// its own would stop globbing it. Whether the assembled word is actually a
+// pattern is is_pattern's question, below.
 [[nodiscard]] bool has_pattern_characters(std::string_view text) noexcept;
+
+// True when the whole WORD is a pattern - the gate pathname expansion consults
+// before it touches the filesystem.
+//
+// Stricter than has_pattern_characters, and a second function rather than a
+// stricter version of it, because the two are asked of different text. POSIX
+// 2.13.1: a `[` with no matching `]` LATER IN THE SAME WORD is an ordinary
+// character, and a `]` on its own always is. So `[`, `[abc`, `a[b` and `[]` name
+// themselves and must not cost a directory scan - which is what `[ $i -lt 1 ]`
+// was paying, twenty microseconds an iteration, once per loop turn (#204).
+//
+// Answering it needs the word entire, which is why it lives here and not at the
+// segment gate above. Quoting is unchanged: `"["` was already literal, having
+// never set the segment flag in the first place.
+[[nodiscard]] bool is_pattern(std::string_view word) noexcept;
 
 // Every byte this matcher reads as SYNTAX rather than as data, and therefore
 // every byte that has to be escaped when it arrives QUOTED. Lives here because
