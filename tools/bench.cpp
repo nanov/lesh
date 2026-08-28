@@ -273,15 +273,18 @@ int main() {
 	// Three passes over 100000 iterations rather than many passes over few: the
 	// number wanted is nanoseconds per ITERATION, and a loop this long buries the
 	// parse and the pool setup around it.
-	// TWO SPELLINGS OF THE SAME LOOP, and the gap between them is not the seam's.
-	// `[ $i -lt 100000 ]` is the shape #199 named, and it is ~20x the cost of
-	// `test $i -lt 100000` on this machine, almost all of it SYSTEM time: `[` and
-	// `]` hold pattern characters, so each iteration attempts pathname expansion
-	// on two words that cannot match anything (the bracket expression is
-	// unterminated) and pays an opendir/readdir/closedir for each. Both are
-	// reported so a reader is not left thinking a command boundary costs 20
-	// microseconds - it costs about one, and the `test` row is the one with the
-	// resolution to see a change in it.
+	// TWO SPELLINGS OF THE SAME LOOP, and they should now agree to within a few
+	// percent. `[ $i -lt 100000 ]` is the shape #199 named, and it used to be ~19x
+	// the cost of `test $i -lt 100000` on this machine - 17400ns an iteration
+	// against 912 - almost all of it SYSTEM time: `[` holds a pattern character,
+	// so every iteration attempted pathname expansion on a word that could only
+	// ever match itself and paid an opendir/readdir/closedir for it. #204 taught
+	// the glob gate POSIX 2.13.1's rule (an unterminated `[` is an ordinary
+	// character) and the row fell to 939-952ns.
+	//
+	// Both are kept, because a DIVERGENCE between them is now the signal: the two
+	// loops differ only in how the condition is spelled, so a gap reappearing here
+	// means a word that names itself has started costing syscalls again.
 	std::printf("\ncommand-boundary cost (while loop through run_input)\n");
 	{
 		constexpr size_t kLoopIterations = 100000;
