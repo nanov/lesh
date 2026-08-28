@@ -213,6 +213,23 @@ public:
 		return out;
 	}
 
+	// THE HOST'S HALF OF `recv` (#208). `recv` parks and therefore belongs to a
+	// fiber; the host has no stack to park and asks instead. Nothing else
+	// differs - the value is moved out, the slot is empty afterwards, and
+	// `in_flight()` is the token for what was just handed over - so a host
+	// polling a slot and a fiber waiting on one see the same channel.
+	//
+	// The one customer is `event_loop`'s `done` slot: the execution fiber sends
+	// the status back and the host, which cannot park, turns until it is there.
+	[[nodiscard]] std::optional<T> try_recv() {
+		if (!_value.has_value())
+			return std::nullopt;
+		_in_flight = token(*this, _sends);
+		std::optional<T> out = std::move(_value);
+		_value.reset();
+		return out;
+	}
+
 	// The token for the value `recv` last delivered. Handed out separately rather
 	// than returned alongside the value so that `recv`'s result can be a plain
 	// `T` and the receiver can keep the token for as long as its compute lasts.

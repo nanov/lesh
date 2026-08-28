@@ -465,6 +465,12 @@ private:
 	// borrows the host, the engine, the pool and the hub, so it must die first,
 	// which means being declared last.
 	event_loop _loop;
+	// THE RUNTIME'S HOST (#208). Declared after the loop it points at and
+	// therefore destroyed before it; installed on `shell_state` in the
+	// constructor and taken away again in the destructor, because a `shell_state`
+	// outlives the session that borrowed it and a dangling host would be worse
+	// than no host at all.
+	loop_cooperation _cooperation;
 	std::optional<leshper_binding_console> _console;
 	std::optional<prompt_console_impl> _prompt_console;
 
@@ -524,6 +530,20 @@ loop_options options_for(const provider_bundle& providers, bool manage_terminal)
 	options.capabilities = leshper::terminal_capabilities::from_env(
 		std::getenv("TERM"), std::getenv("COLORTERM"), std::getenv("NO_COLOR"));
 	options.manage_terminal = manage_terminal;
+	// HOW AN ACCEPTED LINE IS RUN (#208). The fiber by default; `LESH_EXECUTION=
+	// inline` picks the direct call, which is the shell exactly as it ran before
+	// this ticket.
+	//
+	// AN ENVIRONMENT KNOB AND NOT A BUILD FLAG, for two reasons that are the same
+	// reason: the pty tests exec the real binary and must be able to drive both
+	// paths through it, and the inline path is the recorded fallback if a fiber
+	// stack ever turns out to be the wrong place to fork from - a user who hits
+	// that needs a way out that is not a rebuild. Anything other than `inline` -
+	// including the variable being absent, which is the ordinary case - is the
+	// fiber.
+	if (const char* how = std::getenv("LESH_EXECUTION");
+	    how != nullptr && std::string_view{how} == "inline")
+		options.execution = execution_mode::inline_;
 	return options;
 }
 
@@ -541,7 +561,8 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	  _host(&_knowledge,
 	        providers.completion != nullptr ? providers.completion : &_completer),
 	  _autosuggester(providers.history),
-	  _loop(loop_fds{in, out}, options_for(providers, true)) {
+	  _loop(loop_fds{in, out}, options_for(providers, true)),
+	  _cooperation(_loop) {
 	// THE SHIPPED EXTENSION SET, ON THE ENGINE THAT WAS JUST BUILT (#163),
 	// THROUGH A HOOK THIS LAYER CANNOT NAME ITSELF (#164).
 	//
@@ -606,6 +627,12 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// three used to be `shell_actor`'s constructor arguments; the loop is what
 	// calls `execute` and `port_call` now, so the loop is what holds them.
 	_loop.attach_shell(*this, &_host, &_writing);
+	// AND THE OTHER DIRECTION (#208): what the RUNTIME may ask of the host. One
+	// pointer, never null, reset to the static no-op in every forked child by
+	// `enter_subshell` - so a `( )`, a `$( )` and a non-exec pipeline stage each
+	// wait with a plain `::waitpid` on their own stack and never call into a
+	// scheduler that does not exist in their address space.
+	_state.set_cooperation(_cooperation);
 	_loop.attach_signals(_signals);
 	// THE HISTORY'S DIRECTORY WATCH, as the loop's sixth topic (#195, ADR-0010
 	// §Locking and staleness; fish #3565). One `int` and one function pointer:
@@ -663,6 +690,12 @@ session::~session() {
 	// And the prompt's, before the engine it points at goes. Same rule, same
 	// sentence: the owner takes the view away as it takes the object.
 	_state.set_prompt_console(nullptr);
+	// And the host (#208), by the same rule and with the same sentence - except
+	// that here "nothing" is an object rather than a null, because a command
+	// boundary happens in every shell and "nobody is waiting for it" is a
+	// behaviour. A `shell_state` that outlives this session goes back to being a
+	// non-interactive one.
+	_state.set_cooperation(runtime::noop_cooperation());
 }
 
 void session::register_line_actions() {

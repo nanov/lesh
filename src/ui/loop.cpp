@@ -1,7 +1,7 @@
 #include "ui/loop.h"
 
 #include "fiber/slot.h"
-
+#include "fiber/stack.h"
 #include "leshper/keymap.h"
 #include "substrate/assert.h"
 #include "substrate/fork_guard.h"
@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
@@ -339,6 +340,17 @@ void signal_hub::deliver(int signo) noexcept {
 	previous(signo);
 }
 
+bool signal_hub::catches(int signo) const noexcept {
+	// ASKED OF THE KERNEL. See the header: a `trap` inside the command that is
+	// running now has already replaced the disposition and the `reassert` on the
+	// way out of that command has not happened yet, so a member would be stale
+	// exactly when the answer matters.
+	struct sigaction now{};
+	if (signo < 0 || signo >= kMaxTrackedSignal || ::sigaction(signo, nullptr, &now) != 0)
+		return false;
+	return (now.sa_flags & SA_SIGINFO) == 0 && now.sa_handler == &fish_style_handler;
+}
+
 void signal_hub::poke() noexcept {
 	const char byte = 0;
 	ssize_t n;
@@ -549,6 +561,10 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	_signal_numbers.reserve(8);
 	_out.reserve(4096);
 	_accepted.reserve(256);
+	// RESERVED, because `await_child` is reached through a `noexcept` verb and
+	// must not allocate. Eight is far past what any shape today can produce -
+	// there is one execution fiber and it waits for one child at a time.
+	_child_waits.reserve(8);
 
 	install_fork_child_detection();
 }
@@ -690,8 +706,15 @@ int event_loop::poll_timeout_ms() const noexcept {
 	// loop owes, so the poll must not sleep on top of it - it asks the terminal
 	// what is there and comes straight back to the slice. With nothing runnable
 	// the loop blocks exactly as it always did.
-	if (_sched.runnable(group_mask(fiber_group::emitters)))
+	if (_sched.runnable(sliced_lanes()))
 		return 0;
+	// WHILE A COMMAND RUNS THERE IS NO CLOCK (#208). The timer topic is out of the
+	// turn - a timer would dispatch an action into an editor with no terminal -
+	// and the decoder's ESC deadline belongs to bytes nothing is reading. What is
+	// left to wait for is the signal topic (the SIGCHLD that ends the wait) and
+	// the watch, and both of those are descriptors, so the poll blocks on them.
+	if (_phase == phase::executing)
+		return -1;
 	if (!soonest.has_value())
 		return -1;  // nothing waits on time; block until a topic speaks
 
@@ -740,7 +763,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	// The events and the render a leading slice produces are this turn's: the walk
 	// and the render below are after it, so a batch that lands here is applied and
 	// painted without waiting for another poll.
-	(void)tick_emitters();
+	(void)tick_fibers();
 
 	int at = 0;
 	int tty_at = -1, signal_at = -1, watch_at = -1;
@@ -750,7 +773,13 @@ turn_result event_loop::turn(int timeout_ms) {
 		_poll[static_cast<std::size_t>(at)].revents = 0;
 		return at++;
 	};
-	if (_fds.input >= 0)
+	// THE TTY TOPIC IS OUT WHILE A COMMAND RUNS (#208). The terminal is the
+	// child's - the loop gave up the foreground group at `quiesce` - so reading it
+	// would earn a SIGTTIN, and the bytes the user types belong to the command
+	// and not to a line editor that is not on screen. The signal topic and the
+	// watch stay in: the first is how the foreground wait ends, and a history
+	// written by another shell is no less true during a command.
+	if (_fds.input >= 0 && _phase != phase::executing)
 		tty_at = poll_on(_fds.input);
 	if (_signals != nullptr)
 		signal_at = poll_on(_signals->wakeup_fd());
@@ -761,7 +790,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	// (#202). `turn()` computes its timeout and finds the zero there; `turn(ms)`
 	// is what the tests and the paste path call, and a reactor mid-walk must not
 	// be held behind somebody's 50 ms either.
-	if (timeout_ms != 0 && _sched.runnable(group_mask(fiber_group::emitters)))
+	if (timeout_ms != 0 && _sched.runnable(sliced_lanes()))
 		timeout_ms = 0;
 
 	const int ready = ready_now(_poll.data(), at, timeout_ms);
@@ -797,13 +826,27 @@ turn_result event_loop::turn(int timeout_ms) {
 	}
 	// The ESC disambiguation, whether or not anything arrived: `expire` re-reads
 	// `now` and declines if the deadline has not passed, so an early wake cannot
-	// resolve a sequence that is still legitimately in flight (#111).
-	_decoder.expire(now, _events);
+	// resolve a sequence that is still legitimately in flight (#111). Nothing to
+	// disambiguate while a command runs: `quiesce` reset the decoder and no byte
+	// has reached it since.
+	if (_phase != phase::executing)
+		_decoder.expire(now, _events);
 
 	if (signal_at >= 0
 	    && (ready < 0 || revents_of(_poll[static_cast<std::size_t>(signal_at)]) != 0))
 		drain_signal_topic(result);
-	fire_timers(now, result);
+	// THE FOREGROUND WAIT'S OTHER HALF (#208). The SIGCHLD byte is what made the
+	// poll come back; this is where the awaited children are reaped and their
+	// fibers woken. Guarded on the table rather than on the phase, so a wait taken
+	// from anywhere else would be served the same way, and costing one
+	// `waitpid(WNOHANG)` per outstanding wait per wake.
+	if (!_child_waits.empty())
+		reap_awaited_children();
+	// AND NO TIMERS WHILE A COMMAND RUNS. A timer expiring here would dispatch an
+	// action into an editor that has no terminal; the arming survives, and the
+	// first turn after `resume_after_execution` fires whatever is due.
+	if (_phase != phase::executing)
+		fire_timers(now, result);
 	// LAST, AND IT PRODUCES NO EVENT. Everything above turns a descriptor into
 	// something the editor sees; the watch turns one into a fact about a file the
 	// editor has never heard of. Last because it is the least urgent thing in a
@@ -846,10 +889,13 @@ turn_result event_loop::turn(int timeout_ms) {
 		if (sliced || _exiting)
 			break;
 		sliced = true;
-		(void)tick_emitters();
+		(void)tick_fibers();
 	}
 
-	if (_needs_render && !_exiting) {
+	// NO RENDER WHILE A COMMAND RUNS (#208). The screen is the command's, the
+	// terminal is out of raw mode, and the frame that goes back up is the full
+	// repaint `resume_after_execution` asks for.
+	if (_needs_render && !_exiting && _phase != phase::executing) {
 		render();
 		result.rendered = true;
 	}
@@ -924,6 +970,21 @@ void event_loop::drain_signal_topic(turn_result& result) {
 
 	if (signals != 0 || resizes != _resizes_seen)
 		++result.topics_drained;
+
+	// DRAINED, AND THEN DROPPED, WHILE A COMMAND RUNS (#208). The byte was the
+	// point: it woke the poll so the awaited children can be reaped. What must NOT
+	// happen is an event - a SIGINT turned into `cancel_line` here would call
+	// `execute` a second time from inside the first, and a resize dispatched into
+	// an editor with no terminal would paint over the command's output. Both are
+	// answered where they always were: the shell's own handler chain set
+	// `g_pending` for the signal (#134), and `resume_after_execution` re-reads the
+	// resize counter and the winsize on the way back.
+	if (_phase == phase::executing) {
+		LESH_LOG(log::level::debug, log::category::loop,
+		         "topic=signal during execution: %zu signal(s) dropped, %u resize(s)",
+		         signals, resizes);
+		return;
+	}
 
 	if (resizes != _resizes_seen) {
 		// #128's trap 12: the counter was read BEFORE this ioctl.
@@ -1258,9 +1319,17 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 // The reactor fibers (#202, step 1d of #145)
 // ---------------------------------------------------------------------------
 
-bool event_loop::tick_emitters() {
-	const bool more = _sched.tick(group_mask(fiber_group::emitters));
-	return more;
+std::uint8_t event_loop::sliced_lanes() noexcept {
+	return static_cast<std::uint8_t>(group_mask(fiber_group::emitters)
+	                                 | group_mask(fiber_group::execution));
+}
+
+bool event_loop::tick_fibers() {
+	// ONE MASK FOR BOTH LANES, and no phase test, because the scheduler's own park
+	// bit already answers it: while a command runs the emitters' group is parked
+	// and skipped, and while a line is being edited the execution fiber is parked
+	// on its inbox. Two sets that are never runnable at once are one tick.
+	return _sched.tick(sliced_lanes());
 }
 
 reactor_lane& event_loop::lane_for(std::string_view name) {
@@ -1643,15 +1712,7 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 
 	std::optional<std::int32_t> status;
 	if (_shell != nullptr) {
-		// ADR-0009's one writer, ANNOUNCED (#151), and now trivially true: this
-		// is where a `PATH=` assignment, an `alias`, a function definition or an
-		// `unset` actually happens, and any read through the session's adapter
-		// while it runs would be reading a table mid-rewrite. The flag is kept
-		// because the assertion is what says so out loud - the completer reads
-		// through that adapter from inside an action, and the premise it leans on
-		// is exactly that this scope is not open.
-		const shell_writing_flag::scope writing{_writing};
-		status = _shell->execute(_accepted);
+		status = run_the_line(_accepted);
 		_exit_status = *status;
 	}
 
@@ -1709,15 +1770,174 @@ void event_loop::finish_cancelled_line() {
 		return;
 	quiesce();
 	assert_quiesced();
-	{
-		const shell_writing_flag::scope writing{_writing};
-		// THE STATUS IS KEPT, as it was when this went through the `execute` slot
-		// and `wait_on_shell` recorded every `execute_done` it matched: a cancel
-		// reports 130 (#98 decision 3), and the loop's copy of `$?` is what a test
-		// reads to see that it did.
-		_exit_status = _shell->execute(std::string_view{});
-	}
+	// THE STATUS IS KEPT, as it was when this went through the `execute` slot and
+	// `wait_on_shell` recorded every `execute_done` it matched: a cancel reports
+	// 130 (#98 decision 3), and the loop's copy of `$?` is what a test reads to
+	// see that it did. Down the same door an accepted line takes, so an INT trap
+	// body that forks forks from wherever an ordinary command would.
+	_exit_status = run_the_line(std::string_view{});
 	resume_after_execution();
+}
+
+// ---------------------------------------------------------------------------
+// Running a line: the execution fiber, or the host's own stack (#208)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 8 MB OF RESERVE FOR THE EXECUTION FIBER, 16 under ASan - the same doubling
+// `stack.h` applies to a reactor's, and for the same reason: instrumented frames
+// are bigger and a guard-page fault is not a recoverable condition.
+//
+// RESERVE, NOT MEMORY. minicoro's mapping is committed page by page as the stack
+// is touched, so a shell that never nests pays for the pages a `run_input`
+// actually walks and nothing more. What the number buys is the case a 512 KB
+// reactor stack could not carry: `tree_walking_executor` recurses through the
+// node tree, and a deeply nested script - a function calling a function inside a
+// `while` inside a `case` - is frames all the way down. Eight megabytes is what
+// a thread gets on Linux by default, so it is also the depth the same script
+// survives in a non-interactive shell.
+[[nodiscard]] std::size_t execution_stack_bytes() noexcept {
+	return fiber::built_under_asan() ? 16u * 1024u * 1024u : 8u * 1024u * 1024u;
+}
+
+} // namespace
+
+void event_loop::execution_body(fiber::scheduler& on, void* userdata) {
+	event_loop& me = *static_cast<event_loop*>(userdata);
+	(void)on;
+	// FOR EVER, like a reactor's (ADR-0011's "there is no fiber call stack"): it
+	// parks on its inbox, runs the line it is sent, sends the status back and
+	// parks again. It is never called and never returns, so the host stays the
+	// sole resumer and every yield inside `execute` - which is what a foreground
+	// wait's park is - comes back to `turn`.
+	for (;;) {
+		const std::string_view line = me._exec_inbox.recv();
+		std::int32_t status = 0;
+		if (me._shell != nullptr) {
+			// ADR-0009's one writer, ANNOUNCED (#151): this is where a `PATH=`
+			// assignment, an `alias`, a function definition or an `unset` actually
+			// happens. The flag is up for the whole command now - including the
+			// turns the host takes while this fiber is parked in a wait - and that
+			// is exactly right: the shell IS writing for the whole of it, and the
+			// emitters that would read through the adapter are a parked group.
+			const shell_writing_flag::scope writing{me._writing};
+			status = me._shell->execute(line);
+		}
+		me._exec_done.send(status);
+	}
+}
+
+std::int32_t event_loop::run_the_line(std::string_view line) {
+	if (_options.execution == execution_mode::inline_) {
+		// THE DIRECT CALL, KEPT FIRST-CLASS. `execute` runs on this stack,
+		// `scheduler::current()` is null throughout, and every `wait_child` under
+		// it is a blocking `::waitpid` - the shell exactly as it ran before this
+		// ticket, and the honest fallback if a fiber stack ever turns out to be
+		// the wrong place to fork from.
+		const shell_writing_flag::scope writing{_writing};
+		return _shell->execute(line);
+	}
+
+	// SPAWNED ON THE FIRST LINE AND NEVER AGAIN. A loop that never accepts one -
+	// which is most of the editor's own tests - reserves no stack at all.
+	if (_execution == nullptr) {
+		_execution = &_sched.spawn(&event_loop::execution_body, this, "execution",
+		                           group_index(fiber_group::execution),
+		                           execution_stack_bytes());
+		LESH_LOG(log::level::debug, log::category::exec,
+		         "execution fiber spawned: stack=%zu", execution_stack_bytes());
+	}
+
+	// A VIEW OF `_accepted`, WHICH IS A MEMBER. The slot's own debug assert covers
+	// the hazard this would otherwise be (a message pointing into the SENDER's
+	// fiber stack); the sender here is the host, whose stack outlives everything.
+	_exec_inbox.send(line);
+
+	// AND THE HOST KEEPS TURNING. This is the whole of what the ticket buys: the
+	// signal topic and the watch are polled, the execution fiber gets its slices,
+	// and the wait at the bottom of the interpreter is a park rather than a
+	// blocked thread. The tty and the timers are out of the turn - see `turn`.
+	//
+	// RE-ENTRANT `turn`, AND IT IS SAFE BY EXCLUSION. The outer turn is walking
+	// `_carried_events` when it reaches `accept_current_line`; a turn taken from
+	// here pushes nothing onto `_events` (the signal drain drops its events while
+	// `executing` and no other topic is polled), so the swap that would move the
+	// outer walk's storage never happens.
+	while (_exec_done.empty() && !_exiting)
+		turn();
+
+	// `try_recv` and not `recv`, because the host has no stack to park. Nothing
+	// there means the loop is exiting under a poll error with the command still
+	// on the fiber - a terminal that has gone away mid-command - and 0 is the only
+	// status there is to report for a command whose result never arrived.
+	return _exec_done.try_recv().value_or(0);
+}
+
+pid_t event_loop::await_child(pid_t pid, int flags, int* status) noexcept {
+	// NO SIGCHLD, NO WAKE - so do the thing that always worked (#208).
+	//
+	// The park below is paid for by exactly one wake, and that wake is the hub's
+	// self-pipe byte. `signal_hub::reassert`'s rule 3 leaves an inherited SIG_IGN
+	// and a user's `trap '' CHLD` alone, both of which are legitimate and both of
+	// which mean nothing will ever ring the pipe again - and with SIGCHLD ignored
+	// the kernel reaps children itself, so even a poll that woke for another
+	// reason would find nothing. Asking the kernel per foreground command is a
+	// syscall nowhere near a keystroke, and the alternative is a shell that hangs
+	// on `trap '' CHLD; sleep 1`.
+	if (_signals == nullptr || !_signals->catches(SIGCHLD))
+		return ::waitpid(pid, status, flags);
+
+	child_wait waiting;
+	waiting.pid = pid;
+	waiting.flags = flags;
+	waiting.status = status;
+	return static_cast<pid_t>(_sched.block_or_park(
+		waiting.slot,
+		// No fiber to park: an action's `port_call`, the EXIT trap after `run()`
+		// has returned, or `execution_mode::inline_`.
+		[&] { return ::waitpid(pid, status, flags); },
+		[&] {
+			_child_waits.push_back(&waiting);
+			// AND ASK ONCE, RIGHT NOW. The child may already be a zombie - `sleep
+			// 0.1 & wait` is the ordinary shape - and the SIGCHLD that said so may
+			// have been drained turns ago. `reap_awaited_children` completes the
+			// slot in that case, and `block_or_park` then never parks.
+			reap_awaited_children();
+		}));
+}
+
+void event_loop::reap_awaited_children() noexcept {
+	// ONLY AWAITED PIDS, NEVER `-1`. A background child stays a zombie until
+	// `wait` asks for it, exactly as it did before this ticket, so nothing about
+	// job control moves here - the "the shell notices mid-command" upgrade is a
+	// later ticket built on this seam and not a side effect of it.
+	//
+	// WNOHANG ON TOP OF THE CALL SITE'S OWN FLAGS, which is what keeps `WUNTRACED`
+	// meaning what it means: a foreground command stopped by Ctrl-Z reports here
+	// exactly as it reported to the blocking wait, and the executor's stop path
+	// runs unchanged.
+	for (std::size_t i = 0; i < _child_waits.size();) {
+		child_wait& waiting = *_child_waits[i];
+		int wait_status = 0;
+		const pid_t got = ::waitpid(waiting.pid, &wait_status, waiting.flags | WNOHANG);
+		if (got == 0)
+			{ ++i; continue; }              // still running: leave it enlisted
+		if (got < 0 && errno == EINTR)
+			continue;                       // ask again for the same waiter
+		// `> 0` is an exit or a stop; `< 0` is ECHILD, which is `waitpid`'s own
+		// answer and the one the blocking call would have returned. Either way the
+		// wait is over, so the entry goes before the waiter is woken - a woken
+		// fiber may enlist again on its very next statement.
+		if (waiting.status != nullptr)
+			*waiting.status = wait_status;
+		_child_waits.erase(_child_waits.begin() + static_cast<std::ptrdiff_t>(i));
+		waiting.slot.complete(got);
+	}
+}
+
+std::size_t event_loop::execution_slices() const noexcept {
+	return _execution != nullptr ? _execution->slices() : 0;
 }
 
 port_result event_loop::call_port(std::string_view code) {
