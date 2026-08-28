@@ -747,6 +747,20 @@ turn_result event_loop::turn(int timeout_ms) {
 	_needs_render = false;
 	drain_registry_effects();
 
+	// THE SIGNALS A COMMAND'S TURNS HELD BACK (#208), FIRST THING. Replayed here
+	// rather than at `resume_after_execution` for a plain reason: a turn clears
+	// `_events` before it does anything else, so an event pushed between turns
+	// would be wiped. This is the same delivery the self-pipe byte used to make
+	// on the first turn after a command - see `_deferred_signals`.
+	if (_phase != phase::executing && !_deferred_signals.empty()) {
+		for (const int signo : _deferred_signals) {
+			LESH_LOG(log::level::debug, log::category::loop,
+			         "topic=signal (deferred past a command) signo=%d", signo);
+			_events.push_back(leshper::signal_event{signo});
+		}
+		_deferred_signals.clear();
+	}
+
 	// THERE IS NO DEFERRED QUEUE ANY MORE (#201). `_deferred` held what the
 	// blocked `wait_on_shell` poll drained while a command ran - it was the only
 	// thing that polled during an execution, so what it read had to be kept
@@ -980,8 +994,15 @@ void event_loop::drain_signal_topic(turn_result& result) {
 	// `g_pending` for the signal (#134), and `resume_after_execution` re-reads the
 	// resize counter and the winsize on the way back.
 	if (_phase == phase::executing) {
+		for (const int signo : _signal_numbers) {
+			// A LEVEL AND NOT A COUNT, exactly as the hub's own `_pending` is, which
+			// is what bounds this list by the number of signals that exist.
+			if (std::find(_deferred_signals.begin(), _deferred_signals.end(), signo)
+			    == _deferred_signals.end())
+				_deferred_signals.push_back(signo);
+		}
 		LESH_LOG(log::level::debug, log::category::loop,
-		         "topic=signal during execution: %zu signal(s) dropped, %u resize(s)",
+		         "topic=signal during execution: %zu signal(s) deferred, %u resize(s)",
 		         signals, resizes);
 		return;
 	}

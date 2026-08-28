@@ -1072,6 +1072,23 @@ private:
 	// reason it cannot dangle rather than a reason to drop the first.
 	std::vector<leshper::event> _carried_events;
 	std::vector<int> _signal_numbers;
+	// WHAT ARRIVED WHILE A COMMAND WAS RUNNING (#208), REPLAYED WHEN THE EDITOR IS
+	// BACK. `_deferred` was deleted in #201 with the words "nothing polls during
+	// an execution now"; something does again, so the smallest possible form of it
+	// comes back - a list of signal NUMBERS, and nothing else.
+	//
+	// The fact it preserves is #201's own: nothing is dropped because the editor
+	// was not there to receive it. Before this ticket the byte simply stayed in the
+	// self-pipe for the length of the command and the next ordinary turn made an
+	// event of it; now the byte is consumed during the command (it is what ends the
+	// foreground wait), so the numbers are held here instead and the next ordinary
+	// turn makes exactly the same events. What must NOT happen is dispatching them
+	// while `executing`: a SIGINT turned into `cancel_line` there would call
+	// `execute` from inside `execute`.
+	//
+	// DEDUPLICATED, because the hub's own `_pending` is a level and not a count -
+	// so this is bounded by `kMaxTrackedSignal` however long the command runs.
+	std::vector<int> _deferred_signals;
 	std::string _out;
 	std::string _accepted;
 	leshper::effects _carried;         // what the registry queued, taken per turn
