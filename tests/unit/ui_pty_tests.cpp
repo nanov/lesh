@@ -1924,3 +1924,142 @@ TEST(UiPtyExecution, TheExitBuiltinEndsTheSessionInBothModes) {
 		EXPECT_TRUE(is_cooked(after)) << mode_name(execution) << ": `exit` left the terminal raw";
 	}
 }
+
+// ===========================================================================
+// `read` ON THE REAL BINARY, IN BOTH MODES (#209)
+// ===========================================================================
+//
+// The interactive `read` is the one shape where the shell blocks for as long as
+// a user is willing to think, and until this ticket it did it on the thread that
+// is also the line editor. What these assert is that it now does it through
+// `await_readable` in the default mode and through a blocking `::read` in the
+// inline one, and that a user cannot tell the two apart.
+//
+// EVERY MARKER IS COMPUTED, as in the block above: `$((1 + 1))` is five
+// characters on the wire the moment it is keyed, so a shell that only echoed
+// could not produce one.
+
+TEST(UiPtyExecution, ReadTakesATypedLineInBothModes) {
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("read x\r");
+		// THE PROMPT DOES NOT COME BACK HERE, and that is the point: `read` is
+		// still running, on a parked fiber in one mode and on a blocked thread in
+		// the other. The line is typed into the COMMAND, not into the editor.
+		std::this_thread::sleep_for(std::chrono::milliseconds{300});
+		shell.type("hello world\r");
+
+		shell.type("echo got=[$x]-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("got=[hello world]-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}
+
+TEST(UiPtyExecution, AWhileReadLoopTakesThreeLinesInBothModes) {
+	// The shape the ticket names beside `read x`, and the one that would have
+	// found a table entry left behind: three awaits per line, one after another,
+	// each on the same descriptor, with the entry removed before the fiber runs
+	// again. A leak of one entry would put a stale pointer into the poll set on
+	// the second line.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("while read l; do echo \"[$l]\"; done\r");
+		std::this_thread::sleep_for(std::chrono::milliseconds{300});
+		for (const char* line : {"one", "two", "three"}) {
+			shell.type(std::string{line} + "\r");
+			EXPECT_TRUE(shell.wait_for(std::string{"["} + line + "]"))
+				<< mode_name(execution) << ": saw: " << shell.seen();
+		}
+		// Ctrl-D ends the loop's input, which is the only way out of a `while read`
+		// that has no more lines.
+		shell.type("\x04");
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+			<< mode_name(execution) << ": the loop did not end; saw: " << shell.seen();
+
+		shell.type("echo alive-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("alive-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}
+
+TEST(UiPtyExecution, ControlCDuringAReadBehavesExactlyAsItAlwaysHasInBothModes) {
+	// THE DECISION THIS TICKET HAD TO MAKE, WRITTEN AS A TEST. The wait is NOT
+	// completed with an EINTR-shaped answer: the shell's handlers carry
+	// `SA_RESTART`, so a SIGINT has never interrupted this read, and the byte it
+	// rings the self-pipe with wakes the HOST - which drains it, defers the number
+	// past the command (#208) and goes back to polling - while the fiber stays
+	// parked on the descriptor.
+	//
+	// So `read` still finishes with the line the user goes on to type, `$x` is
+	// assigned, and the deferred SIGINT settles `$?` at 130 at the command
+	// boundary. Byte for byte what the shell did before this ticket, in both
+	// modes, and the reason the alternative was rejected: waking the fiber early
+	// would return it to a `::read` that then blocks the whole loop.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("read x\r");
+		std::this_thread::sleep_for(std::chrono::milliseconds{300});
+		shell.type("\x03");
+		std::this_thread::sleep_for(std::chrono::milliseconds{400});
+
+		// NO SECOND PROMPT YET: the interrupt did not end the read.
+		EXPECT_EQ(shell.count_of(kPrompt), 1u)
+			<< mode_name(execution) << ": Ctrl-C ended the read; saw: " << shell.seen();
+
+		shell.type("after-the-interrupt\r");
+		shell.type("echo got=[$x] st=$?\r");
+		EXPECT_TRUE(shell.wait_for("got=[after-the-interrupt] st=130"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+
+		// And the session is usable, which is what "behaves as today" has to mean
+		// on the far side of the interrupt.
+		shell.type("echo alive-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("alive-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}
+
+TEST(UiPtyExecution, ReadFromAPipeAndFromAFileAreUnchangedInBothModes) {
+	// The two non-tty descriptors the ticket names, and neither reaches an
+	// interactive host at all: the pipeline stage is a forked child, whose
+	// `enter_subshell` put the no-op cooperation back, and the redirected `read`
+	// is a regular file, which is readable the instant it is asked about.
+	//
+	// `echo hi | read y` therefore leaves `$y` UNCHANGED in the parent - POSIX's
+	// subshell rule, and the assertion that this ticket did not accidentally move
+	// the read into the shell process.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("y=kept; echo hi | read y; echo pipe=[$y]-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("pipe=[kept]-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+
+		shell.type("printf 'from-a-file\\n' > \"$HOME/in\"; read z < \"$HOME/in\";"
+		           " echo file=[$z]-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("file=[from-a-file]-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+
+		// AND `read` DOES NOT OVER-READ, which is read-p.tst's own assertion made
+		// interactively: the `cat` after it gets the second line.
+		shell.type("printf 'a\\nb\\n' > \"$HOME/two\"; { read p; cat; } < \"$HOME/two\";"
+		           " echo p=[$p]-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("p=[a]-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}

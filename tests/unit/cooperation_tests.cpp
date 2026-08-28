@@ -48,9 +48,21 @@ public:
 		return ::waitpid(pid, status, flags);
 	}
 
+	// AND THIS ONE DOES NOTHING BUT COUNT, which is exactly what the no-op does
+	// (#209): the verb transfers no bytes, reports no error and answers nothing,
+	// so a double that records the descriptor and returns IS the production no-op
+	// - and the counts below are therefore statements about the runtime's call
+	// sites rather than about a stub.
+	void await_readable(int fd) noexcept override {
+		++awaits;
+		fds_awaited.push_back(fd);
+	}
+
 	std::size_t calls = 0;
 	std::size_t waits = 0;
 	std::vector<int> flags_seen;
+	std::size_t awaits = 0;
+	std::vector<int> fds_awaited;
 };
 
 class CooperationTest : public ::testing::Test {
@@ -86,6 +98,31 @@ protected:
 		state.set_cooperation(host);
 		(void)run(src);
 		return host.flags_seen;
+	}
+
+	// The third counter (#209): every descriptor the snippet said it was about to
+	// block on, in order. Runs the snippet with `text` on fd 0, because `read` is
+	// the only caller and it has no input without one.
+	std::vector<int> awaits(std::string_view src, std::string_view text) {
+		int fds[2] = {-1, -1};
+		[&] { ASSERT_EQ(::pipe(fds), 0); }();
+		[&] {
+			ASSERT_EQ(::write(fds[1], text.data(), text.size()),
+			          static_cast<ssize_t>(text.size()));
+		}();
+		::close(fds[1]);
+		const int saved = ::dup(STDIN_FILENO);
+		::dup2(fds[0], STDIN_FILENO);
+		::close(fds[0]);
+
+		host.awaits = 0;
+		host.fds_awaited.clear();
+		state.set_cooperation(host);
+		(void)run(src);
+
+		::dup2(saved, STDIN_FILENO);
+		::close(saved);
+		return host.fds_awaited;
 	}
 };
 
@@ -263,6 +300,84 @@ TEST_F(CooperationTest, TheNoOpWaitIsWaitpidAndTheStatusIsRight) {
 }
 
 // ---------------------------------------------------------------------------
+// THE INPUT WAIT (#209, phase 2b of #145)
+// ---------------------------------------------------------------------------
+//
+// Same discipline again: WHERE the runtime says it and HOW OFTEN, derived from
+// the file rather than recorded from a run. `read_byte` is the one call site,
+// and it says the verb before EACH of its one-byte reads - which is what makes
+// the counts below arithmetic on the input rather than a number to be updated.
+
+// A shell with no `read` in it never reaches the verb. The first assertion,
+// because "one await per byte `read` consumes" is only a sentence if there is
+// something it does not apply to.
+TEST_F(CooperationTest, NothingButReadReachesTheInputWait) {
+	EXPECT_TRUE(awaits(":\n:\n:\n", "").empty());
+	EXPECT_TRUE(awaits("/bin/echo a >/dev/null\n", "").empty());
+}
+
+// ONE AWAIT PER BYTE, AND ALWAYS FD 0. `read x` on `ab\n` consumes three bytes -
+// 'a', 'b' and the delimiter - so three awaits; the delimiter ends the line, so
+// there is no fourth. The descriptor is `STDIN_FILENO` at every one of them,
+// which is the half a host builds a poll set on.
+TEST_F(CooperationTest, OneAwaitPerByteReadAndAlwaysOnFdZero) {
+	EXPECT_EQ(awaits("read x\n", "ab\n"), (std::vector<int>{0, 0, 0}));
+	EXPECT_EQ(awaits("read x\n", "\n"), (std::vector<int>{0}));
+}
+
+// EOF IS AN AWAIT TOO, and the one that would be tempting to skip: the read that
+// returns 0 is still a read that could have blocked, so the host has to be told
+// before it. `read x` on `a` with no newline consumes 'a' and then meets end of
+// input - two awaits, and a status of 1.
+TEST_F(CooperationTest, TheReadThatFindsEndOfInputWasAwaitedLikeAnyOther) {
+	EXPECT_EQ(awaits("read x\n", "a"), (std::vector<int>{0, 0}));
+	EXPECT_EQ(awaits("read x\n", ""), (std::vector<int>{0}));
+}
+
+// A LOOP IS BYTES ALL THE WAY DOWN, which is the property the whole verb rests
+// on: `while read line` hands the host the thread once per byte, forever, and
+// not once per line. Two lines of two characters plus their delimiters is six
+// reads, then the seventh finds end of input.
+TEST_F(CooperationTest, EachByteOfEachIterationOfAWhileReadIsAnAwait) {
+	EXPECT_EQ(awaits("while read l; do :; done\n", "ab\ncd\n").size(), 7u);
+}
+
+// The seam moves NOTHING, and this is the assertion that says so: the same
+// snippet through a host that counts and through the no-op leaves the same
+// variables with the same values and the same status. `read` is a builtin with
+// twelve field-splitting cases behind it, and a verb that transfers no bytes
+// cannot have touched one of them.
+TEST_F(CooperationTest, TheAwaitChangesNothingAboutWhatReadReads) {
+	const auto value_of = [this](std::string_view name) {
+		std::string_view text;
+		return state.lookup(name, text) ? std::string{text} : std::string{"<unset>"};
+	};
+
+	(void)awaits("read a b\n", "one two three\n");
+	EXPECT_EQ(value_of("a"), "one");
+	EXPECT_EQ(value_of("b"), "two three");
+
+	state.set_cooperation(noop_cooperation());
+	host.awaits = 0;
+	int fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(fds), 0);
+	const std::string_view text = "one two three\n";
+	ASSERT_EQ(::write(fds[1], text.data(), text.size()),
+	          static_cast<ssize_t>(text.size()));
+	::close(fds[1]);
+	const int saved = ::dup(STDIN_FILENO);
+	::dup2(fds[0], STDIN_FILENO);
+	::close(fds[0]);
+	(void)run("read c d\n");
+	::dup2(saved, STDIN_FILENO);
+	::close(saved);
+
+	EXPECT_EQ(value_of("c"), "one");
+	EXPECT_EQ(value_of("d"), "two three");
+	EXPECT_EQ(host.awaits, 0u) << "the no-op was installed and something still called out";
+}
+
+// ---------------------------------------------------------------------------
 // A FORKED CHILD COOPERATES WITH NOBODY (#202, answering #199's open question)
 // ---------------------------------------------------------------------------
 
@@ -308,6 +423,10 @@ public:
 	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
 		return ::waitpid(pid, status, flags);
 	}
+
+	// Nothing, for the reason the no-op says nothing: this test is about which
+	// PROCESS reaches the seam, and no snippet in it reads.
+	void await_readable(int) noexcept override {}
 
 	void on_command_boundary() noexcept override {
 		const char who = ::getpid() == _owner ? 'P' : 'C';
