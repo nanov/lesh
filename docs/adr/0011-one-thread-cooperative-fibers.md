@@ -84,6 +84,16 @@ waiting for. `cooperation::wait_child` is a five-line adapter over it, and #209'
 awaiting fiber's own frame, the same "complete from inside `enlist`" for the case
 that has already happened.
 
+**THE RUN ORDER IS AN INTRUSIVE READY LIST** (#211). A fiber is linked exactly while
+it is `ready` or `running`, and arrival order IS list order: `spawn` and every
+parked-to-ready `wake` append at the tail, a `park` unlinks, and a yield touches
+neither - which is what keeps a reactor yielding at every poll point from reshuffling
+the tick. A tick walks from the head to the tail it saw on entry, so a fiber woken
+during a tick still waits for the next one; `runnable(mask)` is eight comparisons
+against per-group counts. What went with it was a per-tick vector, a `std::sort` by
+an arrival stamp, and two scans over every fiber per tick. `tick()` with one yielding
+fiber: 21 ns before, 17 after, release, arm64.
+
 **Phase is where the session is**, written at exactly two places — `quiesce()`
 (→`executing`) and `resume_after_execution()` (→`boundary`→`editing`). **Groups
 are scheduler tags**, one bit each, and a group's bit is derived FROM the phase,
@@ -164,10 +174,15 @@ is the read it always was.
 **The host's half is an FD INTEREST, and an interest is not a topic.** A topic is a
 fixed descriptor with a drain behind it; an interest is one fiber's question about
 one descriptor, for the length of one wait, with nothing behind it - the waiter's
-own `::read` is what takes the bytes. The table is `_child_waits`' shape exactly, in
-a four-entry inline array because this one is reached through a `noexcept` verb with
-no constructor to reserve in, and its descriptors are appended to the poll set each
-turn. **That is also how the tty gets back into the poll set while a command runs**:
+own `::read` is what takes the bytes. **THERE IS ONE WAITER TABLE FOR EVERY KIND OF
+WAIT** (#211): an `awaiter` is a probe (`bool(void* self, intptr_t& answer)`), the
+`void*` it reads, the descriptor the poll set needs - `-1` for a child, whose wake is
+the SIGCHLD byte - and the `await_slot`; the pid, the flags, the status pointer and
+the fd live in the awaiting fiber's own frame. An eight-entry inline array, because
+both verbs are reached through a `noexcept` interface with no constructor to reserve
+in, and the descriptors it names are appended to the poll set each turn. #208
+declined `request<Req,Rep>` because it would not have removed code, and that was true
+until #209 made a second copy of the same ten lines. **That is also how the tty gets back into the poll set while a command runs**:
 #208 took its TOPIC out, and `await_readable(0)` puts the same descriptor back as an
 interest - polled, never drained, so the byte that ended the wait is still in the
 kernel for the builtin. A key that arrives while nothing awaits the tty does what it
@@ -279,15 +294,15 @@ has held for all five steps.
 - **A closed descriptor must not be waited on** (#209). `poll` answers POLLNVAL for
   one, which is not a readable bit, so a host that waited for readability would wait
   for ever on `read x 0<&-` - a line that used to report an error and carry on.
-  `wake_readable_fds` therefore treats anything that is not a definite "nothing there
+  the readable probe therefore treats anything that is not a definite "nothing there
   yet" as go-and-read-it: POLLIN, a hangup, an error, an invalid descriptor, or a
   poll that refuses the set outright. The caller's own `::read` is the thing with the
   right answer in every one of those.
 - **The interest is asked PER WAITER rather than read off the turn's `revents`.** One
   zero-timeout `select` per outstanding wait per wake - 0.2 us on this platform, and
-  only while a wait is outstanding - buys ONE function with the two call sites
-  `reap_awaited_children` has: the turn, and `await_readable`'s own `enlist`, which
-  has no poll set to read. Mapping poll slots back to table entries would have been
+  only while a wait is outstanding - buys ONE probe with the two call sites
+  `service_awaits` has: the turn, and the verb's own `enlist`, which has no poll set
+  to read. Mapping poll slots back to table entries would have been
   the same work plus an index that goes stale the moment an entry is removed.
 - A keystroke costs no more than it did: the reactors' contribution to 100
   keystrokes is **0 mallocs**, measured against a loop with no reactors at all.

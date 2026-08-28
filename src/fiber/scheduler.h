@@ -36,8 +36,14 @@
 // before and after. Yielding does NOT re-stamp the arrival - a reactor yielding
 // at every `kPollEvery` point would otherwise reshuffle the tick on every slice,
 // and the grilling record wants the sequence FIXED. Only the parked->ready
-// transition stamps a new arrival, which is what makes a group's replayed wakes
+// transition is a new arrival, which is what makes a group's replayed wakes
 // observable in arrival order. See GROUPS.
+//
+// ARRIVAL ORDER IS A LIST, NOT A NUMBER (#211 §3.1). The fibers are threaded on
+// an intrusive ready list in exactly that order, so a tick walks the runnable
+// ones and nothing else - where it used to clear a vector, scan every fiber into
+// it, `std::sort` it by an arrival stamp and scan every fiber again to answer
+// `runnable()`. The list IS the order; there is nothing left to sort.
 //
 // ---------------------------------------------------------------------------
 // GROUPS (#200) - PARKING A SET WITH ONE BIT
@@ -70,12 +76,12 @@
 //   1. REPLAYED WAKES RUN IN WAKE ORDER, NOT SPAWN ORDER. "Replay in arrival
 //      order" is the record's determinism promise, and a promise nothing can
 //      observe is not one - so it had to reach the tick, not just the queue.
-//      The mechanism is the arrival stamp above: `resume_group` walks its queue
-//      front to back and each `wake` stamps a fresh, larger arrival, so the next
-//      tick's snapshot - sorted by arrival - hands out slices in exactly the
-//      order the wakes came in. The alternative (queue in arrival order, then
-//      slice in spawn order) makes the queue's order unobservable and the
-//      documented promise untestable; rejected for that reason.
+//      The mechanism is the ready list above: `resume_group` walks its queue
+//      front to back and each `wake` appends at the list's tail, so the next
+//      tick hands out slices in exactly the order the wakes came in. The
+//      alternative (queue in arrival order, then slice in spawn order) makes the
+//      queue's order unobservable and the documented promise untestable;
+//      rejected for that reason.
 //
 //   2. A GROUP PARKED MID-TICK TAKES EFFECT AT ONCE FOR ITS OWN MEMBERS; THE
 //      REST OF THE SNAPSHOT FINISHES. A tick's snapshot bounds WHICH fibers may
@@ -217,10 +223,15 @@ private:
 	std::uint8_t _group = 0;
 	std::size_t _slices = 0;
 
-	// WHEN THIS FIBER BECAME RUNNABLE - stamped at `spawn` and at every
-	// parked->ready transition, never at a yield. The tick sorts its snapshot by
-	// it; see the header's decision 1.
-	std::uint64_t _ready_at = 0;
+	// THE READY LIST, THREADED THROUGH THE FIBERS THEMSELVES (#211 §3.1). A fiber
+	// is linked exactly while it is `ready` or `running`, and ARRIVAL ORDER IS
+	// LIST ORDER: `spawn` and every parked->ready `wake` append at the tail, a
+	// `park` unlinks, and a YIELD TOUCHES NEITHER - which is what keeps a reactor
+	// yielding at every poll point from reshuffling the tick on every slice. It
+	// replaced a `_ready_at` stamp, a per-tick snapshot vector and a `std::sort`;
+	// see the header's decision 1, whose promise this list IS rather than encodes.
+	fiber* _ready_prev = nullptr;
+	fiber* _ready_next = nullptr;
 
 	static void trampoline(mco_coro* co);
 };
@@ -300,7 +311,9 @@ public:
 	             std::size_t stack_bytes = 0);
 
 	// One slice for every fiber that is runnable NOW, in arrival order. Returns
-	// whether anything is still runnable afterwards.
+	// whether anything is still runnable afterwards. O(runnable): the ready list
+	// is the snapshot, and its tail at entry is the boundary a fiber woken during
+	// the tick lands past.
 	//
 	// The mask overload restricts the tick to the groups whose bits are set -
 	// this is what lets step 1's host run "emitters" and "observers" as different
@@ -415,13 +428,24 @@ public:
 
 private:
 	// True when `f` is in `group_mask` AND its group is not parked AND it is
-	// `ready`. The one definition of runnable, so the tick, the snapshot's
-	// re-check and `runnable()` cannot drift apart.
+	// `ready`. The one definition of runnable, so the tick and its re-check
+	// cannot drift apart.
 	[[nodiscard]] bool is_runnable(const fiber& f, std::uint8_t group_mask) const noexcept;
+
+	// The ready list's two edits. Appending is what "became runnable" means, so
+	// there is no insert-in-the-middle and no order to maintain beyond the tail.
+	void link_ready(fiber& f) noexcept;
+	void unlink_ready(fiber& f) noexcept;
 
 	scheduler_options _options;
 	std::vector<std::unique_ptr<fiber>> _fibers;
-	std::vector<fiber*> _slice_order;   // reused per tick, so a tick allocates nothing
+	// ARRIVAL ORDER, OLDEST FIRST (#211 §3.1). Holds every fiber that is `ready`
+	// or `running` and nothing else; see `fiber::_ready_next`.
+	fiber* _ready_head = nullptr;
+	fiber* _ready_tail = nullptr;
+	// How many of them are in each group, so `runnable(mask)` is eight
+	// comparisons rather than a walk over every fiber the scheduler has.
+	std::size_t _ready_in_group[group_count]{};
 	// Wakes that arrived for members of a parked group, oldest first. ONE list
 	// for the whole scheduler rather than one per group, so a wake's position is
 	// its arrival among all wakes and not merely among its group's. Reserved to
@@ -441,7 +465,6 @@ private:
 	[[maybe_unused]] std::size_t _host_stack_size = 0;
 	std::size_t _overruns = 0;
 	std::uint8_t _parked_groups = 0;
-	std::uint64_t _next_ready_at = 0;   // stamps `fiber::_ready_at`; see decision 1
 };
 
 // Out of line only because it wakes, and `scheduler` is not complete above.
