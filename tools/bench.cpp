@@ -17,7 +17,9 @@
 // Run:    ./build/bench/tools/lesh_bench
 
 #include "fiber/scheduler.h"
+#include "leshper/abi.h"
 #include "leshper/registry.h"
+#include "leshper/state.h"
 #include "runtime/executor.h"
 #include "runtime/expander.h"
 #include "runtime/shell_state.h"
@@ -330,11 +332,26 @@ int main() {
 	//
 	//   run_one_slice   host -> fiber -> host                     (the row above)
 	//   tick            + the snapshot, the sort and `runnable`
-	//   turn(0)         + poll(2), the drains, the render check
+	//   turn(0)         + the readiness check, the drains, the render check
 	//
-	// and the fourth pair is what they add up to on the reactor that takes the
+	// and the fourth group is what they add up to on the reactor that takes the
 	// longest walk in the shell: the autosuggester, on a history whose entries the
 	// typed prefix never extends.
+	//
+	// WHERE #206 FOUND THE COST, and it was none of the three: `turn(0)` was
+	// 6706 ns of which ~6500 was one `poll(2)` that found nothing, which XNU
+	// charges 8 us for and `select` charges 0.2 (see `ready_now` in loop.cpp).
+	// The walk was then still 25x its own no-yield time on arithmetic alone - an
+	// entry is 4 ns and a yield is 155 - so the walk strides its cancellation
+	// poll (see `history_search::poll_every`). This machine, release:
+	//
+	//                                        before      after
+	//   turn(0), nothing to do              6706.6 ns   223.2 ns
+	//   walk, poll per entry, no yield        31.2 us    22.2 us
+	//   walk, through the loop             19885.1 us    26.9 us
+	//   ...as a multiple of no-yield            984x      1.21x
+	//   yields per walk                          5000        20
+	//   gap between polls, p95                15.58 us   2.92 us
 	std::printf("\ncooperative yield, layer by layer (#206)\n");
 	{
 		fiber::scheduler sched;
@@ -355,10 +372,11 @@ int main() {
 	{
 		constexpr std::size_t kEntries = 5000;
 		const ui::vector_history_source source = novel_history(kEntries);
+		double baseline_ns = 0.0;
 
-		// THE FLOOR: the same walk with no host under it. `history_search::run`
-		// with no cancel poll is the work the shell would do if a compute could
-		// never be interrupted, and it is what the 1.5x acceptance is 1.5x OF.
+		// THE FLOOR: the same walk with nothing under it. `history_search::run`
+		// with no cancel poll at all is the work itself, and nothing the shell
+		// does can be cheaper than this.
 		ui::history_search::options search;
 		search.search = ui::history_search::mode::prefix;
 		search.max_matches = 0;
@@ -368,8 +386,33 @@ int main() {
 			const auto walked = searcher.run("zqx", source, {}, {});
 			benchmark_sink += static_cast<int>(walked.entries_examined);
 		});
-		std::printf("  %-40s %12.1f us (%.1f ns/entry)\n", "no yields, searcher alone",
+		std::printf("  %-40s %12.1f us (%.1f ns/entry)\n", "no poll, searcher alone",
 		            bare_ns / 1000.0, bare_ns / static_cast<double>(kEntries));
+
+		// AND THE BASELINE THE 1.5x IS 1.5x OF: the same reactor, the same token
+		// and the same poll per entry, on the HOST'S OWN STACK - which is what
+		// `loop_harness` is, and it is the shipped path a reactor takes when
+		// nothing gave it a fiber (`lesh_request::cooperate` is null, so the poll
+		// reads the flag and returns). The difference between this row and the
+		// next is exactly what YIELDING costs.
+		{
+			leshper::registry reg;
+			ui::owned_autosuggester sugg{&source};
+			std::ignore = ui::register_autosuggester(reg, sugg.get());
+			leshper::loop_harness harness{reg};
+			leshper::state typed;
+			typed.buffer.replace(typed.buffer.begin_position(), typed.buffer.begin_position(),
+			                     "zqx");
+			typed.cursor = typed.buffer.end_position();
+			typed.gen.bump();
+			const double polled_ns = time_ns(200, [&] {
+				benchmark_sink +=
+					static_cast<int>(harness.react(typed, LESH_EVENT_BUFFER_CHANGED).size());
+			});
+			std::printf("  %-40s %12.1f us (%.1f ns/entry)\n", "poll per entry, no yield",
+			            polled_ns / 1000.0, polled_ns / static_cast<double>(kEntries));
+			baseline_ns = polled_ns;
+		}
 
 		// AND THROUGH THE HOST, which is the shell's real number: every keystroke
 		// is one full walk, and every cancellation poll on the way is a yield.
@@ -408,7 +451,7 @@ int main() {
 			/ static_cast<double>(kKeystrokes);
 		std::printf("  %-40s %12.1f us (%.1f ns/entry, %.2fx)\n", "through the loop, one walk",
 		            per_walk_ns / 1000.0, per_walk_ns / static_cast<double>(kEntries),
-		            per_walk_ns / bare_ns);
+		            per_walk_ns / baseline_ns);
 		std::printf("  %-40s %12zu slices, %zu yields\n", "for that last walk",
 		            loop.reactor_slices("autosuggester"), loop.reactor_yields("autosuggester"));
 		std::sort(gaps.begin(), gaps.end());
