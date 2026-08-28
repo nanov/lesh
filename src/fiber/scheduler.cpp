@@ -124,17 +124,6 @@ void back_on_the_host_stack(const void* bottom, std::size_t size) noexcept {
 // snapshot buffer while it is mid-compute, since `run_reactor_here` moves the
 // string into the token - is unreachable as far as LSan can tell, and reported.
 //
-// #198 CONCLUDED THE OPPOSITE, and the reason it looked that way is the ASan
-// defect above. `FiberLsan.ABlockHeldOnlyByAParkedFiberStackIsNotReported`
-// passed on Darwin because minicoro left ASan's record of the THREAD's stack
-// pointing at the fiber's stack after the yield - so the leak check scanned the
-// fiber stack as if it were the thread's, and found the block. Correcting the
-// bounds so that `__asan_handle_no_return` works removed that accident, the
-// negative control went red, and what it had been proving was that a bug was
-// still there. The research note called this "the single most likely way fibers
-// break the gate on CI", and it was right about the shape and wrong about only
-// the platform.
-//
 // The fix is the documented interface, not a suppression: every live fiber stack
 // is registered as an LSan ROOT REGION, so blocks held from it are TRACED - which
 // keeps them, and everything they in turn point at, honestly reachable. An

@@ -13,43 +13,31 @@
 // So an overflow does not run off the end of anything. It walks down out of the
 // stack and into `storage`, then into `_mco_context`, then into `mco_coro`
 // itself - the state word, the `dealloc_cb`, the `prev_co` chain - and the only
-// thing that ever notices is a magic-number check at the *next* `mco_yield`,
-// whose own upstream comment reads "This check happens when the stack overflow
-// already happened, but better later than never." That is a silent-corruption
-// bug with a delayed, misleading report, and it is the one thing the research
-// note said to fix before measuring anything else.
+// thing that notices is a magic-number check at the *next* `mco_yield`, whose own
+// upstream comment reads "This check happens when the stack overflow already
+// happened, but better later than never". Silent corruption with a delayed,
+// misleading report.
 //
 // `install_guarded_allocator` fixes it through minicoro's documented allocator
 // seam: `mco_desc.alloc_cb`/`dealloc_cb`. See `stack.cpp` for the arithmetic and
 // for why the guard page ends up in padding rather than in live bookkeeping.
 //
-// THE GUARD STAYS ON UNDER ASan - deliberately, and unlike Tarantool.
+// THE GUARD STAYS ON UNDER ASan, unlike Tarantool's - which is disabled there
+// because theirs is a PROT_NONE hole carved out of a slab that the allocator, and
+// therefore LeakSanitizer, later walks. Ours is an independent `mmap` per fiber:
+// nothing but this file walks it, it is not a malloc chunk, and the guard sits
+// OUTSIDE the [stack_base, stack_base + stack_size) range minicoro hands
+// `__sanitizer_start_switch_fiber`. There is nothing for a sanitizer to trip
+// over, and ASan's fiber-stack instrumentation is no substitute in any case: it
+// tracks which stack is live across a switch, it does not bound the stack.
+// Turning the guard off in the one configuration where the gate runs would mean
+// the overflow test only ever proved something about release.
 //
-//   Tarantool disables its guard page under ASan (`fiber.c:1504-1514`, "If we
-//   panic then fiber stacks remain protected which cause leak sanitizer
-//   failures"). Their guard is carved by hand out of a slab from the cord's
-//   `small` cache: a PROT_NONE hole INSIDE a block that the allocator - and
-//   therefore LeakSanitizer - will later walk. LSan reads the block, hits the
-//   hole, and dies. That is a property of allocating stacks out of a pooled
-//   heap, not a property of guard pages.
-//
-//   Ours is an independent `mmap` per fiber. Nothing but this file ever walks
-//   it; it is not a malloc chunk, so no allocator scans it; and the guard page
-//   sits OUTSIDE the [stack_base, stack_base + stack_size) range that minicoro
-//   hands `__sanitizer_start_switch_fiber`, so ASan's own fiber bookkeeping
-//   never touches it either. There is nothing for a sanitizer to trip over, and
-//   ASan's fiber-stack instrumentation is not a substitute for the guard in any
-//   case: it tracks which stack is live across a switch, it does not bound the
-//   stack. Turning the guard off in the one configuration where the gate
-//   actually runs would mean the overflow test only ever proves something about
-//   release. So: on in both, and `FiberGuardPage.*` runs under the sanitized
-//   gate.
-//
-// SIZES are Tarantool's, from `cmake/SetFiberStackSize.cmake:11-18`: 512 KB, and
-// 1 MB under Clang + ASan + Debug, which is exactly lesh's debug preset. They
-// are a decade-old production answer for LuaJIT interpreter frames, JIT trace
-// frames, C functions and FFI callbacks on one stack. minicoro's own default -
-// 56 KB - is precisely the "8-64 KiB default" #145 warned about.
+// SIZES are Tarantool's (`cmake/SetFiberStackSize.cmake`): 512 KB, and 1 MB under
+// Clang + ASan + Debug, which is exactly lesh's debug preset. A decade-old
+// production answer for LuaJIT interpreter frames, JIT trace frames, C functions
+// and FFI callbacks on one stack. minicoro's own default - 56 KB - is precisely
+// the "8-64 KiB default" #145 warned about.
 
 #include <cstddef>
 

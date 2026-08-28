@@ -242,8 +242,7 @@ const char* name_of(phase which) noexcept {
 // storage the lane owns and the slot carries the notification: "these kinds
 // changed". Two snapshots rather than one, swapped at `recv`, because the sender
 // must be able to write the NEXT one while a compute is still reading the last -
-// which is exactly the `std::swap(job, owner->pending)` the helper pool used to
-// do, one thread further in.
+// which is one `std::swap` per compute and no allocation at all.
 //
 // The `slot` is still doing the whole of its job: it is the conflating channel
 // whose send counter supersedes every outstanding token, it is what parks and
@@ -566,13 +565,7 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 }
 
 event_loop::~event_loop() {
-	// NOTHING TO JOIN AND NOTHING TO GIVE BACK (#201). This used to `stop()` a
-	// thread of its own and then hand the actor's pooled messages back before the
-	// actor that owned their storage died (ADR-0007); there is no thread and no
-	// message pool. `run()` has returned by the time a caller destroys a loop,
-	// because `run()` is a call on the caller's own thread.
-	//
-	// ONE THING TO DO, AND IT IS NOT OPTIONAL (#202). v1 has no cancellation by
+	// ONE THING TO DO, AND IT IS NOT OPTIONAL. v1 has no cancellation by
 	// destruction: `~scheduler` unmaps a parked fiber's stack WITHOUT unwinding
 	// it, so anything that stack owned is lost - and the one thing a reactor's
 	// stack always owns mid-compute is the snapshot's buffer, which
@@ -661,10 +654,8 @@ void event_loop::enter_read() {
 	// what makes a resize missed during a command impossible rather than
 	// handled. The SIGWINCH counter is realigned here for the same reason.
 	// THE COUNTER ONLY, AND NO `sigaction` (#142). Re-asserting the dispositions
-	// used to happen here, which made the loop a writer of process-wide state the
-	// `trap` builtin writes too - two writers when the loop was a thread of its
-	// own. It moved to the shell side of the ui layer (`ui/session.cpp`), which
-	// leaves one; the loop only ever READS the hub.
+	// belongs to the shell side of the ui layer (`ui/session.cpp`), so the `trap`
+	// builtin and the hub have ONE writer between them; the loop only READS it.
 	if (_signals != nullptr)
 		_resizes_seen = _signals->resize_count();
 	refresh_size_from_terminal();
@@ -766,18 +757,11 @@ turn_result event_loop::turn(int timeout_ms) {
 		_deferred_signals.clear();
 	}
 
-	// THERE IS NO DEFERRED QUEUE ANY MORE (#201). `_deferred` held what the
-	// blocked `wait_on_shell` poll drained while a command ran - it was the only
-	// thing that polled during an execution, so what it read had to be kept
-	// somewhere until the editor existed again. Nothing polls during an execution
-	// now: the signal sits in the self-pipe, this turn's poll finds it readable,
-	// and `drain_signal_topic` turns it into an event like any other.
-
-	// THE LEADING SLICES (#202). Every emitter that was runnable when this turn
-	// began gets one, BEFORE the terminal is polled - which is what continues a
-	// walk that yielded at its last cancellation poll. `tick` snapshots the ready
-	// set up front (#198), so a fiber woken by another fiber's slice waits for the
-	// next turn and this call is bounded work.
+	// THE LEADING SLICES. Every emitter that was runnable when this turn began gets
+	// one, BEFORE the terminal is polled - which is what continues a walk that
+	// yielded at its last cancellation poll. `tick` bounds itself to the fibers
+	// that were ready when it began, so a fiber woken by another fiber's slice
+	// waits for the next turn and this call is bounded work.
 	//
 	// The events and the render a leading slice produces are this turn's: the walk
 	// and the render below are after it, so a batch that lands here is applied and
@@ -1092,9 +1076,8 @@ void event_loop::fire_timers(leshper::input_instant now, turn_result& result) {
 		         leshper::timer_action_name(*_registry, armed.action).data());
 		// AN EVENT, NOT A DISPATCH (#168). What the host knows is that a timer
 		// came due; which action that is and how to run it is the editor's, and
-		// `step` runs it through the same registry a keystroke reaches. The loop
-		// used to invoke it here, through a `loop_harness` of its own, which is
-		// how a timer expiry and a key came to run through two different objects.
+		// `step` runs it through the same registry a keystroke reaches - so a timer
+		// expiry and a key cannot run through two different objects.
 		_events.push_back(leshper::timer_fired{armed.id, armed.action});
 	}
 }
@@ -1317,18 +1300,16 @@ void event_loop::refresh_dispatch_table() {
 		return;
 	}
 	for (const auto& [name, entry] : _registry->reactors) {
-		// ADR-0009: the highlighter reads the alias, function and builtin tables,
-		// and that state has exactly one owner - which since #201 is this thread and
-		// since #202 is a fiber on it. So what the comparison still decides is
-		// WHOSE HOST is stamped on the token, and it is made HERE, once per table
-		// change, rather than once per reactor per keystroke.
+		// ADR-0011: the highlighter reads the alias, function and builtin tables,
+		// and that state has exactly one owner, on this thread. So what the
+		// comparison decides is WHOSE HOST is stamped on the token, and it is made
+		// HERE, once per table change, rather than once per reactor per keystroke.
 		//
-		// AND THE FIBER IS SPAWNED HERE (#202), which is what the ticket means by
-		// "spawned when the dispatch table is (re)built": `lane_for` creates the
-		// lane and its fiber the first time a name is seen and hands back the
-		// existing one on every rebuild after that. The fn and userdata are
-		// refreshed from the registry on every rebuild, so a re-registered reactor
-		// runs its new function on the fiber it already had.
+		// AND THE FIBER IS SPAWNED HERE: `lane_for` creates the lane and its fiber
+		// the first time a name is seen and hands back the existing one on every
+		// rebuild after that. The fn and userdata are refreshed from the registry on
+		// every rebuild, so a re-registered reactor runs its new function on the
+		// fiber it already had.
 		reactor_lane& lane = lane_for(name);
 		lane.fn = entry.fn;
 		lane.userdata = entry.userdata;
@@ -1695,8 +1676,8 @@ void event_loop::quiesce() {
 			_terminal.leave_raw();
 		_decoder.reset();
 	}
-	// IDEMPOTENT (#203): a second call finds the bit up and does nothing. Nothing
-	// nests - see the header - so what used to be a depth counter is this bit.
+	// IDEMPOTENT: a second call finds the bit up and does nothing. Nothing nests -
+	// see the header.
 	_quiesced = true;
 }
 
@@ -2146,14 +2127,10 @@ port_result event_loop::call_port(std::string_view code) {
 // ---------------------------------------------------------------------------
 
 void event_loop::run() {
-	// ON THE CALLER'S THREAD, WHICH IS MAIN (#201). This was the body of a thread
-	// this class spawned, and the first statement of that body blocked the caught
-	// signal set. THAT BLOCK WAS DELETED, NOT MOVED - a signal mask survives
-	// `execve`, main is the thread that forks and execs, and a child born with
-	// SIGINT blocked ignores the `kill -INT` meant for it (#142, #143). Main stays
-	// unmasked, the handler runs here as it did before leshper existed, and the
-	// poll below takes the EINTR it always could. The function that did the
-	// blocking went in #203, once nothing was left to call it.
+	// ON THE CALLER'S THREAD, WHICH IS MAIN, AND MAIN TAKES NO SIGNAL MASK - a
+	// mask survives `execve`, main is the thread that forks and execs, and a child
+	// born with SIGINT blocked ignores the `kill -INT` meant for it (#142, #143).
+	// The handler runs here, and the poll below takes the EINTR it always could.
 	enter_read();
 	// THE PROMPT IS PAINTED BEFORE THE FIRST POLL. `enter_read` asks for a
 	// render, but a turn clears that flag before it polls and the first poll
@@ -2167,12 +2144,10 @@ void event_loop::run() {
 }
 
 void event_loop::request_stop() noexcept {
-	// A FLAG AND NOTHING ELSE (#201). It used to ring the signal topic's pipe as
-	// well, because the caller was the shell's thread and the loop was asleep in a
-	// `poll` that had to be woken. Every caller is this thread now - `end_of_file`
-	// and the hangup from inside a turn, an `exit` from inside the `execute` this
-	// loop called - and a poll that is not running needs no wakeup. `run`'s
-	// `while` and `accept_current_line` read it at the next statement either way.
+	// A FLAG AND NOTHING ELSE. Every caller is this thread - `end_of_file` and the
+	// hangup from inside a turn, an `exit` from inside the `execute` this loop
+	// called - and a poll that is not running needs no wakeup. `run`'s `while` and
+	// `accept_current_line` read it at the next statement either way.
 	_stopping = true;
 }
 
