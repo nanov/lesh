@@ -92,6 +92,17 @@ int32_t counting_reactor(lesh_request* request, void* userdata) {
 	return LESH_OK;
 }
 
+// A REACTOR THAT YIELDS ONCE MID-COMPUTE. `lesh_request_superseded` is the
+// cancellation poll, and since #202 the poll IS the yield - so one call hands the
+// thread back to the host in the middle of the compute, which is the only moment
+// at which the editor's generation can move between the snapshot a compute was
+// handed and the batch it emits. That is N-4's drop rule in its real shape.
+int32_t yielding_reactor(lesh_request* request, void* userdata) {
+	int32_t superseded = 0;
+	(void)lesh_request_superseded(request, &superseded);
+	return counting_reactor(request, userdata);
+}
+
 // --- An action, for the timer topic ----------------------------------------
 
 std::atomic<int> g_action_runs{0};
@@ -629,25 +640,37 @@ TEST(UiLoopReactors, AnEmissionLandsInTheEditorsOwnDecorations) {
 }
 
 TEST(UiLoopReactors, ABatchComputedAgainstAnOlderGenerationIsDropped) {
-	// N-4, and the loop is the only applier, so this is the only place the rule
-	// is decided. The emitters group is parked while the notification is made, so
-	// the fiber is handed a snapshot that was already stale when it arrived -
-	// which is what `submit`-then-bump used to arrange one thread away.
+	// N-4, and the loop is the only applier, so this is the only place the rule is
+	// decided. The staleness is arranged MID-COMPUTE: the reactor yields at its
+	// cancellation poll, the host moves the editor's generation on while the fiber
+	// is suspended there, and the batch that comes back is about a buffer the
+	// editor has left behind.
+	//
+	// THIS USED TO USE `quiesce()` TO PARK THE GROUP, and #208 took that away: the
+	// tty topic is out of the poll set while `executing`, so a keystroke typed
+	// after a `quiesce` is not read at all - which is the point of the exclusion,
+	// the terminal being the running command's. The yield is a better arrangement
+	// anyway: a fiber suspended in the middle of a walk is the production shape,
+	// where a parked group with a queued wake was a stand-in for it.
 	fake_tty tty;
 	registry reg;
 	ASSERT_EQ(lesh_reactor_register(&reg, "counter", LESH_EVENT_BUFFER_CHANGED,
-	                                &counting_reactor, nullptr),
+	                                &yielding_reactor, nullptr),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
 	loop.enter_read();
 
-	loop.quiesce();
 	tty.type("a");
 	loop.turn(50);
+	// The fiber took the notification, started computing and yielded at its poll:
+	// runnable, not finished, and nothing applied yet.
+	ASSERT_TRUE(loop.reactors().runnable(group_mask(fiber_group::emitters)))
+		<< "the reactor should be suspended mid-compute at its cancellation poll";
+	ASSERT_EQ(loop.applied_batches(), 0u);
+
 	loop.editor().gen.bump();
-	loop.resume_after_execution();
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.dropped_batches() > 0; }));
 	EXPECT_EQ(loop.applied_batches(), 0u);
@@ -1790,4 +1813,520 @@ TEST(UiLoopWatch, AnFdWithNoHookIsNotATopic) {
 
 	::close(pipe_fds[0]);
 	::close(pipe_fds[1]);
+}
+
+// ===========================================================================
+// EXECUTION: ON A FIBER, OR ON THE HOST'S OWN STACK (#208)
+// ===========================================================================
+//
+// BOTH MODES ARE FIRST-CLASS AND BOTH ARE TESTED, which is the owner's
+// requirement on this ticket rather than a nicety. Every case below runs twice,
+// once per `execution_mode`, and the ones that differ say what differs and why.
+//
+// THE SHELL IN THESE TESTS REALLY FORKS AND REALLY WAITS, through
+// `event_loop::await_child` - which is the same function
+// `cooperation::wait_child` reaches one indirect call away. A `fake_shell` that
+// returns without waiting cannot exercise any of this: the park only happens at a
+// wait, and the loop only stays alive because something parked.
+//
+// AND THE FORK IS ON THE FIBER STACK in `on_a_fiber` mode, under ASan, which is
+// the first-contact risk #202 flagged. That it is a plain test here rather than a
+// separate experiment is the finding.
+
+namespace {
+
+loop_options pipe_options_with(execution_mode how) {
+	loop_options options = pipe_options();
+	options.execution = how;
+	return options;
+}
+
+const char* name_of(execution_mode how) {
+	return how == execution_mode::on_a_fiber ? "on_a_fiber" : "inline_";
+}
+
+// A shell that forks a child, awaits it through the host's verb, and reports what
+// it saw while it was in there.
+class awaiting_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	// How long the child lives. Long enough that the host is certain to reach its
+	// poll before the SIGCHLD arrives, short enough not to make the suite slow.
+	unsigned child_ms = 40;
+	// A second child that is NEVER awaited, forked first and exiting at once - the
+	// background job whose zombie must survive this command.
+	bool fork_an_unawaited_child = false;
+	// Bytes typed into the test's own tty from inside the command, which is the
+	// only way a single-threaded test can type "while a command runs".
+	std::string type_during;
+	fake_tty* tty = nullptr;
+
+	pid_t awaited = -1;
+	pid_t unawaited = -1;
+	pid_t reaped = -1;
+	int wait_status = 0;
+	std::size_t executes = 0;
+	phase phase_inside = phase::editing;
+	bool on_a_fiber_inside = false;
+	std::size_t watch_drains_before = 0;
+
+	std::int32_t execute(std::string_view) override {
+		++executes;
+		phase_inside = loop->session_phase();
+		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		watch_drains_before = loop->watch_drains();
+		if (tty != nullptr && !type_during.empty())
+			tty->type(type_during);
+		if (fork_an_unawaited_child) {
+			unawaited = ::fork();
+			if (unawaited == 0)
+				::_exit(4);
+			// Given a moment to become a zombie, so that a sweep reaping `-1`
+			// would certainly have taken it.
+			::usleep(5 * 1000);
+		}
+		awaited = ::fork();
+		if (awaited == 0) {
+			::usleep(child_ms * 1000);
+			::_exit(9);
+		}
+		reaped = loop->await_child(awaited, 0, &wait_status);
+		return WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, BothModesRunTheLineWaitForTheChildAndReportItsStatus) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		const std::optional<std::int32_t> status = loop.accept_current_line();
+
+		ASSERT_TRUE(status.has_value()) << name_of(how);
+		EXPECT_EQ(*status, 9) << name_of(how) << ": the child's exit status";
+		EXPECT_EQ(shell.executes, 1u) << name_of(how);
+		EXPECT_EQ(shell.reaped, shell.awaited)
+			<< name_of(how) << ": the wait answered with the pid it was given";
+		EXPECT_TRUE(WIFEXITED(shell.wait_status)) << name_of(how);
+		EXPECT_EQ(WEXITSTATUS(shell.wait_status), 9) << name_of(how);
+		// PHASE IS STILL WRITTEN AT THE TWO HOST PLACES, and a command sees
+		// `executing` from inside itself whichever stack it is on.
+		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
+		EXPECT_EQ(loop.session_phase(), phase::editing)
+			<< name_of(how) << ": and `editing` again on the way out";
+		// AND THE WAITER TABLE IS EMPTY AGAIN. An entry left behind would be a
+		// pointer into a frame that has returned.
+		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// NOTHING IS SPAWNED UNTIL A LINE IS ACCEPTED, in either mode: a loop that
+		// only ever edits reserves no execution stack.
+		EXPECT_FALSE(loop.has_execution_fiber()) << name_of(how);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_TRUE(loop.has_execution_fiber());
+			EXPECT_TRUE(shell.on_a_fiber_inside)
+				<< "`execute` ran on a fiber, so `current()` is not null inside it";
+			// TWO SLICES AT LEAST FOR ONE LINE, and that is the park made visible:
+			// one slice runs down to the wait, another resumes it after the wake.
+			EXPECT_GE(loop.execution_slices(), 2u)
+				<< "one slice would mean the wait never parked";
+		} else {
+			EXPECT_FALSE(loop.has_execution_fiber());
+			EXPECT_EQ(loop.execution_slices(), 0u);
+			EXPECT_FALSE(shell.on_a_fiber_inside)
+				<< "`current()` must be null throughout the inline path";
+		}
+
+		// A SECOND LINE REUSES THE FIBER. It is spawned once and parks on its
+		// inbox between commands; a second one would be a second 8 MB reserve and
+		// a second thing to drain at shutdown.
+		const std::size_t fibers = loop.reactors().fiber_count();
+		(void)loop.accept_current_line();
+		EXPECT_EQ(loop.reactors().fiber_count(), fibers) << name_of(how);
+		EXPECT_EQ(shell.executes, 2u) << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnAFiberTheLoopIsALIVEWhileACommandRunsAndInlineItIsNot) {
+	// THE WHOLE POINT OF THE TICKET, and the one observable that separates the two
+	// modes at a glance: the `watch` topic. The child makes the watched descriptor
+	// readable and then takes its time dying, so a loop that is turning during the
+	// command drains it DURING the command and a loop that is blocked in a
+	// `waitpid` drains it only afterwards.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int watch_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(watch_fds), 0);
+		ASSERT_EQ(::fcntl(watch_fds[0], F_SETFL, O_NONBLOCK), 0);
+		watch_probe probe;
+		probe.fd = watch_fds[0];
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		loop.attach_watch(watch_fds[0], &watch_probe::on_readable, &probe);
+		shell.loop = &loop;
+		// The write happens in the child, AFTER the fork, so the byte is there
+		// while the parent is inside its wait.
+		const int notify_fd = watch_fds[1];
+		shell.child_ms = 60;
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// One byte written by the test just before the accept is enough: what is
+		// under test is WHEN the loop notices it, not who wrote it.
+		const char one = 'x';
+		ASSERT_EQ(::write(notify_fd, &one, 1), 1);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_GE(probe.runs, 1u)
+				<< "the loop polled the watch topic while the command was running";
+			EXPECT_GE(loop.watch_drains(), 1u);
+		} else {
+			EXPECT_EQ(probe.runs, 0u)
+				<< "the inline path blocks in `waitpid`: nothing polls anything";
+			EXPECT_EQ(loop.watch_drains(), 0u);
+			// AND IT IS NOT LOST - the first ordinary turn afterwards drains it,
+			// which is exactly what happened before this ticket existed.
+			(void)loop.turn(0);
+			EXPECT_GE(probe.runs, 1u);
+		}
+
+		loop.detach_watch();
+		loop.leave_read();
+		hub.uninstall();
+		::close(watch_fds[0]);
+		::close(watch_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, TheTtyTopicIsOutOfTheTurnWhileACommandRuns) {
+	// Point 4: the terminal is the child's. A loop that read it would earn a
+	// SIGTTIN in a real session, and the bytes it took would be the command's
+	// input rather than the editor's. So they are LEFT IN THE DESCRIPTOR, and the
+	// first turn after the command picks them up - which is the same thing that
+	// happened when nothing polled at all.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.tty = &tty;
+		shell.type_during = "ab";
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(buffer_of(loop), "")
+			<< name_of(how) << ": nothing typed during the command reached the editor";
+		const turn_result after = loop.turn(0);
+		// TWO KEYSTROKES AND THE CHILD'S OWN SIGCHLD, which is three events and
+		// not two: the SIGCHLD that ended the wait reaches the editor on this turn
+		// exactly as it did before this ticket, when the byte simply stayed in the
+		// self-pipe for the length of the command.
+		EXPECT_GE(after.events, 2u)
+			<< name_of(how) << ": and both bytes were still in the descriptor";
+		EXPECT_EQ(buffer_of(loop), "ab") << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, TheTimerTopicIsOutOfTheTurnWhileACommandRuns) {
+	// The other half of point 4, and the reason is not symmetry: a timer expiring
+	// during a command would dispatch an ACTION into an editor that is not on
+	// screen and whose terminal belongs to the child.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.child_ms = 60;
+
+		registry& reg = context_of(loop.editor()).actions();
+		loop.attach_registry(reg);
+		g_action_runs.store(0, std::memory_order_relaxed);
+		ASSERT_EQ(lesh_action_register(&reg, "tick", &counting_action, nullptr), LESH_OK);
+		std::uint64_t id = 0;
+		ASSERT_EQ(lesh_timer_start(&reg, 1, "tick", &id), LESH_OK);
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(loop.timer_dispatches(), 0u)
+			<< name_of(how) << ": a 1 ms timer must not fire inside a 60 ms command";
+		// ARMED THROUGHOUT, not disarmed: the very next turn fires it.
+		ASSERT_TRUE(turn_until(loop, [&] { return loop.timer_dispatches() > 0; }));
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, ASignalDeliveredDuringACommandIsReplayedWhenTheEditorIsBack) {
+	// #201's fact, kept through a change of mechanism for the second time. The
+	// byte used to sit in the self-pipe for the whole command; now the command's
+	// own turns consume it - it is what ends the foreground wait - so the NUMBER
+	// is held and the first ordinary turn makes the same event of it.
+	//
+	// WHAT MUST NOT HAPPEN is the event being dispatched during the command: a
+	// SIGINT turned into `cancel_line` there would call `execute` from inside
+	// `execute`. `executes == 1` is that assertion.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// Delivered to the hub the way the handler delivers it, with no signal
+		// raised at the process: the child's own SIGCHLD is the other byte in
+		// there, and both have to come out of one drain.
+		hub.deliver(SIGINT);
+
+		(void)loop.accept_current_line();
+		EXPECT_EQ(shell.executes, 1u)
+			<< name_of(how) << ": the deferred SIGINT must not re-enter `execute`";
+
+		const turn_result after = loop.turn(0);
+		EXPECT_GE(after.events, 1u)
+			<< name_of(how) << ": the signal reaches the editor once it exists again";
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnlyAwaitedPidsAreEverReaped) {
+	// Point 5, and it is what keeps this ticket free of job-control consequences: a
+	// sweep that reaped `-1` would take the `&` child the script has not waited
+	// for yet, and `wait` would then answer 127 for a job it started. So the
+	// unawaited child is STILL A ZOMBIE when the command is over, and this test is
+	// the one that can prove it - it reaps it itself.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.fork_an_unawaited_child = true;
+		shell.child_ms = 60;
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		ASSERT_GT(shell.unawaited, 0);
+		int leftover = 0;
+		EXPECT_EQ(::waitpid(shell.unawaited, &leftover, WNOHANG), shell.unawaited)
+			<< name_of(how) << ": the loop reaped a pid nobody had awaited";
+		EXPECT_TRUE(WIFEXITED(leftover));
+		EXPECT_EQ(WEXITSTATUS(leftover), 4);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, WithNoSIGCHLDToWakeItTheWaitIsTakenInline) {
+	// The park is paid for by exactly one wake, and that wake is the hub's
+	// self-pipe byte. `reassert`'s rule 3 leaves an inherited SIG_IGN and a
+	// `trap '' CHLD` alone - both legitimate, both meaning nothing will ever ring
+	// the pipe again - so `await_child` asks the kernel first and blocks on its own
+	// if the answer is no. Without this the shell hangs on `trap '' CHLD; sleep 1`.
+	const every_hub_disposition guards;
+	guards.child().ignore();   // what a parent that ignored SIGCHLD hands us
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	// Rule 3: the newest ignore stands, so the hub did NOT take SIGCHLD.
+	ASSERT_FALSE(hub.catches(SIGCHLD));
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	ASSERT_TRUE(status.has_value());
+	EXPECT_TRUE(loop.has_execution_fiber()) << "still on the fiber - only the WAIT differs";
+	// ONE SLICE, because the wait never parked: the fiber ran the whole command in
+	// the slice it was given.
+	EXPECT_EQ(loop.execution_slices(), 1u);
+	EXPECT_EQ(loop.awaited_children(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
+}
+
+TEST(UiLoopExecution, AndTheHubKnowsWhetherItHoldsASignal) {
+	// `catches` is asked of the KERNEL, which is the only side that knows: a
+	// `trap` inside the command that is running now has already replaced the
+	// disposition and the reassert on the way out has not happened yet.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	signal_hub hub;
+	EXPECT_FALSE(hub.catches(SIGCHLD)) << "nothing installed yet";
+	ASSERT_TRUE(hub.install());
+	EXPECT_TRUE(hub.catches(SIGCHLD));
+	EXPECT_TRUE(hub.catches(SIGINT));
+	// The IGNORED set is never the hub's to hold: its SIG_IGN was only "better
+	// than the default".
+	EXPECT_FALSE(hub.catches(SIGTSTP));
+	// And a `trap` typed a moment ago takes it away, which is the case this
+	// function exists for.
+	install_handler(SIGCHLD, trap_style_handler);
+	EXPECT_FALSE(hub.catches(SIGCHLD));
+
+	hub.uninstall();
+}
+
+TEST(UiLoopExecution, ACancelledLineTakesTheSameDoorAsAnAcceptedOne) {
+	// `finish_cancelled_line` delivers an EMPTY line through the same `execute`,
+	// on the same path, because an INT trap body is arbitrary shell code and may
+	// fork - so it must fork from wherever an ordinary command forks.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		loop.finish_cancelled_line();
+
+		EXPECT_EQ(shell.executes, 1u) << name_of(how);
+		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
+		EXPECT_EQ(loop.exit_status(), 9) << name_of(how) << ": the status is kept";
+		EXPECT_EQ(loop.session_phase(), phase::editing) << name_of(how);
+		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+		if (how == execution_mode::on_a_fiber)
+			EXPECT_GE(loop.execution_slices(), 2u);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, APortCallNeverParksBecauseThereIsNoFiberUnderIt) {
+	// `port_call` stays a direct call (point 3): the execution fiber is parked in
+	// `recv` whenever an action runs, so an action's shell code runs on the HOST's
+	// stack and every wait under it is a blocking `::waitpid` - `current() == null`
+	// throughout, with no branch anywhere saying so.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	// One accepted line first, so the fiber exists and is parked on its inbox.
+	(void)loop.accept_current_line();
+	ASSERT_TRUE(loop.has_execution_fiber());
+	const std::size_t slices = loop.execution_slices();
+
+	// A wait taken from the host, through the same verb the runtime reaches.
+	const pid_t child = ::fork();
+	if (child == 0)
+		::_exit(5);
+	int status = 0;
+	EXPECT_EQ(loop.await_child(child, 0, &status), child);
+	EXPECT_TRUE(WIFEXITED(status));
+	EXPECT_EQ(WEXITSTATUS(status), 5);
+	EXPECT_EQ(loop.execution_slices(), slices)
+		<< "the execution fiber was not resumed for a wait that was not its own";
+	EXPECT_EQ(loop.awaited_children(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
 }

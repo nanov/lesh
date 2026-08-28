@@ -262,6 +262,24 @@ TEST(FiberStack, SizeIsTarantoolsAndTheGuardIsOnePageDirectlyBelow) {
 	EXPECT_EQ(f.stack().stack_base, nullptr) << "a finished fiber's stack is unmapped";
 }
 
+// A PER-SPAWN OVERRIDE (#208). The execution fiber wants an 8 MB reserve for a
+// deeply nested script while a reactor wants the 512 KB that is plenty for a
+// token sweep, and one scheduler has to give out both - a second scheduler for a
+// second stack size would be a second tick.
+TEST(FiberStack, OneSpawnMayAskForAStackOfItsOwn) {
+	scheduler sched;   // default: 512 KB, 1 MB under ASan
+	fiber& big = sched.spawn(&finish_immediately, nullptr, "big", 0, 8u * 1024u * 1024u);
+	fiber& ordinary = sched.spawn(&finish_immediately, nullptr, "ordinary");
+
+	EXPECT_EQ(big.stack().stack_size, 8u * 1024u * 1024u);
+	EXPECT_EQ(ordinary.stack().stack_size, default_stack_size())
+		<< "the override is this spawn's, not the scheduler's";
+	// And the big one is guarded exactly like every other.
+	EXPECT_EQ(big.stack().guard_size, page_size());
+	EXPECT_EQ(big.stack().guard_base + big.stack().guard_size, big.stack().stack_base);
+	EXPECT_FALSE(sched.tick());
+}
+
 TEST(FiberStack, ASmallerStackIsHonouredAndStillGuarded) {
 	scheduler_options opts;
 	opts.stack_bytes = 64u * 1024u;
@@ -538,6 +556,169 @@ void receive_and_compute(scheduler& on, void* userdata) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// `block_or_park` - THE FIBER-OR-INLINE DECISION, MADE ONCE (#208)
+// ---------------------------------------------------------------------------
+//
+// NOT ONE PID IN THIS SECTION, which is the property under test as much as the
+// behaviour is: the scheduler must be able to host phase 2's awaits without
+// learning what a child, a descriptor or a timeout is. The "blocking thing" here
+// is a counter, and the "host" is the test body.
+
+namespace {
+
+// What a caller of `block_or_park` brings: the slot, its own answer, and its own
+// table. `ui::event_loop::await_child` is this with a pid in it.
+struct fake_wait {
+	await_slot slot;
+	int enlisted = 0;        // how many times `enlist` ran
+	int blocked = 0;         // how many times the BLOCKING path ran
+	bool complete_at_once = false;   // the "it already happened" case
+	std::intptr_t answer_when_complete = 0;
+};
+
+// The host's waiter table: one entry, because that is all these cases need.
+fake_wait* g_awaiting = nullptr;
+
+std::intptr_t await_through(scheduler& on, fake_wait& what) {
+	return on.block_or_park(
+		what.slot,
+		[&] { ++what.blocked; return 41 + 1; },
+		[&] {
+			++what.enlisted;
+			g_awaiting = &what;
+			// A caller's chance to notice that the thing has already happened.
+			if (what.complete_at_once)
+				what.slot.complete(what.answer_when_complete);
+		});
+}
+
+struct awaiting_fiber {
+	fake_wait wait;
+	std::intptr_t got = -1;
+	int rounds = 0;
+};
+
+void await_once(scheduler& on, void* userdata) {
+	auto& me = *static_cast<awaiting_fiber*>(userdata);
+	me.got = await_through(on, me.wait);
+	++me.rounds;
+}
+
+} // namespace
+
+// NO FIBER, NO PARK. `current() == nullptr` is the whole test: the blocking
+// function runs on the stack the caller is already on and its answer comes
+// straight back. This is a script, a `lesh -c`, an action's `port_call`, and a
+// host that was asked to run execution inline - none of them a degraded mode.
+TEST(FiberAwait, WithNoFiberTheBlockingPathRunsInline) {
+	scheduler sched;
+	fake_wait wait;
+	g_awaiting = nullptr;
+
+	EXPECT_EQ(await_through(sched, wait), 42);
+	EXPECT_EQ(wait.blocked, 1);
+	EXPECT_EQ(wait.enlisted, 0) << "nothing to enlist: there is nobody to wake";
+	EXPECT_EQ(g_awaiting, nullptr);
+	EXPECT_FALSE(wait.slot.pending());
+}
+
+// ON A FIBER: enlist, park, and answer with what the host stored. The fiber is
+// unrunnable for as long as the wait lasts, which is what makes the host's own
+// loop the thing that keeps running.
+TEST(FiberAwait, OnAFiberItEnlistsParksAndAnswersWithTheStoredResult) {
+	scheduler sched;
+	awaiting_fiber state;
+	g_awaiting = nullptr;
+	fiber& f = sched.spawn(&await_once, &state, "awaiter");
+
+	// `tick` answers "is anything still runnable", and a fiber that parked in its
+	// slice is not - which is the whole point of the primitive.
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(f.parked());
+	EXPECT_EQ(state.wait.enlisted, 1);
+	EXPECT_EQ(state.wait.blocked, 0) << "the blocking path must not run on a fiber";
+	ASSERT_EQ(g_awaiting, &state.wait);
+	EXPECT_TRUE(state.wait.slot.pending());
+	EXPECT_EQ(state.rounds, 0);
+
+	// A tick with nothing runnable does nothing at all: a parked awaiter is not
+	// a spinning one.
+	EXPECT_FALSE(sched.runnable());
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(f.parked());
+
+	// THE HOST COMPLETES IT. One store and one wake.
+	g_awaiting->slot.complete(7);
+	EXPECT_FALSE(state.wait.slot.pending());
+	EXPECT_TRUE(f.ready());
+
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(f.finished());
+	EXPECT_EQ(state.got, 7);
+	EXPECT_EQ(state.rounds, 1);
+}
+
+// COMPLETING FROM INSIDE `enlist` IS LEGAL, and it is what a caller does when
+// the thing it was going to wait for has already happened - the child exited
+// turns ago, the descriptor is readable now. The fiber never parks, and a `wake`
+// for a fiber that is not parked is already the no-op it needs to be.
+TEST(FiberAwait, AWaitCompletedInsideEnlistNeverParks) {
+	scheduler sched;
+	awaiting_fiber state;
+	state.wait.complete_at_once = true;
+	state.wait.answer_when_complete = 99;
+	fiber& f = sched.spawn(&await_once, &state, "already-done");
+
+	// ONE slice, and the body runs to completion inside it.
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(f.finished());
+	EXPECT_EQ(f.slices(), 1u) << "a park would have cost a second slice";
+	EXPECT_EQ(state.got, 99);
+	EXPECT_EQ(state.wait.blocked, 0);
+	EXPECT_EQ(state.wait.enlisted, 1);
+}
+
+// THE LOOP IS THE CONDITION, as with a condition variable. A wake that nobody
+// paired with a `complete` - and `scheduler::wake` is public, so anything may
+// make one - parks again rather than returning an answer nobody wrote.
+TEST(FiberAwait, ASpuriousWakeParksAgainRatherThanAnsweringNothing) {
+	scheduler sched;
+	awaiting_fiber state;
+	fiber& f = sched.spawn(&await_once, &state, "spurious");
+
+	EXPECT_FALSE(sched.tick());
+	ASSERT_TRUE(f.parked());
+
+	sched.wake(f);
+	EXPECT_TRUE(f.ready());
+	EXPECT_FALSE(sched.tick()) << "the slice must park again, not finish";
+	EXPECT_TRUE(f.parked());
+	EXPECT_EQ(state.rounds, 0);
+	EXPECT_TRUE(state.wait.slot.pending());
+
+	state.wait.slot.complete(5);
+	EXPECT_FALSE(sched.tick());
+	EXPECT_TRUE(f.finished());
+	EXPECT_EQ(state.got, 5);
+}
+
+// A second `complete` before the waiter has been resumed keeps the FIRST answer.
+// Two completions for one wait is a caller bug, and the first one was the one
+// that was true.
+TEST(FiberAwait, TheFirstCompletionWins) {
+	scheduler sched;
+	awaiting_fiber state;
+	fiber& f = sched.spawn(&await_once, &state, "twice");
+	EXPECT_FALSE(sched.tick());
+	ASSERT_TRUE(f.parked());
+
+	state.wait.slot.complete(11);
+	state.wait.slot.complete(22);
+	EXPECT_FALSE(sched.tick());
+	EXPECT_EQ(state.got, 11);
+}
 
 TEST(FiberSlot, RecvParksWhenEmptyAndSendWakesTheReceiver) {
 	scheduler sched;

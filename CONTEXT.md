@@ -280,6 +280,9 @@ side is the **UI**; the legacy-or-next axis is gone entirely - #28 deleted
 `src/legacy/`, the `LESH_FRONTEND` variable and `spec_run.py --frontend` with
 it, so there is one shell and nothing to select between.
 _Avoid_: the word itself, in every sense.
+_Note_: the one `LESH_*` variable that selects anything today is
+`LESH_EXECUTION=inline` (#208), and it selects an **execution mode** inside the
+one shell rather than a shell — the accept path's stack, nothing else.
 
 **Shell state** _[lesh]_:
 Variables, scopes, functions, aliases, options, working directory, and `$?`. Read by
@@ -573,7 +576,9 @@ minicoro under `third_party/`). Long-lived and never called: it parks on a
 channel, the host is the only thing that resumes it, and every yield returns to
 the host — there is no fiber call stack (#145). Since #202 every **reactor** has
 one, in the `emitters` **group**, and a turn gives each runnable one a slice
-before and after the UI part.
+before and after the UI part; since #208 EXECUTION has one too, in a lane of its
+own, and a turn slices both sets with one mask because they are never runnable at
+the same time.
 _Avoid_: a fiber per event; calling a fiber; resuming one from inside another.
 
 **Slice** _[lesh]_:
@@ -602,13 +607,34 @@ _Avoid_: giving an observer a **slot**; cancelling one on supersede.
 
 **Cooperation** _[lesh]_:
 What the runtime wants of whatever is hosting it — `runtime::cooperation`
-(`src/runtime/cooperation.h`, #199). One verb in v1, `on_command_boundary()`,
-called where the executor already polls `g_pending`. NEVER NULL: `shell_state`
-starts with a static no-op, so `lesh -c`, a script, a test and a forked child all
-cooperate with nobody at the cost of an indirect call. The name says
-"cooperation" and never "fibers" on purpose - the runtime must not learn what is
-on the other side.
-_Avoid_: a null check; a template parameter; naming a scheduler from the runtime.
+(`src/runtime/cooperation.h`, #199). Two verbs: `on_command_boundary()`, called
+where the executor already polls `g_pending`, and `wait_child(pid, flags, status)`
+(#208), whose no-op implementation IS `::waitpid` — which is why the second one
+moved no behaviour. NEVER NULL: `shell_state` starts with a static no-op, so
+`lesh -c`, a script, a test and a forked child all cooperate with nobody at the
+cost of an indirect call. The name says "cooperation" and never "fibers" on
+purpose - the runtime must not learn what is on the other side.
+_Avoid_: a null check; a template parameter; naming a scheduler from the runtime;
+a `waitpid` anywhere in `src/runtime/` except `reap`'s one line.
+
+**Reap** _[lesh]_:
+`tree_walking_executor::reap(pid, flags, &status)`, the runtime's ONE wait (#208).
+All seven former direct `waitpid` calls go through it and it is nothing but
+`_state.cooperation().wait_child(...)`. `WUNTRACED` stays where the file already
+had it: the foreground simple command and the foreground `( )`, which are the two
+waits Ctrl-Z can reach.
+_Avoid_: adding a wait beside it; a null check; taking `WUNTRACED` off a
+foreground wait "for symmetry".
+
+**Block-or-park** _[lesh]_:
+`fiber::scheduler::block_or_park(slot, run_blocking, enlist)` — the ONE place in
+the tree where "is there a fiber to park" is asked (#208). Null `current()` runs
+the blocking thing inline and answers with it; on a fiber it enlists the caller's
+`await_slot`, parks, and answers with what the completer stored. Completing from
+inside `enlist` means the fiber never parks. `src/fiber/` sees no pid and no fd:
+the waiter table is the host's, on the awaiting fiber's own frozen frame.
+_Avoid_: a second `current() == nullptr` branch anywhere; putting a pid or an fd
+in `src/fiber/`; reaping `-1`.
 
 **Group** _[lesh]_:
 A scheduler tag, eight of them, that parks a SET of fibers with one bit (#200).
@@ -617,14 +643,40 @@ it is parked - #145's word, and the reason `loop.h` calls a reactor's fiber,
 slot and storage its `reactor_lane`.
 `emitters = 0` are the per-line reactors — the highlighter and the autosuggester,
 superseded on every edit and parked at accept; `observers = 1` is reserved for the
-session-lived kind (history persistence, telemetry) and has no members yet. Which
-groups are runnable is derived from the **phase** and never written beside it.
+session-lived kind (history persistence, telemetry) and has no members yet;
+`execution = 2` holds the one execution fiber and is NEVER parked by phase, because
+it is what the phase is about (#208). Which of the other groups are runnable is
+derived from the **phase** and never written beside it.
 
 **Phase** _[lesh]_:
 Where an interactive session is: `editing`, `executing`, `boundary`
 (`ui/loop.h`, #202). Written at exactly two places — `quiesce()`, which is the
 accept path's park, and `resume_after_execution()`, which runs when `execute`
-returns — and the emitters group's bit is written FROM it.
+returns — and the emitters group's bit is written FROM it. Since #208 it also says
+what a turn polls: while `executing` the tty and timer topics are OUT of the poll
+set, render is suppressed, and the signal topic's events are deferred rather than
+dispatched.
+
+**Execution fiber** _[lesh]_:
+The fiber an accepted line runs on (#208): `for(;;){ line = inbox.recv();
+done.send(shell.execute(line)); }`, in the `execution` lane, 8 MB of reserve stack
+(16 under ASan), spawned on the first accepted line and parked on its inbox
+between commands. Its point is that `reap` can PARK: the host keeps turning while
+a command runs, so the signal topic and the history's watch stay alive and #209's
+awaits have somewhere to land.
+_Avoid_: a second one; calling it; assuming a line is one slice — a line with a
+foreground command in it is at least two.
+
+**Execution mode** _[lesh]_:
+Which of the two ways the host runs an accepted line (`loop_options::execution`,
+`LESH_EXECUTION=inline`, #208). `on_a_fiber` is the default; `inline_` runs
+`execute` on the host's own stack with `current()` null throughout and every wait a
+blocking `::waitpid`, which is the shell exactly as it ran before #208. Both are
+first-class and both are covered by `UiLoop*` and `UiPty*`. The inline path is
+also what an action's `port_call` and the EXIT trap take regardless of the mode,
+because neither has a fiber under it.
+_Avoid_: calling `inline_` a fallback in code; branching on the mode below
+`event_loop`.
 
 **Slot** _[lesh]_:
 A capacity-one conflating channel, `fiber::slot<T>` (`src/fiber/slot.h`, #198).

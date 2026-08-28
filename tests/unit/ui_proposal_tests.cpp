@@ -63,6 +63,13 @@ bool turn_until(event_loop& loop, Predicate predicate, int budget = 200) {
 struct offer {
 	std::string candidate = "git status";
 	std::uint32_t kind = LESH_PROPOSAL_AUTOSUGGESTION;
+	// WHETHER THE COMPUTE YIELDS IN THE MIDDLE. `lesh_request_superseded` is the
+	// cancellation poll and since #202 the poll IS the yield, so one call suspends
+	// this compute and hands the thread back - which is what lets a test move the
+	// editor's generation between the snapshot this compute was handed and the
+	// batch it emits. Off by default: every other case here wants the answer in
+	// the turn that asked for it.
+	bool yield_mid_compute = false;
 };
 
 int32_t offering_reactor(lesh_request* request, void* userdata) {
@@ -71,6 +78,10 @@ int32_t offering_reactor(lesh_request* request, void* userdata) {
 	std::size_t length = 0;
 	if (lesh_request_buffer(request, typed, sizeof(typed), &length) != LESH_OK)
 		return LESH_OK;
+	if (what.yield_mid_compute) {
+		int32_t superseded = 0;
+		(void)lesh_request_superseded(request, &superseded);
+	}
 	const std::string_view line{typed, length};
 	if (line.empty() || line.size() >= what.candidate.size()
 	    || std::string_view{what.candidate}.substr(0, line.size()) != line)
@@ -239,15 +250,18 @@ TEST(UiProposal, ABatchFromASupersededGenerationIsNeverReadable) {
 	looped driven;
 	driven.bind("<C-y>", "probe_proposal");
 
-	// THE STALE BATCH, BUILT WITH THE GROUP PARKED (#202: there is no `submit` any
-	// more, and a fiber whose group is runnable would have computed and applied its
-	// answer inside the same turn as the keystroke). Parked, the send lands in the
-	// slot and the wake queues; the editor is moved on; the resume hands the fiber a
-	// snapshot that was already stale when it arrived.
-	driven.loop.quiesce();
+	// THE STALE BATCH, BUILT MID-COMPUTE. The reactor yields at its cancellation
+	// poll, the editor's generation moves on while the fiber is suspended there,
+	// and what comes back is an offer about text the buffer no longer holds.
+	//
+	// IT USED TO BE ARRANGED WITH `quiesce()` - a parked group, a send that queued
+	// its wake, a bump, a resume - and #208 took that away: while `executing` the
+	// tty topic is out of the poll set, because the terminal belongs to the running
+	// command, so a keystroke typed after a `quiesce` is never read. The yield is
+	// the production shape of the same race in any case.
+	driven.what.yield_mid_compute = true;
 	driven.press("x");
 	driven.loop.editor().gen.bump();
-	driven.loop.resume_after_execution();
 	ASSERT_TRUE(turn_until(driven.loop, [&] { return driven.loop.dropped_batches() > 0; }));
 
 	EXPECT_TRUE(driven.loop.editor().proposals.empty());

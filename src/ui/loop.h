@@ -130,6 +130,8 @@
 #include "leshper/state.h"
 #include "leshper/surface.h"
 #include "fiber/scheduler.h"
+#include "fiber/slot.h"
+#include "runtime/cooperation.h"
 #include "ui/reactor_call.h"
 #include "ui/shell_knowledge.h"
 #include "ui/shell_side.h"
@@ -346,6 +348,17 @@ public:
 	// the sanitizers' handlers are for signals this hub never takes.
 	void deliver(int signo) noexcept;
 
+	// WHETHER THIS HUB CURRENTLY HOLDS `signo` - ASKED OF THE KERNEL, not read off
+	// a member (#208). The question is "will a delivery of this signal ring my
+	// pipe", and only the kernel knows: a `trap '' CHLD` inside the command that
+	// is running RIGHT NOW has already replaced the disposition, and the next
+	// `reassert` (which is on the way out of that command) has not happened yet.
+	//
+	// The one caller is `event_loop::await_child`, which parks a fiber on a
+	// SIGCHLD it will never get if the answer is no - see the note there. One
+	// `sigaction` query per foreground command, which is nowhere near a keystroke.
+	[[nodiscard]] bool catches(int signo) const noexcept;
+
 	// One byte, no signal. What `event_loop::stop()` rings to wake a loop that
 	// is blocked in `poll` with nothing else to say.
 	void poke() noexcept;
@@ -419,6 +432,26 @@ struct loop_fds {
 	int output = -1;
 };
 
+// HOW AN ACCEPTED LINE IS RUN (#208, and the owner's requirement on it).
+//
+// Both are first-class and both are tested. The choice is the HOST's, made once
+// per `execute`, and nothing below `event_loop` can tell which was taken: the
+// runtime sees `cooperation`, and `cooperation` sees `scheduler::block_or_park`,
+// which is where the one branch lives.
+enum class execution_mode : std::uint8_t {
+	// The default. `execute` runs on the execution fiber, so the foreground wait
+	// at the bottom of the interpreter can park and the loop stays alive: signals
+	// are drained, the history's watch is polled, and #209's awaits have somewhere
+	// to land.
+	on_a_fiber,
+	// `execute` on the host stack, `current() == nullptr` throughout, every wait a
+	// blocking `::waitpid`. This is exactly the shell as it ran before this
+	// ticket, kept because it is the honest fallback if a fiber stack ever turns
+	// out to be the wrong place to fork from - and because a path that is not
+	// exercised is a path that does not work.
+	inline_,
+};
+
 struct loop_options {
 	// The left prompt (F-40). A provider (#94) supplies it later; until then the
 	// caller does, which is the same seam.
@@ -490,6 +523,11 @@ struct loop_options {
 	// and the old row count is still the answer.
 	bool assume_reflow = true;
 
+	// WHICH OF THE TWO WAYS AN ACCEPTED LINE IS RUN (#208). `LESH_EXECUTION=inline`
+	// picks the other one at the wiring site; every `UiLoop*` and `UiPty*` case
+	// that touches the accept path runs both.
+	execution_mode execution = execution_mode::on_a_fiber;
+
 	// The paste rule (#128's trap 4, fish's `read_normal_chars`): keep reading
 	// while a zero-timeout poll says the fd is still readable, so a paste is one
 	// edit and one repaint while a typed character paints now. The cap keeps a
@@ -526,6 +564,12 @@ enum class phase : std::uint8_t {
 enum class fiber_group : std::uint8_t {
 	emitters = 0,
 	observers = 1,
+	// THE EXECUTION LANE (#208), AND IT IS NEVER PARKED BY PHASE. Every other
+	// lane's bit is derived from where the session is; this one is what the phase
+	// is ABOUT, so deriving it would be circular - `executing` means "the
+	// execution fiber is the thing that may run". It holds exactly one fiber, and
+	// only in `execution_mode::on_a_fiber`.
+	execution = 2,
 };
 
 [[nodiscard]] inline constexpr std::uint8_t group_index(fiber_group which) noexcept {
@@ -763,6 +807,23 @@ public:
 	// code never gets ECHO back).
 	port_result call_port(std::string_view code);
 
+	// --- The foreground wait (#208) -----------------------------------------
+
+	// WHAT `cooperation::wait_child` BECOMES ON AN INTERACTIVE HOST, and the only
+	// thing in this class the runtime can reach. `loop_cooperation` below is the
+	// adapter; this is the implementation, and it is short because
+	// `scheduler::block_or_park` owns the one decision:
+	//
+	//   nobody to park (inline mode, an action's `port_call`, the EXIT trap after
+	//   `run()` has returned) -> a blocking `::waitpid`, exactly as before;
+	//   on the execution fiber -> the waiter goes into `_child_waits`, the fiber
+	//   parks, and the SIGCHLD wake reaps it.
+	//
+	// ONLY AWAITED PIDS ARE EVER REAPED, never `-1`: a background child stays a
+	// zombie until `wait` asks for it, exactly as today, so no job-control
+	// semantics move in this ticket.
+	pid_t await_child(pid_t pid, int flags, int* status) noexcept;
+
 	// THERE IS NO `read_names` (#151). #139 gave the completer a round trip on
 	// the actor's `enumerate` slot; the owner's reading of ADR-0009 removed the
 	// need for one. The loop may read shell state directly while nothing
@@ -802,6 +863,14 @@ public:
 	// --- The reactor fibers (#202) -------------------------------------------
 
 	[[nodiscard]] phase session_phase() const noexcept { return _phase; }
+	// Whether the execution fiber has been spawned. Null until the first line is
+	// accepted, and null for ever in `execution_mode::inline_` - which is what a
+	// test asserts to know which of the two paths it is on.
+	[[nodiscard]] bool has_execution_fiber() const noexcept { return _execution != nullptr; }
+	// Slices the execution fiber has been given, and children currently awaited.
+	// Both are counters a test reads; neither decides anything.
+	[[nodiscard]] std::size_t execution_slices() const noexcept;
+	[[nodiscard]] std::size_t awaited_children() const noexcept { return _child_waits.size(); }
 	[[nodiscard]] const fiber::scheduler& reactors() const noexcept { return _sched; }
 	// Fibers spawned, which is one per reactor the dispatch table has ever held.
 	[[nodiscard]] std::size_t reactor_fibers() const noexcept { return _lanes.size(); }
@@ -846,7 +915,16 @@ private:
 	// One slice for every runnable emitter, plus the batches those slices left.
 	// Called twice per turn - the "before and after the UI part" the owner asked
 	// for - and once more per pass while anything is still runnable.
-	bool tick_emitters();
+	//
+	// AND FOR THE EXECUTION FIBER TOO (#208), because the two sets are never
+	// runnable at the same time and the scheduler already skips a parked group:
+	// while a command runs the emitters' bit is down, and while a line is being
+	// edited the execution fiber is parked on its inbox. One tick, one mask.
+	bool tick_fibers();
+	// The lanes this loop ever gives a slice to. Not derived from the phase - the
+	// scheduler's own park bit is - so this is a constant, and it is a function
+	// only so that the three places that need it cannot disagree.
+	[[nodiscard]] static std::uint8_t sliced_lanes() noexcept;
 	// Rebuilds `_dispatch_table` from the registry's reactor map. Called only
 	// when the cheap staleness check in `notify_reactors` says the copy is out of
 	// date; the steady state never reaches it.
@@ -878,6 +956,35 @@ private:
 	// owned with it, which the leak gate would report and be right to.
 	void drain_emitters();
 	void refresh_size_from_terminal();
+
+	// --- The execution fiber and the waiter table (#208) ---------------------
+
+	// The two ways to run an accepted line, and the ONE place the choice is made.
+	// `accept_current_line` and `finish_cancelled_line` both call this and neither
+	// knows which it got.
+	std::int32_t run_the_line(std::string_view line);
+	// THE FIBER BODY: `for(;;){ line = inbox.recv(); done.send(shell.execute(line)); }`.
+	// A static member for the reason `reactor_body` is one: `fiber::entry_fn` is a
+	// plain function pointer and a `void*`.
+	static void execution_body(fiber::scheduler& on, void* userdata);
+	// Every awaited child that has something to report, reaped and its waiter
+	// woken. Run when the poll comes back - the SIGCHLD byte is what made it come
+	// back - and once more from inside `await_child`'s enlist, which is how a
+	// child that finished before anybody asked is noticed without a wake.
+	void reap_awaited_children() noexcept;
+
+	// ONE OUTSTANDING WAIT, ON THE WAITING FIBER'S OWN STACK. The `child_wait` is
+	// a local in `await_child`'s frame and the table holds its address, which is
+	// safe for precisely the length of the wait: the fiber is parked, so the frame
+	// is frozen, and the entry is removed before `complete` lets it run again.
+	// (This is coost's `io_event` shape, and it is the reason the table needs no
+	// allocation and no ownership rule.)
+	struct child_wait {
+		pid_t pid = -1;
+		int flags = 0;
+		int* status = nullptr;   // the executor's own `wait_status`
+		fiber::await_slot slot;
+	};
 
 	// How far above the cursor the top of the frame the terminal is showing sits
 	// (#185). `loop_options::assume_reflow` picks the model; the reflowing one
@@ -965,6 +1072,23 @@ private:
 	// reason it cannot dangle rather than a reason to drop the first.
 	std::vector<leshper::event> _carried_events;
 	std::vector<int> _signal_numbers;
+	// WHAT ARRIVED WHILE A COMMAND WAS RUNNING (#208), REPLAYED WHEN THE EDITOR IS
+	// BACK. `_deferred` was deleted in #201 with the words "nothing polls during
+	// an execution now"; something does again, so the smallest possible form of it
+	// comes back - a list of signal NUMBERS, and nothing else.
+	//
+	// The fact it preserves is #201's own: nothing is dropped because the editor
+	// was not there to receive it. Before this ticket the byte simply stayed in the
+	// self-pipe for the length of the command and the next ordinary turn made an
+	// event of it; now the byte is consumed during the command (it is what ends the
+	// foreground wait), so the numbers are held here instead and the next ordinary
+	// turn makes exactly the same events. What must NOT happen is dispatching them
+	// while `executing`: a SIGINT turned into `cancel_line` there would call
+	// `execute` from inside `execute`.
+	//
+	// DEDUPLICATED, because the hub's own `_pending` is a level and not a count -
+	// so this is bounded by `kMaxTrackedSignal` however long the command runs.
+	std::vector<int> _deferred_signals;
 	std::string _out;
 	std::string _accepted;
 	leshper::effects _carried;         // what the registry queued, taken per turn
@@ -1052,6 +1176,24 @@ private:
 	// `resume_after_execution`.
 	phase _phase = phase::editing;
 
+	// THE EXECUTION FIBER (#208), SPAWNED ON THE FIRST LINE AND NEVER AGAIN. Null
+	// until then, and null for ever in `execution_mode::inline_`: a loop that
+	// never accepts a line - which is most of `ui_loop_tests.cpp` - reserves no
+	// stack at all.
+	fiber::fiber* _execution = nullptr;
+	// The two channels, and they are the only ones. `inbox` carries a view of
+	// `_accepted`, which is a member and therefore outlives the command; `done`
+	// carries the status back, and the host takes it with `try_recv` because the
+	// host cannot park.
+	fiber::slot<std::string_view> _exec_inbox{_sched};
+	fiber::slot<std::int32_t> _exec_done{_sched};
+	// Who is waiting for which child. Pointers into the awaiting fibers' own
+	// frames - see `child_wait` - and reserved at construction so that
+	// `await_child`, which is reached through a `noexcept` verb, does not
+	// allocate. One entry is all today's shapes can produce: the execution fiber
+	// waits for one child at a time and nothing else waits at all.
+	std::vector<child_wait*> _child_waits;
+
 	bool _exiting = false;
 	std::int32_t _exit_status = 0;
 	bool _needs_render = false;
@@ -1059,6 +1201,43 @@ private:
 	// from inside `execute` and the loop thread read it; both of those are this
 	// thread now.
 	bool _stopping = false;
+};
+
+// THE RUNTIME'S HOST, AND THE WHOLE OF WHAT THE EXECUTOR LEARNS (#208).
+//
+// Five lines of body, and that is the shape the ticket asked for: the executor
+// says `wait_child` because it has nothing to do until a child does something,
+// this hands the question to the loop, and the loop hands the DECISION to
+// `scheduler::block_or_park`. Nothing on this path branches on whether there is
+// a fiber; exactly one place in the tree does.
+//
+// A SEPARATE CLASS RATHER THAN `event_loop : public cooperation`, because the
+// direction of the dependency is the point: `src/runtime/` must be able to name
+// this interface without naming a loop, a scheduler or a topic, and a loop that
+// WAS a `cooperation` would put the runtime's vocabulary on the host's own
+// public surface. It is also what keeps the seam swappable - a cord, a replay
+// harness or a test can install a different one against the same `shell_state`.
+//
+// INSTALLED BY THE SESSION AND REMOVED BY IT (`session`'s constructor and
+// destructor). `enter_subshell` puts the no-op back in every forked child, which
+// is why a `( )`, a `$( )` and a non-exec pipeline stage all wait with a plain
+// `::waitpid` on their own stack and never touch a scheduler that is not theirs.
+class loop_cooperation final : public runtime::cooperation {
+public:
+	explicit loop_cooperation(event_loop& on) noexcept : _loop(&on) {}
+
+	// STILL EMPTY, deliberately (ADR-0011 §Deferred: "reactors running during
+	// execution (do not flip the bit)"). The boundary is the yield point the door
+	// is priced against; opening it is a later ticket, and doing it here would
+	// make this one about two things.
+	void on_command_boundary() noexcept override {}
+
+	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
+		return _loop->await_child(pid, flags, status);
+	}
+
+private:
+	event_loop* _loop;
 };
 
 } // namespace lesh::ui

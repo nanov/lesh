@@ -89,7 +89,14 @@ private:
 // One real shell on one pty.
 class shell_on_a_pty {
 public:
-	explicit shell_on_a_pty(const scratch_home& home, const char* term = "xterm-256color") {
+	// `execution` is `$LESH_EXECUTION` for the child, or null for "leave it
+	// unset", which is the default and therefore the execution fiber (#208). The
+	// pty tests exec the real binary, so this environment variable is the only
+	// door they have onto the host's execution mode - and it is the same door a
+	// user would reach for if a fiber stack ever turned out to be the wrong place
+	// to fork from.
+	explicit shell_on_a_pty(const scratch_home& home, const char* term = "xterm-256color",
+	                        const char* execution = nullptr) {
 		// A SIZE, EXPLICITLY. `openpty` with no winsize leaves the pty at 0x0 and
 		// the shell falls back to tty.h's 80x24 - which was fine while every
 		// expectation here was a ten-byte `lesh-test>`, and is not fine now that
@@ -128,6 +135,13 @@ public:
 			::unsetenv("XDG_DATA_HOME");
 			::unsetenv("LESH_LOG");
 			::unsetenv("LESH_LOG_FILE");
+			// EXPLICITLY EITHER WAY, never inherited: a developer with
+			// `LESH_EXECUTION` set in their own shell must not silently flip every
+			// default-mode case in this file.
+			if (execution != nullptr)
+				::setenv("LESH_EXECUTION", execution, 1);
+			else
+				::unsetenv("LESH_EXECUTION");
 			// AND `$PWD`, so the shell's LOGICAL working directory is its physical
 			// one. `shell_state::logical_working_directory` prefers an inherited
 			// `$PWD` whenever it still names the current directory, and whatever
@@ -1715,4 +1729,198 @@ TEST(UiPty, ResizingTwiceMidLineLeavesOneCopyOfThePromptAndNotThree) {
 
 	EXPECT_EQ(prompts_after_the_last_erase(shell.seen(), kPrompt), 1u)
 		<< "the resize repaint appended a frame instead of replacing one";
+}
+
+// ===========================================================================
+// EXECUTION MODES, ON THE REAL BINARY (#208)
+// ===========================================================================
+//
+// Every case in this file above runs the DEFAULT mode, which is the execution
+// fiber; these run each case both ways, because the owner's requirement on this
+// ticket is that the inline path stays first-class and a path that is not
+// exercised is a path that does not work.
+//
+// AND THIS IS WHERE FORKING FROM A FIBER STACK IS ON TRIAL. In the default mode
+// `execute` runs on an 8 MB fiber stack, so every fork below - a subshell, a
+// command substitution, both stages of a pipeline, an `&` child, a function
+// calling an external - is taken from that stack, under ASan, in the real
+// binary. #202 named this the first-contact risk of phase 2; the finding is that
+// there is nothing to report beyond these tests passing.
+
+namespace {
+
+// The two modes, spelled as the child's `$LESH_EXECUTION` - null being "unset",
+// which is the fiber.
+constexpr const char* kExecutionModes[] = {nullptr, "inline"};
+
+[[nodiscard]] const char* mode_name(const char* execution) {
+	return execution == nullptr ? "on_a_fiber" : execution;
+}
+
+} // namespace
+
+TEST(UiPtyExecution, EveryForkLaneRunsFromTheInteractiveShellInBothModes) {
+	// Point 7's list, in one shell per mode. Each marker is COMPUTED rather than
+	// typed - `$((1 + 1))` is five characters on the wire the moment it is keyed
+	// and can only become `2` by being executed - so a shell that merely echoed
+	// the line cannot pass any of them.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+		std::size_t prompts = 1;
+
+		const auto run = [&](const std::string& line, const std::string& expect) {
+			shell.type(line + "\r");
+			++prompts;
+			EXPECT_TRUE(shell.wait_for(expect))
+				<< mode_name(execution) << ": `" << line << "`; saw: " << shell.seen();
+			EXPECT_TRUE(shell.wait_for(kPrompt, prompts))
+				<< mode_name(execution) << ": no prompt after `" << line << "`; saw: "
+				<< shell.seen();
+		};
+
+		// A subshell: a fork that goes on running SHELL code, which is the lane
+		// `enter_subshell` resets the cooperation for.
+		run("( echo a$((1 + 1)); echo b$((1 + 1)) )", "b2");
+		// A command substitution: the third fork that runs shell code without
+		// exec'ing, and the one that never receives the terminal.
+		run("x=$(echo hi); echo got-$x-$((1 + 1))", "got-hi-2");
+		// A pipeline: two children, both foreground, both awaited with WUNTRACED.
+		run("echo pipe-$((1 + 1)) | cat", "pipe-2");
+		// An `&` child and then `wait` for it - the one wait with no WUNTRACED and
+		// the one child the sweep must never reap on its own.
+		run("sleep 0.1 & wait; echo after-$((1 + 1))", "after-2");
+		// A function calling an external: shell code on the fiber stack forking to
+		// exec.
+		run("f() { /bin/echo fn-$((1 + 1)); }; f", "fn-2");
+		// `exit` INSIDE a subshell, which ends the subshell and not the session -
+		// and whose status the parent reads off the wait.
+		run("( exit 3 ); echo st=$?-$((1 + 1))", "st=3-2");
+		// And the session is still there afterwards.
+		run("echo alive-$((1 + 1))", "alive-2");
+	}
+}
+
+TEST(UiPtyExecution, ControlCAtThePromptYields130InBothModes) {
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("some words nobody will run");
+		ASSERT_TRUE(shell.wait_for("nobody will run")) << mode_name(execution);
+		shell.type("\x03");
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+			<< mode_name(execution) << ": no fresh prompt after Ctrl-C; saw: " << shell.seen();
+
+		shell.type("echo status=$?\r");
+		EXPECT_TRUE(shell.wait_for("status=130"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}
+
+TEST(UiPtyExecution, ControlCMidCommandAbandonsTheLineInBothModes) {
+	// The during-a-command path in both modes. On a fiber the SIGINT lands while
+	// the host is blocked in a `poll` over the signal topic and the execution
+	// fiber is parked in its wait; inline it lands while the host is blocked in
+	// `waitpid`. Either way the child is the terminal's foreground group and gets
+	// the interrupt, the reap synthesizes the delivery the shell was excluded
+	// from, and #52's interactive default abandons the rest of the line.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("sleep 5; echo $((1 + 1))-ran-anyway\r");
+		// Long enough that `sleep` is certainly the foreground job and the editor
+		// has parked - the same wait the older Ctrl-C cases take.
+		std::this_thread::sleep_for(std::chrono::milliseconds{300});
+		shell.type("\x03");
+
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+			<< mode_name(execution) << ": no prompt after the interrupt; saw: " << shell.seen();
+		EXPECT_EQ(shell.count_of("2-ran-anyway"), 0u)
+			<< mode_name(execution) << ": the interrupt did not abandon the line; saw: "
+			<< shell.seen();
+
+		shell.type("echo status=$?\r");
+		EXPECT_TRUE(shell.wait_for("status=130"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+	}
+}
+
+TEST(UiPtyExecution, ControlZStopsTheForegroundCommandInBothModes) {
+	// #161's case in both modes, which is what makes `WUNTRACED` on the awaited
+	// wait load-bearing rather than inherited: `waitpid(pid, &st, WUNTRACED |
+	// WNOHANG)` in the loop's sweep has to report a STOP exactly as the blocking
+	// call did, or the fiber never wakes and the shell hangs on a process that is
+	// never going to exit.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		shell.type("sleep 30\r");
+		std::this_thread::sleep_for(std::chrono::milliseconds{300});
+		shell.type("\x1a");
+
+		ASSERT_TRUE(shell.wait_for("stopped: pid "))
+			<< mode_name(execution)
+			<< ": no stopped report - the shell is still waiting on a stopped child; saw: "
+			<< shell.seen();
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2))
+			<< mode_name(execution) << ": no prompt after the stop; saw: " << shell.seen();
+
+		shell.type("echo status=$?\r");
+		EXPECT_TRUE(shell.wait_for("status=" + std::to_string(128 + SIGTSTP)))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+
+		// And the prompt is usable, which is the whole of what "returns the
+		// prompt" has to mean.
+		shell.type("echo alive-$((1 + 1))\r");
+		EXPECT_TRUE(shell.wait_for("alive-2"))
+			<< mode_name(execution) << ": saw: " << shell.seen();
+
+		const pid_t stopped = pid_in_stopped_report(shell.seen());
+		ASSERT_GT(stopped, 0) << mode_name(execution) << ": saw: " << shell.seen();
+		::kill(stopped, SIGCONT);
+		::kill(stopped, SIGKILL);
+	}
+}
+
+TEST(UiPtyExecution, TheExitBuiltinEndsTheSessionInBothModes) {
+	// Point 8: `exit` is a status the shell reports from inside the `execute` the
+	// loop is waiting on, and the execution fiber must be left in a state the
+	// process can die in - parked on its inbox owning nothing, which is what the
+	// leak gate judges. On a fiber the `request_stop` happens one stack away from
+	// where it is read, and the flag is still settled by the statement after
+	// `run_the_line` returns.
+	for (const char* execution : kExecutionModes) {
+		const scratch_home home{kRc};
+		shell_on_a_pty shell{home, "xterm-256color", execution};
+		ASSERT_TRUE(shell.alive()) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt)) << mode_name(execution);
+
+		// A command first, so the fiber exists and has parked on its inbox before
+		// the session ends - which is the shutdown shape point 8 is about.
+		shell.type("echo before-$((1 + 1))\r");
+		ASSERT_TRUE(shell.wait_for("before-2")) << mode_name(execution);
+		ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << mode_name(execution);
+
+		shell.type("exit 5\r");
+		const std::optional<int> status = shell.reap();
+		ASSERT_TRUE(status.has_value())
+			<< mode_name(execution) << ": the session did not end; saw: " << shell.seen();
+		ASSERT_TRUE(WIFEXITED(*status)) << mode_name(execution);
+		EXPECT_EQ(WEXITSTATUS(*status), 5) << mode_name(execution);
+
+		struct termios after{};
+		ASSERT_TRUE(shell.modes(after)) << mode_name(execution);
+		EXPECT_TRUE(is_cooked(after)) << mode_name(execution) << ": `exit` left the terminal raw";
+	}
 }

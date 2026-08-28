@@ -6,7 +6,8 @@
 Supersedes [ADR-0009](0009-two-owner-threads.md). Written when step 3 of #145
 landed (#203), against the design recorded on #145 — the grilling record, the
 architecture review, the tick statement and the later notes — and implemented by
-#198, #199, #200, #201 and #202. The library evidence is the research note,
+#198, #199, #200, #201 and #202. Amended by #206 (the yield's price) and #208
+(phase 2a: execution as a fiber). The library evidence is the research note,
 [2026-08-26 stackful fibers: Tarantool and minicoro](../superpowers/research/2026-08-26-stackful-fibers-tarantool-minicoro.md).
 
 ## Context
@@ -40,6 +41,45 @@ stays as the tripwire that says the premise still holds.
 
 **The host is the loop, not a fiber.** `event_loop::run` is the tick. The UI part
 never parks, and a fiber that never parks is the loop with extra ceremony.
+
+**EXECUTION *IS* A FIBER, and that is what phase 2 bought (#208).** One fiber in a
+lane of its own — `execution`, never parked by phase, because it is what the phase
+is ABOUT — with an 8 MB reserve stack (16 under ASan) given per spawn, committed on
+touch, spawned on the first accepted line and parked on its inbox between
+commands. Its body is `for(;;){ line = inbox.recv();
+done.send(shell.execute(line)); }`; the accept path sends and then KEEPS TURNING
+until the answer is there, and the foreground wait at the bottom of the
+interpreter is a park rather than a blocked thread. **Phase is still written at
+exactly the two host places.** While `executing`, the tty and timer topics are out
+of the poll set — the terminal is the child's, and a timer would dispatch an action
+into an editor that is not on screen — render is suppressed, and the signal
+topic's byte is drained without producing an editor event, because a SIGINT turned
+into `cancel_line` there would call `execute` from inside `execute`. The signal
+NUMBERS are held and replayed on the first turn after the command, which is the
+delivery the self-pipe byte used to make by simply staying in the pipe.
+
+**AND EXECUTION IS ALSO RUNNABLE INLINE, first-class, chosen per `execute` by the
+host** (`loop_options::execution`, `LESH_EXECUTION=inline` at the wiring site). On
+that path `shell_side::execute` runs on the host's own stack, `current()` is null
+throughout, and every wait is a blocking `::waitpid` — the shell exactly as it ran
+before #208. It is not a degraded mode: it is what an action's `port_call` and the
+EXIT trap after `run()` has returned take anyway, and it is the recorded way out if
+a fiber stack ever turns out to be the wrong place to fork from. Both modes are
+covered by `UiLoop*` and `UiPty*`, because a path that is not exercised is a path
+that does not work.
+
+**The fiber-or-inline decision is ONE SCHEDULER PRIMITIVE, and nothing above it
+branches.** `scheduler::block_or_park(slot, run_blocking, enlist)`:
+`current() == nullptr` runs the blocking thing on the stack it is already on and
+answers with its result; on a fiber it `enlist`s the caller's `await_slot` with
+whoever will complete it, parks, and answers with what `complete` stored.
+Completing from inside `enlist` is legal and means the fiber never parks — which is
+how a caller says "this has already happened", and how `sleep 0.1 & wait` finds a
+zombie whose SIGCHLD was drained turns ago. `src/fiber/` therefore never sees a pid
+or a file descriptor: `await_slot` is one word of answer and the fiber to wake, and
+the waiter TABLE belongs to the host, which is the only side that knows what it is
+waiting for. `cooperation::wait_child` is a five-line adapter over it, and #209's
+`await_readable` will be another.
 
 **Phase is where the session is**, written at exactly two places — `quiesce()`
 (→`executing`) and `resume_after_execution()` (→`boundary`→`editing`). **Groups
@@ -84,14 +124,27 @@ following turn, and that turn is immediate because a runnable emitter makes the
 poll timeout 0.
 
 **The runtime's seam is `runtime::cooperation`, and it is never null.** The
-executor knows one sentence — "a command just finished, whoever is hosting me may
-run" — and says it through an abstract class, not a template: whether a shell is
+executor knows two sentences — "a command just finished, whoever is hosting me may
+run" and "I have nothing to do until this child does something" — and says them
+through an abstract class, not a template: whether a shell is
 interactive is a runtime fact decided in `main()`. `shell_state` starts with a
 static no-op, so there is not one null check in the runtime and no site can
 forget one. `lesh -c`, a script, a unit test and a forked child all cooperate
 with nobody at the cost of an indirect call to a `return`; `enter_subshell` puts
 the no-op back, for every role, because nothing a child can do makes its parent's
 host the right thing to talk to.
+
+**THE SECOND VERB IS `wait_child`, AND ITS NO-OP IMPLEMENTATION *IS* `::waitpid`
+(#208)** — which is why it could be introduced without moving one behaviour.
+`tree_walking_executor::reap` is the runtime's ONE wait: all seven former direct
+`waitpid` calls go through it, `WUNTRACED` staying exactly where the file already
+had it (the two foreground waits Ctrl-Z can reach), and `run_async`'s `_background`
+bookkeeping untouched. A script, `lesh -c`, a unit test and every forked child
+reach the identical syscall with the identical arguments through one indirect call.
+**The host reaps ONLY AWAITED PIDS, never `-1`**, so a background child stays a
+zombie until `wait` asks for it exactly as before and no job-control semantics
+moved in that ticket. The "notices mid-command" upgrade is a later ticket built on
+this seam, not a side effect of it.
 
 **There is no fiber call stack.** Fibers are long-lived and wait for messages;
 they are never called. The host is the sole resumer, every yield returns to the
@@ -150,7 +203,40 @@ has held for all five steps.
   `[ PASSED ]` line and only `ctest` turns it into a red case (#202: 1915/1915
   green, 512 KB leaked).
 - A fiber's stack is not free: 512 KB reserved per fiber, 1 MB under ASan,
-  committed on touch, with a guard page below. Two fibers is the v1 inventory.
+  committed on touch, with a guard page below. Two fibers was the v1 inventory;
+  #208 makes it three, the third being the execution fiber's 8 MB reserve (16
+  under ASan) through `spawn`'s per-spawn size override. Reserve is not memory —
+  the pages a `run_input` actually walks are what get committed — and the size is
+  what a thread gets on Linux by default, so a deeply nested script survives to
+  the same depth interactively as it does in a script.
+- **FORKING FROM A FIBER STACK UNDER ASan IS FINE, and that was the ticket's
+  first-contact risk** (#202 flagged it, #208 measured it). Every fork lane the
+  interactive shell has — a subshell, a command substitution, both stages of a
+  pipeline, an `&` child, a function calling an external — is taken from the
+  execution fiber's stack in `UiPtyExecution.EveryForkLaneRuns...` and in
+  `UiLoopExecution`'s own forking shell, under ASan/UBSan/LSan, on the real
+  binary, and there is nothing to report. The reason it works is #202's own fix:
+  minicoro announces the switch INTO a coroutine, so ASan's record of the current
+  stack is correct for the whole of a slice, which is exactly when a fork happens;
+  `run_one_slice` restores the host bounds after the resume, and
+  `__asan_handle_no_return` before the child's `_exit` therefore has the right
+  bounds on both sides. No leak is reported for the execution fiber parked on its
+  inbox at shutdown either: its frame owns nothing, and `spawn` registered the
+  stack as an LSan root region in any case.
+- **The park needs a wake, and the wake is SIGCHLD — so the host asks the kernel
+  whether it still has it** (`signal_hub::catches`). `reassert`'s rule 3 leaves an
+  inherited `SIG_IGN` and a user's `trap '' CHLD` alone, both legitimate, and both
+  mean nothing will ever ring the self-pipe again; with SIGCHLD ignored the kernel
+  reaps children itself, so even a poll woken for another reason would find
+  nothing. `await_child` therefore takes the wait inline when the answer is no,
+  which is one `sigaction` query per foreground command and the difference between
+  a shell that runs `trap '' CHLD; sleep 1` and a shell that hangs on it.
+- **`turn` is re-entrant now, and it is safe by exclusion rather than by design.**
+  The accept path's turns run from inside the outer turn's event walk. Nothing is
+  pushed onto `_events` while `executing` — the signal drain defers instead, and no
+  other topic is polled — so the swap that would move the outer walk's storage out
+  from under it never happens. Written down because the next verb to park inside a
+  command inherits this and not a rule.
 - A keystroke costs no more than it did: the reactors' contribution to 100
   keystrokes is **0 mallocs**, measured against a loop with no reactors at all.
 - Serialization is the cost and is bounded the same way it always was: a stat
@@ -176,12 +262,17 @@ has held for all five steps.
 
 ## Deferred — phase 2, priced and not built
 
-`wait_child(pid)` and `await_readable(fd)` on the `cooperation` seam (the fd verb
-is coost's shape: `io_event(fd, ev).wait(ms)` — register interest for the current
-fiber, park, resume on readiness or timeout, deregister); `read`, `wait` and
-`tail -f` as awaits on those; **`vared`'s nested read as a plain nested await**,
-which is what retires its slot-refusal plumbing; `request<Req,Rep>` for the port
-when execution becomes a fiber; **`queue<T,N>` with `close()`** — a receiver
+`wait_child(pid)` LANDED IN #208 and is struck from this list; what is left of the
+line is `await_readable(fd)` on the `cooperation` seam (the fd verb is coost's
+shape: `io_event(fd, ev).wait(ms)` — register interest for the current fiber, park,
+resume on readiness or timeout, deregister), and it is a five-line adapter over
+`block_or_park` like its sibling. Then: `read` and `tail -f` as awaits on it —
+`wait` is already one; **`vared`'s nested read as a plain nested await**, which is
+what retires its slot-refusal plumbing; `request<Req,Rep>` for the port, WHICH #208
+DECLINED TO BUILD because it would not have removed code (the waiter table is
+pointers into the awaiting fibers' own frames, ten lines, and a request/reply type
+over it would have been more machinery for the same shape); **`queue<T,N>` with
+`close()`** — a receiver
 parked on a channel whose producer is destroyed must wake with "closed", not
 sleep for ever (coost `chan::close`) — as the observers group's first customer;
 prompt modules as fibers (`git_head` is I/O, so cord material); Lua plugins,
@@ -204,6 +295,12 @@ group park that this ADR is mostly about.
 
 ## Open
 
+- **What a stopped foreground job does to the loop is unchanged and still
+  unresolved** (#161's ledger line, restated because #208 is where it now lives).
+  `WUNTRACED | WNOHANG` in the sweep reports a stop exactly as the blocking wait
+  did, so Ctrl-Z returns the prompt and `$?` is 128+SIGTSTP; a pipeline whose
+  MIDDLE stage stops still hangs the shell, because there is no job table. That is
+  the same floor as before, now reached through a park.
 - **LSan on Linux is unverified** — no environment. Darwin needed the explicit
   root-region registration; the registration is unconditional, so it should be
   right either way, and the fix if it is not is `__lsan_ignore_object` on parked
@@ -213,7 +310,8 @@ group park that this ADR is mostly about.
 
 ## References
 
-- #145 (the design record), #82 (the umbrella), #198–#203 (the steps).
+- #145 (the design record), #82 (the umbrella), #198–#203 (phase 1), #206 (the
+  yield stride), #208 (phase 2a: execution as a fiber).
 - Research note: `docs/superpowers/research/2026-08-26-stackful-fibers-tarantool-minicoro.md`.
 - ADR-0007 (one owner per message in flight), ADR-0008 (the token capability
   surface, whose `superseded` poll is now also the yield), ADR-0009 (superseded).

@@ -76,7 +76,9 @@ suites are the `Ui*` ones (`UiLoop*`, `UiSession*`, `UiReactorFiber` - where the
 phase, the group park and the tick's two slice positions are asserted; it
 replaced `UiWorkers` when #202 replaced the pool with one fiber per reactor -,
 `UiKnowledge*`,
-`UiLoopProposals`, and since #168 Phase B `UiHighlight`, `UiAutosuggest`,
+`UiLoopProposals`, `UiLoopExecution` and `UiPtyExecution` - where #208's two
+execution modes are each asserted twice over, once per mode -, and since #168
+Phase B `UiHighlight`, `UiAutosuggest`,
 `UiHistorySearch`, `UiComplete*`, `UiCommandKind`, `UiReactorTheme`, `UiPty` -
 which was `LeshperPty` and is renamed for the same rule: a suite that execs the
 real binary over a pty is the host's, not the editor's - and since #170
@@ -116,6 +118,15 @@ overflow case passed in debug for four tickets while the optimizer turned its
 recursion into a jump in release, so it proved nothing there (#203). After
 touching `src/fiber/` or those tests, run
 `./build/release/lesh_tests --gtest_filter='Fiber*'` as well.
+
+**`LESH_EXECUTION` is the one variable that selects anything** (#208), and it is
+NOT the retired `LESH_FRONTEND`: there is still one shell. `LESH_EXECUTION=inline`
+makes an accepted line run on the host's own stack instead of on the execution
+fiber - the shell exactly as it ran before #208, with every foreground wait a
+blocking `::waitpid`. Both modes are gated: `UiLoopExecution` and `UiPtyExecution`
+run every case twice, and `UiPty`'s harness takes the value as its third
+constructor argument. Unset is the fiber. If a hang or a fork-related sanitizer
+report ever appears under a command, this variable is the first bisect.
 
 **Per-file scores reproduce exactly; totals do not across environments.** Measure
 before and after in the same environment and quote the delta, never a remembered
