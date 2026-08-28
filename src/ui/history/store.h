@@ -288,11 +288,21 @@ public:
 	// history has mapped - reloads and publishes, so the very next walk sees the
 	// other terminal's commands.
 	//
-	// THE LOOP'S, like every other mutation (ADR-0009). It cannot race `add` or
-	// `resolve_pending`: those run inside `shell_side::execute`, which since #201
-	// is a call the loop makes - so the loop is in that call for the whole of it
-	// and polls nothing while it is (it was blocked in `wait_on_shell` on the
-	// `shell` and `signal` topics before, which is the same window).
+	// THE LOOP'S, like every other mutation (ADR-0009) - AND IT RUNS DURING A
+	// COMMAND NOW (#208, corrected here by #211 §2.4). This used to say the loop
+	// polls nothing while it is inside `shell_side::execute`, and since execution
+	// became a fiber that is false: the watch topic stays in the poll set for the
+	// whole of a command, so a `drain_watch` - and the `publish` and Tier 1 remap
+	// behind it - can land BETWEEN `add(pending)` and `resolve_pending`.
+	//
+	// THE INVARIANT THAT HOLDS INSTEAD, and it is two sentences. NOT INSIDE EITHER
+	// CALL: `add` and `resolve_pending` run on the execution fiber, and the host
+	// only turns while that fiber is parked in a wait at the bottom of the
+	// interpreter - which is inside neither. AND NOTHING IN THE WINDOW BETWEEN THEM
+	// CAN SEE THE PENDING ITEM: `publish` excludes pending items from every view it
+	// builds, so however many views this drain rebuilds, the command being recorded
+	// is not in any of them; `resolve_pending` replaces the item copy-on-write and
+	// publishes the one view that has it.
 	//
 	// A SPURIOUS WAKE IS THE COMMON CASE and costs one `stat`: the watch is on
 	// the DIRECTORY (it has to be - a `rename` over a file never fires on that

@@ -1898,7 +1898,7 @@ void event_loop::execution_body(fiber::scheduler& on, void* userdata) {
 	// sole resumer and every yield inside `execute` - which is what a foreground
 	// wait's park is - comes back to `turn`.
 	for (;;) {
-		const std::string_view line = me._exec_inbox.recv();
+		const std::string line = me._exec_inbox.recv();
 		std::int32_t status = 0;
 		if (me._shell != nullptr) {
 			// ADR-0009's one writer, ANNOUNCED (#151): this is where a `PATH=`
@@ -1935,10 +1935,12 @@ std::int32_t event_loop::run_the_line(std::string_view line) {
 		         "execution fiber spawned: stack=%zu", execution_stack_bytes());
 	}
 
-	// A VIEW OF `_accepted`, WHICH IS A MEMBER. The slot's own debug assert covers
-	// the hazard this would otherwise be (a message pointing into the SENDER's
-	// fiber stack); the sender here is the host, whose stack outlives everything.
-	_exec_inbox.send(line);
+	// THE LINE ITSELF, OWNED (#211 §2.3). It was a `string_view` into `_accepted`,
+	// which every accept reassigns - safe only for as long as nothing re-enters
+	// `accept_current_line`, which is a rule nothing wrote down and `vared`'s
+	// nested read will break. One copy per accepted line is human frequency and
+	// buys a message that owns its bytes.
+	_exec_inbox.send(std::string{line});
 
 	// AND THE HOST KEEPS TURNING. This is the whole of what the ticket buys: the
 	// signal topic and the watch are polled, the execution fiber gets its slices,

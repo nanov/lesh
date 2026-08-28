@@ -2,6 +2,8 @@
 #include "ui/reactors.h"
 #include "leshper/keymap.h"
 #include "ui/loop.h"
+
+#include "ui/history/store.h"
 #include "ui/shell_side.h"
 #include "ui/tty.h"
 #include "ui/reactor_call.h"
@@ -1991,6 +1993,133 @@ TEST(UiLoopExecution, TheExecutionFiberIsNeverAbandonedWhenThePollFailsMidComman
 	// prompt onto.
 	EXPECT_TRUE(loop.exiting());
 
+	loop.leave_read();
+	hub.uninstall();
+}
+
+namespace {
+
+// THE HISTORY, RECORDED THE WAY `session::execute` RECORDS IT (#211 §2.4): the
+// entry goes in as PENDING before the command runs and is resolved with its exit
+// status after. What is under test is the window between those two, which #208
+// opened and `store.h` used to deny existed.
+class recording_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	lesh::ui::history::store* history = nullptr;
+	std::string directory;
+
+	std::size_t watch_drains_inside = 0;
+	bool pending_was_visible_inside = false;
+	std::size_t entries_visible_inside = 0;
+
+	std::int32_t execute(std::string_view line) override {
+		history->add(line, "/nowhere", true);
+
+		// A SIBLING SHELL TOUCHES THE DATA DIRECTORY. The watch is on the
+		// directory - a `rename` over a file never fires on that file - so any
+		// creation in it makes the descriptor readable, which is exactly the
+		// spurious wake `drain_watch` calls the common case.
+		{
+			std::ofstream sibling{directory + "/history.data.tmp.sibling"};
+			sibling << 'x';
+		}
+
+		const pid_t child = ::fork();
+		if (child == 0) {
+			::usleep(40 * 1000);
+			::_exit(7);
+		}
+		int status = 0;
+		(void)loop->await_child(child, 0, &status);
+
+		// WHAT THE WATCH DID WHILE WE WERE PARKED, and what a walk taken at this
+		// instant - after the drain, before the resolve - can see.
+		watch_drains_inside = loop->watch_drains();
+		history->for_each_merged_newest_first(
+			[&](const lesh::ui::history::merged_entry& one) {
+				++entries_visible_inside;
+				const std::string_view text{
+					reinterpret_cast<const char*>(one.what.cmd.data()), one.what.cmd.size()};
+				if (text == line)
+					pending_was_visible_inside = true;
+				return true;
+			});
+
+		history->resolve_pending(7);
+		return 7;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, TheHistoryWatchFiresBetweenAddPendingAndResolvePending) {
+	// #211 §2.4. `store.h` claimed the loop polls nothing while it is inside
+	// `shell_side::execute`; #208 made that false, and this is the window it
+	// opened - `drain_watch`, and the `publish` and Tier 1 remap behind it,
+	// landing between `add(pending)` and `resolve_pending`.
+	//
+	// The invariant that replaced the claim is the second assertion: `publish`
+	// excludes pending items from every view it builds, so however many views the
+	// drain rebuilds in that window, the command being recorded is in none of them.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	lesh::testing::temp_path scratch;
+	lesh::ui::history::store history;
+	(void)history.open(scratch.dir());
+	if (history.watch_fd() < 0)
+		GTEST_SKIP() << "this data directory gives out no notification descriptor";
+
+	// One older entry, resolved, so the walk inside the command has something to
+	// find and "saw nothing at all" cannot pass for "saw no pending item".
+	history.add("echo older", "/nowhere", true);
+	history.resolve_pending(0);
+
+	fake_tty tty;
+	signal_hub hub;
+	recording_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	loop.attach_watch(
+		history.watch_fd(),
+		[](void* userdata) { static_cast<lesh::ui::history::store*>(userdata)->drain_watch(); },
+		&history);
+	shell.loop = &loop;
+	shell.history = &history;
+	shell.directory = scratch.dir();
+	loop.enter_read();
+
+	tty.type("echo pending");
+	(void)loop.turn(0);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 7);
+	// THE WINDOW IS REAL: the watch fired while the command was running.
+	EXPECT_GE(shell.watch_drains_inside, 1u)
+		<< "the watch topic is polled during a command since #208";
+	// AND NOTHING IN IT COULD SEE THE PENDING ITEM.
+	EXPECT_GE(shell.entries_visible_inside, 1u) << "the walk did run over something";
+	EXPECT_FALSE(shell.pending_was_visible_inside)
+		<< "publish excludes pending items from every view it builds";
+
+	// And the resolve is what puts it in.
+	bool resolved_is_visible = false;
+	history.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
+		const std::string_view text{reinterpret_cast<const char*>(one.what.cmd.data()),
+		                            one.what.cmd.size()};
+		if (text == "echo pending")
+			resolved_is_visible = true;
+		return true;
+	});
+	EXPECT_TRUE(resolved_is_visible);
+
+	loop.detach_watch();
 	loop.leave_read();
 	hub.uninstall();
 }

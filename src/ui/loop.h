@@ -1255,11 +1255,15 @@ private:
 	// never accepts a line - which is most of `ui_loop_tests.cpp` - reserves no
 	// stack at all.
 	fiber::fiber* _execution = nullptr;
-	// The two channels, and they are the only ones. `inbox` carries a view of
-	// `_accepted`, which is a member and therefore outlives the command; `done`
-	// carries the status back, and the host takes it with `try_recv` because the
-	// host cannot park.
-	fiber::slot<std::string_view> _exec_inbox{_sched};
+	// The two channels, and they are the only ones. `inbox` carries THE LINE
+	// ITSELF and not a view of `_accepted` (#211 §2.3): a view into a member that
+	// the next accept reassigns is safe only while `accept_current_line` cannot
+	// re-enter, which is an unwritten rule `vared`'s nested read is going to
+	// break. One move per accepted line, at human frequency, buys a message that
+	// owns what it carries - which is ADR-0007's rule and what `slot` is for.
+	// `done` carries the status back, and the host takes it with `try_recv`
+	// because the host cannot park.
+	fiber::slot<std::string> _exec_inbox{_sched};
 	fiber::slot<std::int32_t> _exec_done{_sched};
 	// Who is waiting for which child. Pointers into the awaiting fibers' own
 	// frames - see `child_wait` - and reserved at construction so that
