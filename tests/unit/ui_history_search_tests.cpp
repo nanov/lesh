@@ -357,11 +357,18 @@ TEST(UiHistorySearch, ASinkThatSaysStopEndsTheWalk) {
 	EXPECT_EQ(result.entries_examined, 1u);
 }
 
-TEST(UiHistorySearch, TheCancelPollRunsBetweenEntries) {
-	// #94's supersede poll: it runs BEFORE an entry is examined, so a cancelled
-	// walk has nothing half-done and the sink was not called for work about to
-	// be thrown away.
-	const vector_history_source source{{"a1", "a2", "a3", "a4"}};
+TEST(UiHistorySearch, TheCancelPollRunsOnAStrideBetweenEntries) {
+	// #94's supersede poll, on #206's stride: BEFORE the first entry and every
+	// `poll_every` entries after it - and always before the entry is examined, so
+	// a cancelled walk has nothing half-done and the sink was not called for work
+	// about to be thrown away.
+	//
+	// The stride is asserted rather than assumed, because it is a number chosen
+	// from a measurement: an entry is four nanoseconds of work and a poll is also
+	// a YIELD costing a hundred and fifty, so a poll per entry cost twenty-five
+	// times what the walk did. See `history_search::poll_every`.
+	const std::vector<std::string> lines(history_search::poll_every + 4, "a");
+	const vector_history_source source{lines};
 	history_search search = searcher_for(history_search::mode::line);
 	std::size_t polls = 0;
 	std::size_t matched = 0;
@@ -372,10 +379,11 @@ TEST(UiHistorySearch, TheCancelPollRunsBetweenEntries) {
 			++matched;
 			return true;
 		},
-		[&]() { return ++polls > 2; });
+		[&]() { return ++polls > 1; });
 
-	EXPECT_EQ(matched, 2u);
-	EXPECT_EQ(result.entries_examined, 2u);
+	EXPECT_EQ(polls, 2u) << "one poll before the walk, one a stride into it";
+	EXPECT_EQ(matched, history_search::poll_every);
+	EXPECT_EQ(result.entries_examined, history_search::poll_every);
 	EXPECT_TRUE(result.cancelled);
 	EXPECT_FALSE(result.stopped);
 }
@@ -467,7 +475,16 @@ TEST(UiHistorySearch, TheProviderCarriesTheModeAndTheProposalKind) {
 TEST(UiHistorySearch, ThePollNoticesMidWalkAndTheAnswerIsDroppedAnyway) {
 	registry reg;
 	loop_harness loop(reg);
-	const superseding_source source{loop, {"git a", "git b", "git c"}};
+	// LONGER THAN THE WALK'S POLL STRIDE (#206). The source supersedes as it hands
+	// out its second entry and the walk notices at its next cancellation poll,
+	// `history_search::poll_every` entries later - so what used to be "one match
+	// was already out" is now "a stride's worth was". The property is the same one:
+	// the stream is part-way out when the supersede lands, and the batch says so.
+	std::vector<std::string> entries;
+	entries.reserve(history_search::poll_every + 2);
+	for (std::size_t i = 0; i < history_search::poll_every + 2; ++i)
+		entries.push_back("git " + std::to_string(i));
+	const superseding_source source{loop, std::move(entries)};
 	history_search_provider provider;
 	provider.source = &source;
 	provider.options.search = history_search::mode::prefix;
@@ -478,8 +495,9 @@ TEST(UiHistorySearch, ThePollNoticesMidWalkAndTheAnswerIsDroppedAnyway) {
 	const std::vector<reactor_batch> batches = loop.react(s, LESH_EVENT_BUFFER_CHANGED);
 
 	ASSERT_EQ(batches.size(), 1u);
-	// Streaming: the first match was already emitted when the supersede landed.
-	EXPECT_EQ(batches[0].proposals.size(), 1u);
+	// Streaming: the matches up to the poll were already emitted when the
+	// supersede was noticed.
+	EXPECT_EQ(batches[0].proposals.size(), history_search::poll_every);
 	// Giving up early is a courtesy to the worker, not a correctness mechanism.
 	EXPECT_EQ(batches[0].status, LESH_ERR_SUPERSEDED);
 }
