@@ -607,15 +607,18 @@ _Avoid_: giving an observer a **slot**; cancelling one on supersede.
 
 **Cooperation** _[lesh]_:
 What the runtime wants of whatever is hosting it — `runtime::cooperation`
-(`src/runtime/cooperation.h`, #199). Two verbs: `on_command_boundary()`, called
-where the executor already polls `g_pending`, and `wait_child(pid, flags, status)`
-(#208), whose no-op implementation IS `::waitpid` — which is why the second one
-moved no behaviour. NEVER NULL: `shell_state` starts with a static no-op, so
+(`src/runtime/cooperation.h`, #199). Three verbs: `on_command_boundary()`, called
+where the executor already polls `g_pending`; `wait_child(pid, flags, status)`
+(#208), whose no-op implementation IS `::waitpid`; and `await_readable(fd)` (#209),
+said by `read` before each blocking read, whose no-op implementation is EMPTY —
+which is why neither of the last two moved a behaviour. NEVER NULL: `shell_state` starts with a static no-op, so
 `lesh -c`, a script, a test and a forked child all cooperate with nobody at the
 cost of an indirect call. The name says "cooperation" and never "fibers" on
 purpose - the runtime must not learn what is on the other side.
 _Avoid_: a null check; a template parameter; naming a scheduler from the runtime;
-a `waitpid` anywhere in `src/runtime/` except `reap`'s one line.
+a `waitpid` anywhere in `src/runtime/` except `reap`'s one line; giving
+`await_readable` a return value — a verb that could report an error would put the
+host inside `read`'s POSIX behaviour.
 
 **Reap** _[lesh]_:
 `tree_walking_executor::reap(pid, flags, &status)`, the runtime's ONE wait (#208).
@@ -635,6 +638,18 @@ inside `enlist` means the fiber never parks. `src/fiber/` sees no pid and no fd:
 the waiter table is the host's, on the awaiting fiber's own frozen frame.
 _Avoid_: a second `current() == nullptr` branch anywhere; putting a pid or an fd
 in `src/fiber/`; reaping `-1`.
+
+**Fd interest** _[lesh]_:
+One fiber's question about one descriptor, for the length of one wait (#209).
+`event_loop::_fd_waits` is a fixed array of four pointers into the awaiting
+fibers' own frames — `_child_waits`' shape, without the heap block — and every
+turn appends its descriptors to the poll set. It is NOT a topic: nothing drains
+it, so the byte that ended the wait is still in the kernel for the waiter's own
+`::read`. That is also how the tty gets back into the poll set during `executing`,
+where #208 took its topic out.
+_Avoid_: draining an interest; a `revents` mapping back from the poll set
+(`wake_readable_fds` asks per waiter, which is what gives it the enlist probe for
+free); waiting on a descriptor `poll` reports POLLNVAL for.
 
 **Group** _[lesh]_:
 A scheduler tag, eight of them, that parks a SET of fibers with one bit (#200).
@@ -662,8 +677,9 @@ The fiber an accepted line runs on (#208): `for(;;){ line = inbox.recv();
 done.send(shell.execute(line)); }`, in the `execution` lane, 8 MB of reserve stack
 (16 under ASan), spawned on the first accepted line and parked on its inbox
 between commands. Its point is that `reap` can PARK: the host keeps turning while
-a command runs, so the signal topic and the history's watch stay alive and #209's
-awaits have somewhere to land.
+a command runs, so the signal topic and the history's watch stay alive — and since
+#209 an interactive `read` parks there too, so the loop is live for as long as a
+user is willing to think.
 _Avoid_: a second one; calling it; assuming a line is one slice — a line with a
 foreground command in it is at least two.
 
