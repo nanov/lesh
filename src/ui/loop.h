@@ -889,6 +889,21 @@ public:
 	// accepted, and null for ever in `execution_mode::inline_` - which is what a
 	// test asserts to know which of the two paths it is on.
 	[[nodiscard]] bool has_execution_fiber() const noexcept { return _execution != nullptr; }
+	// WHETHER A COMMAND IS ON THAT FIBER RIGHT NOW, which is the one state this
+	// loop may never be destroyed in: `~scheduler` unmaps a parked stack without
+	// unwinding it, so an abandoned `execute` leaks the executor's frames, leaves
+	// its redirection fds open, orphans its child and never unwinds
+	// `shell_executing_flag::scope`. Between commands the fiber is parked in
+	// `recv` on its inbox, and the inbox's waiter is the whole of the evidence.
+	[[nodiscard]] bool has_execution_fiber_mid_command() const noexcept {
+		return _execution != nullptr && !_exec_inbox.has_waiter();
+	}
+	// THE ONLY WAY A TEST CAN REACH THE FATAL-POLL PATH. `poll(2)` answers
+	// POLLNVAL in `revents` for a closed descriptor and returns -1 only for
+	// conditions a test cannot arrange with a real fd, so the next `n` polls in
+	// `turn` answer -1 with EBADF instead - which is what a terminal that has gone
+	// away looks like from here. Zero, the default, is every shell.
+	void fail_next_polls(int n) noexcept { _fail_polls = n; }
 	// Slices the execution fiber has been given, and children currently awaited.
 	// Both are counters a test reads; neither decides anything.
 	[[nodiscard]] std::size_t execution_slices() const noexcept;
@@ -1259,6 +1274,14 @@ private:
 	// the fast path: a turn with no interests builds the poll set it always built.
 	std::array<fd_wait*, kMaxFdWaits> _fd_waits{};
 	std::size_t _fd_wait_count = 0;
+
+	// THE POLL HAS FAILED AND A COMMAND IS STILL RUNNING (#211 §4.1). Set once,
+	// never cleared: the turns that follow keep only the signal topic - the
+	// SIGCHLD byte is what ends the foreground wait - and the loop leaves as soon
+	// as the fiber has given the status back. See `turn` and `run_the_line`.
+	bool _poll_failed = false;
+	// Polls a test has asked to fail; see `fail_next_polls`.
+	int _fail_polls = 0;
 
 	bool _exiting = false;
 	std::int32_t _exit_status = 0;

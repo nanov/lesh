@@ -138,6 +138,12 @@ inline constexpr std::size_t effect_index =
 // with a drain that finds nothing and a queue that stops being armed.
 constexpr short kReadable = POLLIN | POLLHUP | POLLERR;
 
+// How long a turn sleeps when even the signal topic will not poll (#211 §4.1).
+// Reached only after `poll` has failed twice on a set narrowed to this process's
+// own self-pipe, which is a shell with nothing left to wait on; what the sleep
+// buys is a `waitpid` sweep that ends the command rather than a spun core.
+constexpr int kBlindWaitMs = 20;
+
 constexpr short revents_of(const struct pollfd& one) noexcept {
 	return static_cast<short>(one.revents & kReadable);
 }
@@ -586,6 +592,15 @@ event_loop::~event_loop() {
 	// exactly this shape. So every emitter is superseded and run out to its next
 	// cancellation poll first, which is where it abandons the walk and parks back
 	// on `recv` owning nothing.
+	//
+	// AND THE EXECUTION FIBER CANNOT BE DRAINED THAT WAY (#211 §4.1), because a
+	// command has no cancellation poll to abandon at. What holds for it is the
+	// stronger statement: `run_the_line` does not return until the status is back,
+	// so by the time anybody can destroy this loop the fiber is parked on its inbox
+	// owning nothing. Asserted rather than trusted - the abandoned case leaked the
+	// executor's frames, its redirection fds and its child, and left no mark.
+	LESH_ASSERT(!has_execution_fiber_mid_command()
+	            && "a loop destroyed with a command still on the execution fiber");
 	drain_emitters();
 }
 
@@ -810,6 +825,16 @@ turn_result event_loop::turn(int timeout_ms) {
 	// builtin puts the same descriptor here instead - polled, never drained.
 	for (std::size_t i = 0; i < _fd_wait_count; ++i)
 		(void)poll_on(_fd_waits[i]->fd);
+	// AND A POLL THAT HAS ALREADY FAILED KEEPS ONLY THE SIGNAL TOPIC (#211 §4.1).
+	// One of the descriptors in the set has gone and the kernel does not say which;
+	// the self-pipe is this process's own, and the SIGCHLD byte on it is the one
+	// thing the foreground wait still needs. Narrowing rather than giving up is
+	// what lets the turns go on until the command has finished.
+	if (_poll_failed) {
+		at = 0;
+		tty_at = watch_at = -1;
+		signal_at = _signals != nullptr ? poll_on(_signals->wakeup_fd()) : -1;
+	}
 
 	// AND THE CALLER'S TIMEOUT IS CLAMPED THE SAME WAY `poll_timeout_ms` IS
 	// (#202). `turn()` computes its timeout and finds the zero there; `turn(ms)`
@@ -818,7 +843,8 @@ turn_result event_loop::turn(int timeout_ms) {
 	if (timeout_ms != 0 && _sched.runnable(sliced_lanes()))
 		timeout_ms = 0;
 
-	const int ready = ready_now(_poll.data(), at, timeout_ms);
+	const int ready = _fail_polls > 0 ? (--_fail_polls, errno = EBADF, -1)
+	                                  : ready_now(_poll.data(), at, timeout_ms);
 	if (ready < 0) {
 		if (errno != EINTR) {
 			// #128's trap 1: a non-EINTR poll error is the terminal having gone,
@@ -826,9 +852,28 @@ turn_result event_loop::turn(int timeout_ms) {
 			// been closed".
 			LESH_LOG(log::level::error, log::category::loop, "poll failed: %s",
 			         std::strerror(errno));
-			_exiting = true;
-			result.exiting = true;
-			return result;
+			// BUT IT DOES NOT LEAVE WHILE A COMMAND IS RUNNING (#211 §4.1).
+			// Returning here used to hand control back to `accept_current_line`
+			// with the execution fiber suspended inside `execute`, and the
+			// destructor then unmapped that stack without unwinding it: the
+			// executor's frames leaked, its redirection fds stayed open, its child
+			// was orphaned and the executing flag was never lowered. The child
+			// still exits and SIGCHLD still rings the self-pipe, so the loop keeps
+			// turning on the signal topic alone (see the narrowing above) until the
+			// status is back, and `run_the_line` leaves then.
+			if (has_execution_fiber_mid_command()) {
+				// STILL FAILING WITH THE SET ALREADY DOWN TO THE SELF-PIPE. There
+				// is nothing left to wait on, so the turn sleeps for a slice
+				// instead of spinning a core and the waiter table below does the
+				// waiting by asking `waitpid` directly.
+				if (_poll_failed)
+					(void)::poll(nullptr, 0, kBlindWaitMs);
+				_poll_failed = true;
+			} else {
+				_exiting = true;
+				result.exiting = true;
+				return result;
+			}
 		}
 		// EINTR means a signal landed. The self-pipe has the byte; fall through
 		// and drain the topics with everything marked not-ready, which the
@@ -1762,7 +1807,10 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	// under it, leaving the user's parent shell to start its own prompt after
 	// `$ `. The unpark still happens - the park depth is a balance and
 	// `leave_read` is owed a terminal to hand back - but the repaint does not.
-	const bool ending = _stopping;
+	// OR THE LOOP ITSELF IS DONE (#211 §4.1): a poll that failed while the command
+	// ran leaves `_exiting` up, and a fresh prompt painted onto a terminal that has
+	// gone is the same mistake as one painted for a line nobody will type.
+	const bool ending = _stopping || _exiting;
 
 	resume_after_execution();
 
@@ -1902,13 +1950,23 @@ std::int32_t event_loop::run_the_line(std::string_view line) {
 	// here pushes nothing onto `_events` (the signal drain drops its events while
 	// `executing` and no other topic is polled), so the swap that would move the
 	// outer walk's storage never happens.
-	while (_exec_done.empty() && !_exiting)
+	// AND THE CONDITION IS THE ANSWER AND NOTHING ELSE (#211 §4.1). It used to be
+	// `&& !_exiting`, which made a fatal poll error during a command a way of
+	// leaving with the fiber suspended inside `execute` - see `turn`. Nothing else
+	// sets `_exiting` while `executing`: the tty topic is out of the poll set, no
+	// event is dispatched, and nothing renders. So this terminates when the command
+	// does, which is what it means for a command to be running.
+	while (_exec_done.empty())
 		turn();
 
-	// `try_recv` and not `recv`, because the host has no stack to park. Nothing
-	// there means the loop is exiting under a poll error with the command still
-	// on the fiber - a terminal that has gone away mid-command - and 0 is the only
-	// status there is to report for a command whose result never arrived.
+	// AND NOW WE LEAVE, if the terminal went away while the command ran. The turns
+	// above happened only so that the fiber could finish and give its stack back;
+	// there is nothing left to edit on.
+	if (_poll_failed)
+		_exiting = true;
+
+	// `try_recv` and not `recv`, because the host has no stack to park - and the
+	// answer is always there now, because the loop above waits for it.
 	return _exec_done.try_recv().value_or(0);
 }
 

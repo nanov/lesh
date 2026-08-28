@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <poll.h>
 #include <sstream>
 #include <sys/ioctl.h>
@@ -1890,8 +1891,15 @@ public:
 			::usleep(child_ms * 1000);
 			::_exit(9);
 		}
+		// A HEAP BLOCK WHOSE ONLY POINTER IS THIS FRAME, held across the wait -
+		// which is what the real executor's frames are, and what makes
+		// LeakSanitizer the judge of #211 §4.1: a fiber abandoned here has its
+		// stack unmapped without unwinding, so this block loses its last reference
+		// and is reported at process exit. Freed on the way out of every other
+		// case, which is every other case in this file.
+		const auto held = std::make_unique<std::vector<char>>(4096, 'x');
 		reaped = loop->await_child(awaited, 0, &wait_status);
-		return WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+		return WIFEXITED(wait_status) && !held->empty() ? WEXITSTATUS(wait_status) : -1;
 	}
 
 	std::int32_t port_call(std::string_view) override { return 0; }
@@ -1935,6 +1943,56 @@ TEST(UiLoopExecution, BothModesRunTheLineWaitForTheChildAndReportItsStatus) {
 		loop.leave_read();
 		hub.uninstall();
 	}
+}
+
+TEST(UiLoopExecution, TheExecutionFiberIsNeverAbandonedWhenThePollFailsMidCommand) {
+	// #211 §4.1. `turn` used to answer a fatal poll error by setting `_exiting` and
+	// returning, and `run_the_line`'s `while (... && !_exiting)` then handed control
+	// back to `accept_current_line` with the execution fiber suspended INSIDE
+	// `execute`. `~scheduler` unmaps a parked stack without unwinding it, so what
+	// went with it was the executor's frames, its open redirection descriptors, its
+	// child - and the executing flag, never lowered. LeakSanitizer is the judge of
+	// the first of those and is why this case lives in the sanitized gate.
+	//
+	// THE FAILURE IS INJECTED because it cannot be provoked: `poll` reports a closed
+	// descriptor as POLLNVAL in `revents`, not as -1. One failure is the realistic
+	// shape - the descriptor that went is the watch or an interest, and the turns
+	// that follow poll the self-pipe alone.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	loop.fail_next_polls(1);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	// THE COMMAND FINISHED ANYWAY. The child still exits and SIGCHLD still rings
+	// the self-pipe, so the wait ends and the status comes back down the slot.
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 9);
+	EXPECT_EQ(shell.reaped, shell.awaited) << "and the child was reaped, not orphaned";
+	EXPECT_TRUE(WIFEXITED(shell.wait_status));
+	EXPECT_EQ(loop.awaited_children(), 0u) << "the waiter table is empty again";
+
+	// AND THE FIBER IS BACK ON ITS INBOX, which is the assertion `~event_loop`
+	// carries and the whole of what the leak gate is about to check.
+	EXPECT_TRUE(loop.has_execution_fiber());
+	EXPECT_FALSE(loop.has_execution_fiber_mid_command());
+
+	// THEN IT LEAVES. A terminal that has gone is not a terminal to paint a fresh
+	// prompt onto.
+	EXPECT_TRUE(loop.exiting());
+
+	loop.leave_read();
+	hub.uninstall();
 }
 
 TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
