@@ -200,9 +200,8 @@ private:
 	// is linked exactly while it is `ready` or `running`, and ARRIVAL ORDER IS
 	// LIST ORDER: `spawn` and every parked->ready `wake` append at the tail, a
 	// `park` unlinks, and a YIELD TOUCHES NEITHER - which is what keeps a reactor
-	// yielding at every poll point from reshuffling the tick on every slice. It
-	// replaced a `_ready_at` stamp, a per-tick snapshot vector and a `std::sort`;
-	// see the header's decision 1, whose promise this list IS rather than encodes.
+	// yielding at every poll point from reshuffling the tick on every slice. See
+	// the header's decision 1, whose promise this list IS rather than encodes.
 	fiber* _ready_prev = nullptr;
 	fiber* _ready_next = nullptr;
 

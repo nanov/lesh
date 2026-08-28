@@ -331,7 +331,7 @@ int main() {
 	// three layers of one yield, each measured on its own:
 	//
 	//   run_one_slice   host -> fiber -> host                     (the row above)
-	//   tick            + the snapshot, the sort and `runnable`
+	//   tick            + the ready-list walk and `runnable`
 	//   turn(0)         + the readiness check, the drains, the render check
 	//
 	// and the fourth group is what they add up to on the reactor that takes the

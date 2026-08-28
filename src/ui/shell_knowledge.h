@@ -104,13 +104,11 @@ enum class name_domain : std::uint8_t {
 // calling them (`event_loop::accept_current_line`, `finish_cancelled_line`,
 // `call_port`).
 //
-// IT WAS `shell_writing_flag`, AND THAT NAME STOPPED BEING TRUE AT #208. It is
-// raised for a whole command's wall-clock now - including every turn the host
-// takes while the execution fiber is parked in a wait - so what it says is not
-// "a write is in progress" but "the shell is executing, and a read taken now
-// would be a read of state a command owns". The load-bearing guard against a
-// reactor doing that is the emitters group's park; this is the tripwire that
-// says so out loud, and it is named for what it means.
+// IT IS UP FOR A WHOLE COMMAND'S WALL-CLOCK, including every turn the host takes
+// while the execution fiber is parked in a wait - so what it says is not "a write
+// is in progress" but "the shell is executing, and a read taken now would be a
+// read of state a command owns". The load-bearing guard against a reactor doing
+// that is the emitters group's park; this is the tripwire that says so out loud.
 //
 // A PLAIN BOOL. It was an atomic because the flag was written on the shell
 // thread and read wherever a reader happened to be, and a `bool` across those

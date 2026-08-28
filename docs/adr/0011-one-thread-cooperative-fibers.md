@@ -37,8 +37,9 @@ never global** — the cord door stays open.
 **Two roles survive, and they are all ADR-0009 ever bought.** The shell owns
 `shell_state`; the loop owns editor state and the terminal. They take turns
 instead of taking locks, and the turn-taking is a call: `event_loop` calls
-`shell_side::execute` and `shell_side::port_call` directly. `shell_writing_flag`
-stays as the tripwire that says the premise still holds.
+`shell_side::execute` and `shell_side::port_call` directly. `shell_executing_flag`
+stays as the tripwire that says the premise still holds - renamed by #211, because
+since #208 it is raised for a whole command's wall-clock and not for one write.
 
 **The host is the loop, not a fiber.** `event_loop::run` is the tick. The UI part
 never parks, and a fiber that never parks is the loop with extra ceremony.

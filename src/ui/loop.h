@@ -1072,9 +1072,8 @@ private:
 		lesh_reactor_fn fn = nullptr;
 		void* userdata = nullptr;
 		std::uint32_t event_mask = 0;
-		// Whether this reactor's tokens carry the shell's own host (#151). It was
-		// `on_shell_thread`, which stopped being a distinction when there stopped
-		// being a second thread.
+		// Whether this reactor's tokens carry the shell's own host (#151), which
+		// since there is one thread is the whole of what the name decides.
 		bool host_stamped = false;
 		// THE FIBER'S LANE (#202). Owned by `_lanes`, which only ever grows, so
 		// this stays valid across every rebuild of the table above.
