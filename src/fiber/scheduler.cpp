@@ -222,14 +222,18 @@ scheduler::~scheduler() {
 		_fibers.pop_back();
 }
 
-fiber& scheduler::spawn(entry_fn fn, void* userdata, const char* name, std::uint8_t group) {
+fiber& scheduler::spawn(entry_fn fn, void* userdata, const char* name, std::uint8_t group,
+                        std::size_t stack_bytes) {
 	LESH_ASSERT(fn != nullptr);
 	LESH_ASSERT(group < group_count && "up to 8 groups: the park set is one byte");
 
 	auto born = std::unique_ptr<fiber>(new fiber(*this, fn, userdata, name, group));
 	born->_ready_at = _next_ready_at++;
 
-	mco_desc desc = mco_desc_init(&fiber::trampoline, _options.stack_bytes);
+	// The per-spawn override, or the scheduler's default when it is 0. Rounded to
+	// a page and given its guard by `install_guarded_allocator` either way.
+	mco_desc desc = mco_desc_init(&fiber::trampoline,
+	                              stack_bytes != 0 ? stack_bytes : _options.stack_bytes);
 	desc.user_data = born.get();
 	install_guarded_allocator(desc);
 

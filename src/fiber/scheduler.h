@@ -225,6 +225,48 @@ private:
 	static void trampoline(mco_coro* co);
 };
 
+// ---------------------------------------------------------------------------
+// AWAITING SOMETHING THE SCHEDULER KNOWS NOTHING ABOUT (#208)
+// ---------------------------------------------------------------------------
+//
+// One word of answer and the fiber that is waiting for it. That is deliberately
+// the WHOLE of what `src/fiber/` learns about phase 2's awaits: there is no pid
+// here, no file descriptor, no `errno`, and no table of outstanding waits -
+// those belong to the host, which is the only side that knows what it is waiting
+// FOR. `ui::event_loop::await_child` keeps the pids; #209's `await_readable`
+// will keep the fds; both reach this file through `scheduler::block_or_park` and
+// neither adds a line to it.
+//
+// `std::intptr_t` because every answer this shape of wait has is a small
+// integer or a pointer - `waitpid`'s pid, `poll`'s revents - and a template
+// parameter here would push a type all the way through `block_or_park` for no
+// gain. What does not fit goes in the caller's own waiter, beside the slot.
+class await_slot {
+public:
+	// WRITE THE ANSWER AND WAKE THE WAITER. Called by whoever completes the wait,
+	// from the host, and legal BEFORE the fiber has parked - which is what lets a
+	// caller's `enlist` notice that the thing has already happened (the child
+	// exited turns ago, the fd is readable now) and complete on the spot: a `wake`
+	// for a fiber that is not parked is already a no-op, and `block_or_park`'s
+	// loop then never parks at all.
+	//
+	// AT MOST ONCE PER WAIT. A second call before the waiter has been resumed is
+	// ignored rather than overwriting the answer, because two completions for one
+	// wait is a caller bug and the FIRST answer is the one that was true.
+	void complete(std::intptr_t answer) noexcept;
+
+	// Whether a fiber is parked on this slot with no answer yet. The host's
+	// waiter table reads it; nothing in this file does.
+	[[nodiscard]] bool pending() const noexcept { return _who != nullptr && !_done; }
+
+private:
+	friend class scheduler;
+	scheduler* _sched = nullptr;
+	fiber* _who = nullptr;
+	std::intptr_t _answer = 0;
+	bool _done = false;
+};
+
 class scheduler {
 public:
 	explicit scheduler(scheduler_options with = {}) noexcept;
@@ -245,7 +287,17 @@ public:
 	// NOT `[[nodiscard]]`: spawning is the effect, and a long-lived reactor that
 	// nothing ever wakes by name is the common case - the scheduler owns the
 	// handle either way.
-	fiber& spawn(entry_fn fn, void* userdata, const char* name, std::uint8_t group = 0);
+	//
+	// `stack_bytes` OVERRIDES `scheduler_options::stack_bytes` FOR THIS FIBER
+	// ONLY, and 0 means "the scheduler's default" (#208). Reserved address space
+	// is not memory: minicoro's mapping is committed page by page as the stack is
+	// touched, so a fiber that needs room for a deeply nested shell script costs
+	// nothing until it uses it, while a reactor keeps the 512 KB that is plenty
+	// for a token sweep. One argument rather than a second scheduler, because a
+	// scheduler is the run order and the group bits, and two of those would be two
+	// ticks.
+	fiber& spawn(entry_fn fn, void* userdata, const char* name, std::uint8_t group = 0,
+	             std::size_t stack_bytes = 0);
 
 	// One slice for every fiber that is runnable NOW, in arrival order. Returns
 	// whether anything is still runnable afterwards.
@@ -268,6 +320,48 @@ public:
 	// somebody calls `wake`.
 	void yield();
 	void park();
+
+	// THE ONE PRIMITIVE PHASE 2's AWAITS ARE MADE OF (#208), and the whole of the
+	// fiber-or-inline decision. Every blocking thing the shell does has two
+	// answers and this picks between them, ONCE, here, so that no caller has to:
+	//
+	//   `current() == nullptr` - nobody to park. Call `run_blocking` on the stack
+	//     we are already on and answer with what it returned. This is the shell as
+	//     it ran before fibers existed: a blocking `waitpid`, a blocking `read`.
+	//     It is not a fallback and not a degraded mode - it is what a script, a
+	//     `lesh -c`, a `port_call` from an action and a host running with the
+	//     execution fiber turned off all take, and it must stay first-class.
+	//
+	//   on a fiber - `enlist` the slot with whoever will complete it, park, and
+	//     answer with what `complete` stored. `enlist` is the caller's chance to
+	//     put this waiter into its own table AND to notice that the thing has
+	//     already happened: completing the slot from inside `enlist` is legal and
+	//     means the fiber never parks.
+	//
+	// WHY THE HOST'S ADAPTER IS FIVE LINES. `ui::event_loop::await_child` is a
+	// `child_wait` on the stack, a `::waitpid` lambda, an `enlist` lambda that
+	// pushes onto the waiter table, and this call. Nothing in it branches on
+	// whether there is a fiber, so there is exactly one place in the tree where
+	// that question is asked and exactly one shape for the next verb to copy.
+	//
+	// THE LOOP IS THE CONDITION, as with a condition variable: a spurious wake -
+	// somebody calling `scheduler::wake` on this fiber for a reason of their own -
+	// parks again rather than returning an answer nobody wrote.
+	template <class Blocking, class Enlist>
+	std::intptr_t block_or_park(await_slot& on, Blocking&& run_blocking, Enlist&& enlist) {
+		fiber* const me = _current;
+		if (me == nullptr)
+			return static_cast<std::intptr_t>(run_blocking());
+		on._sched = this;
+		on._who = me;
+		on._done = false;
+		on._answer = 0;
+		enlist();
+		while (!on._done)
+			park();
+		on._who = nullptr;
+		return on._answer;
+	}
 
 	// Callable from inside a fiber or from the host. Waking a fiber that is not
 	// parked is a no-op, not an error: `slot::send` does not know or care
@@ -349,5 +443,14 @@ private:
 	std::uint8_t _parked_groups = 0;
 	std::uint64_t _next_ready_at = 0;   // stamps `fiber::_ready_at`; see decision 1
 };
+
+// Out of line only because it wakes, and `scheduler` is not complete above.
+inline void await_slot::complete(std::intptr_t answer) noexcept {
+	if (_done || _who == nullptr)
+		return;
+	_answer = answer;
+	_done = true;
+	_sched->wake(*_who);
+}
 
 } // namespace lesh::fiber
