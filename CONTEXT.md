@@ -576,8 +576,45 @@ one, in the `emitters` **group**, and a turn gives each runnable one a slice
 before and after the UI part.
 _Avoid_: a fiber per event; calling a fiber; resuming one from inside another.
 
+**Slice** _[lesh]_:
+One resume of one fiber: it runs until it yields, parks or returns (#198). The
+unit the tick hands out — a turn gives every runnable **emitter** one before the
+UI part and one after — and the unit the debug watchdog measures, because a slice
+that runs 50 ms without yielding is a frozen terminal. A slice is bounded by the
+fiber's OWN cancellation poll and never by the host: there is no preemption.
+_Avoid_: "a task", "a job"; and never assume a compute is one slice.
+
+**Emitter** _[lesh]_:
+A **reactor** whose output is a function of a buffer state and whose lifetime is
+the LINE's: the highlighter and the autosuggester (#145, ADR-0011). Superseded on
+every edit, cancelled and parked at accept, alive for the next line. Fed by a
+**slot**, so latest-wins is correct for it.
+_Avoid_: calling one a worker; "effect" (leshper already uses that for the
+editor's outbound commands).
+
+**Observer** _[lesh]_:
+A **reactor** that consumes EVENTS rather than buffer states — a line was
+accepted — and whose lifetime is the SESSION's: history persistence, and
+recording or telemetry plugins later (#145, ADR-0011). Latest-wins is a BUG for
+one: it must see every event, in order. Its channel is an ordered `queue<T,N>`,
+its group stays runnable through `boundary`, and it has no members yet.
+_Avoid_: giving an observer a **slot**; cancelling one on supersede.
+
+**Cooperation** _[lesh]_:
+What the runtime wants of whatever is hosting it — `runtime::cooperation`
+(`src/runtime/cooperation.h`, #199). One verb in v1, `on_command_boundary()`,
+called where the executor already polls `g_pending`. NEVER NULL: `shell_state`
+starts with a static no-op, so `lesh -c`, a script, a test and a forked child all
+cooperate with nobody at the cost of an indirect call. The name says
+"cooperation" and never "fibers" on purpose - the runtime must not learn what is
+on the other side.
+_Avoid_: a null check; a template parameter; naming a scheduler from the runtime.
+
 **Group** _[lesh]_:
 A scheduler tag, eight of them, that parks a SET of fibers with one bit (#200).
+Also called a LANE when the point is which kind of work it holds rather than how
+it is parked - #145's word, and the reason `loop.h` calls a reactor's fiber,
+slot and storage its `reactor_lane`.
 `emitters = 0` are the per-line reactors — the highlighter and the autosuggester,
 superseded on every edit and parked at accept; `observers = 1` is reserved for the
 session-lived kind (history persistence, telemetry) and has no members yet. Which
@@ -605,7 +642,7 @@ main THREAD serving three latest-wins slots (`execute`, `port_call`,
 serialization is a call stack rather than a channel. Everything else in the
 process is stateless or owns only editor state.
 _Avoid_: reading shell state from another thread; a definitions version or
-concurrent collection for it — one owner makes both unnecessary (ADR-0009). There
+concurrent collection for it — one owner makes both unnecessary (ADR-0011). There
 is no other thread to read from since #202.
 
 **Loop** _[lesh]_:

@@ -243,7 +243,7 @@ struct vacuum_result {
 // The vacuum
 // ---------------------------------------------------------------------------
 
-// Runs ADR-0010 §Vacuum steps 1-6. Blocking, loop-thread only, and the only
+// Runs ADR-0010 §Vacuum steps 1-6. Blocking, the loop's alone, and the only
 // `fsync` in the subsystem.
 //
 // THE CORRUPT-FILE POLICY, which #194 was asked to decide and which is decided

@@ -10,7 +10,9 @@
 //
 // Bounded by construction (capacity one), the message is MOVED and therefore
 // owned - ADR-0007's rule, and the reason `send` takes `T` by value rather than
-// a pointer into the sender's state. A `slot` never blocks a sender: `send` over
+// a pointer into the sender's state. A `T` that is ITSELF an address is the hole
+// in that sentence, and a debug assert closes it: see THE MESSAGE MAY NOT POINT
+// INTO THE SENDER'S OWN FIBER STACK below. A `slot` never blocks a sender: `send` over
 // an unconsumed value overwrites it. Backpressure would be `queue<T,N>`'s job,
 // and v1 has no customer for one (architecture review 2026-08-27: reactor
 // emissions append to the UI's pending batch on the same thread), so `queue` is
@@ -62,12 +64,84 @@
 
 #include "substrate/assert.h"
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace lesh::fiber {
+
+// ---------------------------------------------------------------------------
+// THE MESSAGE MAY NOT POINT INTO THE SENDER'S OWN FIBER STACK
+// ---------------------------------------------------------------------------
+//
+// coost's one-liner, taken deliberately (`Sched::on_stack(p)`: is `p` inside
+// `[stack_base, stack_base + size)` of the running coroutine?). ADR-0007 says a
+// message in flight has exactly one owner, and `send` takes `T` by value so that
+// an owned `T` is what the slot holds - but a `T` that IS an address, a
+// `string_view` or a span borrows bytes it did not bring, and if those bytes are
+// the sender's own frame they are gone at its next yield. The receiver would
+// read a stack that has been reused by whatever ran next, which is the worst
+// shape a bug can take: it depends on the schedule, so it reproduces on one
+// machine and not another.
+//
+// TRAIT-GATED, AND THE TRAIT IS "BORROWS RATHER THAN OWNS". Two shapes qualify:
+// a raw pointer, and a view - trivially copyable, with `data()` and `size()`.
+// The trivial-copyability clause is what keeps `std::string` and `std::vector`
+// out, and keeping them out is not fussiness: a short `std::string`'s `data()`
+// points INSIDE the object, so a `slot<std::string>` sent from a fiber would
+// trip on every short string while being perfectly correct - the bytes are moved
+// into the slot. Anything else - an int, an event mask, a struct with a pointer
+// buried in it - is not inspected, and the comment is the honest limit: this
+// catches the shapes whose whole content is an address, not every address a
+// message could hide.
+//
+// DEBUG ONLY. The whole expression sits inside `LESH_ASSERT`, so a release build
+// computes nothing.
+
+namespace detail {
+
+// A view: it hands out an address it does not own.
+template <typename T>
+concept borrowing_view = std::is_trivially_copyable_v<T> && requires(const T& value) {
+	{ value.data() } -> std::convertible_to<const void*>;
+	{ value.size() };
+};
+
+// The address a message would hand its receiver, or null when it hands out none.
+template <typename T>
+[[nodiscard]] constexpr const void* borrowed_bytes(const T& value) noexcept {
+	if constexpr (std::is_pointer_v<T>)
+		return static_cast<const void*>(value);
+	else if constexpr (borrowing_view<T>)
+		return static_cast<const void*>(value.data());
+	else
+		return nullptr;
+}
+
+// `Sched::on_stack`, for the fiber that is running right now. False when the
+// host is the sender: the host's stack outlives every fiber on it, so a pointer
+// into it is not the hazard this exists for.
+[[nodiscard]] inline bool points_into_the_running_fiber_stack(const scheduler& on,
+                                                              const void* p) noexcept {
+	if (p == nullptr)
+		return false;
+	const fiber* const running = on.current();
+	if (running == nullptr)
+		return false;
+	const stack_extents where = running->stack();
+	if (where.stack_base == nullptr)
+		return false;
+	// Through integers rather than by comparing unrelated pointers, which the
+	// standard leaves unordered and a sanitizer is entitled to say so about.
+	const auto at = reinterpret_cast<std::uintptr_t>(p);
+	const auto base = reinterpret_cast<std::uintptr_t>(where.stack_base);
+	return at >= base && at < base + where.stack_size;
+}
+
+} // namespace detail
 
 template <typename T>
 class slot {
@@ -103,6 +177,9 @@ public:
 	// from a fiber or from the host loop - the UI's send at a keystroke is the
 	// second of those.
 	void send(T value) {
+		LESH_ASSERT(!detail::points_into_the_running_fiber_stack(
+		                *_sched, detail::borrowed_bytes(value))
+		            && "a message may not point into the sending fiber's own stack");
 		if (_value.has_value())
 			++_superseded_sends;   // the narrow case: nobody consumed the last one
 		_value.emplace(std::move(value));

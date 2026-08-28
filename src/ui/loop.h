@@ -1,7 +1,7 @@
 #pragma once
 
-// The event loop: `poll(2)`, five topics, and quiesce (#129; #128's resolution;
-// architecture spec §4 and §4.1; ADR-0009 as amended by #201).
+// The event loop: `poll(2)`, four topics, and quiesce (#129; #128's resolution;
+// architecture spec §4 and §4.1; ADR-0011).
 //
 // THE HOST'S, AND IN `src/ui/` SINCE #168. This file drives leshper; it is not
 // part of it. The editor is `step(state, event, now) -> effects` and knows no
@@ -162,31 +162,24 @@ namespace lesh::ui {
 // carries the same rule for the same reason).
 inline constexpr int kMaxTrackedSignal = 32;
 
-// Blocks the hub's caught set - SIGINT, SIGCHLD, SIGWINCH - on the CALLING
-// thread, and answers false if `pthread_sigmask` refused.
+// THERE IS NO `block_caught_signals_on_this_thread` (#203). It blocked the
+// hub's caught set on the calling thread, and delivery is pinned to main by
+// having no other thread at all now: #201 put the loop on main and #202 turned
+// the helper pool into fibers, which left the function with no callers. It is
+// deleted rather than kept as documentation, and the rule it carried is written
+// where a future thread will read it - ADR-0011's background-thread contract:
 //
-// DELIVERY IS PINNED TO MAIN, and this is the whole mechanism (#142). A
-// process-directed signal is delivered to any one thread that does not block it,
-// so before this existed a Ctrl-C could land on a helper thread, on the loop
-// thread, or on main, chosen by the kernel afresh each time. Every thread the
-// host spawns calls this first thing in its body; main does not, so main is the
-// one thread left unblocked and the handler runs there - which is where it ran
-// before leshper existed at all.
+//   A process-directed signal is delivered to any one thread that does not
+//   block it, so a thread that shares the caught set steals Ctrl-C at the
+//   kernel's whim. But A SIGNAL MASK SURVIVES `execve`, so the block goes on the
+//   spawned thread and never on main: main is the thread that forks and execs,
+//   and a child born with SIGINT blocked ignores the `kill -INT` meant for it
+//   (#142, #143). Any thread this host ever spawns therefore blocks the caught
+//   set first thing in its body and never spawns children of its own.
 //
-// THE INVARIANT, and it is the reason the block goes on the spawned threads
-// rather than on main: A SIGNAL MASK SURVIVES `execve`. A thread that forks and
-// execs must therefore stay unmasked, or every child inherits a shell's mask and
-// a `kill -INT` on a pipeline does nothing. Main is the only thread that forks,
-// so the invariant holds by construction - but a future thread that spawns
-// children must not call this.
-//
-// THE CALLERS ARE THE HELPER POOL'S, AND ONLY THE POOL'S (#201). The loop thread
-// used to call this first thing in its body; there is no loop thread now - the
-// loop runs on main - and the block was DELETED rather than moved, because main
-// forks. Main pays for the mask it does not take with an EINTR out of `poll`,
-// which `turn` has always handled: the wakeup it acts on is the self-pipe byte,
-// never the EINTR.
-bool block_caught_signals_on_this_thread() noexcept;
+// Main pays for the mask it does not take with an EINTR out of `poll`, which
+// `turn` has always handled: the wakeup it acts on is the self-pipe byte, never
+// the EINTR.
 
 // The self-pipe, the pending set, and the resize counter.
 //
@@ -309,17 +302,16 @@ public:
 	//
 	// THE SHELL SIDE IS THE ONLY WRITER, and this call belongs to it (#142's
 	// second amendment; trivially true since #201). `install`, `reassert` and
-	// `uninstall` all `sigaction`, which is process-wide state; the trap builtin
-	// writes the same state; and `block_caught_signals_on_this_thread` leaves main
-	// as the only thread a signal is delivered to. The writer, the other writer
-	// and the handler are one thread - and the loop is on it too now, which is why
-	// what the LOOP does with the hub is still only READING it: `drain`,
+	// `uninstall` all `sigaction`, which is process-wide state, and the trap
+	// builtin writes the same state - so the writer, the other writer and the
+	// handler are one thread, which since #202 is the only thread there is. That
+	// is why what the LOOP does with the hub is still only READING it: `drain`,
 	// `resize_count`, and the byte in the pipe (`TheLoopNeverWritesADisposition`).
 	//
 	// The chain slots are atomic anyway (see `_chain`): a `sigprocmask` fence
 	// would have been no fence at all, because it masks the calling thread and
 	// says nothing about delivery elsewhere, and one lock-free pointer store
-	// costs nothing and stays correct if a thread is ever left unmasked.
+	// costs nothing and keeps the handler-versus-mainline race benign.
 	bool reassert() noexcept;
 
 	// THE HANDLER'S WHOLE BODY, async-signal-safe, exposed so a test can deliver
@@ -342,9 +334,11 @@ public:
 	// thing called; `_saved` is the entry-time disposition and belongs to
 	// `uninstall` alone. See `reassert` for why one slot could not be both.
 	//
-	// THIS RUNS ON THE SHELL THREAD in a real session, not on the loop's - the
-	// spawned threads block the caught set, so main is the only thread a
-	// process-directed signal reaches. The loop hears about it as a byte.
+	// THIS RUNS ON MAIN in a real session, which since #202 is the only thread
+	// the process has - so there is nowhere else a process-directed signal could
+	// be delivered. The loop hears about it as a byte all the same: the handler's
+	// whole body is atomics and one `write`, and the byte is what turns a signal
+	// into an event inside a turn.
 	//
 	// A previous handler installed with SA_SIGINFO is NOT chained: this entry
 	// point has only a signal number, and inventing a `siginfo_t` to pass it
@@ -638,7 +632,7 @@ public:
 	// captureless lambda plus the owner's address, which is three lines there
 	// and no allocation anywhere.
 	//
-	// `on_readable` RUNS ON THE LOOP THREAD, inside the turn, and is responsible
+	// `on_readable` RUNS INSIDE THE TURN, on the one thread, and is responsible
 	// for CONSUMING what made the fd readable - a hook that leaves its descriptor
 	// readable turns the poll into a spin. It must not block; the history's drain is a
 	// non-blocking read, a `stat` and a pointer swap.
@@ -705,7 +699,7 @@ public:
 	// `accept_current_line` immediately after the call returns.
 	void request_stop() noexcept;
 
-	// --- Quiesce (#91, #128, ADR-0009) --------------------------------------
+	// --- Quiesce (#91, #128, ADR-0011) --------------------------------------
 
 	// The emitters superseded and their group parked, the terminal restored and
 	// given up, the decoder's held bytes dropped. After this returns, a fork on
@@ -718,8 +712,14 @@ public:
 	// than a hope: the flag is up, so the fiber's own poll abandons the walk, and
 	// the receiver declines to apply a batch whose token was superseded.
 	//
-	// NESTS: two calls need two resumes. `park_group` is idempotent, so the depth
-	// counter is the whole of the nesting.
+	// IDEMPOTENT, AND NOTHING NESTS (#203). This used to keep a depth counter,
+	// because #91's park was a negotiation with a set of threads and two callers
+	// could each need one. The two callers are `accept_current_line` and
+	// `finish_cancelled_line`, neither reachable from inside the other, and the
+	// nested case the counter was really held for - `vared` running the editor
+	// from inside a command - is phase 2's nested await and not a second park.
+	// So a second call is a no-op and one resume is owed, which `resume_after_execution`
+	// asserts.
 	void quiesce();
 
 	// The other end, and the SECOND phase writer: `executing` becomes `boundary`
@@ -730,13 +730,16 @@ public:
 	// whatever the command left, so there is no `previous` to diff against.
 	void resume_after_execution();
 
-	// The debug assertion every fork-and-continue site carries (#91). Three
-	// clauses since #202: the depth is up, the emitters group is parked, and no
-	// emitter is mid-slice. The third is structurally true - the host is the only
-	// resumer, and nothing a reactor can reach forks - and is asserted anyway,
-	// because "structurally true" is a sentence and an assertion is a test.
+	// The debug assertion every fork-and-continue site carries (#91), and since
+	// #203 it asserts the two things that are not already a store two lines up:
+	// NO EMITTER IS MID-SLICE, and the terminal is out of raw mode. The first is
+	// structurally true - the host is the only resumer, and nothing a reactor can
+	// reach forks - and is asserted anyway, because "structurally true" is a
+	// sentence and an assertion is a test; the second is the half only the loop
+	// can check. What went is the bookkeeping: asserting that `quiesce()` set the
+	// bit it sets is not evidence of anything.
 	void assert_quiesced() const noexcept;
-	[[nodiscard]] bool quiesced() const noexcept { return _park_depth > 0; }
+	[[nodiscard]] bool quiesced() const noexcept { return _quiesced; }
 
 	// --- Accept, and the port ------------------------------------------------
 
@@ -1022,7 +1025,12 @@ private:
 	std::size_t _watch_drains = 0;
 
 	unsigned _resizes_seen = 0;
-	std::size_t _park_depth = 0;
+	// PARKED, AND IT IS ONE BIT (#203). A depth counter until then; see `quiesce`
+	// for why nothing nests. It is the terminal handoff's bookkeeping and nothing
+	// else - the emitters group's own bit is the scheduler's, derived from
+	// `_phase` - which is why `resume_after_execution` reads it three times and
+	// each read is about the terminal, the size or the repaint.
+	bool _quiesced = false;
 	std::size_t _applied = 0;
 	std::size_t _dropped = 0;
 	std::size_t _timer_dispatches = 0;

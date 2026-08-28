@@ -101,9 +101,11 @@ enum class append_status : std::uint8_t {
 // builder per command line. `error()` is the second reason - an errno wants
 // somewhere to live that is not a return value the caller has to unpack.
 //
-// NOT THREAD-SAFE, and does not need to be: appends run on the loop thread
-// (ADR-0009). Two PROCESSES appending to the same file is the case this format
-// is built for; two threads sharing one appender is not a thing that happens.
+// NOT THREAD-SAFE, and does not need to be: appends run at a command boundary,
+// on the one thread (ADR-0011). Two PROCESSES appending to the same file is the
+// case this format is built for; two threads sharing one appender is not a thing
+// that happens - and if the append ever moves to ADR-0011's I/O thread, it moves
+// whole, with the appender.
 class log_appender {
 public:
 	log_appender();

@@ -1,7 +1,7 @@
 #pragma once
 
-// THE v1 COMPLETER (#139, #137, spec §6.9): three sources, synchronously, on
-// the loop thread.
+// THE v1 COMPLETER (#139, #137, spec §6.9): three sources, synchronously, inside
+// the loop's own dispatch.
 //
 // WHAT TAB DOES, in one paragraph. The token under the cursor is found with
 // C-6's LEXER - a lex, never a parse: the parser would want a whole grammatical
@@ -9,7 +9,7 @@
 // then classified into one of three sources: a word in command position
 // completes to command names, a token whose tail is `$name` completes to
 // variable names, and everything else completes to paths. The two name lists
-// come from `shell_knowledge::enumerate`, called RIGHT HERE on the loop thread -
+// come from `shell_knowledge::enumerate`, called RIGHT HERE, inside the action -
 // one copy per Tab per domain. The directory walk runs here too.
 //
 // READING THE SHELL'S TABLES FROM AN ACTION IS ADR-0009's OWN RULE (#151), not
@@ -23,11 +23,12 @@
 // wrong.
 //
 // SYNCHRONOUS, AND THAT IS THE OWNER-APPROVED DEVIATION FROM F-31. F-31 wants
-// candidates streamed from a worker so a cold directory cannot block. §6.9 defers
-// that to the index stage and says so in the spec rather than quietly: "a Tab on
-// a huge cold directory briefly blocks, as fish's did for years". Nothing in the
-// #94 contract changes when the work moves to a helper, because #94's `Completer`
-// is the shape below and not the thread it runs on.
+// candidates streamed so a cold directory cannot block. §6.9 defers that to the
+// index stage and says so in the spec rather than quietly: "a Tab on a huge cold
+// directory briefly blocks, as fish's did for years". Nothing in the #94 contract
+// changes when the work moves onto a fiber of its own, because #94's `Completer`
+// is the shape below and not what drives it - and the completer is deliberately
+// not a fiber in v1 (ADR-0011: an accept-or-insert decision cannot await).
 //
 // NOTHING FROM THE EXPANDER, AND A TEST IS WHAT ENFORCES IT NOW. `completion.cpp`
 // includes `syntax/` and `substrate/` and no `runtime/` header. While this was
@@ -49,7 +50,7 @@
 // action feeds them to the pager and commits.
 //
 // v2, RECORDED IN §6.9 AND DELIBERATELY ABSENT: a command index/registry done
-// properly, per-thread cached command lists, per-command and option completion,
+// properly, a cached command list refreshed at the boundary, per-command and option completion,
 // user completers through A-13, and `$VAR`-in-prefix expansion by a safe path.
 
 #include "ui/shell_knowledge.h"
@@ -124,7 +125,7 @@ struct completion_query {
 // THE FIRST DOOR IS `shell_knowledge` (shell_knowledge.h), unchanged and not
 // wrapped. #139 put a second interface in front of it - `name_source`, one
 // method, every implementation a cross-thread round trip - because the completer
-// was on the loop and the tables were the shell thread's. #151 removed the round
+// was the loop's and the tables were the shell thread's. #151 removed the round
 // trip, and with it the only difference between the two shapes; a second
 // interface whose implementation is now `return _knowledge->enumerate(...)` is
 // one spelling too many for one idea. A null `shell_knowledge*` says what

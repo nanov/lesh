@@ -46,6 +46,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace lesh::fiber;
@@ -423,17 +424,38 @@ void write_just_below_the_stack() {
 	(void)sched.tick();
 }
 
-__attribute__((noinline)) void eat_stack(int depth) {
+// THE RECURSION HAS TO SURVIVE THE OPTIMIZER, and until #203 it did not.
+//
+// The call was in TAIL POSITION, so Release rewrote it as a jump: one frame,
+// reused for ever, a stack that never grows, and a child that exits cleanly -
+// `AFiberThatOverflowsItsStackFaults` failed in the release binary while passing
+// under the sanitized gate, which is the shape of failure that makes a test
+// worth nothing. Two things that do NOT fix it, both tried:
+//
+//   `[[gnu::noinline]]` forbids INLINING, not the sibling-call rewrite; and
+//   using the callee's result in an arithmetic expression is exactly the
+//   ACCUMULATOR pattern LLVM's tail-recursion pass also folds into a loop.
+//
+// What does fix it is a SIDE EFFECT ORDERED AFTER THE CALL. The volatile store
+// below has to happen once the callee has returned, so the call cannot become a
+// jump and the frame cannot be reused - and the volatile read of `g_recurse`
+// keeps the exit test unpredictable, so nothing bounds the depth either.
+volatile int g_recurse = 1;
+volatile unsigned char g_deep_sink = 0;
+
+__attribute__((noinline)) unsigned char eat_stack(int depth) {
 	volatile unsigned char frame[2048];
 	frame[0] = static_cast<unsigned char>(depth);
 	frame[sizeof(frame) - 1] = static_cast<unsigned char>(depth);
-	if (frame[0] == 0xFF)   // never; keeps the recursion from being folded away
-		return;
-	eat_stack(depth + 1);
+	if (g_recurse == 0)   // never; the compiler cannot know that
+		return frame[sizeof(frame) - 1];
+	const unsigned char deeper = eat_stack(depth + 1);
+	g_deep_sink = static_cast<unsigned char>(deeper + frame[0]);
+	return frame[0];
 }
 
 void overflow_by_recursion(scheduler& /*on*/, void* /*userdata*/) {
-	eat_stack(0);
+	g_deep_sink = eat_stack(0);
 }
 
 void recurse_off_the_bottom_of_the_stack() {
@@ -461,6 +483,11 @@ TEST(FiberGuardPage, AFiberThatOverflowsItsStackFaults) {
 	// SIGSEGV, not corruption" - and with the test above it says both halves:
 	// an overflow dies, and it dies at the guard rather than after eating the
 	// bookkeeping.
+	//
+	// IN RELEASE TOO, since #203. It used to pass only where the optimizer left
+	// the recursion alone; see `eat_stack` for what made the call a jump and what
+	// makes it a call again. The gate is the debug binary, but a guard-page test
+	// that cannot fault in the build users run was measuring the compiler.
 	expect_faulted(run_in_child(&recurse_off_the_bottom_of_the_stack), "stack overflow");
 }
 
@@ -619,6 +646,58 @@ TEST(FiberSlot, AStaleTokenAndADefaultTokenBothReadSuperseded) {
 
 	inbox.send(2);
 	EXPECT_TRUE(first.superseded()) << "a token from an earlier recv never comes back";
+}
+
+// ---------------------------------------------------------------------------
+// The message may not point into the sender's own fiber stack (#203)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A static one, so the bytes outlive every stack in the process.
+constexpr std::string_view kBorrowedFromNobody = "a line nobody's frame owns";
+
+void send_a_view_of_something_that_outlives_me(scheduler& /*on*/, void* userdata) {
+	auto* const inbox = static_cast<slot<std::string_view>*>(userdata);
+	inbox->send(kBorrowedFromNobody);
+}
+
+} // namespace
+
+TEST(FiberSlot, AViewOfBytesTheSenderDoesNotOwnIsFine) {
+	// The negative control, and it is the whole point of the trait being narrow:
+	// a view is not suspect because it is a view, it is suspect because of WHERE
+	// it points. This one points at a string literal.
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	sched.spawn(&send_a_view_of_something_that_outlives_me, &inbox, "sender");
+	EXPECT_FALSE(sched.tick());
+	EXPECT_FALSE(inbox.empty());
+}
+
+TEST(FiberSlot, TheHostMaySendAViewOfItsOwnStack) {
+	// The host's stack outlives every fiber on it - the loop is the sole resumer
+	// and a fiber never runs while the frame that sent to it has returned - so
+	// the check is about the RUNNING FIBER's stack and nothing else. `event_loop`
+	// sends from exactly here.
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	char frame[32] = "typed at the prompt";
+	inbox.send(std::string_view{frame, 19});
+	EXPECT_FALSE(inbox.empty());
+}
+
+TEST(FiberSlot, AnOwningMessageIsNotInspectedAtAll) {
+	// `std::string` has `data()` and `size()` and is NOT trivially copyable, so
+	// the trait leaves it alone - which it must, because a short string's `data()`
+	// points inside the object, i.e. at the sender's own frame, while the bytes
+	// are moved into the slot and are perfectly safe. This test is that reasoning
+	// written down: it would fail if the trait ever widened to "has data()".
+	scheduler sched;
+	slot<std::string> inbox{sched};
+	std::string tiny = "short";
+	inbox.send(std::move(tiny));
+	EXPECT_FALSE(inbox.empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -951,6 +1030,21 @@ void park_the_group_the_running_fiber_is_in() {
 	(void)sched.tick();
 }
 
+void send_a_view_of_my_own_stack(scheduler& /*on*/, void* userdata) {
+	auto* const inbox = static_cast<slot<std::string_view>*>(userdata);
+	// `volatile` so the frame is real storage and not something the optimizer
+	// folds into the literal it was copied from.
+	volatile char frame[64] = "a line that dies at the next switch";
+	inbox->send(std::string_view{const_cast<const char*>(frame), 35});
+}
+
+void send_a_message_pointing_into_my_own_stack() {
+	scheduler sched;
+	slot<std::string_view> inbox{sched};
+	sched.spawn(&send_a_view_of_my_own_stack, &inbox, "sender");
+	(void)sched.tick();
+}
+
 void spawn_into_a_ninth_group() {
 	scheduler sched;
 	std::string log;
@@ -973,6 +1067,16 @@ TEST(FiberGroupsDeathTest, AFiberCannotParkTheGroupItIsRunningIn) {
 	// group" - held by the narrowest assert that holds it.
 	EXPECT_DEATH(park_the_group_the_running_fiber_is_in(),
 	             "a fiber cannot park the group it is running in");
+}
+
+TEST(FiberSlotDeathTest, AMessagePointingIntoTheSendersOwnStackIsRefused) {
+	// coost's `on_stack` check, and the reason it earns its keep: this send is
+	// legal C++, the slot holds the view happily, and the bug appears in whatever
+	// reads it after the sender's next yield - on one machine and not another,
+	// because it depends on what ran next. The assert moves the failure to the
+	// line that did the wrong thing.
+	EXPECT_DEATH(send_a_message_pointing_into_my_own_stack(),
+	             "a message may not point into the sending fiber's own stack");
 }
 
 TEST(FiberGroupsDeathTest, ThereAreEightGroupsAndNoMore) {

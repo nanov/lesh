@@ -60,7 +60,7 @@ private:
 	const shell_knowledge* _knowledge;
 	const completer* _completion;
 	// The address-stable storage the event above points into. Mutable in spirit
-	// and in fact: `carry_out` is the only writer and it is loop-thread-only.
+	// and in fact: `carry_out` is the only writer and it runs inside a turn.
 	completion_result _answer;
 };
 

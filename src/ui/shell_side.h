@@ -44,9 +44,9 @@ public:
 
 	// Runs an accepted command line to completion. Answers its exit status.
 	//
-	// The fork happens inside here, on this thread, which is the main thread -
-	// and it is legal because the loop has already parked the helpers and given
-	// the terminal back before it made the call. The child claims the terminal
+	// The fork happens inside here, on this thread, which is the main thread and
+	// since #202 the only one - and it is legal because the loop has already
+	// parked the emitters and given the terminal back before it made the call. The child claims the terminal
 	// itself between fork and exec, so nothing here needs anybody's cooperation
 	// on process groups.
 	virtual std::int32_t execute(std::string_view line) = 0;

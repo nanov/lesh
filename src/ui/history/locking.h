@@ -38,8 +38,8 @@
 // of the vacuum, so that #194's rewrite and #195's append path share one
 // implementation of the identity check rather than each carrying a copy.
 //
-// THREADS: `file_id_*`, `lock_*` and `unlock` are called from the loop thread
-// (ADR-0009) and hold no state between calls; the latch is atomic. Nothing here
+// THREADS: `file_id_*`, `lock_*` and `unlock` are called from the one thread
+// (ADR-0011) and hold no state between calls; the latch is atomic. Nothing here
 // allocates.
 
 #include <cstdint>

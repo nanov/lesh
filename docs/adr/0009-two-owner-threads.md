@@ -1,12 +1,22 @@
 # ADR-0009: Two owner threads — the shell owns its state, leshper only reads it
 
-**Status:** Accepted
+**Status:** Superseded by [ADR-0011](0011-one-thread-cooperative-fibers.md) (2026-08-28, #203)
 **Date:** 2026-08-26
+
+**Read ADR-0011 for what is true now.** This ADR is kept because its REASONING
+is what permitted its own removal - the two threads were separated because
+worker threads read shell state, and when #151 made the shell-state reactor the
+one reader there was nothing left for a second thread to protect - and because
+the three amendments below are the record of how the removal happened, step by
+step. The two ROLES it names (the shell owns `shell_state`, the loop owns editor
+state and the terminal) survive verbatim in ADR-0011; the two THREADS do not.
 
 Amended 2026-08-27 (#168 Phase A): the loop is the host's (`src/ui/loop.cpp`); the two-owner rule stands.
 
 Amended 2026-08-27 (#201, step 1 of #145): **the loop thread is gone; the two-owner rule is now one owner.** The loop runs on main and calls `shell_side::execute` and `shell_side::port_call` directly; `shell_actor`, its three latest-wins slots, its condition variable and the `shell` topic are deleted, and the shell-state reactor runs in place on the thread that owns the tables it reads. This ADR's own reasoning is what permitted it: the two threads were separated because *worker threads* read shell state, and #151 made the shell-state reactor the one reader — so there was nothing left for a second thread to protect. What survives unchanged: the two ROLES (the shell owns `shell_state`, the loop owns editor state and the terminal, and they take turns), the generation as the one version, the stateless helper pool, quiesce before the fork, and `shell_writing_flag` as the assertion that "one writer, announced" still holds. The signal mask is NOT moved to main (#142, #143: a mask survives `execve` and main forks). The superseding ADR is the cleanup ticket's, once the park/quiesce apparatus is structural.
 Amended 2026-08-27 (#202, step 1d of #145): **the helper pool is gone; a reactor is a fiber on the one thread.** `worker_pool`, its threads, its arenas, its latest-wins slots, its pooled messages, `parked_scope`, `current_worker_arena` and the `worker` topic are deleted (`src/ui/workers.{h,cpp}`, 1,007 lines); `event_loop` owns a `fiber::scheduler` and gives every registered reactor one long-lived fiber in the `emitters` group, fed by a `fiber::slot` whose every send supersedes what that reactor had in flight. A turn gives each runnable emitter a slice before and after the UI part and polls with a timeout of 0 while any of them is runnable. What this ADR argued survives, in a stronger form than it was written in: "state-free work stays parallel" is the one clause that does NOT — nothing is parallel any more, and the ADR's own reasoning is why that is legal, since the only thing parallelism was buying was work that did not touch shell state, and the price of it was every mechanism this ADR exists to remove. Serialization is still the cost and still bounded the same way: a `$PATH` stat storm delays the next highlight and not a keystroke, because the poll before every lookup is now also a YIELD (`lesh_request::cooperate`), so a long walk is spread over turns that each read the terminal first. Quiesce keeps both halves and loses its reason for one of them: the terminal is still handed back, the emitters group is still parked and superseded (F-22), and a fork is now taken from a single-threaded process by construction rather than by parking. `shell_writing_flag` stands. The superseding ADR is still the cleanup ticket's (#203).
+
+Superseded 2026-08-28 (#203): [ADR-0011](0011-one-thread-cooperative-fibers.md).
 
 ## Context
 

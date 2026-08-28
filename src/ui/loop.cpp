@@ -32,9 +32,9 @@ const pid_t g_main_pid = ::getpid();
 // a time may own the dispositions; every other hub is a test's and is driven
 // through `deliver()`.
 //
-// A plain pointer and not an atomic: it is written on the loop thread before
-// `sigaction` publishes the handler and cleared after `sigaction` unpublishes
-// it, so a handler that runs at all runs after the write and before the clear.
+// A plain pointer and not an atomic: it is written before `sigaction` publishes
+// the handler and cleared after `sigaction` unpublishes it, so a handler that
+// runs at all runs after the write and before the clear.
 signal_hub* g_installed_hub = nullptr;
 
 void fish_style_handler(int signo) {
@@ -226,22 +226,6 @@ struct reactor_lane {
 // signal_hub
 // ---------------------------------------------------------------------------
 
-bool block_caught_signals_on_this_thread() noexcept {
-	// EXACTLY THE CAUGHT SET, and nothing more. The ignored set needs no mask -
-	// SIG_IGN is process-wide and a blocked-and-ignored signal is the same
-	// nothing - and masking anything the hub does not take would be this
-	// function quietly deciding policy for signals it knows nothing about.
-	sigset_t caught;
-	sigemptyset(&caught);
-	sigaddset(&caught, SIGINT);
-	sigaddset(&caught, SIGCHLD);
-	sigaddset(&caught, SIGWINCH);
-	// `pthread_sigmask` and not `sigprocmask`: in a multi-threaded process the
-	// latter's behaviour is unspecified, and this is called from precisely the
-	// threads that make it one.
-	return ::pthread_sigmask(SIG_BLOCK, &caught, nullptr) == 0;
-}
-
 signal_hub::signal_hub() {
 	const bool made = make_wakeup_pipe(_read_fd, _write_fd);
 	LESH_ASSERT(made);
@@ -430,8 +414,8 @@ bool signal_hub::take_dispositions() noexcept {
 	// whenever the next key happens to arrive.
 	catch_it(SIGINT, 0);
 	// SIGCHLD WITH SA_RESTART: "we want SIGCHLD to not interrupt restartable
-	// syscalls" (fish `signal.cpp`). The reap is the shell thread's, and there
-	// is nothing here that a child exiting should tear.
+	// syscalls" (fish `signal.cpp`). The reap is the shell's own, on this same
+	// thread, and there is nothing here that a child exiting should tear.
 	catch_it(SIGCHLD, SA_RESTART);
 	catch_it(SIGWINCH, SA_RESTART);
 
@@ -598,10 +582,10 @@ void event_loop::enter_read() {
 	// what makes a resize missed during a command impossible rather than
 	// handled. The SIGWINCH counter is realigned here for the same reason.
 	// THE COUNTER ONLY, AND NO `sigaction` (#142). Re-asserting the dispositions
-	// used to happen here, and it was the loop thread writing process-wide state
-	// that the shell thread's `trap` builtin writes too. It moved to the shell
-	// side of the ui layer (`ui/session.cpp`), which leaves one writer; this thread
-	// only ever READS the hub.
+	// used to happen here, which made the loop a writer of process-wide state the
+	// `trap` builtin writes too - two writers when the loop was a thread of its
+	// own. It moved to the shell side of the ui layer (`ui/session.cpp`), which
+	// leaves one; the loop only ever READS the hub.
 	if (_signals != nullptr)
 		_resizes_seen = _signals->resize_count();
 	refresh_size_from_terminal();
@@ -668,8 +652,8 @@ int event_loop::poll_timeout_ms() const noexcept {
 // ---------------------------------------------------------------------------
 
 turn_result event_loop::turn() {
-	// THE REGISTRY'S QUEUE BEFORE THE DEADLINE (#168). A timer armed while this
-	// thread was parked - the prompt's tick, rearmed from the shell thread on its
+	// THE REGISTRY'S QUEUE BEFORE THE DEADLINE (#168). A timer armed while the
+	// loop was not turning - the prompt's tick, rearmed by the shell side on its
 	// way out of a command - has to be in the table before the poll timeout is
 	// computed from it, or the wake it asked for waits on the next input instead.
 	drain_registry_effects();
@@ -1500,7 +1484,7 @@ leshper::cursor_placement event_loop::frame_top_above_cursor() {
 // ---------------------------------------------------------------------------
 
 void event_loop::quiesce() {
-	if (_park_depth == 0) {
+	if (!_quiesced) {
 		// THE EMITTERS DIE AT ACCEPT - "cancel, park", in the owner's words, and
 		// not kill. Every flag is raised first, so a walk in progress abandons at
 		// its next poll and `apply_reactor_batch` declines whatever it produced;
@@ -1517,52 +1501,53 @@ void event_loop::quiesce() {
 			_terminal.leave_raw();
 		_decoder.reset();
 	}
-	++_park_depth;
+	// IDEMPOTENT (#203): a second call finds the bit up and does nothing. Nothing
+	// nests - see the header - so what used to be a depth counter is this bit.
+	_quiesced = true;
 }
 
 void event_loop::resume_after_execution() {
-	LESH_ASSERT(_park_depth > 0);
-	--_park_depth;
+	LESH_ASSERT(_quiesced && "a resume with nothing parked is a caller that lost track");
+	_quiesced = false;
 	// THE SECOND PHASE WRITE. `execute` has returned, so the history append has
 	// already happened inside `session::execute` and the prompt is refreshed on
 	// the way out of the command; `boundary` is that instant, and it is the phase
 	// an `observers` group would still be runnable in.
-	if (_park_depth == 0)
-		_phase = phase::boundary;
-	if (_park_depth == 0 && _options.manage_terminal) {
+	_phase = phase::boundary;
+	if (_options.manage_terminal) {
 		// The order is the read-entry order, because that is what this is: the
 		// terminal comes back, then the modes, then the size.
 		ignore_background_write_signals();
 		_terminal.reclaim();
 		_terminal.enter_raw();
 	}
-	if (_park_depth == 0) {
-		// The counter only; see `enter_read`. The command that just ran may well
-		// have been a `trap`, but the side that ran it re-asserts before it hands
-		// the loop back - one thread writes dispositions (#142).
-		if (_signals != nullptr)
-			_resizes_seen = _signals->resize_count();
-		refresh_size_from_terminal();
-		// The screen is whatever the command left behind, so there is nothing to
-		// diff against: the next render is a full repaint.
-		_have_previous = false;
-		_needs_render = true;
-		// AND THE EDITOR IS BACK. The emitters are runnable again from here, and
-		// each of them is parked on `recv` owning nothing of the line that just
-		// ran - the supersede at `quiesce` is what made that true.
-		_phase = phase::editing;
-		_sched.resume_group(group_index(fiber_group::emitters));
-	}
+	// The counter only; see `enter_read`. The command that just ran may well have
+	// been a `trap`, but the side that ran it re-asserts before it hands the loop
+	// back - one thread writes dispositions (#142).
+	if (_signals != nullptr)
+		_resizes_seen = _signals->resize_count();
+	refresh_size_from_terminal();
+	// The screen is whatever the command left behind, so there is nothing to
+	// diff against: the next render is a full repaint.
+	_have_previous = false;
+	_needs_render = true;
+	// AND THE EDITOR IS BACK. The emitters are runnable again from here, and
+	// each of them is parked on `recv` owning nothing of the line that just
+	// ran - the supersede at `quiesce` is what made that true.
+	_phase = phase::editing;
+	_sched.resume_group(group_index(fiber_group::emitters));
 }
 
 void event_loop::assert_quiesced() const noexcept {
-	LESH_ASSERT(_park_depth > 0);
-	// THE EMITTERS' HALF (#202). Two clauses: the group's bit is down, and no
-	// emitter is mid-slice. The second is structurally true - the host is the only
-	// resumer, every yield returns here, and nothing a reactor can reach forks -
-	// and #91 chose crash-on-violation over `pthread_atfork` precisely so that the
-	// day somebody adds a fork site inside a slice, the sanitized gate says so.
-	LESH_ASSERT(_sched.group_parked(group_index(fiber_group::emitters)));
+	// TWO CLAUSES SINCE #203, and both of them are checks rather than echoes. The
+	// group's bit and the park flag are stores `quiesce()` made a few lines up -
+	// asserting them proved that an assignment assigns. What is worth asserting
+	// is what the code around them CLAIMS:
+	//
+	// NO EMITTER IS MID-SLICE. Structurally true - the host is the only resumer,
+	// every yield returns there, and nothing a reactor can reach forks - and
+	// #91 chose crash-on-violation over `pthread_atfork` precisely so that the day
+	// somebody adds a fork site inside a slice, the sanitized gate says so.
 	const fiber::fiber* const running = _sched.current();
 	LESH_ASSERT(running == nullptr
 	            || running->group() != group_index(fiber_group::emitters));
@@ -1587,7 +1572,7 @@ std::optional<std::int32_t> event_loop::accept_current_line() {
 	_have_previous = false;
 
 	// PARK, THEN RESTORE, THEN CALL. In that order, and the order is the whole of
-	// quiesce: the fork happens inside `execute`, on this thread, so the helpers
+	// quiesce: the fork happens inside `execute`, on this thread, so the emitters
 	// have to be parked and the terminal handed back BEFORE the call is made.
 	// #201 shortened the distance between the park and the fork from a channel to
 	// a stack frame; it did not change what has to be true at it.
@@ -1656,7 +1641,7 @@ void event_loop::finish_cancelled_line() {
 	// which is where #33 says a trap body belongs.
 	//
 	// THE QUIESCE IS NOT CEREMONY. A trap body is arbitrary shell code and may
-	// fork, so the helpers have to be parked and the terminal handed back before
+	// fork, so the emitters have to be parked and the terminal handed back before
 	// the call is made, on the identical path an accepted line takes.
 	if (_shell == nullptr)
 		return;
@@ -1704,13 +1689,13 @@ port_result event_loop::call_port(std::string_view code) {
 
 void event_loop::run() {
 	// ON THE CALLER'S THREAD, WHICH IS MAIN (#201). This was the body of a thread
-	// this class spawned, and the first statement of that body was
-	// `block_caught_signals_on_this_thread()`. THAT BLOCK IS DELETED, NOT MOVED,
-	// and it is the one line of this ticket that would have been a bug to carry
-	// over: a signal mask survives `execve`, main is the thread that forks and
-	// execs, and a child born with SIGINT blocked ignores the `kill -INT` meant
-	// for it (#142, #143). Main stays unmasked, the handler runs here as it did
-	// before leshper existed, and the poll below takes the EINTR it always could.
+	// this class spawned, and the first statement of that body blocked the caught
+	// signal set. THAT BLOCK WAS DELETED, NOT MOVED - a signal mask survives
+	// `execve`, main is the thread that forks and execs, and a child born with
+	// SIGINT blocked ignores the `kill -INT` meant for it (#142, #143). Main stays
+	// unmasked, the handler runs here as it did before leshper existed, and the
+	// poll below takes the EINTR it always could. The function that did the
+	// blocking went in #203, once nothing was left to call it.
 	enter_read();
 	// THE PROMPT IS PAINTED BEFORE THE FIRST POLL. `enter_read` asks for a
 	// render, but a turn clears that flag before it polls and the first poll
@@ -1725,7 +1710,7 @@ void event_loop::run() {
 
 void event_loop::request_stop() noexcept {
 	// A FLAG AND NOTHING ELSE (#201). It used to ring the signal topic's pipe as
-	// well, because the caller was the shell thread and the loop was asleep in a
+	// well, because the caller was the shell's thread and the loop was asleep in a
 	// `poll` that had to be woken. Every caller is this thread now - `end_of_file`
 	// and the hangup from inside a turn, an `exit` from inside the `execute` this
 	// loop called - and a poll that is not running needs no wakeup. `run`'s

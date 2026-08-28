@@ -18,11 +18,12 @@
 //
 // ONE OWNER, NO VERSION. #130 resolved this over a copy-on-write definitions
 // version held by the request token, because the highlighter then ran on a
-// worker while the loop mutated the tables. ADR-0009 dissolved that: the shell
-// is the main thread, it owns `shell_state`, and a highlight, a port call and an
-// execution are serialized on it. So the implementation may hand back views into
-// the state's own storage - there is no second thread that could invalidate one
-// mid-call - and this interface is a plain const reference, not a refcounted
+// helper thread while the loop mutated the tables. ADR-0009 dissolved that and
+// ADR-0011 keeps it: the shell is the main thread, it owns `shell_state`, and a
+// highlight, a port call and an execution are serialized on it - the highlight
+// because it is a fiber the host resumes on that same thread, never beside it.
+// So the implementation may hand back views into the state's own storage - there
+// is nothing that could invalidate one mid-call - and this interface is a plain const reference, not a refcounted
 // snapshot. The only version left is the editor's generation, already on the
 // token.
 //
@@ -108,9 +109,11 @@ enum class name_domain : std::uint8_t {
 // WHY AN ATOMIC WHEN THE CLAIM IS THAT THERE IS NO CONCURRENCY. Because the
 // claim was exactly what was being checked: the flag was written on the shell
 // thread and read wherever a reader happened to be - the shell thread for the
-// highlighter, the LOOP thread for the completer (see `enumerate` below) - and
+// highlighter, the loop's thread for the completer (see `enumerate` below) - and
 // a plain `bool` read across those would be the data race the assertion exists
-// to catch, which is a poor way to catch it. Relaxed on both sides: this is a
+// to catch, which is a poor way to catch it. There is one thread now and the
+// atomic is vestigial; it is kept because what it costs is nothing and what it
+// would cost to re-derive the argument is not. Relaxed on both sides: this is a
 // tripwire, not a handshake, and it orders nothing.
 //
 // DEBUG-ONLY COST. The load lives inside `LESH_ASSERT` and compiles out in
@@ -208,11 +211,11 @@ public:
 	//
 	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
 	// out of `classify`: the walk is a readdir per directory and it belongs on
-	// the side that memoizes it - which is the completer, on the loop, where the
+	// the side that memoizes it - which is the completer, in the loop, where the
 	// directory walk it is already doing lives. `path_directory` hands over the
 	// SPLIT of the value and stops there. Folding the sweep in would put a
-	// filesystem walk on the shell thread, serialized ahead of the next
-	// execution, to answer a question the loop was about to walk anyway.
+	// filesystem walk on the shell's side of the two roles, serialized ahead of
+	// the next execution, to answer a question the loop was about to walk anyway.
 	//
 	// A DEFAULTED BODY, not a pure virtual: this arrived after two
 	// implementations and several fakes, and #130's growth rule for this door is
@@ -232,9 +235,9 @@ public:
 // silent `getenv` inside the ABI, so that "where did that PATH come from" has an
 // object to point at.
 //
-// The environment belongs to the shell thread, which is the only thread that
-// writes it; a reader on any other thread is reading a table that could be
-// changing under it. That is a pre-existing property of `getenv`, unchanged
+// The environment belongs to the shell, which is the only side that writes it;
+// a reader that is not the shell is reading a table that could be changing under
+// it. That is a pre-existing property of `getenv`, unchanged
 // here, and it is one more reason the wired-up path passes a real
 // `shell_knowledge` instead.
 class environment_knowledge final : public shell_knowledge {

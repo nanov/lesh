@@ -38,7 +38,7 @@
 // becomes "the file I mapped is not the file that is there".
 //
 // NO THREAD (ADR-0010, in as many words). The descriptor is one more topic in
-// the loop's `poll`; the drain runs on the loop thread like every other drain.
+// the loop's `poll`; the drain runs inside a turn like every other drain.
 //
 // ADR-0007: the destructor closes both descriptors, and there are at most two.
 

@@ -1348,9 +1348,8 @@ inline std::int32_t set_placements(lesh_registry* registry, std::uint32_t surfac
 // `next_wake()`'s own zero carried through - a static prompt causes zero idle
 // wakeups (§6.10) and that has to survive this conversion.
 //
-// PURE, and in the header, because the wiring that arms the timer runs on the
-// loop thread inside a session and the arithmetic is the part worth testing on
-// its own. A wiring site is hard to reach from a test; a function is not.
+// PURE, and in the header, because the wiring that arms the timer runs inside a
+// session's loop and the arithmetic is the part worth testing on its own. A wiring site is hard to reach from a test; a function is not.
 //
 // PAST-DUE CLAMPS TO ONE TICK rather than to zero: a deadline that has already
 // gone by means the loop was busy, and the answer is "fire at the next

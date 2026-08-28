@@ -79,7 +79,7 @@ bool directory_watch::drain() noexcept {
 
 	// One `inotify_event` plus the longest name the kernel will hand back, which
 	// is what the manual page's own example sizes its buffer to. On the stack:
-	// this runs on the loop thread and must not allocate.
+	// this runs inside a turn and must not allocate.
 	alignas(struct inotify_event) char buffer[4096];
 	bool anything = false;
 	for (;;) {

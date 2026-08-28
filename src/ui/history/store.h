@@ -7,32 +7,36 @@
 //
 // WHAT IT IS, IN ONE SENTENCE. `add` before a command runs, `resolve_pending`
 // after it finishes, `for_each_newest_first` from anywhere - and the third of
-// those runs on a keystroke, on a worker, while the first two are running on
-// the loop thread.
+// those runs on a keystroke, inside a reactor's slice, while the first two run
+// at the boundary of a command.
 //
-// THAT IS THE WHOLE DESIGN PROBLEM, and ADR-0009 answers it with SNAPSHOT
+// THAT IS THE WHOLE DESIGN PROBLEM, and ADR-0011 answers it with SNAPSHOT
 // VIEWS. A mutation never edits anything a reader can see: it builds a fresh
 // immutable `view` - the resolved items of this session, the items loaded from
 // the log at open, and a refcounted handle on the mapping - and swaps a
 // `shared_ptr` to it. A walk takes the current view ONCE, at the top, and is
-// then reading a graph nothing will ever touch again. A view that a worker is
-// still walking keeps its mapping alive by holding the handle, so the mapping
-// cannot be pulled out from under it even by a reload; the worst that can
-// happen to a walk is that it reports a history one command out of date, which
-// is what a snapshot IS.
+// then reading a graph nothing will ever touch again. A view a walk is still
+// reading keeps its mapping alive by holding the handle, so the mapping cannot
+// be pulled out from under it even by a reload; the worst that can happen to a
+// walk is that it reports a history one command out of date, which is what a
+// snapshot IS. Under fibers that guarantee is doing MORE work than it looks:
+// a walk yields at every entry (#202), so a boundary's `resolve_pending` really
+// can land between two of its steps.
 //
 // NO LOCK ANYWHERE IN HERE, and that is not bravado - it is the consequence of
-// the above. The only shared mutable state between the two threads is one
+// the above. The only mutable state a walk and a mutation share is one
 // `shared_ptr`, read with `std::atomic_load` and written with
 // `std::atomic_store`. `new_items`, the write cursor, the appender and the
-// warning latch are LOOP-THREAD-ONLY and are never read by a walk.
+// warning latch belong to the MUTATING side and are never read by a walk. The
+// atomics survive one thread on purpose: the history's append is ADR-0011's
+// first candidate for an I/O thread, and this is the seam it would arrive at.
 //
 // THE WALK ALLOCATES NOTHING once it is warm, because it is the autosuggest
 // path and `UiAutosuggest`'s zero-heap tests are the gate on it. Two things
 // could have allocated and neither does: the view is taken by refcount rather
 // than copied, and the per-walk dedup set is a generation-stamped open-address
-// table kept in thread-local storage, so the second walk on a thread reuses the
-// first walk's buckets and clears them by bumping an integer. `scratch_growths`
+// table kept in thread-local storage, so the second walk reuses the first walk's
+// buckets and clears them by bumping an integer. `scratch_growths`
 // below is the instrument that says so out loud.
 //
 // STALENESS IS HERE NOW (#195, ADR-0010 §Locking and staleness), and it is
@@ -361,8 +365,8 @@ public:
 	// --- The read seam (#125's `history_source`) -----------------------------
 
 	// The merge walk, newest first, deduplicated on `cmd` bytes: this session's
-	// resolved items, then the log's, then the mapping's. Safe from any thread,
-	// at any time, including while the loop thread is recording.
+	// resolved items, then the log's, then the mapping's. Safe from anywhere, at
+	// any time, including from a fiber suspended across a recording.
 	void for_each_newest_first(
 		const std::function<bool(std::string_view)>& fn) const override;
 
@@ -420,11 +424,11 @@ public:
 	// `UiAutosuggest`'s zero-heap tests read sees only the arena's malloc
 	// fallback, so it would not notice a `std::vector` growing inside the walk.
 	// This would. It costs one relaxed increment on a path that runs at most
-	// log2(history size) times per thread per process.
+	// log2(history size) times per process.
 	[[nodiscard]] static std::size_t scratch_growths() noexcept;
 
 private:
-	// ONE IMMUTABLE SNAPSHOT (ADR-0009). Built on the loop thread by `publish`,
+	// ONE IMMUTABLE SNAPSHOT (ADR-0011). Built by `publish` on the mutating side,
 	// read by any number of walks, never modified after the swap.
 	struct view {
 		// This session's RESOLVED items, newest first. Shared pointers and not
@@ -548,11 +552,11 @@ private:
 	// `set_vacuum_cap`.
 	std::size_t _vacuum_cap = k_history_save_max;
 
-	// --- The one thing both threads touch ------------------------------------
+	// --- The one thing a walk and a mutation share ---------------------------
 
 	// `std::atomic_load`/`std::atomic_store`, not `std::atomic<shared_ptr>`:
 	// libc++ does not implement the C++20 specialization (it static_asserts on
-	// trivial copyability), and the free functions are ADR-0009's other named
+	// trivial copyability), and the free functions are ADR-0011's other named
 	// option. Never null after construction.
 	std::shared_ptr<const view> _view;
 };
