@@ -799,6 +799,17 @@ turn_result event_loop::turn(int timeout_ms) {
 		signal_at = poll_on(_signals->wakeup_fd());
 	if (_watch_fd >= 0)
 		watch_at = poll_on(_watch_fd);
+	// AND THEN THE FD INTERESTS (#209), WHICH ARE NOT TOPICS. A topic is a fixed
+	// descriptor with a drain behind it; an interest is one fiber's question about
+	// one descriptor, for the length of one wait, with nothing behind it at all -
+	// the waiter's own `::read` is what consumes the bytes. Nearly always none, so
+	// the fast path is the poll set this loop has always built.
+	//
+	// THIS IS ALSO HOW THE TTY GETS BACK IN WHILE A COMMAND RUNS. The topic above
+	// is out during `executing` (#208) and `await_readable(0)` from the `read`
+	// builtin puts the same descriptor here instead - polled, never drained.
+	for (std::size_t i = 0; i < _fd_wait_count; ++i)
+		(void)poll_on(_fd_waits[i]->fd);
 
 	// AND THE CALLER'S TIMEOUT IS CLAMPED THE SAME WAY `poll_timeout_ms` IS
 	// (#202). `turn()` computes its timeout and finds the zero there; `turn(ms)`
@@ -856,6 +867,12 @@ turn_result event_loop::turn(int timeout_ms) {
 	// `waitpid(WNOHANG)` per outstanding wait per wake.
 	if (!_child_waits.empty())
 		reap_awaited_children();
+	// AND THE INPUT WAIT'S OTHER HALF (#209), on exactly the same terms: guarded
+	// on the table rather than on the phase, so a wait taken from anywhere would
+	// be served the same way, and costing one zero-timeout `select` per
+	// outstanding wait per wake.
+	if (_fd_wait_count != 0)
+		wake_readable_fds();
 	// AND NO TIMERS WHILE A COMMAND RUNS. A timer expiring here would dispatch an
 	// action into an editor that has no terminal; the arming survives, and the
 	// first turn after `resume_after_execution` fires whatever is due.
@@ -1954,6 +1971,73 @@ void event_loop::reap_awaited_children() noexcept {
 			*waiting.status = wait_status;
 		_child_waits.erase(_child_waits.begin() + static_cast<std::ptrdiff_t>(i));
 		waiting.slot.complete(got);
+	}
+}
+
+void event_loop::await_readable(int fd) noexcept {
+	// A DESCRIPTOR THAT IS NOT ONE is not something to park on. The caller's read
+	// will answer with EBADF, which is what it would have answered anyway.
+	if (fd < 0)
+		return;
+
+	fd_wait waiting;
+	waiting.fd = fd;
+	(void)_sched.block_or_park(
+		waiting.slot,
+		// NO FIBER TO PARK, so there is nothing to say: `execution_mode::inline_`,
+		// an action's `port_call`, a `read` in the EXIT trap after `run()` has
+		// returned. The caller's `::read` blocks on this stack, exactly as it did
+		// before this ticket - which is the same answer the no-op cooperation
+		// gives every non-interactive shell.
+		[] { return 0; },
+		[&] {
+			// THE ONE PLACE THE FIXED CAPACITY IS CHECKED, and an overflow degrades
+			// rather than corrupts: no entry means no park, which means the blocking
+			// read above. Unreachable with today's shapes - one waiter, one fd.
+			if (_fd_wait_count >= kMaxFdWaits) {
+				LESH_ASSERT(false && "more descriptors awaited than the table can hold");
+				waiting.slot.complete(0);
+				return;
+			}
+			_fd_waits[_fd_wait_count++] = &waiting;
+			// AND ASK ONCE, RIGHT NOW - `await_child`'s move, for `await_child`'s
+			// reason. A regular file is always readable and a pipe usually has the
+			// rest of the line already in it, so the common `read` never parks at
+			// all and never reaches a poll: `wake_readable_fds` completes the slot
+			// here and `block_or_park`'s loop returns without a switch.
+			wake_readable_fds();
+		});
+}
+
+void event_loop::wake_readable_fds() noexcept {
+	// ASKED PER WAITER RATHER THAN READ OFF THE TURN'S `revents`, which is what
+	// lets this be one function with the two call sites `reap_awaited_children`
+	// has - the enlist probe has no poll set to read - and costs a `select` with
+	// a zero timeout per outstanding wait per wake (0.2 us; see `ready_now`).
+	for (std::size_t i = 0; i < _fd_wait_count;) {
+		struct pollfd one{};
+		one.fd = _fd_waits[i]->fd;
+		one.events = POLLIN;
+		const int ready = ready_now(&one, 1, 0);
+		if (ready == 0)
+			{ ++i; continue; }              // nothing there yet: leave it enlisted
+		if (ready < 0 && errno == EINTR)
+			continue;                       // ask again for the same waiter
+		// EVERYTHING ELSE MEANS "GO AND READ IT", and deliberately so. `ready > 0`
+		// is POLLIN, or a POLLHUP/POLLERR that `revents_of` has always folded into
+		// "go and drain it", or a POLLNVAL from a descriptor that is not open;
+		// `ready < 0` is a poll that refuses the set at all. In every one of those
+		// the caller's `::read` is the thing with the right answer - a byte, end of
+		// file, or EBADF, which `read` reports as end of input - and a wait would
+		// be for ever.
+		fd_wait* const waiting = _fd_waits[i];
+		// The entry goes BEFORE the waiter is woken, for `reap_awaited_children`'s
+		// reason: a woken fiber enlists again on its very next statement, which for
+		// this verb is the next byte of the same line.
+		for (std::size_t at = i + 1; at < _fd_wait_count; ++at)
+			_fd_waits[at - 1] = _fd_waits[at];
+		--_fd_wait_count;
+		waiting->slot.complete(1);
 	}
 }
 

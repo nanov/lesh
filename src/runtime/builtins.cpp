@@ -1617,8 +1617,23 @@ builtin_result builtin_kill(shell_state&, char** argv) {
 // its input than the line it needs, which read-p.tst's "read does not read more
 // than needed" asserts by running `cat` straight after it. A block-buffered
 // stream would have swallowed that line too.
-bool read_byte(char& c) {
+//
+// AND THE HOST IS TOLD BEFORE EACH ONE OF THEM (#209, phase 2b of #145). `read`
+// is the shell's one builtin that blocks for as long as a user is willing to
+// think, and on the thread that also is the line editor - so it says
+// `await_readable(0)` first, which for a non-interactive shell is an indirect
+// call to a `return` and for an interactive one is the execution fiber parking
+// while the loop keeps turning. BEFORE EACH read and not once per line: a byte
+// is the unit this loop works in, the second byte of a line may be minutes after
+// the first, and the await returns at once whenever the descriptor already has
+// something (which, mid-line, it always does).
+//
+// WHAT IT IS NOT is an error path. The await answers nothing, so the read below
+// is unchanged and every one of `read`'s behaviours - EINTR under SA_RESTART,
+// EOF, EBADF from a closed fd - is decided exactly where it always was.
+bool read_byte(cooperation& host, char& c) {
 	for (;;) {
+		host.await_readable(STDIN_FILENO);
 		const ssize_t n = ::read(STDIN_FILENO, &c, 1);
 		if (n == 1)
 			return true;
@@ -1641,11 +1656,11 @@ struct input_line {
 	bool at_eof = false;  // input ended before the delimiter was seen
 };
 
-input_line read_input_line(char delimiter, bool raw) {
+input_line read_input_line(cooperation& host, char delimiter, bool raw) {
 	input_line line;
 	for (;;) {
 		char c = '\0';
-		if (!read_byte(c)) {
+		if (!read_byte(host, c)) {
 			line.at_eof = true;
 			break;
 		}
@@ -1653,7 +1668,7 @@ input_line read_input_line(char delimiter, bool raw) {
 			break;
 		if (!raw && c == '\\') {
 			char next = '\0';
-			if (!read_byte(next)) {
+			if (!read_byte(host, next)) {
 				// "orphan backslash is ignored": a trailing backslash at end of input
 				// contributes nothing rather than being kept as a literal.
 				line.at_eof = true;
@@ -1751,7 +1766,7 @@ builtin_result builtin_read(shell_state& state, char** argv) {
 	const char delimiter = parsed.opts.delimiter.empty() ? '\0' : parsed.opts.delimiter.front();
 	size_t first = static_cast<size_t>(parsed.rest - argv);
 
-	const input_line line = read_input_line(delimiter, raw);
+	const input_line line = read_input_line(state.cooperation(), delimiter, raw);
 
 	// A readonly target makes `read` FAIL rather than discard the line quietly.
 	// dash reports `read: v: is read only` and returns 2 and, being a regular

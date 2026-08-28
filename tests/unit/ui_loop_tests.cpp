@@ -2330,3 +2330,330 @@ TEST(UiLoopExecution, APortCallNeverParksBecauseThereIsNoFiberUnderIt) {
 	loop.leave_read();
 	hub.uninstall();
 }
+
+// ===========================================================================
+// THE INPUT WAIT (#209, phase 2b of #145)
+// ===========================================================================
+//
+// `await_readable` is `await_child`'s sibling, so these are that block's cases
+// read across: the same two modes, the same "the table is empty again", the same
+// watch-topic observable for "the loop is ALIVE". What is new is the shape of
+// the answer - readiness rather than a status - and the three descriptor kinds
+// the seam promises something about: a pipe that becomes readable later, a
+// regular file that is readable already, and a descriptor the host cannot ask
+// about at all.
+
+namespace {
+
+// A shell that awaits a descriptor through the host's verb and then reads it.
+//
+// THE BYTE COMES FROM A FORKED CHILD, which is the only way a single-threaded
+// test can make a descriptor readable WHILE the awaiting side is parked - the
+// same trick `awaiting_shell` uses to make a child exit mid-command.
+class reading_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	int read_fd = -1;
+	int write_fd = -1;
+	// How long before the byte appears. Zero means "it is already there", which
+	// is the path where the await must not park at all.
+	unsigned byte_after_ms = 40;
+	bool write_from_a_child = true;
+
+	pid_t writer = -1;
+	char got = '\0';
+	ssize_t read_answer = -2;
+	bool on_a_fiber_inside = false;
+	std::size_t slices_at_the_await = 0;
+
+	std::int32_t execute(std::string_view) override {
+		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		if (write_from_a_child) {
+			writer = ::fork();
+			if (writer == 0) {
+				::usleep(byte_after_ms * 1000);
+				const char one = 'x';
+				[[maybe_unused]] const ssize_t wrote = ::write(write_fd, &one, 1);
+				::_exit(0);
+			}
+		}
+		slices_at_the_await = loop->execution_slices();
+		loop->await_readable(read_fd);
+		// AND THE READ AFTER IT DOES NOT BLOCK, which is the whole promise of the
+		// verb: this test would hang rather than fail if it did.
+		read_answer = ::read(read_fd, &got, 1);
+		if (writer > 0) {
+			int ignored = 0;
+			(void)loop->await_child(writer, 0, &ignored);
+		}
+		return 0;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int pipe_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(pipe_fds), 0);
+
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.read_fd = pipe_fds[0];
+		shell.write_fd = pipe_fds[1];
+		loop.enter_read();
+
+		// EMPTY BEFORE, so the count afterwards is evidence rather than a constant.
+		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(shell.read_answer, 1) << name_of(how) << ": the read did not get its byte";
+		EXPECT_EQ(shell.got, 'x') << name_of(how);
+		// AND THE TABLE IS EMPTY AGAIN. An entry left behind would be a pointer
+		// into a frame that has returned.
+		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_TRUE(shell.on_a_fiber_inside) << "`execute` ran on a fiber";
+			// TWO SLICES AT LEAST, AND THAT IS THE PARK MADE VISIBLE: the byte is
+			// 40 ms away, so the await cannot answer inside the slice that asked.
+			EXPECT_GE(loop.execution_slices(), shell.slices_at_the_await + 1)
+				<< "one slice for the whole command would mean the await never parked";
+		} else {
+			EXPECT_FALSE(loop.has_execution_fiber()) << name_of(how);
+			EXPECT_FALSE(shell.on_a_fiber_inside) << name_of(how);
+		}
+
+		loop.leave_read();
+		hub.uninstall();
+		::close(pipe_fds[0]);
+		::close(pipe_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, ADescriptorThatIsREADYALREADYNeverParks) {
+	// The common case by a long way - the second byte of a line, a regular file,
+	// a pipe with the rest of the line still in it - and it must not cost a
+	// switch. `await_readable`'s enlist asks once on the spot and completes the
+	// slot there, so `block_or_park`'s loop returns without parking: exactly the
+	// "completing from inside enlist is legal" property #208 built the primitive
+	// around.
+	//
+	// ONE SLICE FOR THE WHOLE COMMAND is what says so. The fiber body's `recv`,
+	// the `execute`, the `send` and the park on the next `recv` are all inside a
+	// single resume unless something in the middle of them parks.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	int pipe_fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(pipe_fds), 0);
+	const char one = 'x';
+	ASSERT_EQ(::write(pipe_fds[1], &one, 1), 1);
+
+	fake_tty tty;
+	signal_hub hub;
+	reading_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	shell.read_fd = pipe_fds[0];
+	shell.write_fd = pipe_fds[1];
+	shell.write_from_a_child = false;
+
+	loop.enter_read();
+	(void)loop.accept_current_line();
+
+	EXPECT_EQ(shell.read_answer, 1);
+	EXPECT_EQ(shell.got, 'x');
+	EXPECT_EQ(loop.execution_slices(), 1u)
+		<< "a descriptor that was readable already cost a park";
+	EXPECT_EQ(loop.awaited_fds(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
+	::close(pipe_fds[0]);
+	::close(pipe_fds[1]);
+}
+
+TEST(UiLoopExecution, ARegularFileIsAlwaysReadableAndAClosedOneIsNeverWaitedOn) {
+	// The two descriptor kinds the seam promises something about beside a pipe,
+	// and they are one test because they share the answer: DO NOT PARK.
+	//
+	// A regular file is always readable, so `read x < file` behaves exactly as it
+	// did. A CLOSED descriptor - `read x 0<&-` - is what the answer has to be
+	// deliberate about: `poll` reports POLLNVAL, which is not a readable bit, and
+	// a host that waited for one would wait for ever on a shell that used to
+	// report an error and carry on.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	const lesh::testing::temp_path dir;
+	const std::string path = dir.file("input");
+	{
+		std::ofstream out{path};
+		out << "from-a-file\n";
+	}
+	for (const bool a_file : {true, false}) {
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.write_from_a_child = false;
+		loop.enter_read();
+
+		// MINTED LAST, AFTER EVERYTHING ELSE HAS TAKEN ITS DESCRIPTORS, and that is
+		// not fussiness - it cost this test an hour. A closed descriptor is a
+		// NUMBER, and the pipes a `fake_tty` and a `signal_hub` open are handed the
+		// lowest free one: a number closed before they were constructed is one of
+		// THEIRS by the time it is awaited, and the await then waits for ever on a
+		// perfectly open pipe nobody is going to write to.
+		int fd = -1;
+		if (a_file) {
+			fd = ::open(path.c_str(), O_RDONLY);
+			ASSERT_GE(fd, 0);
+		} else {
+			int pipe_fds[2] = {-1, -1};
+			ASSERT_EQ(::pipe(pipe_fds), 0);
+			fd = pipe_fds[0];
+			::close(pipe_fds[0]);
+			::close(pipe_fds[1]);
+		}
+		shell.read_fd = fd;
+
+		// The assertion is that this RETURNS. A park with nothing to wake it would
+		// hang the suite, which is the failure mode worth having here.
+		(void)loop.accept_current_line();
+
+		const char* which = a_file ? "a regular file" : "a closed descriptor";
+		EXPECT_EQ(loop.awaited_fds(), 0u) << which;
+		EXPECT_EQ(loop.execution_slices(), 1u) << which << ": it parked";
+		if (a_file) {
+			EXPECT_EQ(shell.got, 'f') << "the file's first byte";
+			::close(fd);
+		} else {
+			EXPECT_EQ(shell.read_answer, -1) << "a closed descriptor still answers EBADF";
+		}
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnAFiberTheLoopIsALIVEWhileAREADWaitsAndInlineItIsNot) {
+	// THE VISIBLE RESULT OF THE TICKET, asserted with the same observable
+	// `OnAFiberTheLoopIsALIVEWhileACommandRuns...` uses: an interactive `read`
+	// used to freeze the loop for as long as a user was willing to think, and on
+	// a fiber it does not.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int pipe_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(pipe_fds), 0);
+		int watch_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(watch_fds), 0);
+		ASSERT_EQ(::fcntl(watch_fds[0], F_SETFL, O_NONBLOCK), 0);
+		watch_probe probe;
+		probe.fd = watch_fds[0];
+
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		loop.attach_watch(watch_fds[0], &watch_probe::on_readable, &probe);
+		shell.loop = &loop;
+		shell.read_fd = pipe_fds[0];
+		shell.write_fd = pipe_fds[1];
+		shell.byte_after_ms = 60;
+		loop.enter_read();
+
+		const char one = 'w';
+		ASSERT_EQ(::write(watch_fds[1], &one, 1), 1);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_GE(probe.runs, 1u)
+				<< "the loop polled the watch topic while a `read` was waiting";
+		} else {
+			EXPECT_EQ(probe.runs, 0u)
+				<< "the inline path blocks in `::read`: nothing polls anything";
+			// AND IT IS NOT LOST, which is what makes the inline path a mode and
+			// not a bug: the first ordinary turn afterwards drains it.
+			(void)loop.turn(0);
+			EXPECT_GE(probe.runs, 1u);
+		}
+
+		loop.detach_watch();
+		loop.leave_read();
+		hub.uninstall();
+		::close(pipe_fds[0]);
+		::close(pipe_fds[1]);
+		::close(watch_fds[0]);
+		::close(watch_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, AwaitingTheTTYPUTSITBACKInThePollSetWithoutMakingItATopic) {
+	// POINT 2 OF THE TICKET, and the reason an interest is not a topic. #208 took
+	// the tty topic out of the turn during `executing` - the bytes belong to the
+	// command, not to an editor that is not on screen - and `await_readable(0)`
+	// puts the same descriptor back for the length of one `read`.
+	//
+	// TWO ASSERTIONS, and the second is the one that could go wrong: the byte
+	// reaches the COMMAND's own read, and the editor never saw it. A host that
+	// re-armed the topic instead would decode the keystroke into the buffer and
+	// the builtin would then block for ever on input somebody else had eaten.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	reading_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	shell.read_fd = tty.fds().input;
+	shell.write_from_a_child = false;
+	loop.enter_read();
+
+	// TYPED BEFORE THE ACCEPT rather than during it, because the point is not the
+	// timing: a byte in the descriptor while the phase is `executing` is a byte
+	// the editor must not take, whenever it arrived.
+	tty.type("k");
+
+	(void)loop.accept_current_line();
+
+	EXPECT_EQ(shell.read_answer, 1) << "the command's own read did not get the byte";
+	EXPECT_EQ(shell.got, 'k');
+	EXPECT_EQ(loop.awaited_fds(), 0u);
+	EXPECT_TRUE(buffer_of(loop).empty())
+		<< "the loop decoded a keystroke that belonged to the command: "
+		<< buffer_of(loop);
+
+	loop.leave_read();
+	hub.uninstall();
+}

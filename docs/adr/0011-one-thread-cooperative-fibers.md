@@ -6,8 +6,9 @@
 Supersedes [ADR-0009](0009-two-owner-threads.md). Written when step 3 of #145
 landed (#203), against the design recorded on #145 — the grilling record, the
 architecture review, the tick statement and the later notes — and implemented by
-#198, #199, #200, #201 and #202. Amended by #206 (the yield's price) and #208
-(phase 2a: execution as a fiber). The library evidence is the research note,
+#198, #199, #200, #201 and #202. Amended by #206 (the yield's price), #208
+(phase 2a: execution as a fiber) and #209 (phase 2b: `read` awaits its
+descriptor). The library evidence is the research note,
 [2026-08-26 stackful fibers: Tarantool and minicoro](../superpowers/research/2026-08-26-stackful-fibers-tarantool-minicoro.md).
 
 ## Context
@@ -79,7 +80,9 @@ zombie whose SIGCHLD was drained turns ago. `src/fiber/` therefore never sees a 
 or a file descriptor: `await_slot` is one word of answer and the fiber to wake, and
 the waiter TABLE belongs to the host, which is the only side that knows what it is
 waiting for. `cooperation::wait_child` is a five-line adapter over it, and #209's
-`await_readable` will be another.
+`await_readable` IS another - the same primitive, the same table of entries on the
+awaiting fiber's own frame, the same "complete from inside `enlist`" for the case
+that has already happened.
 
 **Phase is where the session is**, written at exactly two places — `quiesce()`
 (→`executing`) and `resume_after_execution()` (→`boundary`→`editing`). **Groups
@@ -145,6 +148,41 @@ reach the identical syscall with the identical arguments through one indirect ca
 zombie until `wait` asks for it exactly as before and no job-control semantics
 moved in that ticket. The "notices mid-command" upgrade is a later ticket built on
 this seam, not a side effect of it.
+
+**AND THE THIRD VERB IS `await_readable`, WHOSE NO-OP IMPLEMENTATION IS EMPTY
+(#209)** - which is why it, too, was introduced without moving a behaviour. `read`
+is the shell's one builtin that blocks for as long as a user is willing to think,
+and on the thread that is also the line editor; `read_byte` now says
+`await_readable(0)` before each of its one-byte reads, and the loop keeps turning
+for the length of the wait. BEFORE EACH READ and not once per line: a byte is the
+unit that loop works in, the second byte of a line may be minutes after the first,
+and an await on a descriptor that is ready already never parks at all. THE VERB
+ANSWERS NOTHING - no bytes, no error, not even readiness - so every one of `read`'s
+POSIX behaviours stays on the runtime's side of the seam and the read that follows
+is the read it always was.
+
+**The host's half is an FD INTEREST, and an interest is not a topic.** A topic is a
+fixed descriptor with a drain behind it; an interest is one fiber's question about
+one descriptor, for the length of one wait, with nothing behind it - the waiter's
+own `::read` is what takes the bytes. The table is `_child_waits`' shape exactly, in
+a four-entry inline array because this one is reached through a `noexcept` verb with
+no constructor to reserve in, and its descriptors are appended to the poll set each
+turn. **That is also how the tty gets back into the poll set while a command runs**:
+#208 took its TOPIC out, and `await_readable(0)` puts the same descriptor back as an
+interest - polled, never drained, so the byte that ended the wait is still in the
+kernel for the builtin. A key that arrives while nothing awaits the tty does what it
+always did: nothing. It waits in the kernel buffer for the next `read` or for the
+next prompt.
+
+**A SIGNAL DOES NOT END AN INPUT WAIT, and that is the shell lesh already was.** The
+handlers carry `SA_RESTART`, so a SIGINT has never interrupted `read`'s `::read`: it
+sets `g_pending`, the read is restarted, the line the user goes on to type is
+assigned, and the command boundary settles `$?` at 130. Under the fiber the same
+byte wakes the HOST - which drains it, defers the number past the command and goes
+back to polling - while the fiber stays parked on its descriptor. Completing the
+wait with an EINTR-shaped answer was the alternative and is rejected: `await_readable`
+answers nothing, so the woken fiber would go straight into a `::read` that then
+blocks the whole loop - strictly worse than what it replaced.
 
 **There is no fiber call stack.** Fibers are long-lived and wait for messages;
 they are never called. The host is the sole resumer, every yield returns to the
@@ -236,7 +274,21 @@ has held for all five steps.
   pushed onto `_events` while `executing` — the signal drain defers instead, and no
   other topic is polled — so the swap that would move the outer walk's storage out
   from under it never happens. Written down because the next verb to park inside a
-  command inherits this and not a rule.
+  command inherits this and not a rule - and #209's `await_readable` is that verb,
+  inheriting it unchanged, because an fd interest produces no event either.
+- **A closed descriptor must not be waited on** (#209). `poll` answers POLLNVAL for
+  one, which is not a readable bit, so a host that waited for readability would wait
+  for ever on `read x 0<&-` - a line that used to report an error and carry on.
+  `wake_readable_fds` therefore treats anything that is not a definite "nothing there
+  yet" as go-and-read-it: POLLIN, a hangup, an error, an invalid descriptor, or a
+  poll that refuses the set outright. The caller's own `::read` is the thing with the
+  right answer in every one of those.
+- **The interest is asked PER WAITER rather than read off the turn's `revents`.** One
+  zero-timeout `select` per outstanding wait per wake - 0.2 us on this platform, and
+  only while a wait is outstanding - buys ONE function with the two call sites
+  `reap_awaited_children` has: the turn, and `await_readable`'s own `enlist`, which
+  has no poll set to read. Mapping poll slots back to table entries would have been
+  the same work plus an index that goes stale the moment an entry is removed.
 - A keystroke costs no more than it did: the reactors' contribution to 100
   keystrokes is **0 mallocs**, measured against a loop with no reactors at all.
 - Serialization is the cost and is bounded the same way it always was: a stat
@@ -262,12 +314,14 @@ has held for all five steps.
 
 ## Deferred — phase 2, priced and not built
 
-`wait_child(pid)` LANDED IN #208 and is struck from this list; what is left of the
-line is `await_readable(fd)` on the `cooperation` seam (the fd verb is coost's
-shape: `io_event(fd, ev).wait(ms)` — register interest for the current fiber, park,
-resume on readiness or timeout, deregister), and it is a five-line adapter over
-`block_or_park` like its sibling. Then: `read` and `tail -f` as awaits on it —
-`wait` is already one; **`vared`'s nested read as a plain nested await**, which is
+`wait_child(pid)` LANDED IN #208 and `await_readable(fd)` IN #209, with `read` as
+its first customer; both are struck from this list, and `wait` was already one. What
+#209 deliberately did NOT build is the rest of coost's `io_event(fd, ev).wait(ms)`:
+there is one interest, readable, with no timeout and no writable case, because
+building a `select` nobody has asked for is how a ten-line waiter table becomes an
+event library. What is left of the line is: `tail -f` as an await on the same verb,
+which is phase 2's second customer and the one that brings the timeout with it;
+**`vared`'s nested read as a plain nested await**, which is
 what retires its slot-refusal plumbing; `request<Req,Rep>` for the port, WHICH #208
 DECLINED TO BUILD because it would not have removed code (the waiter table is
 pointers into the awaiting fibers' own frames, ten lines, and a request/reply type
@@ -311,7 +365,8 @@ group park that this ADR is mostly about.
 ## References
 
 - #145 (the design record), #82 (the umbrella), #198–#203 (phase 1), #206 (the
-  yield stride), #208 (phase 2a: execution as a fiber).
+  yield stride), #208 (phase 2a: execution as a fiber), #209 (phase 2b: the input
+  wait).
 - Research note: `docs/superpowers/research/2026-08-26-stackful-fibers-tarantool-minicoro.md`.
 - ADR-0007 (one owner per message in flight), ADR-0008 (the token capability
   surface, whose `superseded` poll is now also the yield), ADR-0009 (superseded).

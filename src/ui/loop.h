@@ -824,6 +824,28 @@ public:
 	// semantics move in this ticket.
 	pid_t await_child(pid_t pid, int flags, int* status) noexcept;
 
+	// --- The input wait (#209) ----------------------------------------------
+
+	// WHAT `cooperation::await_readable` BECOMES ON AN INTERACTIVE HOST, and the
+	// sibling of `await_child` in every respect that matters: the same primitive
+	// owns the same one decision, the entry lives on the awaiting fiber's own
+	// frame, and this function is five lines because of it.
+	//
+	//   nobody to park -> nothing at all; the caller's `::read` blocks as today;
+	//   on the execution fiber -> the fd goes into `_fd_waits`, it joins the poll
+	//   set for exactly as long as the wait lasts, the fiber parks, and the
+	//   readiness wakes it.
+	//
+	// AND IT IS THE TTY'S WAY BACK INTO THE POLL SET WHILE A COMMAND RUNS. #208
+	// took the tty TOPIC out during `executing` - the bytes a user types belong to
+	// the command, not to an editor that is not on screen - and this puts the same
+	// descriptor back, as an INTEREST rather than as a topic: nothing drains it,
+	// nothing decodes it, and the byte that made the poll return is still in the
+	// kernel for the builtin's own `::read` to take. A key that arrives while
+	// nothing awaits the tty does exactly what it did before: nothing. It waits in
+	// the kernel buffer for the next `read` or for the next prompt.
+	void await_readable(int fd) noexcept;
+
 	// THERE IS NO `read_names` (#151). #139 gave the completer a round trip on
 	// the actor's `enumerate` slot; the owner's reading of ADR-0009 removed the
 	// need for one. The loop may read shell state directly while nothing
@@ -871,6 +893,9 @@ public:
 	// Both are counters a test reads; neither decides anything.
 	[[nodiscard]] std::size_t execution_slices() const noexcept;
 	[[nodiscard]] std::size_t awaited_children() const noexcept { return _child_waits.size(); }
+	// Descriptors currently awaited (#209), on the same terms: a counter a test
+	// reads, and a table that has to be empty again when the wait is over.
+	[[nodiscard]] std::size_t awaited_fds() const noexcept { return _fd_wait_count; }
 	[[nodiscard]] const fiber::scheduler& reactors() const noexcept { return _sched; }
 	// Fibers spawned, which is one per reactor the dispatch table has ever held.
 	[[nodiscard]] std::size_t reactor_fibers() const noexcept { return _lanes.size(); }
@@ -985,6 +1010,36 @@ private:
 		int* status = nullptr;   // the executor's own `wait_status`
 		fiber::await_slot slot;
 	};
+
+	// THE SAME SHAPE FOR A DESCRIPTOR (#209), and deliberately the same shape:
+	// an entry on the awaiting fiber's frame, alive for exactly the length of the
+	// wait, removed before `complete` lets the fiber run again. There is no
+	// `events` field because there is one interest - readable - and building the
+	// writable and the timeout cases before phase 2 has a customer for them would
+	// be inventing a `select` nobody has asked for.
+	struct fd_wait {
+		int fd = -1;
+		fiber::await_slot slot;
+	};
+
+	// Every awaited descriptor that is ready, its waiter removed and woken. Run
+	// when the poll comes back and once more from inside `await_readable`'s
+	// enlist, which is how a descriptor that was ALREADY readable - a regular
+	// file, always; a pipe with the line still in it, usually - never parks at
+	// all. Exactly `reap_awaited_children`'s two call sites, for exactly its
+	// reason.
+	void wake_readable_fds() noexcept;
+
+	// A FIXED CAPACITY AND AN ASSERT, because `await_readable` is reached through
+	// a `noexcept` verb and must not allocate on the way (`_child_waits` buys the
+	// same property with a `reserve` at construction; an inline array buys it
+	// without a heap block at all). FOUR, where one is what today's shapes can
+	// produce: the execution fiber awaits one descriptor at a time and nothing
+	// else awaits any. The three spare are for the nested read `vared` will want
+	// and the providers phase 2 will add; an overflow asserts and then DEGRADES
+	// to the no-op - the caller's `::read` blocks, which is what it did before
+	// this ticket - rather than writing past the end of the table.
+	static constexpr std::size_t kMaxFdWaits = 4;
 
 	// How far above the cursor the top of the frame the terminal is showing sits
 	// (#185). `loop_options::assume_reflow` picks the model; the reflowing one
@@ -1119,7 +1174,11 @@ private:
 	std::uint64_t _dispatch_generation = 0;
 	std::string _dispatch_shell_reactor;
 	bool _dispatch_valid = false;
-	std::array<struct pollfd, static_cast<std::size_t>(topic::count_)> _poll{};
+	// THE TOPICS AND THE INTERESTS SHARE ONE ARRAY (#209). A turn's poll set is
+	// the fixed topics plus whatever `_fd_waits` holds, so the array is sized for
+	// both and `turn` fills as many of its slots as this turn happens to need.
+	std::array<struct pollfd, static_cast<std::size_t>(topic::count_) + kMaxFdWaits>
+		_poll{};
 
 	// One armed timer, WHOLE (#168). The declaration - the action's name and the
 	// interval - used to live in the registry and the due instant here, so arming
@@ -1193,6 +1252,13 @@ private:
 	// allocate. One entry is all today's shapes can produce: the execution fiber
 	// waits for one child at a time and nothing else waits at all.
 	std::vector<child_wait*> _child_waits;
+	// AND WHO IS WAITING FOR WHICH DESCRIPTOR (#209). The same pointers-into-
+	// frames rule, in a fixed array rather than a vector because this one is
+	// reached through a `noexcept` verb with no constructor to reserve in and
+	// there is nothing here a heap block would buy. Nearly always empty, which is
+	// the fast path: a turn with no interests builds the poll set it always built.
+	std::array<fd_wait*, kMaxFdWaits> _fd_waits{};
+	std::size_t _fd_wait_count = 0;
 
 	bool _exiting = false;
 	std::int32_t _exit_status = 0;
@@ -1235,6 +1301,11 @@ public:
 	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
 		return _loop->await_child(pid, flags, status);
 	}
+
+	// THE SECOND FIVE-LINE ADAPTER (#209), and it reads as the first one does on
+	// purpose: the verb hands the question to the loop, and the loop hands the
+	// DECISION to `scheduler::block_or_park`. Two verbs, one branch, one place.
+	void await_readable(int fd) noexcept override { _loop->await_readable(fd); }
 
 private:
 	event_loop* _loop;
