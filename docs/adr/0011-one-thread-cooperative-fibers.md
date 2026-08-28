@@ -75,7 +75,9 @@ token — not only a send that overwrites an unconsumed value, because the case
 that matters is the reactor that already consumed line 1 and is computing when
 line 2 arrives. The reactor notices at its next cancellation poll, and **that
 poll is also its yield** (`lesh_request::cooperate`): a `$PATH` stat storm is
-spread over turns that each read the terminal first. **The paint therefore lands
+spread over turns that each read the terminal first. How OFTEN a reactor polls is
+the reactor's own, and is a statement about the size of its unit of work — per
+`$PATH` lookup, per 256 tokens, per 256 history entries (#206, in Consequences). **The paint therefore lands
 one turn after the keystroke, and that is the semantics, not a regression** — a
 reactor that polls has yielded, so its compute finishes in a leading slice of the
 following turn, and that turn is immediate because a runnable emitter makes the
@@ -153,6 +155,24 @@ has held for all five steps.
   keystrokes is **0 mallocs**, measured against a loop with no reactors at all.
 - Serialization is the cost and is bounded the same way it always was: a stat
   storm delays the next highlight, never a keystroke's dispatch.
+- **A yield's price is one readiness check, and the platform charges for it**
+  (#206). The switch is 12 ns and the tick is 20; `turn(0)` was 6.7 µs, of which
+  ~6.5 was a `poll(2)` that found nothing — XNU takes a "wait for zero
+  nanoseconds" path through the scheduler for that case, and charges 8 µs for it
+  whether or not there are any descriptors, where `select` with a zero `timeval`
+  charges 0.2. The zero-timeout case now asks `select` (`ready_now` in
+  `loop.cpp`); the blocking case keeps `poll`, where the cost is the wait.
+- **A poll site strides to the size of its unit, and the walk was the one that
+  did not.** A history entry is 4 ns of work and a yield is ~155, so the
+  autosuggester's 5000-entry walk paid 760 µs to protect 20 — 25x its own
+  no-yield time even with the turn made cheap. `history_search::run` therefore
+  polls every `history_search::poll_every` (256) entries, exactly as the
+  highlighter's segment sweep already polls every 256 tokens; the walk is then
+  1.2x its no-yield time, ~1 µs of latency before a keystroke is looked at, and
+  ~1 µs of work done past a supersede nobody noticed. **The stride is on the WALK
+  and not on the yield**, because `classify_command` polls immediately before
+  each `$PATH` stat precisely so that a stat storm yields between stats — a
+  stride on `lesh_request::cooperate` would have been a stride over syscalls.
 
 ## Deferred — phase 2, priced and not built
 
@@ -188,11 +208,6 @@ group park that this ADR is mostly about.
   root-region registration; the registration is unconditional, so it should be
   right either way, and the fix if it is not is `__lsan_ignore_object` on parked
   stacks rather than a redesign.
-- **The yield stride** (#206). Yield-at-every-poll costs the autosuggester's walk
-  ~6x and buys ~400x on keystroke latency; the autosuggester polls per entry
-  while the highlighter polls per 256 tokens, and a stride or a clock gate would
-  decouple cancellation granularity from latency at the price of the
-  deterministic slice count N-3's replay wants.
 - The cold-cache `$PATH` sweep's contribution to keystroke latency has not been
   measured once, as ADR-0009's third amendment asked.
 
