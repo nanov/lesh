@@ -12,7 +12,6 @@
 #include <functional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace {
@@ -33,13 +32,14 @@ using lesh::leshper::virtual_text;
 // only agreement left to keep is #138's - already asserted beside the pager
 // doors below.
 
-// A thread's identity as a plain integer, so no header needs <thread> to hold
-// one. Never zero, because zero means "no owner" on a dead handle.
-std::uint64_t current_thread_key() noexcept {
-	const std::uint64_t key =
-		static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-	return key == 0 ? 1 : key;
-}
+// THERE IS NO THREAD KEY (#211 §1.3). `current_thread_key` hashed
+// `std::this_thread::get_id()` and every handle and token mint stamped it -
+// unconditionally, in release - so that `handle_is_live` and `token_is_live`
+// could refuse an accessor called from the wrong thread. There is no other
+// thread: #201 put the loop on main and #202 turned the helper pool into fibers,
+// which run on main too. What is left of the check is `call_token`, which is the
+// half that catches the bug ADR-0008 is actually about - an action stashing the
+// handle and using it after the call.
 
 // ---------------------------------------------------------------------------
 // Handle validity (ADR-0008: valid for the receiving call, loop thread only).
@@ -1622,12 +1622,11 @@ difference diff_of(std::string_view was, std::string_view now) noexcept {
 } // namespace
 
 bool handle_is_live(const editor_handle* handle) noexcept {
-	return handle != nullptr && handle->live() && handle->target != nullptr
-	    && handle->owner_thread == current_thread_key();
+	return handle != nullptr && handle->live() && handle->target != nullptr;
 }
 
 bool token_is_live(const request_token* token) noexcept {
-	return token != nullptr && token->live() && token->owner_thread == current_thread_key();
+	return token != nullptr && token->live();
 }
 
 action_result loop_harness::invoke(state& target, std::string_view name,
@@ -1668,7 +1667,6 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
 	_handle.depth = 0;
-	_handle.owner_thread = current_thread_key();
 	_handle.call_token = ++_registry->calls;
 
 	lesh_invocation crossing{};
@@ -1687,7 +1685,6 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	// receiving call" that a check can catch. What follows is the loop reading
 	// its own staging area, which it owns and which no handle guards.
 	_handle.call_token = 0;
-	_handle.owner_thread = 0;
 
 	const difference change = diff_of(target.buffer.text(), _handle.staged);
 
@@ -1851,7 +1848,6 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		token.spans = &batch.spans;
 		token.texts = &batch.texts;
 		token.proposals = &batch.proposals;
-		token.owner_thread = current_thread_key();
 		token.call_token = ++_registry->calls;
 
 		batch.status = entry.fn(&token, entry.userdata);

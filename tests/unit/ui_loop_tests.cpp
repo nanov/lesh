@@ -669,7 +669,7 @@ TEST(UiLoopReactors, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	loop.turn(50);
 	// The fiber took the notification, started computing and yielded at its poll:
 	// runnable, not finished, and nothing applied yet.
-	ASSERT_TRUE(loop.reactors().runnable(group_mask(fiber_group::emitters)))
+	ASSERT_TRUE(loop.scheduler().runnable(group_mask(fiber_group::emitters)))
 		<< "the reactor should be suspended mid-compute at its cancellation poll";
 	ASSERT_EQ(loop.applied_batches(), 0u);
 
@@ -938,7 +938,7 @@ TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	bool parked_during_execute = false;
 	shell.on_execute = [&] {
 		parked_during_execute =
-			loop.reactors().group_parked(group_index(fiber_group::emitters));
+			loop.scheduler().group_parked(group_index(fiber_group::emitters));
 	};
 	shell.execute_status = 42;
 
@@ -956,7 +956,7 @@ TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	// walk back into a command that has already run.
 	EXPECT_EQ(buffer_of(loop), "");
 	// And the resume released it: the group is runnable again.
-	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_FALSE(loop.quiesced());
 }
 
@@ -979,7 +979,7 @@ TEST(UiLoopQuiesce, QuiesceIsIdempotentAndOneResumeUndoesIt) {
 
 	loop.resume_after_execution();
 	EXPECT_FALSE(loop.quiesced()) << "one resume undoes both calls";
-	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 }
 
 TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsNotLost) {
@@ -1876,7 +1876,7 @@ public:
 	std::int32_t execute(std::string_view) override {
 		++executes;
 		phase_inside = loop->session_phase();
-		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
 		watch_drains_before = loop->watch_drains();
 		if (tty != nullptr && !type_during.empty())
 			tty->type(type_during);
@@ -2163,9 +2163,9 @@ TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
 		// A SECOND LINE REUSES THE FIBER. It is spawned once and parks on its
 		// inbox between commands; a second one would be a second 8 MB reserve and
 		// a second thing to drain at shutdown.
-		const std::size_t fibers = loop.reactors().fiber_count();
+		const std::size_t fibers = loop.scheduler().fiber_count();
 		(void)loop.accept_current_line();
-		EXPECT_EQ(loop.reactors().fiber_count(), fibers) << name_of(how);
+		EXPECT_EQ(loop.scheduler().fiber_count(), fibers) << name_of(how);
 		EXPECT_EQ(shell.executes, 2u) << name_of(how);
 
 		loop.leave_read();
@@ -2554,7 +2554,7 @@ public:
 	std::size_t slices_at_the_await = 0;
 
 	std::int32_t execute(std::string_view) override {
-		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
 		if (write_from_a_child) {
 			writer = ::fork();
 			if (writer == 0) {

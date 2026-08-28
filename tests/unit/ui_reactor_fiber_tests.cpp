@@ -54,7 +54,7 @@ loop_options pipe_options() {
 	options.prompt = "> ";
 	// The fiber-facing suite wants a slice that never checks in to be a failure
 	// rather than a log line (#198): `abort_` is what `lesh_tests` asks for.
-	options.reactor_watchdog = fiber::watchdog_action::abort_;
+	options.watchdog = fiber::watchdog_action::abort_;
 	return options;
 }
 
@@ -237,18 +237,18 @@ TEST(UiReactorFiber, EachRegisteredReactorGetsOneLongLivedFiberInTheEmittersGrou
 
 	// The dispatch table - and therefore the fibers - is built on the first
 	// notification, which is the first keystroke that changes anything.
-	EXPECT_EQ(d.loop.reactor_fibers(), 0u);
+	EXPECT_EQ(d.loop.lanes(), 0u);
 	d.tty.type("a");
 	d.loop.turn(0);
 
-	EXPECT_EQ(d.loop.reactor_fibers(), 2u);
-	EXPECT_EQ(d.loop.reactors().fiber_count(), 2u);
+	EXPECT_EQ(d.loop.lanes(), 2u);
+	EXPECT_EQ(d.loop.scheduler().fiber_count(), 2u);
 	for (const char* name : {"one", "two"}) {
 		EXPECT_GE(d.loop.reactor_slices(name), 1u) << name << " never ran";
 		EXPECT_EQ(d.loop.reactor_computes(name), 1u) << name;
 	}
 	// Both are in `emitters`, which is the group `quiesce` parks with one store.
-	EXPECT_FALSE(d.loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(d.loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_EQ(d.loop.session_phase(), phase::editing);
 }
 
@@ -264,7 +264,7 @@ TEST(UiReactorFiber, TheFiberIsTheSameOneAcrossEveryKeystrokeAndEveryTableRebuil
 		d.tty.type("x");
 		d.loop.turn(0);
 	}
-	EXPECT_EQ(d.loop.reactor_fibers(), 1u);
+	EXPECT_EQ(d.loop.lanes(), 1u);
 	EXPECT_EQ(probe.started, 8u);
 
 	// A second reactor registering bumps the registry's generation and rebuilds the
@@ -272,7 +272,7 @@ TEST(UiReactorFiber, TheFiberIsTheSameOneAcrossEveryKeystrokeAndEveryTableRebuil
 	walker& later = d.reactor("later", LESH_EVENT_BUFFER_CHANGED);
 	d.tty.type("y");
 	d.loop.turn(0);
-	EXPECT_EQ(d.loop.reactor_fibers(), 2u);
+	EXPECT_EQ(d.loop.lanes(), 2u);
 	EXPECT_EQ(probe.started, 9u);
 	EXPECT_EQ(later.started, 1u);
 }
@@ -350,7 +350,7 @@ TEST(UiReactorFiber, AKeystrokeSupersedesAnInFlightWalkPartWayThroughIt) {
 	d.loop.turn(0);
 	ASSERT_EQ(probe.started, 1u);
 	ASSERT_EQ(probe.finished, 0u) << "a fifty-unit walk cannot have finished in one slice";
-	ASSERT_TRUE(d.loop.reactors().runnable(group_mask(fiber_group::emitters)))
+	ASSERT_TRUE(d.loop.scheduler().runnable(group_mask(fiber_group::emitters)))
 		<< "the walk yielded, so its fiber is still runnable";
 
 	d.tty.type("b");
@@ -505,7 +505,7 @@ TEST(UiReactorFiber, ARunnableReactorMakesThePollTimeoutZero) {
 	EXPECT_EQ(d.loop.poll_timeout_ms(), -1) << "nothing to do: block";
 	d.tty.type("a");
 	d.loop.turn(0);
-	ASSERT_TRUE(d.loop.reactors().runnable(group_mask(fiber_group::emitters)));
+	ASSERT_TRUE(d.loop.scheduler().runnable(group_mask(fiber_group::emitters)));
 	EXPECT_EQ(d.loop.poll_timeout_ms(), 0);
 
 	ASSERT_TRUE(d.turn_until([&] { return probe.finished == 1u; }));
@@ -537,7 +537,7 @@ TEST(UiReactorFiber, AtAcceptTheGroupIsParkedAndTheDeadLinesEmissionIsNeverAppli
 	phase phase_during_execute = phase::editing;
 	shell.on_execute = [&] {
 		parked_during_execute =
-			d.loop.reactors().group_parked(group_index(fiber_group::emitters));
+			d.loop.scheduler().group_parked(group_index(fiber_group::emitters));
 		phase_during_execute = d.loop.session_phase();
 	};
 
@@ -549,7 +549,7 @@ TEST(UiReactorFiber, AtAcceptTheGroupIsParkedAndTheDeadLinesEmissionIsNeverAppli
 	EXPECT_EQ(phase_during_execute, phase::executing);
 	// And back, with the group runnable again.
 	EXPECT_EQ(d.loop.session_phase(), phase::editing);
-	EXPECT_FALSE(d.loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(d.loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 
 	// The dead line's walk abandons at its next poll and applies nothing.
 	ASSERT_TRUE(d.turn_until([&] { return probe.gave_up == 1u; }));
@@ -570,7 +570,7 @@ TEST(UiReactorFiber, AfterResumeTheNextLinesFirstSendIsReceived) {
 	d.tty.type("first");
 	d.loop.turn(0);
 	ASSERT_EQ(probe.started, 1u);
-	ASSERT_EQ(d.loop.reactor_fibers(), 1u);
+	ASSERT_EQ(d.loop.lanes(), 1u);
 
 	ASSERT_TRUE(d.loop.accept_current_line().has_value());
 	ASSERT_EQ(buffer_of(d.loop), "");
@@ -578,7 +578,7 @@ TEST(UiReactorFiber, AfterResumeTheNextLinesFirstSendIsReceived) {
 	d.tty.type("second");
 	ASSERT_TRUE(d.turn_until([&] { return probe.finished >= 1u; }))
 		<< "the next line's first send never reached the fiber";
-	EXPECT_EQ(d.loop.reactor_fibers(), 1u) << "and it is the same fiber";
+	EXPECT_EQ(d.loop.lanes(), 1u) << "and it is the same fiber";
 	EXPECT_EQ(probe.buffers.back(), "second");
 	EXPECT_GE(d.loop.applied_batches(), 1u);
 }
@@ -601,7 +601,7 @@ TEST(UiReactorFiber, QuiesceIsIdempotentAndTakesThePhaseWithIt) {
 	d.loop.resume_after_execution();
 	EXPECT_FALSE(d.loop.quiesced());
 	EXPECT_EQ(d.loop.session_phase(), phase::editing);
-	EXPECT_FALSE(d.loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(d.loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 }
 
 TEST(UiReactorFiber, AQuiescedLoopIsSafeToForkThrough) {
@@ -626,10 +626,10 @@ TEST(UiReactorFiber, AQuiescedLoopIsSafeToForkThrough) {
 	if (child == 0) {
 		const bool as_expected =
 			d.loop.quiesced()
-			&& d.loop.reactors().group_parked(group_index(fiber_group::emitters))
-			&& d.loop.reactor_fibers() == 1u
+			&& d.loop.scheduler().group_parked(group_index(fiber_group::emitters))
+			&& d.loop.lanes() == 1u
 			&& d.loop.reactor_computes("probe") == 1u
-			&& !d.loop.reactors().runnable(group_mask(fiber_group::emitters));
+			&& !d.loop.scheduler().runnable(group_mask(fiber_group::emitters));
 		::_exit(as_expected ? 0 : 1);
 	}
 
@@ -691,7 +691,7 @@ TEST(UiReactorFiber, ALoopDestroyedWhileParkedStillDrainsItsEmitters) {
 		d.loop.turn(0);
 		ASSERT_EQ(probe.started, 1u);
 		d.loop.quiesce();
-		ASSERT_TRUE(d.loop.reactors().group_parked(group_index(fiber_group::emitters)));
+		ASSERT_TRUE(d.loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 		// No resume. The destructor has to get them out anyway.
 	}
 	EXPECT_EQ(probe.gave_up, 1u);
@@ -706,9 +706,9 @@ TEST(UiReactorFiber, ALoopWithNoReactorsSpawnsNoFibersAndMapsNoStacks) {
 	d.tty.type("hello");
 	d.loop.turn(0);
 	EXPECT_EQ(buffer_of(d.loop), "hello");
-	EXPECT_EQ(d.loop.reactor_fibers(), 0u);
-	EXPECT_EQ(d.loop.reactors().fiber_count(), 0u);
-	EXPECT_FALSE(d.loop.reactors().runnable());
+	EXPECT_EQ(d.loop.lanes(), 0u);
+	EXPECT_EQ(d.loop.scheduler().fiber_count(), 0u);
+	EXPECT_FALSE(d.loop.scheduler().runnable());
 }
 
 // ===========================================================================

@@ -9,9 +9,8 @@
 // the shell runs is minted here, on the one thread, from a fiber's stack.
 //
 // WHAT IT IS NOT is a second reactor path - it builds exactly the
-// `request_token` registry.cpp builds, and asserts `token_is_live` on it because
-// the thread key is computed in two places and a disagreement would make every
-// accessor on the token refuse.
+// `request_token` registry.cpp builds, and asserts `token_is_live` on it, which
+// is what says so.
 //
 // THE SNAPSHOT LIVES HERE TOO, since #202. It was `ui/workers.h`'s, because the
 // pool was what copied editor state for a worker to compute against; the pool is

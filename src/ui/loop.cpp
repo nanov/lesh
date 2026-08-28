@@ -270,16 +270,10 @@ struct reactor_lane {
 	request_snapshot computing;
 	leshper::reactor_batch batch;
 
-	// THE FLAG THE ABI POLLS, and how it reflects the slot.
-	//
-	// #202 kept `run_reactor_here`'s `const std::atomic<bool>&` rather than
-	// adapting `lesh_request_superseded` to a callback, so `abi.h` and #90's poll
-	// are untouched. The flag is RAISED by the send site and CLEARED by the fiber
-	// immediately after `recv`, which makes it exactly the token's own answer:
-	// `slot::send` bumps the counter that supersedes every outstanding token, and
-	// `slot::recv` mints a fresh one. `reactor_yield` asserts the two agree at
-	// every poll point, so the duplication is held to account by a check rather
-	// than by this comment.
+	// THE FLAG THE ABI POLLS. Raised by the send site, cleared by the fiber
+	// immediately after `recv`, and `reactor_yield` asserts it against the slot's
+	// own counter at every poll point. `std::atomic<bool>` because that is the
+	// published shape `lesh_request::superseded` points at (abi.h, #90).
 	std::atomic<bool> superseded{false};
 
 	std::size_t computes = 0;
@@ -550,7 +544,7 @@ event_loop::event_loop(loop_fds fds, loop_options options)
 	  // 512 KB and 1 MB under ASan: two fibers is one or two megabytes of reserved
 	  // address space, committed on touch.
 	  _sched(fiber::scheduler_options{0, std::chrono::milliseconds{50},
-	                                  _options.reactor_watchdog}) {
+	                                  _options.watchdog}) {
 	// The signal topic always exists, even in a loop that never installs a
 	// handler: `stop()` rings its pipe to wake a poll that has nothing else to
 	// say, and a test delivers to it through `deliver()`. Only `install()` is
@@ -603,10 +597,10 @@ event_loop::~event_loop() {
 void event_loop::attach_registry(leshper::registry& reg) noexcept { _registry = &reg; }
 
 void event_loop::attach_shell(shell_side& shell, const leshper::host* host,
-                             shell_writing_flag* writing) noexcept {
+                             shell_executing_flag* executing) noexcept {
 	_shell = &shell;
 	_shell_host = host;
-	_writing = writing;
+	_executing = executing != nullptr ? executing : &_own_executing;
 }
 
 void event_loop::attach_signals(signal_hub& hub) noexcept {
@@ -717,7 +711,7 @@ int event_loop::poll_timeout_ms() const noexcept {
 	// loop owes, so the poll must not sleep on top of it - it asks the terminal
 	// what is there and comes straight back to the slice. With nothing runnable
 	// the loop blocks exactly as it always did.
-	if (_sched.runnable(sliced_lanes()))
+	if (_sched.runnable(sliced_lanes))
 		return 0;
 	// WHILE A COMMAND RUNS THERE IS NO CLOCK (#208). The timer topic is out of the
 	// turn - a timer would dispatch an action into an editor with no terminal -
@@ -788,7 +782,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	// The events and the render a leading slice produces are this turn's: the walk
 	// and the render below are after it, so a batch that lands here is applied and
 	// painted without waiting for another poll.
-	(void)tick_fibers();
+	tick_fibers();
 
 	int at = 0;
 	int tty_at = -1, signal_at = -1, watch_at = -1;
@@ -837,7 +831,7 @@ turn_result event_loop::turn(int timeout_ms) {
 	// (#202). `turn()` computes its timeout and finds the zero there; `turn(ms)`
 	// is what the tests and the paste path call, and a reactor mid-walk must not
 	// be held behind somebody's 50 ms either.
-	if (timeout_ms != 0 && _sched.runnable(sliced_lanes()))
+	if (timeout_ms != 0 && _sched.runnable(sliced_lanes))
 		timeout_ms = 0;
 
 	const int ready = _fail_polls > 0 ? (--_fail_polls, errno = EBADF, -1)
@@ -956,7 +950,7 @@ turn_result event_loop::turn(int timeout_ms) {
 		if (sliced || _exiting)
 			break;
 		sliced = true;
-		(void)tick_fibers();
+		tick_fibers();
 	}
 
 	// NO RENDER WHILE A COMMAND RUNS (#208). The screen is the command's, the
@@ -1340,11 +1334,11 @@ void event_loop::refresh_dispatch_table() {
 		lane.userdata = entry.userdata;
 		_dispatch_table.push_back(reactor_dispatch{
 			std::string_view{name}, entry.fn, entry.userdata, entry.event_mask,
-			name == _options.shell_thread_reactor, &lane});
+			name == _options.host_stamped_reactor, &lane});
 	}
 	_dispatch_built_from = _registry;
 	_dispatch_generation = _registry->reactors_generation;
-	_dispatch_shell_reactor = _options.shell_thread_reactor;
+	_dispatch_host_stamped_reactor = _options.host_stamped_reactor;
 	_dispatch_valid = true;
 }
 
@@ -1357,7 +1351,7 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 	// or the caller renames the shell-thread one.
 	if (!_dispatch_valid || _dispatch_built_from != _registry
 	    || _dispatch_generation != _registry->reactors_generation
-	    || _dispatch_shell_reactor != _options.shell_thread_reactor)
+	    || _dispatch_host_stamped_reactor != _options.host_stamped_reactor)
 		refresh_dispatch_table();
 
 	for (const reactor_dispatch& one : _dispatch_table) {
@@ -1376,7 +1370,7 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 		// serves one shell, and this is that shell's door, on every token it mints
 		// for the reactor that reads shell state. Every other reactor is state-free
 		// and gets the honest null `take_snapshot` just wrote.
-		if (one.on_shell_thread)
+		if (one.host_stamped)
 			lane.arriving.host = _shell_host;
 
 		// AND THE SEND IS THE CANCELLATION. `slot::send` bumps the counter that
@@ -1393,17 +1387,12 @@ void event_loop::notify_reactors(std::uint32_t kinds) {
 // The reactor fibers (#202, step 1d of #145)
 // ---------------------------------------------------------------------------
 
-std::uint8_t event_loop::sliced_lanes() noexcept {
-	return static_cast<std::uint8_t>(group_mask(fiber_group::emitters)
-	                                 | group_mask(fiber_group::execution));
-}
-
-bool event_loop::tick_fibers() {
+void event_loop::tick_fibers() {
 	// ONE MASK FOR BOTH LANES, and no phase test, because the scheduler's own park
 	// bit already answers it: while a command runs the emitters' group is parked
 	// and skipped, and while a line is being edited the execution fiber is parked
 	// on its inbox. Two sets that are never runnable at once are one tick.
-	return _sched.tick(sliced_lanes());
+	(void)_sched.tick(sliced_lanes);
 }
 
 reactor_lane& event_loop::lane_for(std::string_view name) {
@@ -1853,7 +1842,15 @@ void event_loop::finish_cancelled_line() {
 	// see that it did. Down the same door an accepted line takes, so an INT trap
 	// body that forks forks from wherever an ordinary command would.
 	_exit_status = run_the_line(std::string_view{});
+	// THE SAME QUESTION `accept_current_line` ASKS, and it was missing here (#211
+	// §4.4). An INT trap body is arbitrary shell code: it may run `exit`, which
+	// sets `_stopping` from inside the call above, and the poll may have failed
+	// while it ran. Either way the loop is done and the unpark is still owed -
+	// `leave_read` has a terminal to hand back.
+	const bool ending = _stopping || _exiting;
 	resume_after_execution();
+	if (ending)
+		_exiting = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,7 +1895,7 @@ void event_loop::execution_body(fiber::scheduler& on, void* userdata) {
 			// turns the host takes while this fiber is parked in a wait - and that
 			// is exactly right: the shell IS writing for the whole of it, and the
 			// emitters that would read through the adapter are a parked group.
-			const shell_writing_flag::scope writing{me._writing};
+			const shell_executing_flag::scope executing{*me._executing};
 			status = me._shell->execute(line);
 		}
 		me._exec_done.send(status);
@@ -1912,7 +1909,7 @@ std::int32_t event_loop::run_the_line(std::string_view line) {
 		// it is a blocking `::waitpid` - the shell exactly as it ran before this
 		// ticket, and the honest fallback if a fiber stack ever turns out to be
 		// the wrong place to fork from.
-		const shell_writing_flag::scope writing{_writing};
+		const shell_executing_flag::scope executing{*_executing};
 		return _shell->execute(line);
 	}
 
@@ -1993,6 +1990,10 @@ bool child_is_done(void* self, std::intptr_t& answer) noexcept {
 		const pid_t got = ::waitpid(waiting.pid, &status, waiting.flags | WNOHANG);
 		if (got == 0)
 			return false;
+		// EINTR IS NOT AN ANSWER, so ask again about the SAME child rather than
+		// moving on: a signal landing inside `waitpid` says nothing about whether
+		// the child has exited, and leaving the entry enlisted on the strength of
+		// one would park a fiber whose wake has already been and gone.
 		if (got < 0 && errno == EINTR)
 			continue;
 		if (waiting.status != nullptr)
@@ -2023,6 +2024,8 @@ bool fd_is_readable(void* self, std::intptr_t& answer) noexcept {
 		const int ready = ready_now(&one, 1, 0);
 		if (ready == 0)
 			return false;
+		// EINTR IS NOT AN ANSWER: ask again about the same descriptor. See
+		// `child_is_done`.
 		if (ready < 0 && errno == EINTR)
 			continue;
 		answer = 1;
@@ -2131,7 +2134,7 @@ port_result event_loop::call_port(std::string_view code) {
 	// export anything - and the answer is the call's, so there is nothing left for
 	// a sequence number to match.
 	{
-		const shell_writing_flag::scope writing{_writing};
+		const shell_executing_flag::scope executing{*_executing};
 		answer.status = _shell->port_call(code);
 	}
 	answer.answered = true;

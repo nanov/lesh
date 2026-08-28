@@ -336,7 +336,13 @@ private:
 			// A token has no such unit, so this counts: often enough that a
 			// 100 KiB paste gives up promptly, rare enough that the atomic load
 			// is not the sweep's cost.
-			if ((i & (kPollEvery - 1)) == 0 && i != 0 && superseded())
+			//
+			// BEFORE THE FIRST TOKEN AS WELL, which is `history_search`'s spelling
+			// of the same stride and now the only one (#211 §4.4). The two used to
+			// differ by an `i != 0` here, so one walk asked before its first item
+			// and the other did not - a difference nothing wanted and nobody could
+			// have named the reason for.
+			if ((i & (kPollEvery - 1)) == 0 && superseded())
 				return LESH_ERR_SUPERSEDED;
 			const token& t = _tree->token_at(i);
 			if (!is_real(t))

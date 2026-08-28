@@ -97,7 +97,7 @@
 // stopped being true when #151 made the shell-thread reactor the one reader:
 // with the reads serialized on the owning thread there is nothing left for a
 // second thread to protect, and the condvar, the three slots, the reply pool and
-// the `shell` topic were the whole cost of having one. `shell_writing_flag` stays
+// the `shell` topic were the whole cost of having one. `shell_executing_flag` stays
 // as the assertion that says so - trivially true now, and still the tripwire if
 // a future thread ever wants a read.
 //
@@ -464,20 +464,20 @@ struct loop_options {
 	leshper::style prompt_pen{};
 	leshper::style text_pen{};
 
-	// The reactor that READS SHELL STATE (ADR-0009's keystone). Every reactor runs
-	// on this thread now - #201 made "the shell thread" and "this thread" the same
-	// thread, and #202 gave each reactor a fiber on it - so what this name still
-	// decides is narrower and is the whole of what it ever decided: WHOSE HOST is
-	// stamped on the token. A name rather than an ABI flag, because #93's
-	// registration tuple is fixed and adding a bit to it for one built-in would be
-	// the side door the whole registry design exists to prevent.
-	std::string shell_thread_reactor = "highlighter";
+	// The reactor that READS SHELL STATE (ADR-0009's keystone), NAMED FOR WHAT THE
+	// NAME DECIDES. Every reactor runs on this thread - there is no other - so what
+	// is left is the whole of what it ever decided: WHOSE HOST is stamped on the
+	// token. A name rather than an ABI flag, because #93's registration tuple is
+	// fixed and adding a bit to it for one built-in would be the side door the
+	// whole registry design exists to prevent.
+	std::string host_stamped_reactor = "highlighter";
 
-	// WHAT THE SCHEDULER'S WATCHDOG DOES when a reactor slice runs 50 ms without
-	// yielding (#198). `log` for a shell, where a frozen prompt is bad and a dead
-	// prompt is worse; the fiber-facing tests pass `abort_` because in a test a
-	// slice that never checks in is the defect under study.
-	fiber::watchdog_action reactor_watchdog = fiber::watchdog_action::log;
+	// WHAT THE SCHEDULER'S WATCHDOG DOES when ANY slice runs 50 ms without
+	// yielding (#198) - it is the scheduler's, not a reactor's. `log` for a shell,
+	// where a frozen prompt is bad and a dead prompt is worse; the fiber-facing
+	// tests pass `abort_` because in a test a slice that never checks in is the
+	// defect under study.
+	fiber::watchdog_action watchdog = fiber::watchdog_action::log;
 
 	// What a SIGINT at the prompt runs (#98 decision 2). A name, so Ctrl-C is
 	// rebindable exactly as a key is (F-13), and dispatched by the loop rather
@@ -652,12 +652,14 @@ public:
 	// is still legal and still means "no host attached" - every name classifies as
 	// LESH_COMMAND_UNKNOWN - but it has to be WRITTEN.
 	//
-	// `writing` is ADR-0009's tripwire, raised around the two calls. Null is
-	// "unchecked", which is what a test with no adapter to protect wants.
+	// `executing` is ADR-0009's tripwire, raised around the two calls. Null means
+	// the loop keeps raising its OWN, which nothing reads - the same arrangement
+	// `_own_signals` makes for the hub, and what lets the raise itself be
+	// unconditional (#211 §1.7).
 	//
 	// None of the three is owned and all must outlive the loop.
 	void attach_shell(shell_side& shell, const leshper::host* host = nullptr,
-	                  shell_writing_flag* writing = nullptr) noexcept;
+	                  shell_executing_flag* executing = nullptr) noexcept;
 
 	// What every token this loop mints for the shell-thread reactor reads through.
 	// Exposed so the wiring site can assert the loop and the registry are looking
@@ -853,7 +855,7 @@ public:
 	// `execute` and `port_call` are the only writers and the loop is what CALLS
 	// them, so an action dispatched by the loop is by construction not inside
 	// either. So the completer holds a `const shell_knowledge*` and calls
-	// `enumerate` on it, on this thread, and `shell_writing_flag` asserts the
+	// `enumerate` on it, on this thread, and `shell_executing_flag` asserts the
 	// premise on every read rather than leaving it as a paragraph. (#168 Phase B:
 	// the completer is `ui::shell_completer` and the loop reaches it through
 	// `ui::editor_host`, which is what `lesh_complete` raises `want_completion`
@@ -911,9 +913,11 @@ public:
 	// into a frame that has returned.
 	[[nodiscard]] std::size_t execution_slices() const noexcept;
 	[[nodiscard]] std::size_t awaited() const noexcept { return _await_count; }
-	[[nodiscard]] const fiber::scheduler& reactors() const noexcept { return _sched; }
-	// Fibers spawned, which is one per reactor the dispatch table has ever held.
-	[[nodiscard]] std::size_t reactor_fibers() const noexcept { return _lanes.size(); }
+	// THE SCHEDULER, and it is named for what it is: it holds the execution fiber
+	// as well, and `reactors()` had not been true of it since #208.
+	[[nodiscard]] const fiber::scheduler& scheduler() const noexcept { return _sched; }
+	// Lanes, which is one per reactor the dispatch table has ever held.
+	[[nodiscard]] std::size_t lanes() const noexcept { return _lanes.size(); }
 
 	// Per-reactor counters, by name; zero for a name with no fiber. `slices` is
 	// the scheduler's own count of resumes, which is what "a slice before AND
@@ -960,11 +964,17 @@ private:
 	// runnable at the same time and the scheduler already skips a parked group:
 	// while a command runs the emitters' bit is down, and while a line is being
 	// edited the execution fiber is parked on its inbox. One tick, one mask.
-	bool tick_fibers();
+	//
+	// `void`, because `tick`'s answer - "is anything still runnable" - is a
+	// question the two call sites ask the scheduler for themselves, one turn later
+	// and with the mask in hand.
+	void tick_fibers();
 	// The lanes this loop ever gives a slice to. Not derived from the phase - the
-	// scheduler's own park bit is - so this is a constant, and it is a function
-	// only so that the three places that need it cannot disagree.
-	[[nodiscard]] static std::uint8_t sliced_lanes() noexcept;
+	// scheduler's own park bit is - so it is a constant, and it is a name only so
+	// that the three places that need it cannot disagree.
+	static constexpr std::uint8_t sliced_lanes =
+		static_cast<std::uint8_t>(group_mask(fiber_group::emitters)
+		                          | group_mask(fiber_group::execution));
 	// Rebuilds `_dispatch_table` from the registry's reactor map. Called only
 	// when the cheap staleness check in `notify_reactors` says the copy is out of
 	// date; the steady state never reaches it.
@@ -1111,7 +1121,14 @@ private:
 	// given, and the flag raised around the two calls that write shell state.
 	// Both arrive with the shell at `attach_shell`.
 	const leshper::host* _shell_host = nullptr;
-	shell_writing_flag* _writing = nullptr;
+	// THE TRIPWIRE, AND THE LOOP ALWAYS HAS ONE. `_own_executing` when nothing
+	// attached its own, exactly as `_own_signals` backs `_signals` - which is what
+	// lets every raise be unconditional and `scope` take a reference (#211 §1.7).
+	shell_executing_flag _own_executing;
+	shell_executing_flag* _executing = &_own_executing;
+	// THE SIGNAL TOPIC ALWAYS EXISTS, so this is never null: the constructor
+	// builds `_own_signals` and points here at it, and `attach_signals` only ever
+	// repoints. Nothing tests it.
 	signal_hub* _signals = nullptr;
 	// THE LOOP HAS NO DISPATCHER OF ITS OWN any more (#168). `_dispatch` was a
 	// second `loop_harness`, minted at `attach_registry`, and it existed for one
@@ -1161,7 +1178,7 @@ private:
 
 	// THE REACTOR TABLE, FLATTENED (the reorg cleanup). `notify_reactors` used to
 	// walk `registry::reactors` - a red-black tree - and string-compare
-	// `shell_thread_reactor` against every key, once per reactor per keystroke.
+	// `host_stamped_reactor` against every key, once per reactor per keystroke.
 	// This is the same table contiguous, with that comparison already made, and
 	// it is rebuilt only when the registry's `reactors_generation` moves (or the
 	// registry, or the shell-thread reactor's name, changes underneath it). The
@@ -1175,7 +1192,10 @@ private:
 		lesh_reactor_fn fn = nullptr;
 		void* userdata = nullptr;
 		std::uint32_t event_mask = 0;
-		bool on_shell_thread = false;
+		// Whether this reactor's tokens carry the shell's own host (#151). It was
+		// `on_shell_thread`, which stopped being a distinction when there stopped
+		// being a second thread.
+		bool host_stamped = false;
 		// THE FIBER'S LANE (#202). Owned by `_lanes`, which only ever grows, so
 		// this stays valid across every rebuild of the table above.
 		reactor_lane* lane = nullptr;
@@ -1183,7 +1203,7 @@ private:
 	std::vector<reactor_dispatch> _dispatch_table;
 	const leshper::registry* _dispatch_built_from = nullptr;
 	std::uint64_t _dispatch_generation = 0;
-	std::string _dispatch_shell_reactor;
+	std::string _dispatch_host_stamped_reactor;
 	bool _dispatch_valid = false;
 	// THE TOPICS AND THE INTERESTS SHARE ONE ARRAY (#209). A turn's poll set is
 	// the fixed topics plus whatever descriptors `_awaits` names, so the array is

@@ -438,7 +438,7 @@ int main() {
 			host.type("z");
 			auto last = steady_clock::now();
 			while (loop.reactor_computes("autosuggester") == before
-			       || loop.reactors().runnable(ui::group_mask(ui::fiber_group::emitters))) {
+			       || loop.scheduler().runnable(ui::group_mask(ui::fiber_group::emitters))) {
 				benchmark_sink += loop.turn(0).events;
 				const auto now = steady_clock::now();
 				gaps.push_back(static_cast<double>(
