@@ -363,11 +363,8 @@ public:
 	[[nodiscard]] const syntax_layer& syntax() const noexcept { return *_providers.syntax; }
 
 	// Set by the `cancel_line` action, read and cleared by `execute` - which the
-	// loop calls the moment the action returns, on this thread. The atomic is
-	// vestigial now that both sides are one thread; it is kept because a flag that
-	// crossed a channel and now does not is the sort of thing #145's next step
-	// will want to look at once, rather than twice.
-	void note_cancel() noexcept { _cancelled.store(true, std::memory_order_relaxed); }
+	// loop calls the moment the action returns, on this thread.
+	void note_cancel() noexcept { _cancelled = true; }
 
 private:
 	void register_line_actions();
@@ -412,7 +409,7 @@ private:
 	// because both borrow it: the loop raises it around the `execute` and
 	// `port_call` calls it makes below, and the adapter asserts it is down on
 	// every read. One flag, so the two cannot be talking about different windows.
-	shell_writing_flag _writing;
+	shell_executing_flag _executing;
 	shell_state_knowledge _knowledge;
 	// --- The completer, and the one door the editor has ----------------------
 
@@ -424,8 +421,8 @@ private:
 	// lines; the owner's reading of ADR-0009 removed the need. `complete` is
 	// called from inside an action, dispatched by the loop; the only writers are
 	// `execute` and `port_call`, both of which the loop CALLS and is therefore not
-	// inside while it dispatches. So while this call runs, nothing is writing -
-	// and `_writing` above is what says so out loud if that ever stops being
+	// inside while it dispatches. So while this call runs, nothing is executing -
+	// and `_executing` above is what says so out loud if that ever stops being
 	// true.
 	shell_completer _completer;
 
@@ -474,7 +471,7 @@ private:
 	std::optional<leshper_binding_console> _console;
 	std::optional<prompt_console_impl> _prompt_console;
 
-	std::atomic<bool> _cancelled{false};
+	bool _cancelled = false;
 	// Scratch for the accept action, and scratch for the prompt. Members so
 	// neither path allocates once the session is warm.
 	//
@@ -553,7 +550,7 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	: _state(state),
 	  _providers(providers),
 	  _executor(pool, state),
-	  _knowledge(state, &_writing),
+	  _knowledge(state, &_executing),
 	  _completer(&_knowledge),
 	  // #94's `Completer` override point, filled (#139). The bundle's field wins
 	  // when a caller supplied one - which is what makes it an override point and
@@ -626,7 +623,7 @@ session::session(runtime::shell_state& state, buffer_pool& pool,
 	// THE SHELL, AND WHAT IT KNOWS, AND THE TRIPWIRE, in one call (#201). All
 	// three used to be `shell_actor`'s constructor arguments; the loop is what
 	// calls `execute` and `port_call` now, so the loop is what holds them.
-	_loop.attach_shell(*this, &_host, &_writing);
+	_loop.attach_shell(*this, &_host, &_executing);
 	// AND THE OTHER DIRECTION (#208): what the RUNTIME may ask of the host. One
 	// pointer, never null, reset to the static no-op in every forked child by
 	// `enter_subshell` - so a `( )`, a `$( )` and a non-exec pipeline stage each
@@ -909,7 +906,7 @@ std::int32_t session::execute(std::string_view line) {
 	// A CANCEL ARRIVES AS AN EMPTY LINE (see event_loop::finish_cancelled_line):
 	// nothing to run, at a command boundary. `$?` = 130 and the INT trap are what
 	// it is for.
-	if (_cancelled.exchange(false, std::memory_order_relaxed))
+	if (std::exchange(_cancelled, false))
 		_executor.interrupt_at_prompt();
 
 	// ZEROED FIRST, so that a cancel and an Enter on an empty line both report

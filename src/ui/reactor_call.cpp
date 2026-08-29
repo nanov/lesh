@@ -2,25 +2,9 @@
 
 #include "substrate/assert.h"
 
-#include <functional>
-#include <thread>
 #include <utility>
 
 namespace lesh::ui {
-namespace {
-
-// The SECOND copy of registry.cpp's thread key (it was the third until #202 took
-// the pool's with it): the two must agree or every accessor on the token would
-// refuse, so `run_reactor_here` asserts `token_is_live` on a token it has just
-// built rather than trusting that they still do.
-std::uint64_t this_thread_key() noexcept {
-	const std::uint64_t key =
-		static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-	return key == 0 ? 1 : key;
-}
-
-} // namespace
-
 void take_snapshot(request_snapshot& into, const leshper::state& target,
                    std::uint32_t event_kind) {
 	// `assign` AND NOT `=`: the string keeps whatever capacity it arrived with,
@@ -96,11 +80,11 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	token.spans = &into.spans;
 	token.texts = &into.texts;
 	token.proposals = &into.proposals;
-	token.owner_thread = this_thread_key();
-	// Any non-zero value satisfies the ABI's only requirement of a live token.
-	// A counter local to this thread is enough and reaches into nothing that is
-	// loop-thread-only by ADR-0008.
-	static thread_local std::uint64_t calls = 0;
+	// Any non-zero value satisfies the ABI's only requirement of a live token,
+	// and since #211 §1.3 it is the whole requirement: the thread key this used to
+	// stamp beside it was a second copy of registry.cpp's, kept so that the two
+	// could agree about a thread that no longer has a rival.
+	static std::uint64_t calls = 0;
 	token.call_token = ++calls;
 
 	LESH_ASSERT(leshper::token_is_live(&token));
@@ -108,7 +92,6 @@ void run_reactor_here(std::string_view reactor, lesh_reactor_fn fn, void* userda
 	into.status = fn(&token, userdata);
 
 	token.call_token = 0;
-	token.owner_thread = 0;
 	// AND THE STORAGE GOES BACK. Without this the token's destructor would free a
 	// buffer the caller is about to want again - which is the whole reason the
 	// snapshot is borrowed rather than consumed, and the reason a warm keystroke

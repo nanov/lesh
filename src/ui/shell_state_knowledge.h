@@ -54,13 +54,13 @@ namespace lesh::ui {
 // `LESH_ASSERT` compiles out in release.
 class shell_state_knowledge final : public shell_knowledge {
 public:
-	// `writing` is the flag the loop raises around the two writers (it was
-	// `shell_actor` that raised it, until #201). Null - the default - means "unchecked", which is what every
-	// adapter built over a state no loop is driving gets, and what the tests that
-	// own their own `shell_state` want.
+	// `executing` is the flag the loop raises around the two writers. Null - the
+	// default - means "unchecked", which is what every adapter built over a state
+	// no loop is driving gets, and what the tests that own their own `shell_state`
+	// want.
 	explicit shell_state_knowledge(const runtime::shell_state& state,
-	                               const shell_writing_flag* writing = nullptr) noexcept
-		: _state(&state), _writing(writing) {}
+	                               const shell_executing_flag* executing = nullptr) noexcept
+		: _state(&state), _executing(executing) {}
 
 	// Alias, function, builtin - the executor's own order, and the reason it is
 	// worth reading beside `executor.cpp`'s command search rather than inventing
@@ -143,7 +143,7 @@ private:
 	// ADR-0011 in one line, and the reason the rest of this file may borrow.
 	//
 	// NOT A GUARD ON THE CALLER - it says nothing about WHO is reading, only that
-	// the one writer is not writing. That is the whole invariant: the highlighter
+	// no command is running. That is the whole invariant: the highlighter
 	// reads inside a slice the loop gave it, the completer reads inside an action
 	// the loop dispatched, and neither of those is inside `execute` - so either is
 	// safe exactly when this is false.
@@ -152,8 +152,8 @@ private:
 		// the flag is a member nobody reads. Keeping the member in both builds
 		// rather than compiling it out keeps this class one layout, which is what
 		// lets the same header be compiled into `lesh` and into `lesh_tests`.
-		(void)_writing;
-		LESH_ASSERT(_writing == nullptr || !_writing->writing());
+		(void)_executing;
+		LESH_ASSERT(_executing == nullptr || !_executing->executing());
 	}
 
 	// `$PATH`, cut on `:`, with POSIX 2.6's rule applied HERE and nowhere else:
@@ -178,7 +178,7 @@ private:
 	}
 
 	const runtime::shell_state* _state;
-	const shell_writing_flag* _writing;
+	const shell_executing_flag* _executing;
 };
 
 } // namespace lesh::ui

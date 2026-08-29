@@ -1,20 +1,15 @@
 #pragma once
 
-// THE SCHEDULER. Instantiable, never global.
+// THE SCHEDULER. Instantiable, never global: a `scheduler` owns its fibers, its
+// stacks and its run order, and it holds no process state at all - which is what
+// keeps the cord door open. The day history persistence gets its own thread, that
+// thread constructs its own scheduler and nothing has to be untangled first.
 //
-// The house rule the ticket names is `signal_hub`'s: "INSTANTIABLE, only
-// install() is process-global". Here there is not even an install(). A
-// `scheduler` owns its fibers, its stacks and its run order, and it holds no
-// process state at all - which is what keeps the cord door open. The day
-// history persistence gets its own thread, that thread constructs its own
-// scheduler and nothing has to be untangled first.
-//
-// WHAT IT IS NOT, in this step: it does not own `poll(2)`, it has no phase, it
-// has no timers, and it does not know what a file descriptor is. `lesh_fiber`
-// links `lesh_substrate` and nothing else, which is the same argument that makes
+// WHAT IT IS NOT: it does not own `poll(2)`, it has no phase, it has no timers,
+// and it does not know what a file descriptor is. `lesh_fiber` links
+// `lesh_substrate` and nothing else, which is the same argument that makes
 // `Fiber*` sweep-exempt: a change here provably cannot reach syntax, the runtime
-// or an fd. Step 1 (#145) makes `event_loop::run` slice this from the host loop;
-// `tick()` is the seam it will call.
+// or an fd. `event_loop::run` is the host that calls `tick()`.
 //
 // THE SLICE IS THE UNIT. One slice = one `mco_resume`: the fiber runs until it
 // yields, parks, or returns. `tick()` runs one slice for each fiber that was
@@ -29,15 +24,12 @@
 //   - a fiber that yields stays runnable, so `tick()` returning true means "call
 //     me again with a zero poll timeout", exactly the shape the loop wants.
 //
-// "IN THE ORDER THEY BECAME RUNNABLE" READ "IN SPAWN ORDER" UNTIL #200, and for
-// the fibers step 1 actually has, it is the same sentence: a fiber that has
-// never parked became runnable at `spawn`, so spawn order IS arrival order and
-// `FiberSwitch.ThreeFibersGetOneSlicePerTickInSpawnOrder` reads identically
-// before and after. Yielding does NOT re-stamp the arrival - a reactor yielding
-// at every `kPollEvery` point would otherwise reshuffle the tick on every slice,
-// and the grilling record wants the sequence FIXED. Only the parked->ready
-// transition stamps a new arrival, which is what makes a group's replayed wakes
-// observable in arrival order. See GROUPS.
+// ARRIVAL ORDER IS A LIST, and the fibers are threaded on it. A fiber that has
+// never parked arrived at `spawn`, so for those spawn order IS arrival order.
+// YIELDING IS NOT A NEW ARRIVAL - a reactor yielding at every `kPollEvery` point
+// would otherwise reshuffle the tick on every slice, and the grilling record
+// wants the sequence FIXED. Only the parked->ready transition is one, which is
+// what makes a group's replayed wakes observable in arrival order. See GROUPS.
 //
 // ---------------------------------------------------------------------------
 // GROUPS (#200) - PARKING A SET WITH ONE BIT
@@ -53,8 +45,8 @@
 // The point, in #145's words: "parking a set is not something done TO the fibers
 // - it is a scheduler bit. Park = mark the group unrunnable; wake events for its
 // members QUEUE instead of scheduling. Resume = clear the bit, replay the queued
-// wakes in arrival order." O(1), no handshake, no race, because under
-// cooperative scheduling suspended is every fiber's default state.
+// wakes in arrival order." No handshake and no race, because under cooperative
+// scheduling suspended is every fiber's default state.
 //
 // While a group is parked, its fibers are NOT RUNNABLE. `runnable()` says so,
 // `tick()` skips them, and `run_one_slice` on one of them asserts - the host
@@ -63,19 +55,16 @@
 // for. `wake(f)` for a member is queued instead of applied, and `resume_group`
 // replays the queue.
 //
-// TWO DECISIONS #200 LEFT TO THIS FILE - the first exactly as the ticket
-// recommended, the second as far as the ticket's own other requirements leave
-// room for:
+// TWO DECISIONS THIS FILE MAKES:
 //
 //   1. REPLAYED WAKES RUN IN WAKE ORDER, NOT SPAWN ORDER. "Replay in arrival
 //      order" is the record's determinism promise, and a promise nothing can
 //      observe is not one - so it had to reach the tick, not just the queue.
-//      The mechanism is the arrival stamp above: `resume_group` walks its queue
-//      front to back and each `wake` stamps a fresh, larger arrival, so the next
-//      tick's snapshot - sorted by arrival - hands out slices in exactly the
-//      order the wakes came in. The alternative (queue in arrival order, then
-//      slice in spawn order) makes the queue's order unobservable and the
-//      documented promise untestable; rejected for that reason.
+//      The mechanism is the ready list above: `resume_group` walks its queue
+//      front to back and each `wake` appends at the list's tail, so the next
+//      tick hands out slices in exactly the order the wakes came in. Queueing in
+//      arrival order and then slicing in spawn order makes the queue's order
+//      unobservable and the promise untestable; rejected for that reason.
 //
 //   2. A GROUP PARKED MID-TICK TAKES EFFECT AT ONCE FOR ITS OWN MEMBERS; THE
 //      REST OF THE SNAPSHOT FINISHES. A tick's snapshot bounds WHICH fibers may
@@ -84,25 +73,15 @@
 //      immediately before every slice, which is what `tick()` already did for
 //      individual state ("an earlier slice may have parked it"). The group bit
 //      is one more way of not being runnable and is checked at the same place,
-//      so there is one rule rather than two.
+//      so there is one rule rather than two. The tick does not bail out: every
+//      fiber outside the parked group still gets its slice.
 //
-//      The ticket's recommendation - "a park takes effect for the next tick; the
-//      current snapshot finishes" - is honoured in the part that matters: the
-//      tick does not bail out, and every fiber outside the parked group still
-//      gets its slice. It is NOT honoured in the reading where the newly parked
-//      group's own remaining snapshot entries run anyway, and that reading is
-//      unavailable: the same ticket asks `run_one_slice` to ASSERT on a
-//      parked-group fiber, so a tick that sliced one would trip its own gate.
-//      The two requirements only fit this way round.
-//
-//      Consequently `park_group` is legal from inside a fiber - the grilling
-//      record's phase writer is "the execution fiber on return", which is inside
-//      a slice - and the assert it carries is the narrow one that preserves the
-//      ticket's stated invariant exactly: A FIBER MAY NOT PARK THE GROUP IT IS
-//      RUNNING IN, so "a fiber that was mid-slice cannot be in a parked group"
-//      holds. The blanket `_current == nullptr` the ticket sketched would also
-//      hold it, and would additionally forbid the mid-tick case it asks to be
-//      tested; the narrow form keeps the invariant and the test.
+//      `park_group` is therefore legal from inside a fiber - the phase writer is
+//      "the execution fiber on return", which is inside a slice - and the assert
+//      it carries is the narrow one that keeps the invariant: A FIBER MAY NOT
+//      PARK THE GROUP IT IS RUNNING IN, so "a fiber that was mid-slice cannot be
+//      in a parked group" holds. A blanket `_current == nullptr` would hold it
+//      too, and would additionally forbid the mid-tick case that is tested.
 //
 // THERE IS NO CANCELLATION IN v1. Destroying a parked fiber does not unwind its
 // stack - minicoro cannot, and neither could a stackless design without
@@ -217,10 +196,14 @@ private:
 	std::uint8_t _group = 0;
 	std::size_t _slices = 0;
 
-	// WHEN THIS FIBER BECAME RUNNABLE - stamped at `spawn` and at every
-	// parked->ready transition, never at a yield. The tick sorts its snapshot by
-	// it; see the header's decision 1.
-	std::uint64_t _ready_at = 0;
+	// THE READY LIST, THREADED THROUGH THE FIBERS THEMSELVES (#211 §3.1). A fiber
+	// is linked exactly while it is `ready` or `running`, and ARRIVAL ORDER IS
+	// LIST ORDER: `spawn` and every parked->ready `wake` append at the tail, a
+	// `park` unlinks, and a YIELD TOUCHES NEITHER - which is what keeps a reactor
+	// yielding at every poll point from reshuffling the tick on every slice. See
+	// the header's decision 1, whose promise this list IS rather than encodes.
+	fiber* _ready_prev = nullptr;
+	fiber* _ready_next = nullptr;
 
 	static void trampoline(mco_coro* co);
 };
@@ -233,9 +216,8 @@ private:
 // the WHOLE of what `src/fiber/` learns about phase 2's awaits: there is no pid
 // here, no file descriptor, no `errno`, and no table of outstanding waits -
 // those belong to the host, which is the only side that knows what it is waiting
-// FOR. `ui::event_loop::await_child` keeps the pids; #209's `await_readable`
-// will keep the fds; both reach this file through `scheduler::block_or_park` and
-// neither adds a line to it.
+// FOR. `ui::event_loop`'s one waiter table keeps them, and every verb reaches
+// this file through `scheduler::block_or_park` without adding a line to it.
 //
 // `std::intptr_t` because every answer this shape of wait has is a small
 // integer or a pointer - `waitpid`'s pid, `poll`'s revents - and a template
@@ -289,18 +271,19 @@ public:
 	// handle either way.
 	//
 	// `stack_bytes` OVERRIDES `scheduler_options::stack_bytes` FOR THIS FIBER
-	// ONLY, and 0 means "the scheduler's default" (#208). Reserved address space
-	// is not memory: minicoro's mapping is committed page by page as the stack is
-	// touched, so a fiber that needs room for a deeply nested shell script costs
-	// nothing until it uses it, while a reactor keeps the 512 KB that is plenty
-	// for a token sweep. One argument rather than a second scheduler, because a
-	// scheduler is the run order and the group bits, and two of those would be two
-	// ticks.
+	// ONLY, and 0 means "the scheduler's default". Reserved address space is not
+	// memory: minicoro's mapping is committed page by page as the stack is touched,
+	// so a fiber that needs room for a deeply nested shell script costs nothing
+	// until it uses it, while a reactor keeps the 512 KB that is plenty for a token
+	// sweep. One argument rather than a second scheduler, because a scheduler is
+	// the run order and the group bits, and two of those would be two ticks.
 	fiber& spawn(entry_fn fn, void* userdata, const char* name, std::uint8_t group = 0,
 	             std::size_t stack_bytes = 0);
 
 	// One slice for every fiber that is runnable NOW, in arrival order. Returns
-	// whether anything is still runnable afterwards.
+	// whether anything is still runnable afterwards. O(runnable): the ready list
+	// is the snapshot, and its tail at entry is the boundary a fiber woken during
+	// the tick lands past.
 	//
 	// The mask overload restricts the tick to the groups whose bits are set -
 	// this is what lets step 1's host run "emitters" and "observers" as different
@@ -339,10 +322,10 @@ public:
 	//     means the fiber never parks.
 	//
 	// WHY THE HOST'S ADAPTER IS FIVE LINES. `ui::event_loop::await_child` is a
-	// `child_wait` on the stack, a `::waitpid` lambda, an `enlist` lambda that
-	// pushes onto the waiter table, and this call. Nothing in it branches on
-	// whether there is a fiber, so there is exactly one place in the tree where
-	// that question is asked and exactly one shape for the next verb to copy.
+	// frame struct on the stack, a `::waitpid` lambda, an `enlist` call and this.
+	// Nothing in it branches on whether there is a fiber, so there is exactly one
+	// place in the tree where that question is asked and exactly one shape for the
+	// next verb to copy.
 	//
 	// THE LOOP IS THE CONDITION, as with a condition variable: a spurious wake -
 	// somebody calling `scheduler::wake` on this fiber for a reason of their own -
@@ -415,13 +398,24 @@ public:
 
 private:
 	// True when `f` is in `group_mask` AND its group is not parked AND it is
-	// `ready`. The one definition of runnable, so the tick, the snapshot's
-	// re-check and `runnable()` cannot drift apart.
+	// `ready`. The one definition of runnable, so the tick and its re-check
+	// cannot drift apart.
 	[[nodiscard]] bool is_runnable(const fiber& f, std::uint8_t group_mask) const noexcept;
+
+	// The ready list's two edits. Appending is what "became runnable" means, so
+	// there is no insert-in-the-middle and no order to maintain beyond the tail.
+	void link_ready(fiber& f) noexcept;
+	void unlink_ready(fiber& f) noexcept;
 
 	scheduler_options _options;
 	std::vector<std::unique_ptr<fiber>> _fibers;
-	std::vector<fiber*> _slice_order;   // reused per tick, so a tick allocates nothing
+	// ARRIVAL ORDER, OLDEST FIRST (#211 §3.1). Holds every fiber that is `ready`
+	// or `running` and nothing else; see `fiber::_ready_next`.
+	fiber* _ready_head = nullptr;
+	fiber* _ready_tail = nullptr;
+	// How many of them are in each group, so `runnable(mask)` is eight
+	// comparisons rather than a walk over every fiber the scheduler has.
+	std::size_t _ready_in_group[group_count]{};
 	// Wakes that arrived for members of a parked group, oldest first. ONE list
 	// for the whole scheduler rather than one per group, so a wake's position is
 	// its arrival among all wakes and not merely among its group's. Reserved to
@@ -441,7 +435,6 @@ private:
 	[[maybe_unused]] std::size_t _host_stack_size = 0;
 	std::size_t _overruns = 0;
 	std::uint8_t _parked_groups = 0;
-	std::uint64_t _next_ready_at = 0;   // stamps `fiber::_ready_at`; see decision 1
 };
 
 // Out of line only because it wakes, and `scheduler` is not complete above.

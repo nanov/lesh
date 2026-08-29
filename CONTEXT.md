@@ -639,16 +639,23 @@ the waiter table is the host's, on the awaiting fiber's own frozen frame.
 _Avoid_: a second `current() == nullptr` branch anywhere; putting a pid or an fd
 in `src/fiber/`; reaping `-1`.
 
+**Awaiter** _[lesh]_:
+One outstanding wait, on the waiting fiber's own frozen frame — a probe
+(`bool(void* self, intptr_t& answer)`), the `void*` it reads, the descriptor the
+turn's poll set needs (`-1` for a child, whose wake is the SIGCHLD byte) and the
+`await_slot`. ONE TABLE FOR EVERY KIND OF WAIT since #211: `event_loop::_awaits`
+is a fixed array of eight pointers, `service_awaits()` is the one servicer, and
+`awaited()` the one counter. The pid, its flags, the status pointer and the fd
+live in the caller's frame, so `src/fiber/` still sees neither.
+
 **Fd interest** _[lesh]_:
-One fiber's question about one descriptor, for the length of one wait (#209).
-`event_loop::_fd_waits` is a fixed array of four pointers into the awaiting
-fibers' own frames — `_child_waits`' shape, without the heap block — and every
-turn appends its descriptors to the poll set. It is NOT a topic: nothing drains
-it, so the byte that ended the wait is still in the kernel for the waiter's own
-`::read`. That is also how the tty gets back into the poll set during `executing`,
-where #208 took its topic out.
+One fiber's question about one descriptor, for the length of one wait (#209) — an
+`awaiter` whose `fd` is set, appended to the poll set each turn. It is NOT a
+topic: nothing drains it, so the byte that ended the wait is still in the kernel
+for the waiter's own `::read`. That is also how the tty gets back into the poll
+set during `executing`, where #208 took its topic out.
 _Avoid_: draining an interest; a `revents` mapping back from the poll set
-(`wake_readable_fds` asks per waiter, which is what gives it the enlist probe for
+(`service_awaits` asks per waiter, which is what gives it the enlist probe for
 free); waiting on a descriptor `poll` reports POLLNVAL for.
 
 **Group** _[lesh]_:

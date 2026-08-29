@@ -4,14 +4,12 @@
 
 namespace lesh::runtime {
 
-// WHAT THE RUNTIME WANTS OF WHATEVER IS HOSTING IT (#199, step 1a of #145).
+// WHAT THE RUNTIME WANTS OF WHATEVER IS HOSTING IT (#199, #145; ADR-0011).
 //
 // The name is the whole point of this file. It says "cooperation" and never
 // "fibers", because the runtime must not learn what is on the other side: today
-// nothing is, tomorrow it is a scheduler slicing reactor fibers inside
-// `event_loop`, and the day after it could be something else again. The executor
-// knows one sentence - "a command just finished, whoever is hosting me may run" -
-// and that sentence is this interface.
+// it is a scheduler slicing fibers inside `event_loop`, tomorrow it could be
+// something else again.
 //
 // AN ABSTRACT CLASS, NOT A TEMPLATE. Whether a shell is interactive is a RUNTIME
 // fact, decided in `main()` from the invocation and the terminal, and both kinds
@@ -21,64 +19,53 @@ namespace lesh::runtime {
 // the branch is paid once, as an indirect call, instead. The measured price is in
 // tools/bench.cpp: the loop-iteration number does not move.
 //
-// NEVER NULL, which is the second decision worth stating. `shell_state` starts
-// with `&noop_cooperation()` and every setter takes a reference, so there is not
-// one null check in the runtime and no site can forget one. The two consoles
-// beside it (`set_binding_console`, `set_prompt_console`) are null in a
-// non-interactive shell BECAUSE a null there is an answer - `bind` says "no line
-// editor" rather than pretending. Here there is no such answer to give: a command
-// boundary happens in every shell, and "nobody is waiting for it" is a behaviour,
-// not an absence. So it is an object with an empty body.
+// NEVER NULL. `shell_state` starts with `&noop_cooperation()` and every setter
+// takes a reference, so there is not one null check in the runtime and no site
+// can forget one. The two consoles beside it (`set_binding_console`,
+// `set_prompt_console`) are null in a non-interactive shell BECAUSE a null there
+// is an answer - `bind` says "no line editor" rather than pretending. Here there
+// is no such answer to give: a command boundary happens in every shell, and
+// "nobody is waiting for it" is a behaviour, not an absence. So it is an object
+// with an empty body.
+//
+// EVERY VERB IS `noexcept`, because every one of them is called from inside the
+// executor's own control flow, which expects to return a status rather than to
+// unwind.
 class cooperation {
 public:
 	virtual ~cooperation() = default;
 
-	// THE COMMAND BOUNDARY, and in v1 the only verb.
+	// THE COMMAND BOUNDARY, and a no-op for every non-interactive shell.
 	//
 	// Called once per command, beside each of `run_pending_traps()`'s two call
-	// sites and always after it: the command loop in `run_command_list`, and
+	// sites and always AFTER it: the command loop in `run_command_list`, and
 	// `interrupt_at_prompt`, where a cancelled line is a boundary with no command
-	// in it. AFTER the traps rather than before, because a trap body is itself
+	// in it. After the traps rather than before, because a trap body is itself
 	// commands and what the host is told about is the state they left behind - and
 	// in `interrupt_at_prompt` last rather than adjacent, for the same reason:
 	// what settles `$?` there runs after the traps do.
-	//
-	// `noexcept`, because the boundary is inside the executor's command loop and a
-	// host throwing out of it would unwind the shell through code that expects to
-	// return a status.
-	//
-	// v1 WAS A NO-OP FOR EVERYONE and still is for every non-interactive shell.
-	// Phase 2 of #145 added `wait_child` (#208) and `await_readable` (#209) below,
-	// and the next of them is `vared`'s nested read as a nested await. None was
-	// declared before it had a caller.
 	virtual void on_command_boundary() noexcept = 0;
 
-	// THE FOREGROUND WAIT, AND THE SECOND VERB (#208, phase 2a of #145).
+	// THE FOREGROUND WAIT (#208).
 	//
-	// `::waitpid(pid, status, flags)`, said as a question rather than as a
-	// syscall. The executor has exactly one wait - `tree_walking_executor::reap`,
-	// which every one of its seven former `waitpid` sites now goes through - and
-	// what it means is "I have nothing to do until this child does something;
-	// whoever is hosting me may use the thread until then".
+	// `::waitpid(pid, status, flags)`, said as a question rather than as a syscall:
+	// "I have nothing to do until this child does something; whoever is hosting me
+	// may use the thread until then". The executor has exactly one wait,
+	// `tree_walking_executor::reap`, and every `waitpid` site goes through it.
 	//
-	// THE NO-OP IMPLEMENTATION *IS* `::waitpid`, which is the whole reason this
-	// verb can be introduced without moving a single behaviour: `lesh -c`, a
-	// script, a unit test and a forked child call through one indirect call into
-	// the identical syscall with the identical arguments. Only an interactive
-	// host answers differently, and even it answers differently only when there
-	// is a fiber to park - see `ui::event_loop::await_child`.
+	// THE NO-OP IMPLEMENTATION *IS* `::waitpid`, which is why the verb moves no
+	// behaviour: `lesh -c`, a script, a unit test and a forked child reach the
+	// identical syscall with the identical arguments through one indirect call.
+	// Only an interactive host answers differently, and even it only when there is
+	// a fiber to park - see `ui::event_loop::await_child`.
 	//
-	// THE ARGUMENTS ARE `waitpid`'s, IN `waitpid`'s ORDER OF MEANING but with the
-	// flags beside the pid, because at every call site the flags are a property of
-	// the WAIT (`WUNTRACED` where Ctrl-Z can reach it, nothing where it cannot)
-	// and the status is the out-parameter. The answer is `waitpid`'s answer: the
-	// pid, or -1 when there is no such child.
-	//
-	// `noexcept`, for the reason `on_command_boundary` is: this is called from
-	// inside the executor, which expects to return a status rather than to unwind.
+	// THE ARGUMENTS ARE `waitpid`'s, with the flags beside the pid, because at
+	// every call site the flags are a property of the WAIT (`WUNTRACED` where
+	// Ctrl-Z can reach it, nothing where it cannot) and the status is the
+	// out-parameter. The answer is `waitpid`'s: the pid, or -1 for no such child.
 	virtual pid_t wait_child(pid_t pid, int flags, int* status) noexcept = 0;
 
-	// THE INPUT WAIT, AND THE THIRD VERB (#209, phase 2b of #145).
+	// THE INPUT WAIT (#209).
 	//
 	// "I am about to block in `::read(fd, ...)`; whoever is hosting me may use the
 	// thread until there is something there." Said BEFORE the read and never
@@ -88,12 +75,10 @@ public:
 	// splitting, "no more of the input than the line it needs" - on one side of
 	// the seam and out of the host's reach.
 	//
-	// THE NO-OP IMPLEMENTATION IS EMPTY, which is why - like `wait_child`'s
-	// `::waitpid` - this verb moves no behaviour when it is introduced: a script,
-	// `lesh -c`, a unit test and every forked child return from here immediately
-	// and block in the read exactly as they always did. Only an interactive host
-	// answers differently, and even it only when there is a fiber to park - see
-	// `ui::event_loop::await_readable`.
+	// THE NO-OP IMPLEMENTATION IS EMPTY, so a script, `lesh -c`, a unit test and
+	// every forked child return from here immediately and block in the read exactly
+	// as they always did. Only an interactive host answers differently, and even it
+	// only when there is a fiber to park - see `ui::event_loop::await_readable`.
 	//
 	// WHAT "READABLE" HAS TO MEAN for the read after it not to block: at least one
 	// byte, or end of file. A regular file is always readable, so `read x < file`
@@ -109,8 +94,6 @@ public:
 	// waits here does not end the wait - exactly as `SA_RESTART` means it does not
 	// end the blocking read the no-op takes. The host may well WAKE for it; what
 	// it must not do is return to a caller whose read would then block.
-	//
-	// `noexcept`, for the reason the two verbs above are.
 	virtual void await_readable(int fd) noexcept = 0;
 };
 

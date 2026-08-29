@@ -1,23 +1,15 @@
 #pragma once
 
-// Running ONE reactor, here, now, on the calling thread (#135, #201, #202).
+// Running ONE reactor, here, now, on the calling thread (#135).
 //
 // THE TOKEN MINT THAT IS NOT THE EDITOR'S. `registry.cpp` builds a
 // `request_token` for `loop_harness::react`, which is the editor dispatching a
-// reactor on its own stack; this is the host's, and since #202 it is the ONLY
-// other one - `workers.cpp` had a third and went with the pool. Every reactor
-// the shell runs is minted here, on the one thread, from a fiber's stack.
+// reactor on its own stack; this is the host's, and it is the only other one.
+// Every reactor the shell runs is minted here, on the one thread, from a fiber's
+// stack. It is not a second reactor PATH: it builds exactly the `request_token`
+// registry.cpp builds, and asserts `token_is_live` on it, which is what says so.
 //
-// WHAT IT IS NOT is a second reactor path - it builds exactly the
-// `request_token` registry.cpp builds, and asserts `token_is_live` on it because
-// the thread key is computed in two places and a disagreement would make every
-// accessor on the token refuse.
-//
-// THE SNAPSHOT LIVES HERE TOO, since #202. It was `ui/workers.h`'s, because the
-// pool was what copied editor state for a worker to compute against; the pool is
-// gone and the snapshot's one remaining reader is the call below, so it moved to
-// the file that reads it rather than staying in a header that would exist for
-// nothing else.
+// THE SNAPSHOT LIVES HERE TOO, because the call below is its one reader.
 
 #include "leshper/abi.h"
 #include "leshper/host.h"
@@ -55,23 +47,17 @@ struct request_snapshot {
 	// pointer to the wiring site's adapter over `shell_state`, which outlives
 	// every request.
 	//
-	// ADR-0009 as amended is what makes a bare pointer safe here, and it is worth
-	// naming. The shell is the main thread and owns `shell_state`; a highlight, a
-	// port call that writes it, and an execution are serialized on that thread -
-	// and since #202 a highlight is a fiber ON that thread, which the host resumes
-	// only while it is not inside either writer. So this points at state that
-	// cannot change while the compute it belongs to is running, which is why
-	// #130's copy-on-write definitions version was deleted rather than kept as
+	// ADR-0011 is what makes a bare pointer safe here. The shell owns
+	// `shell_state`; a highlight, a port call that writes it, and an execution are
+	// serialized on the one thread - a highlight is a fiber ON that thread, which
+	// the host resumes only while it is not inside either writer. So this points at
+	// state that cannot change while the compute it belongs to is running, which is
+	// why #130's copy-on-write definitions version was deleted rather than kept as
 	// insurance.
 	//
 	// Null - the default - is "no host attached": every name classifies as
 	// LESH_COMMAND_UNKNOWN. A notification that leaves it null is therefore honest
 	// rather than broken, and is what every state-free reactor gets.
-	//
-	// `leshper::host` since #168 Phase B, where this was a `shell_knowledge*`.
-	// The tables are still what answers - `ui::editor_host` holds them - but the
-	// `$PATH` sweep that used to run inside the editor moved behind the same
-	// door, so what the snapshot carries is the door and not one room of it.
 	const leshper::host* host = nullptr;
 };
 
@@ -94,7 +80,7 @@ void take_snapshot(request_snapshot& into, const leshper::state& target,
 // The call
 // ---------------------------------------------------------------------------
 
-// WHO TO YIELD TO, WHILE THE REACTOR IS COMPUTING (#202).
+// WHO TO YIELD TO, WHILE THE REACTOR IS COMPUTING.
 //
 // Stamped onto the token, where `lesh_request_superseded` calls it before it
 // reads the cancellation flag - see `lesh_request::cooperate` for the whole

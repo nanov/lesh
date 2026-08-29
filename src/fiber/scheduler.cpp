@@ -4,7 +4,6 @@
 #include "substrate/assert.h"
 #include "substrate/log.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -125,17 +124,6 @@ void back_on_the_host_stack(const void* bottom, std::size_t size) noexcept {
 // snapshot buffer while it is mid-compute, since `run_reactor_here` moves the
 // string into the token - is unreachable as far as LSan can tell, and reported.
 //
-// #198 CONCLUDED THE OPPOSITE, and the reason it looked that way is the ASan
-// defect above. `FiberLsan.ABlockHeldOnlyByAParkedFiberStackIsNotReported`
-// passed on Darwin because minicoro left ASan's record of the THREAD's stack
-// pointing at the fiber's stack after the yield - so the leak check scanned the
-// fiber stack as if it were the thread's, and found the block. Correcting the
-// bounds so that `__asan_handle_no_return` works removed that accident, the
-// negative control went red, and what it had been proving was that a bug was
-// still there. The research note called this "the single most likely way fibers
-// break the gate on CI", and it was right about the shape and wrong about only
-// the platform.
-//
 // The fix is the documented interface, not a suppression: every live fiber stack
 // is registered as an LSan ROOT REGION, so blocks held from it are TRACED - which
 // keeps them, and everything they in turn point at, honestly reachable. An
@@ -216,6 +204,11 @@ scheduler::scheduler(scheduler_options with) noexcept : _options(with) {
 
 scheduler::~scheduler() {
 	LESH_ASSERT(_current == nullptr && "a scheduler cannot be destroyed from inside its own fiber");
+	// The ready list first: it is threaded through the fibers themselves, and the
+	// loop below is about to destroy them.
+	_ready_head = _ready_tail = nullptr;
+	for (std::size_t& count : _ready_in_group)
+		count = 0;
 	// Reverse spawn order, so that a fiber holding a reference to an earlier one
 	// is gone before the earlier one is.
 	while (!_fibers.empty())
@@ -228,7 +221,6 @@ fiber& scheduler::spawn(entry_fn fn, void* userdata, const char* name, std::uint
 	LESH_ASSERT(group < group_count && "up to 8 groups: the park set is one byte");
 
 	auto born = std::unique_ptr<fiber>(new fiber(*this, fn, userdata, name, group));
-	born->_ready_at = _next_ready_at++;
 
 	// The per-spawn override, or the scheduler's default when it is 0. Rounded to
 	// a page and given its guard by `install_guarded_allocator` either way.
@@ -251,6 +243,11 @@ fiber& scheduler::spawn(entry_fn fn, void* userdata, const char* name, std::uint
 	         static_cast<unsigned>(group), co->stack_size, page_size());
 
 	_fibers.push_back(std::move(born));
+	// AND IT IS RUNNABLE FROM HERE, which is its arrival: at the tail, behind
+	// everything that arrived before it. Spawning into a parked group is still
+	// legal and still runs nothing - the group's bit is what `is_runnable` reads,
+	// and the list says only where in the order it would be.
+	link_ready(*_fibers.back());
 	// Deduplicated and at most one entry per fiber, so reserving here is what
 	// lets `wake` queue without allocating and stay `noexcept`.
 	_pending_wakes.reserve(_fibers.size());
@@ -321,6 +318,7 @@ void scheduler::run_one_slice(fiber& f) {
 		watch_stack_for_leaks(extents_of(*f._co), false);
 		must(mco_destroy(f._co), "destroy", f._name);
 		f._co = nullptr;
+		unlink_ready(f);
 		f._state = fiber_state::finished;
 		LESH_LOG(log::level::debug, log::category::worker, "fiber finished: %s after %zu slices", f._name, f._slices);
 		return;
@@ -335,26 +333,29 @@ bool scheduler::tick() { return tick(all_groups); }
 bool scheduler::tick(std::uint8_t group_mask) {
 	LESH_ASSERT(_current == nullptr && "tick() is the host's, not a fiber's");
 
-	// Snapshot first, run second. See the header: a fiber woken by an earlier
-	// slice waits for the next tick, which is what makes a tick bounded and its
-	// order reproducible.
-	_slice_order.clear();
-	for (const auto& f : _fibers)
-		if (is_runnable(*f, group_mask))
-			_slice_order.push_back(f.get());
-
-	// Arrival order, not spawn order - and the two coincide for every fiber that
-	// has never parked. `_ready_at` is unique per stamp, so this is a strict
-	// total order and an unstable sort is enough; nothing here allocates.
-	std::sort(_slice_order.begin(), _slice_order.end(),
-	          [](const fiber* a, const fiber* b) noexcept { return a->_ready_at < b->_ready_at; });
-
-	// Re-checked, not assumed: an earlier slice may have parked this fiber or
-	// parked its whole group. Decision 2 in the header - the snapshot bounds
-	// which fibers may run and in what order, never that they will.
-	for (fiber* const f : _slice_order)
+	// THE LIST IS THE SNAPSHOT, AND ITS TAIL IS THE BOUNDARY. See the header: a
+	// fiber woken by an earlier slice waits for the next tick, which is what makes
+	// a tick bounded and its order reproducible - and a wake appends at the tail,
+	// so "past the boundary" is exactly "woken during this tick".
+	//
+	// THE NEXT LINK IS TAKEN BEFORE THE SLICE, because a slice may unlink the
+	// fiber that is running it (`park`, or a body that returns). It may not unlink
+	// any OTHER fiber: parking is the running fiber's own act, so `next` is still
+	// on the list when we get to it.
+	fiber* const boundary = _ready_tail;
+	fiber* next = _ready_head;
+	while (next != nullptr) {
+		fiber* const f = next;
+		const bool last = f == boundary;
+		next = f->_ready_next;
+		// Re-checked, not assumed: an earlier slice may have parked this fiber's
+		// whole group. Decision 2 in the header - the snapshot bounds which fibers
+		// may run and in what order, never that they will.
 		if (is_runnable(*f, group_mask))
 			run_one_slice(*f);
+		if (last)
+			break;
+	}
 
 	return runnable(group_mask);
 }
@@ -366,6 +367,7 @@ void scheduler::yield() {
 
 void scheduler::park() {
 	LESH_ASSERT(_current != nullptr && "park() is called from inside a fiber");
+	unlink_ready(*_current);
 	_current->_state = fiber_state::parked;
 	mco_yield(_current->_co);
 	// Resumed: `wake` put us back to `ready` and `run_one_slice` to `running`.
@@ -387,8 +389,10 @@ void scheduler::wake(fiber& f) noexcept {
 		return;
 	}
 
+	// A FRESH ARRIVAL, AT THE TAIL. This is the only transition that is one: a
+	// yield leaves the fiber where it already was.
 	f._state = fiber_state::ready;
-	f._ready_at = _next_ready_at++;
+	link_ready(f);
 }
 
 void scheduler::park_group(std::uint8_t group) {
@@ -442,11 +446,44 @@ bool scheduler::is_runnable(const fiber& f, std::uint8_t group_mask) const noexc
 	       !group_parked(f._group);
 }
 
+void scheduler::link_ready(fiber& f) noexcept {
+	LESH_ASSERT(f._ready_prev == nullptr && f._ready_next == nullptr && _ready_head != &f);
+	f._ready_prev = _ready_tail;
+	f._ready_next = nullptr;
+	if (_ready_tail != nullptr)
+		_ready_tail->_ready_next = &f;
+	else
+		_ready_head = &f;
+	_ready_tail = &f;
+	++_ready_in_group[f._group];
+}
+
+void scheduler::unlink_ready(fiber& f) noexcept {
+	if (f._ready_prev != nullptr)
+		f._ready_prev->_ready_next = f._ready_next;
+	else if (_ready_head == &f)
+		_ready_head = f._ready_next;
+	else
+		return;   // not on the list: a second park, or a fiber that never arrived
+	if (f._ready_next != nullptr)
+		f._ready_next->_ready_prev = f._ready_prev;
+	else
+		_ready_tail = f._ready_prev;
+	f._ready_prev = nullptr;
+	f._ready_next = nullptr;
+	--_ready_in_group[f._group];
+}
+
 bool scheduler::runnable() const noexcept { return runnable(all_groups); }
 
+// EIGHT COMPARISONS, WHATEVER THE FIBER COUNT (#211 §3.1). The per-group counts
+// are of LINKED fibers - `ready`, plus the one that is `running` if this is asked
+// from inside a slice, which no caller does: `runnable` is the host's question,
+// asked between slices, and between slices linked and ready are the same set.
 bool scheduler::runnable(std::uint8_t group_mask) const noexcept {
-	for (const auto& f : _fibers)
-		if (is_runnable(*f, group_mask))
+	for (std::uint8_t group = 0; group < group_count; ++group)
+		if ((group_mask & group_mask_of(group)) != 0 && _ready_in_group[group] != 0
+		    && !group_parked(group))
 			return true;
 	return false;
 }

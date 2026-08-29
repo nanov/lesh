@@ -310,7 +310,6 @@ struct lesh_editor {
 	// give us, and the ABI says "valid for the receiving call" rather than
 	// pretending otherwise.
 	std::uint64_t call_token = 0;
-	std::uint64_t owner_thread = 0;
 
 	// Action recursion depth (#92's ceiling of 64).
 	int depth = 0;
@@ -392,7 +391,6 @@ struct lesh_request {
 	std::vector<lesh::leshper::proposal>* proposals = nullptr;
 
 	std::uint64_t call_token = 0;
-	std::uint64_t owner_thread = 0;
 
 	[[nodiscard]] bool live() const noexcept { return call_token != 0; }
 };

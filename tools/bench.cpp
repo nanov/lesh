@@ -331,7 +331,7 @@ int main() {
 	// three layers of one yield, each measured on its own:
 	//
 	//   run_one_slice   host -> fiber -> host                     (the row above)
-	//   tick            + the snapshot, the sort and `runnable`
+	//   tick            + the ready-list walk and `runnable`
 	//   turn(0)         + the readiness check, the drains, the render check
 	//
 	// and the fourth group is what they add up to on the reactor that takes the
@@ -438,7 +438,7 @@ int main() {
 			host.type("z");
 			auto last = steady_clock::now();
 			while (loop.reactor_computes("autosuggester") == before
-			       || loop.reactors().runnable(ui::group_mask(ui::fiber_group::emitters))) {
+			       || loop.scheduler().runnable(ui::group_mask(ui::fiber_group::emitters))) {
 				benchmark_sink += loop.turn(0).events;
 				const auto now = steady_clock::now();
 				gaps.push_back(static_cast<double>(

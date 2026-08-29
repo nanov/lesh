@@ -2,6 +2,8 @@
 #include "ui/reactors.h"
 #include "leshper/keymap.h"
 #include "ui/loop.h"
+
+#include "ui/history/store.h"
 #include "ui/shell_side.h"
 #include "ui/tty.h"
 #include "ui/reactor_call.h"
@@ -22,6 +24,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <poll.h>
 #include <sstream>
 #include <sys/ioctl.h>
@@ -666,7 +669,7 @@ TEST(UiLoopReactors, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	loop.turn(50);
 	// The fiber took the notification, started computing and yielded at its poll:
 	// runnable, not finished, and nothing applied yet.
-	ASSERT_TRUE(loop.reactors().runnable(group_mask(fiber_group::emitters)))
+	ASSERT_TRUE(loop.scheduler().runnable(group_mask(fiber_group::emitters)))
 		<< "the reactor should be suspended mid-compute at its cancellation poll";
 	ASSERT_EQ(loop.applied_batches(), 0u);
 
@@ -935,7 +938,7 @@ TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	bool parked_during_execute = false;
 	shell.on_execute = [&] {
 		parked_during_execute =
-			loop.reactors().group_parked(group_index(fiber_group::emitters));
+			loop.scheduler().group_parked(group_index(fiber_group::emitters));
 	};
 	shell.execute_status = 42;
 
@@ -953,7 +956,7 @@ TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	// walk back into a command that has already run.
 	EXPECT_EQ(buffer_of(loop), "");
 	// And the resume released it: the group is runnable again.
-	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_FALSE(loop.quiesced());
 }
 
@@ -976,7 +979,7 @@ TEST(UiLoopQuiesce, QuiesceIsIdempotentAndOneResumeUndoesIt) {
 
 	loop.resume_after_execution();
 	EXPECT_FALSE(loop.quiesced()) << "one resume undoes both calls";
-	EXPECT_FALSE(loop.reactors().group_parked(group_index(fiber_group::emitters)));
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 }
 
 TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsNotLost) {
@@ -1873,7 +1876,7 @@ public:
 	std::int32_t execute(std::string_view) override {
 		++executes;
 		phase_inside = loop->session_phase();
-		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
 		watch_drains_before = loop->watch_drains();
 		if (tty != nullptr && !type_during.empty())
 			tty->type(type_during);
@@ -1890,8 +1893,15 @@ public:
 			::usleep(child_ms * 1000);
 			::_exit(9);
 		}
+		// A HEAP BLOCK WHOSE ONLY POINTER IS THIS FRAME, held across the wait -
+		// which is what the real executor's frames are, and what makes
+		// LeakSanitizer the judge of #211 §4.1: a fiber abandoned here has its
+		// stack unmapped without unwinding, so this block loses its last reference
+		// and is reported at process exit. Freed on the way out of every other
+		// case, which is every other case in this file.
+		const auto held = std::make_unique<std::vector<char>>(4096, 'x');
 		reaped = loop->await_child(awaited, 0, &wait_status);
-		return WIFEXITED(wait_status) ? WEXITSTATUS(wait_status) : -1;
+		return WIFEXITED(wait_status) && !held->empty() ? WEXITSTATUS(wait_status) : -1;
 	}
 
 	std::int32_t port_call(std::string_view) override { return 0; }
@@ -1930,11 +1940,188 @@ TEST(UiLoopExecution, BothModesRunTheLineWaitForTheChildAndReportItsStatus) {
 			<< name_of(how) << ": and `editing` again on the way out";
 		// AND THE WAITER TABLE IS EMPTY AGAIN. An entry left behind would be a
 		// pointer into a frame that has returned.
-		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		loop.leave_read();
 		hub.uninstall();
 	}
+}
+
+TEST(UiLoopExecution, TheExecutionFiberIsNeverAbandonedWhenThePollFailsMidCommand) {
+	// #211 §4.1. `turn` used to answer a fatal poll error by setting `_exiting` and
+	// returning, and `run_the_line`'s `while (... && !_exiting)` then handed control
+	// back to `accept_current_line` with the execution fiber suspended INSIDE
+	// `execute`. `~scheduler` unmaps a parked stack without unwinding it, so what
+	// went with it was the executor's frames, its open redirection descriptors, its
+	// child - and the executing flag, never lowered. LeakSanitizer is the judge of
+	// the first of those and is why this case lives in the sanitized gate.
+	//
+	// THE FAILURE IS INJECTED because it cannot be provoked: `poll` reports a closed
+	// descriptor as POLLNVAL in `revents`, not as -1. One failure is the realistic
+	// shape - the descriptor that went is the watch or an interest, and the turns
+	// that follow poll the self-pipe alone.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	loop.fail_next_polls(1);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	// THE COMMAND FINISHED ANYWAY. The child still exits and SIGCHLD still rings
+	// the self-pipe, so the wait ends and the status comes back down the slot.
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 9);
+	EXPECT_EQ(shell.reaped, shell.awaited) << "and the child was reaped, not orphaned";
+	EXPECT_TRUE(WIFEXITED(shell.wait_status));
+	EXPECT_EQ(loop.awaited(), 0u) << "the waiter table is empty again";
+
+	// AND THE FIBER IS BACK ON ITS INBOX, which is the assertion `~event_loop`
+	// carries and the whole of what the leak gate is about to check.
+	EXPECT_TRUE(loop.has_execution_fiber());
+	EXPECT_FALSE(loop.has_execution_fiber_mid_command());
+
+	// THEN IT LEAVES. A terminal that has gone is not a terminal to paint a fresh
+	// prompt onto.
+	EXPECT_TRUE(loop.exiting());
+
+	loop.leave_read();
+	hub.uninstall();
+}
+
+namespace {
+
+// THE HISTORY, RECORDED THE WAY `session::execute` RECORDS IT (#211 §2.4): the
+// entry goes in as PENDING before the command runs and is resolved with its exit
+// status after. What is under test is the window between those two, which #208
+// opened and `store.h` used to deny existed.
+class recording_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	lesh::ui::history::store* history = nullptr;
+	std::string directory;
+
+	std::size_t watch_drains_inside = 0;
+	bool pending_was_visible_inside = false;
+	std::size_t entries_visible_inside = 0;
+
+	std::int32_t execute(std::string_view line) override {
+		history->add(line, "/nowhere", true);
+
+		// A SIBLING SHELL TOUCHES THE DATA DIRECTORY. The watch is on the
+		// directory - a `rename` over a file never fires on that file - so any
+		// creation in it makes the descriptor readable, which is exactly the
+		// spurious wake `drain_watch` calls the common case.
+		{
+			std::ofstream sibling{directory + "/history.data.tmp.sibling"};
+			sibling << 'x';
+		}
+
+		const pid_t child = ::fork();
+		if (child == 0) {
+			::usleep(40 * 1000);
+			::_exit(7);
+		}
+		int status = 0;
+		(void)loop->await_child(child, 0, &status);
+
+		// WHAT THE WATCH DID WHILE WE WERE PARKED, and what a walk taken at this
+		// instant - after the drain, before the resolve - can see.
+		watch_drains_inside = loop->watch_drains();
+		history->for_each_merged_newest_first(
+			[&](const lesh::ui::history::merged_entry& one) {
+				++entries_visible_inside;
+				const std::string_view text{
+					reinterpret_cast<const char*>(one.what.cmd.data()), one.what.cmd.size()};
+				if (text == line)
+					pending_was_visible_inside = true;
+				return true;
+			});
+
+		history->resolve_pending(7);
+		return 7;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, TheHistoryWatchFiresBetweenAddPendingAndResolvePending) {
+	// #211 §2.4. `store.h` claimed the loop polls nothing while it is inside
+	// `shell_side::execute`; #208 made that false, and this is the window it
+	// opened - `drain_watch`, and the `publish` and Tier 1 remap behind it,
+	// landing between `add(pending)` and `resolve_pending`.
+	//
+	// The invariant that replaced the claim is the second assertion: `publish`
+	// excludes pending items from every view it builds, so however many views the
+	// drain rebuilds in that window, the command being recorded is in none of them.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	lesh::testing::temp_path scratch;
+	lesh::ui::history::store history;
+	(void)history.open(scratch.dir());
+	if (history.watch_fd() < 0)
+		GTEST_SKIP() << "this data directory gives out no notification descriptor";
+
+	// One older entry, resolved, so the walk inside the command has something to
+	// find and "saw nothing at all" cannot pass for "saw no pending item".
+	history.add("echo older", "/nowhere", true);
+	history.resolve_pending(0);
+
+	fake_tty tty;
+	signal_hub hub;
+	recording_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	loop.attach_watch(
+		history.watch_fd(),
+		[](void* userdata) { static_cast<lesh::ui::history::store*>(userdata)->drain_watch(); },
+		&history);
+	shell.loop = &loop;
+	shell.history = &history;
+	shell.directory = scratch.dir();
+	loop.enter_read();
+
+	tty.type("echo pending");
+	(void)loop.turn(0);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 7);
+	// THE WINDOW IS REAL: the watch fired while the command was running.
+	EXPECT_GE(shell.watch_drains_inside, 1u)
+		<< "the watch topic is polled during a command since #208";
+	// AND NOTHING IN IT COULD SEE THE PENDING ITEM.
+	EXPECT_GE(shell.entries_visible_inside, 1u) << "the walk did run over something";
+	EXPECT_FALSE(shell.pending_was_visible_inside)
+		<< "publish excludes pending items from every view it builds";
+
+	// And the resolve is what puts it in.
+	bool resolved_is_visible = false;
+	history.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
+		const std::string_view text{reinterpret_cast<const char*>(one.what.cmd.data()),
+		                            one.what.cmd.size()};
+		if (text == "echo pending")
+			resolved_is_visible = true;
+		return true;
+	});
+	EXPECT_TRUE(resolved_is_visible);
+
+	loop.detach_watch();
+	loop.leave_read();
+	hub.uninstall();
 }
 
 TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
@@ -1976,9 +2163,9 @@ TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
 		// A SECOND LINE REUSES THE FIBER. It is spawned once and parks on its
 		// inbox between commands; a second one would be a second 8 MB reserve and
 		// a second thing to drain at shutdown.
-		const std::size_t fibers = loop.reactors().fiber_count();
+		const std::size_t fibers = loop.scheduler().fiber_count();
 		(void)loop.accept_current_line();
-		EXPECT_EQ(loop.reactors().fiber_count(), fibers) << name_of(how);
+		EXPECT_EQ(loop.scheduler().fiber_count(), fibers) << name_of(how);
 		EXPECT_EQ(shell.executes, 2u) << name_of(how);
 
 		loop.leave_read();
@@ -2230,7 +2417,7 @@ TEST(UiLoopExecution, WithNoSIGCHLDToWakeItTheWaitIsTakenInline) {
 	// ONE SLICE, because the wait never parked: the fiber ran the whole command in
 	// the slice it was given.
 	EXPECT_EQ(loop.execution_slices(), 1u);
-	EXPECT_EQ(loop.awaited_children(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2283,7 +2470,7 @@ TEST(UiLoopExecution, ACancelledLineTakesTheSameDoorAsAnAcceptedOne) {
 		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
 		EXPECT_EQ(loop.exit_status(), 9) << name_of(how) << ": the status is kept";
 		EXPECT_EQ(loop.session_phase(), phase::editing) << name_of(how);
-		EXPECT_EQ(loop.awaited_children(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 		if (how == execution_mode::on_a_fiber)
 			EXPECT_GE(loop.execution_slices(), 2u);
 
@@ -2325,7 +2512,7 @@ TEST(UiLoopExecution, APortCallNeverParksBecauseThereIsNoFiberUnderIt) {
 	EXPECT_EQ(WEXITSTATUS(status), 5);
 	EXPECT_EQ(loop.execution_slices(), slices)
 		<< "the execution fiber was not resumed for a wait that was not its own";
-	EXPECT_EQ(loop.awaited_children(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2367,7 +2554,7 @@ public:
 	std::size_t slices_at_the_await = 0;
 
 	std::int32_t execute(std::string_view) override {
-		on_a_fiber_inside = loop->reactors().current() != nullptr;
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
 		if (write_from_a_child) {
 			writer = ::fork();
 			if (writer == 0) {
@@ -2415,7 +2602,7 @@ TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
 		loop.enter_read();
 
 		// EMPTY BEFORE, so the count afterwards is evidence rather than a constant.
-		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		(void)loop.accept_current_line();
 
@@ -2423,7 +2610,7 @@ TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
 		EXPECT_EQ(shell.got, 'x') << name_of(how);
 		// AND THE TABLE IS EMPTY AGAIN. An entry left behind would be a pointer
 		// into a frame that has returned.
-		EXPECT_EQ(loop.awaited_fds(), 0u) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
 
 		if (how == execution_mode::on_a_fiber) {
 			EXPECT_TRUE(shell.on_a_fiber_inside) << "`execute` ran on a fiber";
@@ -2481,7 +2668,7 @@ TEST(UiLoopExecution, ADescriptorThatIsREADYALREADYNeverParks) {
 	EXPECT_EQ(shell.got, 'x');
 	EXPECT_EQ(loop.execution_slices(), 1u)
 		<< "a descriptor that was readable already cost a park";
-	EXPECT_EQ(loop.awaited_fds(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 
 	loop.leave_read();
 	hub.uninstall();
@@ -2543,7 +2730,7 @@ TEST(UiLoopExecution, ARegularFileIsAlwaysReadableAndAClosedOneIsNeverWaitedOn) 
 		(void)loop.accept_current_line();
 
 		const char* which = a_file ? "a regular file" : "a closed descriptor";
-		EXPECT_EQ(loop.awaited_fds(), 0u) << which;
+		EXPECT_EQ(loop.awaited(), 0u) << which;
 		EXPECT_EQ(loop.execution_slices(), 1u) << which << ": it parked";
 		if (a_file) {
 			EXPECT_EQ(shell.got, 'f') << "the file's first byte";
@@ -2649,7 +2836,7 @@ TEST(UiLoopExecution, AwaitingTheTTYPUTSITBACKInThePollSetWithoutMakingItATopic)
 
 	EXPECT_EQ(shell.read_answer, 1) << "the command's own read did not get the byte";
 	EXPECT_EQ(shell.got, 'k');
-	EXPECT_EQ(loop.awaited_fds(), 0u);
+	EXPECT_EQ(loop.awaited(), 0u);
 	EXPECT_TRUE(buffer_of(loop).empty())
 		<< "the loop decoded a keystroke that belonged to the command: "
 		<< buffer_of(loop);

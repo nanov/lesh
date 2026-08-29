@@ -49,7 +49,7 @@ using lesh::testing::scoped_env_path;
 //   difference being that the pointer now arrives WITH THE SHELL at
 //   `attach_shell` instead of being copied across a thread, which is the copy
 //   that dropped the field and made `exit` and `bind` paint red in a real shell
-//   while every test passed. `shell_writing_flag` turns ADR-0009's rule into an
+//   while every test passed. `shell_executing_flag` turns ADR-0009's rule into an
 //   assertion that can fire, with a death test that fires it.
 //
 // The layers BELOW these - the ABI verb and the highlighter's classes - are
@@ -260,7 +260,7 @@ private:
 // reach it is a buffer change - which is also the only way a real session ever
 // reaches it.
 void run_one_shell_reactor(shell_side& shell, const lesh::leshper::host* host, probe& asked,
-                           shell_writing_flag* writing = nullptr) {
+                           shell_executing_flag* writing = nullptr) {
 	lesh::testing::fake_tty tty;
 	registry reg;
 	ASSERT_EQ(lesh_reactor_register(&reg, "probe", LESH_EVENT_BUFFER_CHANGED,
@@ -269,7 +269,7 @@ void run_one_shell_reactor(shell_side& shell, const lesh::leshper::host* host, p
 
 	loop_options options;
 	options.manage_terminal = false;
-	options.shell_thread_reactor = "probe";
+	options.host_stamped_reactor = "probe";
 	event_loop loop{tty.fds(), options};
 	loop.attach_registry(reg);
 	loop.attach_shell(shell, host, writing);
@@ -342,28 +342,28 @@ TEST(UiKnowledge, TheWritingFlagIsDownExceptInsideTheTwoWriters) {
 	// nothing else - not around a highlight, which is a READER and shares the
 	// shell thread with them.
 	lesh::runtime::shell_state state;
-	shell_writing_flag writing;
+	shell_executing_flag writing;
 	const shell_state_knowledge knowledge{state, &writing};
 
 	bool up_during_execute = false;
 	bool up_during_port_call = false;
 	class watching_shell final : public shell_side {
 	public:
-		watching_shell(const shell_writing_flag& flag, bool& in_execute, bool& in_port)
+		watching_shell(const shell_executing_flag& flag, bool& in_execute, bool& in_port)
 			: _flag(&flag), _in_execute(&in_execute), _in_port(&in_port) {}
 
 		std::int32_t execute(std::string_view) override {
-			*_in_execute = _flag->writing();
+			*_in_execute = _flag->executing();
 			return 0;
 		}
 
 		std::int32_t port_call(std::string_view) override {
-			*_in_port = _flag->writing();
+			*_in_port = _flag->executing();
 			return 0;
 		}
 
 	private:
-		const shell_writing_flag* _flag;
+		const shell_executing_flag* _flag;
 		bool* _in_execute;
 		bool* _in_port;
 	};
@@ -381,16 +381,16 @@ TEST(UiKnowledge, TheWritingFlagIsDownExceptInsideTheTwoWriters) {
 	loop.attach_shell(shell, &host, &writing);
 	loop.enter_read();
 
-	EXPECT_FALSE(writing.writing());
+	EXPECT_FALSE(writing.executing());
 	// An empty line, which is what a cancel is - the shortest way to reach
 	// `execute` with no keystroke in the way.
 	loop.finish_cancelled_line();
 	EXPECT_TRUE(up_during_execute);
-	EXPECT_FALSE(writing.writing()) << "the scope puts it down again";
+	EXPECT_FALSE(writing.executing()) << "the scope puts it down again";
 
 	(void)loop.call_port("anything");
 	EXPECT_TRUE(up_during_port_call);
-	EXPECT_FALSE(writing.writing());
+	EXPECT_FALSE(writing.executing());
 
 	// And a read is legal now, which is the state every reader in the tree runs
 	// in: anywhere in a turn that is not inside one of the two calls.
@@ -409,7 +409,7 @@ TEST(UiKnowledgeDeathTest, AReadWhileTheShellIsWritingTripsTheAssertion) {
 	// and a death test for a statement that is not there would fail honestly.
 	::testing::GTEST_FLAG(death_test_style) = "threadsafe";
 	lesh::runtime::shell_state state;
-	shell_writing_flag writing;
+	shell_executing_flag writing;
 	const shell_state_knowledge knowledge{state, &writing};
 	reading_shell wrong{knowledge};
 	const editor_host host{&knowledge};

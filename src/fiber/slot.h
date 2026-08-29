@@ -22,29 +22,18 @@
 // HOW `superseded` REACHES THE RECEIVER'S IN-FLIGHT TOKEN
 // ---------------------------------------------------------------------------
 //
-// The two candidate mechanisms, because this was a judgment call:
+// A SEND COUNTER THE TOKEN SNAPSHOTS, not a flag the token points at. `send`
+// increments a monotonic counter; `recv` hands back a token carrying the
+// counter's value at delivery; `superseded()` is a comparison. There is nothing
+// to clear, so there is no clear-at-the-wrong-moment bug; a token from an older
+// `recv` reads superseded forever rather than aliasing a reused flag; and it is
+// the same generation discipline the receivers already use to drop stale
+// emissions, so there is one idea in the system instead of two.
 //
-//   (a) A FLAG THE TOKEN POINTS AT, which is what `ui/workers.h` does today: the
-//       slot owns `bool superseded`, `recv` clears it, `send` sets it, and the
-//       token holds its address. It works, and it comes with two liabilities.
-//       The flag has to be cleared at exactly the right moment (workers.cpp does
-//       it in three places), and the token's address must stay valid - the
-//       comment above `ui/workers.h`'s `struct slot` exists only to warn that a
-//       rehash moving the slot would dangle a token mid-compute.
-//
-//   (b) A SEND COUNTER THE TOKEN SNAPSHOTS, which is what this is. `send`
-//       increments a monotonic counter; `recv` hands back a token carrying the
-//       counter's value at delivery; `superseded()` is a comparison. Nothing to
-//       clear, so there is no clear-at-the-wrong-moment bug; a token from an
-//       older `recv` reads superseded forever rather than aliasing a reused
-//       flag; and it is the same generation discipline the receivers already use
-//       to drop stale emissions, so there is one idea in the system instead of
-//       two.
-//
-// (b), then. The token does hold a pointer to the slot, so a token must not
-// outlive its slot - but a token is a local in the receiving fiber's compute
-// loop and the slot outlives the fiber by construction, and an outlived token
-// reads `superseded() == true`, which is the safe answer.
+// The token does hold a pointer to the slot, so a token must not outlive its
+// slot - but a token is a local in the receiving fiber's compute loop and the
+// slot outlives the fiber by construction, and an outlived token reads
+// `superseded() == true`, which is the safe answer.
 //
 // THE COUNTER MOVES ON EVERY `send`, NOT ONLY ON AN OVERWRITE. The ticket words
 // the rule as "a `send` over an unconsumed value overwrites it and sets a

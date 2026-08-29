@@ -40,7 +40,6 @@
 // because a cost cache that can never change an answer belongs with the caller
 // (#168 Phase B).
 
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -92,7 +91,8 @@ enum class name_domain : std::uint8_t {
 	path_directory = 4,
 };
 
-// ADR-0009's rule, made checkable (#151).
+// ADR-0009's rule, made checkable (#151) - AND IT IS ABOUT EXECUTION, NOT ABOUT
+// ONE WRITE (#211 §2.2, which is where the name came from).
 //
 // THE RULE IS "THE SHELL WRITES ITS OWN STATE, AND NOBODY READS IT WHILE IT
 // DOES". Everything above depends on it - the bare pointers on the request
@@ -102,52 +102,45 @@ enum class name_domain : std::uint8_t {
 // checkable is that there are exactly TWO writers, `shell_side::execute` and
 // `shell_side::port_call`, and both are entered from one place: the loop
 // calling them (`event_loop::accept_current_line`, `finish_cancelled_line`,
-// `call_port`; it was `shell_actor` serving a slot until #201). So the loop
-// raises this flag around them and every read through an adapter that holds one
-// asserts it is down.
+// `call_port`).
 //
-// WHY AN ATOMIC WHEN THE CLAIM IS THAT THERE IS NO CONCURRENCY. Because the
-// claim was exactly what was being checked: the flag was written on the shell
-// thread and read wherever a reader happened to be - the shell thread for the
-// highlighter, the loop's thread for the completer (see `enumerate` below) - and
-// a plain `bool` read across those would be the data race the assertion exists
-// to catch, which is a poor way to catch it. There is one thread now and the
-// atomic is vestigial; it is kept because what it costs is nothing and what it
-// would cost to re-derive the argument is not. Relaxed on both sides: this is a
-// tripwire, not a handshake, and it orders nothing.
+// IT IS UP FOR A WHOLE COMMAND'S WALL-CLOCK, including every turn the host takes
+// while the execution fiber is parked in a wait - so what it says is not "a write
+// is in progress" but "the shell is executing, and a read taken now would be a
+// read of state a command owns". The load-bearing guard against a reactor doing
+// that is the emitters group's park; this is the tripwire that says so out loud.
+//
+// A PLAIN BOOL. It was an atomic because the flag was written on the shell
+// thread and read wherever a reader happened to be, and a `bool` across those
+// would have been the data race the assertion exists to catch. There is one
+// thread.
 //
 // DEBUG-ONLY COST. The load lives inside `LESH_ASSERT` and compiles out in
-// release; what remains is two relaxed stores per execution or port call, which
-// is per COMMAND and not per keystroke.
-class shell_writing_flag {
+// release; what remains is two stores per execution or port call, which is per
+// COMMAND and not per keystroke.
+class shell_executing_flag {
 public:
-	[[nodiscard]] bool writing() const noexcept {
-		return _writing.load(std::memory_order_relaxed);
-	}
+	[[nodiscard]] bool executing() const noexcept { return _executing; }
 
-	// Raised for the length of one write, ON THE SHELL THREAD. RAII rather than
-	// a pair of calls, because the write it brackets is a `virtual` the shell
-	// implements and may leave by throwing.
+	// Raised for the length of one execution. RAII rather than a pair of calls,
+	// because what it brackets is a `virtual` the shell implements and may leave
+	// by throwing.
 	class scope {
 	public:
-		explicit scope(shell_writing_flag* flag) noexcept : _flag(flag) {
-			if (_flag != nullptr)
-				_flag->_writing.store(true, std::memory_order_relaxed);
+		explicit scope(shell_executing_flag& flag) noexcept : _flag(&flag) {
+			_flag->_executing = true;
 		}
-		~scope() {
-			if (_flag != nullptr)
-				_flag->_writing.store(false, std::memory_order_relaxed);
-		}
+		~scope() { _flag->_executing = false; }
 
 		scope(const scope&) = delete;
 		scope& operator=(const scope&) = delete;
 
 	private:
-		shell_writing_flag* _flag;
+		shell_executing_flag* _flag;
 	};
 
 private:
-	std::atomic<bool> _writing{false};
+	bool _executing = false;
 };
 
 // The shell's tables, asked one name at a time.
@@ -206,7 +199,7 @@ public:
 	// #201, which is the same argument with a thread in it). #139 routed this
 	// through a round trip on the actor's `enumerate` slot; #151 deleted the
 	// slot, because a copy the loop makes for itself and a copy the shell makes
-	// for it are the same copy with one less protocol. `shell_writing_flag`
+	// for it are the same copy with one less protocol. `shell_executing_flag`
 	// above is the tripwire that keeps the argument true.
 	//
 	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
