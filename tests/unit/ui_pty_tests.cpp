@@ -2063,3 +2063,29 @@ TEST(UiPtyExecution, ReadFromAPipeAndFromAFileAreUnchangedInBothModes) {
 			<< mode_name(execution) << ": saw: " << shell.seen();
 	}
 }
+
+// #214: Tab with several matches must PAINT the menu. The pager state machine
+// always worked - keys cycled, Enter accepted - but no repaint was requested,
+// so the menu was invisible and Tab read as a hang. On the real binary, over
+// the pty, because every unit suite passed while the screen showed nothing.
+TEST(UiPtyCompletion, TabPaintsTheCompletionMenu) {
+	const scratch_home home{kRc};
+	{
+		std::ofstream a{home.path() + "/file_a.txt"};
+		std::ofstream b{home.path() + "/file_b.txt"};
+	}
+	shell_on_a_pty shell{home};
+	ASSERT_TRUE(shell.alive());
+	ASSERT_TRUE(shell.wait_for(kPrompt)) << "no prompt; saw: " << shell.seen();
+
+	shell.type("cd \"$HOME\"\r");
+	ASSERT_TRUE(shell.wait_for(kPrompt, 2)) << "saw: " << shell.seen();
+	shell.type("cat ./file_");
+	ASSERT_TRUE(shell.wait_for_uncoloured("./file_")) << "saw: " << shell.seen();
+
+	shell.type("\t");
+	EXPECT_TRUE(shell.wait_for_uncoloured("file_a.txt"))
+		<< "the menu never painted; saw: " << shell.seen();
+	EXPECT_TRUE(shell.wait_for_uncoloured("file_b.txt"))
+		<< "half a menu; saw: " << shell.seen();
+}
