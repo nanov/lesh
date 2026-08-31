@@ -391,3 +391,89 @@ TEST(Pattern, ABracketExpressionCannotSpanAPathComponent) {
 	ASSERT_EQ(out.size(), 1u);
 	EXPECT_EQ(out[0], word);
 }
+
+// --- quote removal, and the two forms of one field (#210) ---------------------
+
+TEST(Pattern, RemovingEscapesKeepsTheEscapedByteAndDropsTheBackslash) {
+	// The inverse of the escaping the expander does on the way in. Sized for the
+	// worst case, which is the input length: unescaping only ever shortens.
+	const auto unescaped = [](std::string_view pattern) {
+		std::string out(pattern.size(), '\0');
+		out.resize(remove_pattern_escapes(pattern, out.data()));
+		return out;
+	};
+
+	EXPECT_EQ(unescaped("a\\*b"), "a*b");
+	EXPECT_EQ(unescaped("plain"), "plain");
+	EXPECT_EQ(unescaped("\\\\"), "\\") << "an escaped backslash is one backslash";
+	EXPECT_EQ(unescaped("a\\"), "a\\")
+		<< "a trailing lone backslash escapes nothing, so it stands for itself - "
+		   "which is exactly what match_here does with it";
+	EXPECT_EQ(unescaped(""), "");
+	// The whole escaped alphabet, since is_pattern_syntax is wider than the three
+	// metacharacters.
+	EXPECT_EQ(unescaped("\\*\\?\\[\\]\\-\\!\\^"), "*?[]-!^");
+}
+
+TEST(Pattern, AnEscapedMetacharacterIsNotAPatternAndOpensNoDirectory) {
+	// `a\*b` names one file. Nothing in it is live, so it is not a pattern at all
+	// and the walk is refused before it starts - the same observable #204 uses.
+	// The file EXISTS here, which is the harder half: the word must not be walked
+	// even though a scan would produce the very same pathname.
+	lesh::testing::temp_path scratch;
+	{
+		std::ofstream touch(scratch.file("a*b"));
+		ASSERT_TRUE(touch.good());
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	for (const char* name : {"a\\*b", "a\\?b", "\\[a\\]", "a\\*b\\*"}) {
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_FALSE(expand_pathnames(pool, scratch.file(name), out)) << name;
+		EXPECT_EQ(out.size(), 0u) << name;
+	}
+}
+
+TEST(Pattern, TheWalkReadsThePatternAndFallsBackToTheQuoteRemovedForm) {
+	// The two forms POSIX 2.6 hands to pathname expansion and to quote removal.
+	// A live `*` beside an escaped one makes the word a pattern; only the live one
+	// wildcards, so `a\*b*` selects the file literally called `a*b` and not `aXb`.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a*b", "aXb"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	{
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("a\\*b*"),
+		                             scratch.file("a*b*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("a*b"));
+	}
+	{
+		// Nothing matched, so the word expands to itself - and then quote removal
+		// runs on it, which is the second form and not the first. Passing the
+		// pattern here instead would print the backslash the user typed.
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("a\\*q*"),
+		                             scratch.file("a*q*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("a*q*"));
+	}
+	{
+		// A LITERAL component of a globbed word is extended by name, and the name is
+		// the unescaped one: the directory really is called `a*b`.
+		lesh::testing::temp_path tree;
+		ASSERT_EQ(::mkdir(tree.file("a*b").c_str(), 0755), 0);
+		std::ofstream touch(tree.file("a*b/f"));
+		ASSERT_TRUE(touch.good());
+
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, tree.file("a\\*b/*"),
+		                             tree.file("a*b/*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], tree.file("a*b/f"));
+	}
+}
