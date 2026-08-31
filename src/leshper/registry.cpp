@@ -1641,6 +1641,17 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	const generation before = target.gen;
 	const position cursor_before = target.cursor;
+	// THE PAGER'S IDENTITY, for the repaint rule at the bottom (#214). A pager
+	// open, cycle, refilter or close changes neither the generation nor the
+	// cursor - the two things that rule compares - so without this snapshot the
+	// menu waited, invisible, for the next unrelated repaint, and Tab read as a
+	// hang. Sizes rather than contents: every mutation the pager can undergo
+	// moves at least one of these five.
+	const bool pager_open_before = target.pager.open;
+	const std::size_t pager_selected_before = target.pager.selected;
+	const std::uint16_t pager_scroll_before = target.pager.scroll_row;
+	const std::size_t pager_matching_before = target.pager.matching.size();
+	const std::size_t pager_filter_before = target.pager.filter.size();
 
 	// The handle is a member, reused: dispatch happens once per keystroke and
 	// N-2 wants the hot path free of allocation the loop did not have to do.
@@ -1806,8 +1817,15 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	// The same rule the enum path follows: an action that changed nothing asks
 	// for nothing, a mutation asks the reactors to recompute, and a bare cursor
-	// move asks only for a redraw (A-10).
-	if (target.gen != before || result.cursor_moved) {
+	// move asks only for a redraw (A-10). The pager is the third thing on screen
+	// that an action can move (#214), and it asks ONLY for the redraw: a menu is
+	// not a buffer mutation, so the reactors have nothing to recompute.
+	const bool pager_changed = target.pager.open != pager_open_before
+	                           || target.pager.selected != pager_selected_before
+	                           || target.pager.scroll_row != pager_scroll_before
+	                           || target.pager.matching.size() != pager_matching_before
+	                           || target.pager.filter.size() != pager_filter_before;
+	if (target.gen != before || result.cursor_moved || pager_changed) {
 		result.produced.push_back(render_request{});
 		if (target.gen != before)
 			result.produced.push_back(worker_request{target.gen});
