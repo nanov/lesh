@@ -62,6 +62,17 @@ size_t cursor_of(const state& s) { return s.cursor.byte_offset(); }
 constexpr char32_t backspace_key = 0x7F;
 constexpr char32_t kill_word_key = 0x17;  // Ctrl-W
 constexpr char32_t undo_key = 0x1F;       // Ctrl-_
+constexpr char32_t unix_line_discard_key = 0x15;  // Ctrl-U
+constexpr char32_t kill_line_key = 0x0B;          // Ctrl-K
+constexpr char32_t yank_key = 0x19;               // Ctrl-Y
+
+// The unnamed register, the way `leshper_vi_tests.cpp`'s cross-paradigm test
+// reads it: null means never killed, which `<nothing>` distinguishes from an
+// empty kill (#99 answer 3's "killing nothing is still a write").
+std::string killed(const state& s) {
+	const auto* entry = s.kills.get(kill_store::unnamed);
+	return entry == nullptr ? std::string{"<nothing>"} : entry->text;
+}
 
 } // namespace
 
@@ -203,6 +214,133 @@ TEST(LeshperEditor, DeleteBackwardWordEatsTrailingBlanksAndOneWord) {
 	EXPECT_EQ(text_of(s), "");
 	const effects produced = press(s, kill_word_key);
 	EXPECT_TRUE(produced.empty()); // nothing left to delete: no edit, no redraw
+}
+
+// ---------------------------------------------------------------------------
+// `unix_line_discard` and `kill_line` (#207): readline/zsh's `C-u`/`C-k`, the
+// same store `C-w` and `C-y` already reach.
+// ---------------------------------------------------------------------------
+
+TEST(LeshperEditor, UnixLineDiscardKillsFromCursorToLineStart) {
+	state s;
+	type(s, "echo one two");
+	press(s, named_key::home);
+	for (int i = 0; i < 4; ++i)
+		press(s, named_key::right);  // cursor lands after "echo"
+	press(s, unix_line_discard_key);
+	EXPECT_EQ(text_of(s), " one two");
+	EXPECT_EQ(cursor_of(s), 0u);
+	EXPECT_EQ(killed(s), "echo");
+}
+
+TEST(LeshperEditor, UnixLineDiscardAtLineStartDoesNothing) {
+	state s;
+	type(s, "abc");
+	press(s, named_key::home);
+	const effects produced = press(s, unix_line_discard_key);
+	EXPECT_TRUE(produced.empty());  // already at the start: no edit, no redraw
+	EXPECT_EQ(text_of(s), "abc");
+	EXPECT_EQ(killed(s), "<nothing>");
+}
+
+TEST(LeshperEditor, UnixLineDiscardOnAnEmptyLineDoesNothing) {
+	state s;
+	const effects produced = press(s, unix_line_discard_key);
+	EXPECT_TRUE(produced.empty());
+	EXPECT_EQ(text_of(s), "");
+	EXPECT_EQ(s.gen.value(), 0u);
+}
+
+TEST(LeshperEditor, KillLineKillsFromCursorToLineEnd) {
+	state s;
+	type(s, "echo one two");
+	press(s, named_key::home);
+	for (int i = 0; i < 4; ++i)
+		press(s, named_key::right);  // cursor lands after "echo"
+	press(s, kill_line_key);
+	EXPECT_EQ(text_of(s), "echo");
+	EXPECT_EQ(cursor_of(s), 4u);
+	EXPECT_EQ(killed(s), " one two");
+}
+
+TEST(LeshperEditor, KillLineAtLineStartKillsTheWholeLine) {
+	state s;
+	type(s, "abc");
+	press(s, named_key::home);
+	press(s, kill_line_key);
+	EXPECT_EQ(text_of(s), "");
+	EXPECT_EQ(killed(s), "abc");
+}
+
+TEST(LeshperEditor, KillLineAtLineEndDoesNothing) {
+	state s;
+	type(s, "abc");  // typing leaves the cursor at the end already
+	const effects produced = press(s, kill_line_key);
+	EXPECT_TRUE(produced.empty());
+	EXPECT_EQ(text_of(s), "abc");
+	EXPECT_EQ(killed(s), "<nothing>");
+}
+
+TEST(LeshperEditor, KillLineOnAnEmptyLineDoesNothing) {
+	state s;
+	const effects produced = press(s, kill_line_key);
+	EXPECT_TRUE(produced.empty());
+	EXPECT_EQ(text_of(s), "");
+	EXPECT_EQ(s.gen.value(), 0u);
+}
+
+TEST(LeshperEditor, KillLineThenUnixLineDiscardOverwriteTheRegisterRatherThanAppending) {
+	// kill_store.h's `put()`: "Writes `key`, replacing what was there." Two
+	// kills in a row leave the SECOND text in the register, not both joined -
+	// v1's kill store is not readline's kill RING, and this is that decision
+	// read off as a test rather than assumed.
+	state s;
+	type(s, "echo one two");
+	press(s, named_key::home);
+	press(s, kill_line_key);  // kills the whole line
+	EXPECT_EQ(killed(s), "echo one two");
+
+	type(s, "abc");
+	press(s, unix_line_discard_key);  // kills "abc", not "echo one twoabc"
+	EXPECT_EQ(killed(s), "abc");
+	EXPECT_EQ(text_of(s), "");
+}
+
+TEST(LeshperEditor, UnixLineDiscardThenYankRestoresWhatWasKilled) {
+	state s;
+	type(s, "echo hi");
+	press(s, unix_line_discard_key);
+	EXPECT_EQ(text_of(s), "");
+	EXPECT_EQ(killed(s), "echo hi");
+
+	press(s, yank_key);
+	EXPECT_EQ(text_of(s), "echo hi");
+	// emacs's `C-y` leaves point AFTER the inserted text, not on its last byte
+	// the way vi's `P` does - `leshper_vi_tests.cpp`'s cross-paradigm test
+	// names the same rule for `yank` itself.
+	EXPECT_EQ(cursor_of(s), 7u);
+}
+
+TEST(LeshperEditor, UnixLineDiscardCarriesAMultiByteGraphemeWholeIntoTheRegister) {
+	// "café": <e9> is two bytes (0xC3 0xA9), and the killed span must carry
+	// both across or the register holds a byte sequence that is not valid
+	// UTF-8 - F-3's rule, exercised here rather than assumed. `LESH_MOTION_
+	// LINE_START` finds the same boundary `beginning_of_line` already trusts;
+	// this is that trust, checked against a span that is not all ASCII.
+	state s;
+	type(s, "echo caf");
+	step(s, key_event::of(static_cast<char32_t>(0xE9)));  // e-acute, two bytes
+	type(s, " hi");
+	EXPECT_EQ(text_of(s), "echo caf\xC3\xA9 hi");
+	EXPECT_EQ(cursor_of(s), 13u);
+
+	for (int i = 0; i < 3; ++i)
+		press(s, named_key::left);  // step back over "i", "h" and the space
+	EXPECT_EQ(cursor_of(s), 10u);   // right after the e-acute
+
+	press(s, unix_line_discard_key);
+	EXPECT_EQ(text_of(s), " hi");
+	EXPECT_EQ(killed(s), "echo caf\xC3\xA9");
 }
 
 TEST(LeshperEditor, EveryBuiltInActionHasAName) {

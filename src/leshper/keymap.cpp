@@ -649,6 +649,10 @@ void keymap_registry::install_defaults() {
 	bind_notation(*emacs_map, "<C-h>", "delete_backward_char");
 	bind_notation(*emacs_map, "<BSKey>", "delete_backward_char");
 	bind_notation(*emacs_map, "<C-w>", "delete_backward_word");
+	// #207: readline/zsh's `unix-line-discard` and `kill-line`, into the same
+	// store `C-w` feeds. `C-y` below reads either back.
+	bind_notation(*emacs_map, "<C-u>", "unix_line_discard");
+	bind_notation(*emacs_map, "<C-k>", "kill_line");
 	bind_notation(*emacs_map, "<C-a>", "beginning_of_line");
 	bind_notation(*emacs_map, "<C-b>", "backward_char");
 	bind_notation(*emacs_map, "<C-_>", "undo");
@@ -672,6 +676,13 @@ void keymap_registry::install_defaults() {
 	bind_notation(*insert_map, "<C-h>", "delete_backward_char");
 	bind_notation(*insert_map, "<BSKey>", "delete_backward_char");
 	bind_notation(*insert_map, "<C-w>", "delete_backward_word");
+	// #207: zsh's compiled-in `viins` keymap binds `^U` to `vi-kill-line`
+	// (verified against zsh 5.9's `bindkey -v; bindkey -M viins`) - the same
+	// unix-line-discard `C-w`'s neighbour is in emacs. `^K` and `^Y` are
+	// `self-insert` there, so neither joins this map: vi tradition reaches
+	// them through command mode's `D`/`dd` and `p`, not through insert-mode
+	// keys of their own.
+	bind_notation(*insert_map, "<C-u>", "unix_line_discard");
 	bind_notation(*insert_map, "<Left>", "backward_char");
 	bind_notation(*insert_map, "<Home>", "beginning_of_line");
 	bind_notation(*insert_map, "<Esc>", "vi_command_mode");
