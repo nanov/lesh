@@ -72,6 +72,21 @@ namespace lesh::runtime {
 	       c == '!' || c == '^';
 }
 
+// Copies `pattern` with its escapes removed, writing to `out` - which must have
+// room for pattern.size() bytes - and returning how many bytes it wrote.
+//
+// This is POSIX 2.6's quote removal, which runs LAST, after pathname expansion:
+// a pattern that took part in a walk still has to lose its backslashes before it
+// can name a file. The inverse of the escaping above, and it lives here rather
+// than in the expander because the WALK needs it too - a LITERAL component of a
+// globbed word, the `a\*b` of `a\*b/*`, is extended by name instead of scanned
+// for, and the name is the unescaped one. One decoder for the one encoding,
+// which is what the rest of this header is about.
+//
+// A trailing lone backslash is KEPT, because that is what the matcher does with
+// it: with no byte left to escape, it stands for itself.
+[[nodiscard]] size_t remove_pattern_escapes(std::string_view pattern, char* out) noexcept;
+
 // Longest or shortest match anchored at one end, for ${x#pat} and friends.
 // Returns the number of bytes matched, or npos when nothing matched - zero is a
 // legitimate result, since `*` matches the empty string.

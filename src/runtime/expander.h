@@ -320,8 +320,12 @@ private:
 	// The code inside backquotes, with the escapes POSIX 2.6.3 removes.
 	[[nodiscard]] std::string_view unescape_backquotes(std::string_view code,
 	                                                   bool in_double_quotes) noexcept;
-	// Bytes that arrived QUOTED: escaped in a pattern context, verbatim otherwise.
+	// Bytes that arrived QUOTED: escaped in a pattern context; verbatim in the
+	// field otherwise, and escaped in the PATTERN FORM beside it when one is being
+	// built - see _pattern.
 	void append_quoted(std::string_view bytes, expand_context ctx) noexcept;
+	// Marks the next byte appended to the field as DATA in the pattern form.
+	void escape_in_pattern() noexcept;
 	// Bytes that came out of an EXPANSION: escaped only when the expansion itself
 	// was inside double quotes, because an unquoted `${a}` in a pattern is a
 	// pattern - `w='ab\bc' a='*'; ${w#${a}b}` matches while `${w#"${a}b"}` does not.
@@ -400,6 +404,29 @@ private:
 	// Set when a glob metacharacter arrived from unquoted text. Quoted ones are
 	// literal, so `echo "*.txt"` must not touch the filesystem.
 	bool _field_globbable = false;
+
+	// The PATTERN FORM of the field under construction: the same bytes as
+	// _current, except that one which arrived QUOTED is preceded by a backslash.
+	//
+	// A SECOND form rather than escaping _current itself, because POSIX 2.6 gives
+	// pathname expansion and quote removal different text and the field is what
+	// quote removal produced. Escaping in place and unescaping at the end cannot
+	// be right: `\Q` arriving in a VARIABLE'S VALUE is a live pattern escape that
+	// quote removal must LEAVE (`x='\Q'; echo *$x` prints `*\Q`) while the `\Q` a
+	// user typed must go (`echo *\Q` prints `*Q`), and one backslash cannot say
+	// which it was. So the field stays exactly what it was before #210 and the
+	// walk gets its own copy - non-null only in expand_word, and only where
+	// pathname expansion could read it.
+	//
+	// Written only from the first quoted metacharacter of a field onwards: until
+	// then the two forms are the same bytes, which _field_escaped records and
+	// which is every field in almost every script. escape_in_pattern catches it up.
+	arena_array<char>* _pattern = nullptr;
+	// One pattern form per completed field, in the order finish_field emitted them,
+	// so pattern_fields[k] belongs to the field at out[before_fields + k].
+	arena_array<std::string_view>* _pattern_fields = nullptr;
+	// Whether _pattern holds this field. False means "the field IS its pattern".
+	bool _field_escaped = false;
 
 	// Whether the text just expanded held a `"$@"` with no positional parameters,
 	// and whether it held anything else. POSIX: `"$@"` with nothing to expand

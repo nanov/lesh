@@ -55,24 +55,29 @@ void expand_component(const std::string& dir, std::string_view component,
 
 } // namespace
 
-bool expand_pathnames(buffer_pool& pool, std::string_view word,
+bool expand_pathnames(buffer_pool& pool, std::string_view pattern,
+                      std::string_view quote_removed,
                       arena_array<std::string_view>& out) {
 	// POSIX 2.13.1's bracket rule is applied HERE rather than at the expander's
 	// segment gate, because it is a question about the whole word: an unterminated
 	// `[` is an ordinary character, and this is the first place the assembled word
 	// exists to be asked about. Returning false is the observable that says no
 	// directory was opened - it is the statement before the walk.
-	if (!is_pattern(word))
+	//
+	// Asked of the PATTERN form, which is the one that still knows which
+	// metacharacters arrived quoted: `a\*b` holds no live `*` and is not a pattern
+	// at all, so it costs no directory scan either (#210).
+	if (!is_pattern(pattern))
 		return false;
 
-	const bool absolute = !word.empty() && word[0] == '/';
+	const bool absolute = !pattern.empty() && pattern[0] == '/';
 	std::vector<std::string> current;
 	current.emplace_back(absolute ? "/" : "");
 
 	size_t at = absolute ? 1 : 0;
-	while (at <= word.size()) {
-		const size_t slash = word.find('/', at);
-		const std::string_view component = word.substr(
+	while (at <= pattern.size()) {
+		const size_t slash = pattern.find('/', at);
+		const std::string_view component = pattern.substr(
 			at, slash == std::string_view::npos ? std::string_view::npos : slash - at);
 		const bool is_last = slash == std::string_view::npos;
 
@@ -105,7 +110,15 @@ bool expand_pathnames(buffer_pool& pool, std::string_view word,
 					std::string full = dir;
 					if (!full.empty() && full.back() != '/')
 						full += '/';
-					full.append(component);
+					// Quote removal, on this component alone. A literal component is
+					// extended by NAME, and the name is the one the matcher would
+					// have read had the component been scanned for: `a\*b/*` looks
+					// inside the directory called `a*b` (#210). Written in place -
+					// unescaping only ever shortens, so the reserved room is exact.
+					const size_t base = full.size();
+					full.resize(base + component.size());
+					full.resize(base + remove_pattern_escapes(component,
+					                                          full.data() + base));
 					if (is_last) {
 						struct stat st;
 						if (::lstat(full.c_str(), &st) != 0)
@@ -124,15 +137,19 @@ bool expand_pathnames(buffer_pool& pool, std::string_view word,
 
 	// A trailing slash is part of the word: `*/` selects directories and keeps the
 	// slash, which is how `for d in */` is written.
-	if (!word.empty() && word.back() == '/') {
+	if (!pattern.empty() && pattern.back() == '/') {
 		for (auto& path : current)
 			if (path.empty() || path.back() != '/')
 				path += '/';
 	}
 
 	if (current.empty()) {
-		// Nothing matched: POSIX says the word expands to ITSELF, unchanged.
-		out.push(intern(pool, word));
+		// Nothing matched: POSIX says the word expands to ITSELF, unchanged - and
+		// then quote removal runs on it, which is why this is the quote-removed
+		// form rather than the pattern. `echo a\*b` with no such file prints `a*b`,
+		// while `x='\Q'; echo *$x` prints `*\Q`: a backslash the USER wrote is
+		// removed here and one that arrived in a VALUE was never quoting at all.
+		out.push(intern(pool, quote_removed));
 		return true;
 	}
 
