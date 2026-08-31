@@ -331,14 +331,15 @@ has held for all five steps.
   LEFT ALONE (#212).** The unit `classify_command` cannot interrupt is one name's
   whole walk, a `::stat` plus, on a hit, an `::access` per `$PATH` entry, and the
   numbers say leave it: over this machine's real 35-entry `$PATH`, release, a
-  full miss is 27–78 µs (a name the kernel has been asked about before against
+  full miss is 18–36 µs (a name the kernel has been asked about before against
   one it has not — a typed prefix is always the second, since `g`, `gi` and `git`
-  are three names), a hit mid-`$PATH` is 11–17 µs, and a name a table answers is
+  are three names), a hit mid-`$PATH` is 8 µs, and a name a table answers is
   10 ns with no walk at all. Through the real loop the worst keystroke wait
-  observed was **114 µs**, against a 50 ms watchdog. An ordinary line walks one
+  observed was **114 µs** — and that under load average 34, with three other
+  agents on the machine — against a 50 ms watchdog. An ordinary line walks one
   to four times — once per pipeline stage — and the token's memo makes a repeated
   name free within the highlight. Yielding per stat would spend ~35 yields
-  (~0.22 µs each) to shorten a 40 µs slice, which is the stride rule above read
+  (~0.22 µs each) to shorten a 35 µs slice, which is the stride rule above read
   backwards; and it would not buy the thing the ticket feared, because a yield
   BETWEEN stats cannot shorten one stat that blocks — a hung mount in `$PATH`
   freezes the loop for the length of that single syscall either way. The measurement

@@ -582,18 +582,19 @@ int main() {
 	// Measured on the dev machine when this landed (#212), release, arm64,
 	// macOS, APFS, `$PATH` with 35 entries:
 	//
-	//   one stat+access, name asked before          0.61 us
-	//   one stat+access, name never asked           1.17 us
-	//   full walk, 35 entries, name asked before   21.3  us
-	//   full walk, 35 entries, name never asked    41.1  us
-	//   full walk, 20 fresh empty directories      38.8  us
-	//   walks per keystroke, ordinary lines            1-3
-	//   keystroke wait through the loop, max       ~45    us
+	//   one stat+access, name asked before          0.34 us
+	//   one stat+access, name never asked           1.5  us
+	//   full walk, 35 entries, name asked before    18.0 us
+	//   full walk, 35 entries, name never asked     35.4 us
+	//   full walk, 20 fresh empty directories       31.5 us
+	//   walks per keystroke, ordinary lines            1-4
+	//   keystroke wait through the loop, max        86-109 us
 	//
-	// So the un-yielded slice is tens of microseconds against a 50 ms watchdog
-	// and a 160 us keystroke budget: three orders of magnitude of headroom, and
-	// a yield inside the walk would buy ~40 us of latency for a syscall's worth
-	// of poll per stat. #212 changed nothing on the strength of these numbers.
+	// So the un-yielded slice is tens of microseconds against a 50 ms watchdog:
+	// nearly three orders of magnitude of headroom, and a yield inside the walk
+	// would buy ~35 us of latency at ~35 yields per walk - the stride rule
+	// (`history_search::poll_every`) read backwards. #212 changed nothing on the
+	// strength of these numbers.
 	//
 	// WHAT THESE NUMBERS DO NOT SAY, and it is the issue's own scenario: a
 	// yield BETWEEN stats cannot help a single stat that blocks. The un-yielded

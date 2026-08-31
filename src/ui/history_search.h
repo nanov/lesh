@@ -228,7 +228,7 @@ public:
 	// polls immediately before each command NAME, whose `$PATH` walk is a stat
 	// per directory (ADR-0009), and that is why this constant lives here, on the
 	// walk that knows its unit is nanoseconds, rather than on the yield itself.
-	// #212 measured that walk - 27-78 us over a 35-entry `$PATH`, worst keystroke
+	// #212 measured that walk - 18-36 us over a 35-entry `$PATH`, worst keystroke
 	// wait 114 us against a 50 ms watchdog - and left it un-yielded inside.
 	//
 	// A power of two so the test is a mask.
