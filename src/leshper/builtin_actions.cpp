@@ -121,6 +121,53 @@ int32_t delete_backward_word(lesh_editor* editor, const lesh_invocation*, void*)
 	return lesh_buffer_replace(editor, from, cursor, nullptr, 0);
 }
 
+// readline/zsh's `unix-line-discard`, emacs's `C-u`. The other half of
+// `delete_backward_word`'s argument: every kill feeds the one store, and this
+// is the second of the emacs side's built-ins to reach it, motion swapped
+// from `LESH_MOTION_PREV_WORD` to `LESH_MOTION_LINE_START` and nothing else -
+// the store does not care which motion found the span.
+int32_t unix_line_discard(lesh_editor* editor, const lesh_invocation*, void*) {
+	size_t cursor = 0;
+	int32_t status = lesh_cursor_get(editor, &cursor);
+	if (status != LESH_OK)
+		return status;
+	size_t from = 0;
+	status = lesh_position_move(editor, cursor, LESH_MOTION_LINE_START, &from);
+	if (status != LESH_OK)
+		return status;
+	if (from >= cursor)
+		return LESH_OK;  // already at the start of the line: nothing to kill
+	// See `delete_backward_word`'s note on truncation over the same scratch: a
+	// span past the scratch is dropped and not stored, never stored truncated.
+	char killed[kCandidateBytes];
+	size_t length = 0;
+	if (lesh_buffer_read(editor, from, cursor, killed, sizeof(killed), &length) == LESH_OK)
+		lesh_kill_set(editor, nullptr, killed, length, LESH_KILL_CHARWISE);
+	return lesh_buffer_replace(editor, from, cursor, nullptr, 0);
+}
+
+// readline/zsh's `kill-line`, emacs's `C-k` - the forward twin of
+// `unix_line_discard` above. Charwise, like both its neighbours: `C-k` kills
+// what is ahead on the same line, not the line as vi's `dd` means it, and `p`
+// after it must put the bytes back inline rather than on a line of their own.
+int32_t kill_line(lesh_editor* editor, const lesh_invocation*, void*) {
+	size_t cursor = 0;
+	int32_t status = lesh_cursor_get(editor, &cursor);
+	if (status != LESH_OK)
+		return status;
+	size_t to = 0;
+	status = lesh_position_move(editor, cursor, LESH_MOTION_LINE_END, &to);
+	if (status != LESH_OK)
+		return status;
+	if (to <= cursor)
+		return LESH_OK;  // already at the end of the line: nothing to kill
+	char killed[kCandidateBytes];
+	size_t length = 0;
+	if (lesh_buffer_read(editor, cursor, to, killed, sizeof(killed), &length) == LESH_OK)
+		lesh_kill_set(editor, nullptr, killed, length, LESH_KILL_CHARWISE);
+	return lesh_buffer_replace(editor, cursor, to, nullptr, 0);
+}
+
 int32_t backward_char(lesh_editor* editor, const lesh_invocation*, void*) {
 	return cursor_to(editor, LESH_MOTION_PREV_CLUSTER);
 }
@@ -542,6 +589,8 @@ constexpr builtin builtins[] = {
 	{"self_insert", self_insert},
 	{"delete_backward_char", delete_backward_char},
 	{"delete_backward_word", delete_backward_word},
+	{"unix_line_discard", unix_line_discard},
+	{"kill_line", kill_line},
 	{"backward_char", backward_char},
 	{"forward_char", forward_char},
 	{"beginning_of_line", beginning_of_line},
