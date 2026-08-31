@@ -295,6 +295,7 @@ TEST(LeshperKeymapRegistry, TheEmacsDefaultsAreTheHardcodedTableMovedIn) {
 	const std::pair<const char*, const char*> expected[] = {
 		{"<BS>", "delete_backward_char"},   {"<C-h>", "delete_backward_char"},
 		{"<BSKey>", "delete_backward_char"}, {"<C-w>", "delete_backward_word"},
+		{"<C-u>", "unix_line_discard"},      {"<C-k>", "kill_line"},
 		{"<C-a>", "beginning_of_line"},
 		{"<C-e>", "accept_suggestion_or_end_of_line"},
 		{"<C-b>", "backward_char"},
@@ -334,6 +335,33 @@ TEST(LeshperKeymapRegistry, TheAcceptTableIsTheSameSixInEmacsAndViInsert) {
 		ASSERT_NE(in_insert, nullptr) << written;
 		EXPECT_EQ(*in_emacs, *in_insert) << written << " differs between the two modes";
 	}
+}
+
+TEST(LeshperKeymapRegistry, UnixLineDiscardIsSharedButKillLineAndYankAreEmacsOnly) {
+	// #207: zsh's compiled-in `viins` keymap (verified against zsh 5.9's
+	// `bindkey -v; bindkey -M viins`) binds `^U` to `vi-kill-line` but leaves
+	// `^K` and `^Y` as `self-insert` - vi tradition reaches those two through
+	// command mode's `D`/`dd` and `p` instead. So `<C-u>` joins `vi_insert`
+	// the way `<C-w>` already does, and `<C-k>`/`<C-y>` stay emacs-only.
+	keymap_registry maps;
+	maps.install_defaults();
+	const keymap* emacs = maps.find(keymap_registry::emacs);
+	const keymap* insert = maps.find(keymap_registry::vi_insert);
+	ASSERT_NE(emacs, nullptr);
+	ASSERT_NE(insert, nullptr);
+
+	ASSERT_NE(emacs->action_for(keys("<C-u>")), nullptr);
+	ASSERT_NE(insert->action_for(keys("<C-u>")), nullptr);
+	EXPECT_EQ(*emacs->action_for(keys("<C-u>")), "unix_line_discard");
+	EXPECT_EQ(*insert->action_for(keys("<C-u>")), "unix_line_discard");
+
+	ASSERT_NE(emacs->action_for(keys("<C-k>")), nullptr);
+	EXPECT_EQ(*emacs->action_for(keys("<C-k>")), "kill_line");
+	EXPECT_EQ(insert->action_for(keys("<C-k>")), nullptr);
+
+	ASSERT_NE(emacs->action_for(keys("<C-y>")), nullptr);
+	EXPECT_EQ(*emacs->action_for(keys("<C-y>")), "yank");
+	EXPECT_EQ(insert->action_for(keys("<C-y>")), nullptr);
 }
 
 TEST(LeshperKeymapRegistry, ViCommandAcceptsWordsOnWAndEAndKeepsBPure) {
