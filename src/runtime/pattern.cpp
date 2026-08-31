@@ -302,6 +302,19 @@ bool is_pattern(std::string_view word) noexcept {
 	return false;
 }
 
+size_t remove_pattern_escapes(std::string_view pattern, char* out) noexcept {
+	size_t written = 0;
+	for (size_t i = 0; i < pattern.size(); ++i) {
+		// The escaped byte is kept and the backslash is not - and a backslash with
+		// nothing after it is kept, exactly as match_here reads it: that branch
+		// tests `p + 1 < pattern.size()` too, so a trailing one compares as data.
+		if (pattern[i] == '\\' && i + 1 < pattern.size())
+			++i;
+		out[written++] = pattern[i];
+	}
+	return written;
+}
+
 size_t match_prefix(std::string_view pattern, std::string_view text, bool longest) noexcept {
 	// Try every split point. Shortest wants the first hit, longest the last, and
 	// both must consider zero length because `*` matches empty.
