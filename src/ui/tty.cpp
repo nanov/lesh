@@ -27,7 +27,7 @@ exit_restore_state g_exit_restore;
 // while the target group is alive. We hand only to our OWN group (ADR-0009: the
 // child claims the terminal itself between fork and exec), so the liveness test
 // is a signal-zero rather than fish's `waitpid`, and the bound is what stops a
-// group that died mid-retry from spinning the loop thread.
+// group that died mid-retry from spinning the loop.
 constexpr int kTransferRetries = 32;
 
 // Restores, then gets out of the way. Async-signal-safe throughout: the

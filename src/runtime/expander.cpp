@@ -7,6 +7,7 @@
 #include "runtime/glob.h"
 #include "runtime/pattern.h"
 
+#include "substrate/assert.h"
 #include "substrate/char_utils.h"
 
 #include "syntax/lexer.h"
@@ -247,6 +248,12 @@ std::string_view substitution_body(std::string_view segment) noexcept {
 } // namespace
 
 void expander::append(std::string_view bytes) noexcept {
+	// The pattern form only exists once a quoted metacharacter has diverged it -
+	// until then the field is its own pattern, so this costs one branch per run of
+	// bytes and nothing else.
+	if (_field_escaped)
+		for (const char c : bytes)
+			_pattern->push(c);
 	for (const char c : bytes)
 		_current->push(c);
 	// Content, so any separator run is over even when `bytes` is empty: `''` after
@@ -312,9 +319,27 @@ void expander::append_split(std::string_view bytes,
 // for telling the matcher that an asterisk is an asterisk.
 void expander::append_quoted(std::string_view bytes, expand_context ctx) noexcept {
 	if (!ctx.pattern) {
-		append(bytes);
+		// An ordinary word has no escape channel in the FIELD - the field is what
+		// quote removal produced, and `echo "*"` prints one asterisk - so the escape
+		// goes into the pattern form beside it, which is what the walk reads (#210).
+		// Without one being built there is nothing to say and this is quote removal.
+		if (_pattern == nullptr || bytes.empty()) {
+			append(bytes);
+			return;
+		}
+		for (const char c : bytes) {
+			if (is_pattern_syntax(c))
+				escape_in_pattern();
+			push_byte(c);
+		}
 		return;
 	}
+	// A true pattern context - a `case` pattern or a `${x#pat}` argument - escapes
+	// the FIELD, because there the field IS the pattern and nothing else reads it.
+	// The two channels are mutually exclusive by construction: a pattern role is
+	// one_value and so builds no pattern form, and every other pattern context
+	// arrives through expand_to_value, which puts the outer one aside.
+	LESH_ASSERT(_pattern == nullptr);
 	for (const char c : bytes) {
 		if (is_pattern_syntax(c))
 			_current->push('\\');
@@ -327,7 +352,17 @@ void expander::append_value(std::string_view bytes, expand_context ctx) noexcept
 	// Only a value that was inside double quotes is data. An unquoted one is a
 	// PATTERN, which is what makes `${w#${a}b}` and `${w#"${a}b"}` differ when a
 	// holds an asterisk - param-p.tst's 'parameter expansion in embedded pattern'.
-	append_quoted(bytes, ctx.double_quoted ? ctx : expand_context{.pattern = false});
+	if (ctx.double_quoted) {
+		append_quoted(bytes, ctx);
+		return;
+	}
+	// Verbatim in BOTH forms, backslashes and metacharacters alike. Spelled out
+	// rather than passed to append_quoted under a context with `pattern` cleared,
+	// which is what this used to be: that context was indistinguishable from an
+	// ordinary word's, so the day quoted bytes started escaping into a pattern
+	// form beside the field (#210) an unquoted value would have escaped into it
+	// too - and `x='*'; echo $x` would have stopped globbing.
+	append(bytes);
 }
 
 // The interior of an expansion with its LINE CONTINUATIONS removed - except inside
@@ -411,8 +446,27 @@ expander::expand_context expander::brace_ctx(expand_context ctx) noexcept {
 void expander::push_byte(char c) noexcept {
 	_run = split_run::none;
 	_run_closed_a_field = false;
+	if (_field_escaped)
+		_pattern->push(c);
 	_current->push(c);
 	_field_started = true;
+}
+
+// The pattern form's one divergence point: the byte about to be appended arrived
+// QUOTED, so the matcher has to be told it is data.
+//
+// Catching the pattern form up here rather than mirroring every byte into it is
+// what keeps a field with no quoting at exactly its old cost - and it is safe
+// because the two forms are byte-for-byte equal until this fires: nothing else
+// writes to one and not the other.
+void expander::escape_in_pattern() noexcept {
+	if (!_field_escaped) {
+		const std::string_view so_far{_current->data(), _current->size()};
+		for (const char c : so_far)
+			_pattern->push(c);
+		_field_escaped = true;
+	}
+	_pattern->push('\\');
 }
 
 // Closes the field under construction. Returns whether a field was actually
@@ -436,6 +490,23 @@ bool expander::finish_field(arena_array<std::string_view>& out, bool even_if_emp
 	out.push(std::string_view(block, n));
 	_current->truncate(0);
 	_field_started = false;
+	// The pattern form of the field just emitted, in lockstep with `out` so the
+	// two can be indexed together. A field with no quoted metacharacter in it is
+	// its own pattern and SHARES the block rather than copying it, which is every
+	// field in almost every script.
+	if (_pattern_fields != nullptr) {
+		if (!_field_escaped) {
+			_pattern_fields->push(std::string_view(block, n));
+		} else {
+			const size_t m = _pattern->size();
+			char* escaped = nullptr;
+			_pool.allocate(m, escaped);
+			std::memcpy(escaped, _pattern->data(), m);
+			_pattern_fields->push(std::string_view(escaped, m));
+			_pattern->truncate(0);
+		}
+	}
+	_field_escaped = false;
 	return true;
 }
 
@@ -604,6 +675,11 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 				// Quoting suppresses pathname expansion: `echo "*.txt"` must print
 				// *.txt, not a filename. So a field is only glob-eligible when a
 				// metacharacter arrived from unquoted text.
+				//
+				// ELIGIBLE, not a pattern. This sees one segment, and a bracket
+				// expression can open in one and close in another - `[a$x` with x=`]`
+				// globs - so the segment test stays generous on purpose and
+				// expand_pathnames decides on the assembled word (#204).
 				if (ctx.split && has_pattern_characters(body))
 					_field_globbable = true;
 				// Backslash removal is part of quote removal, and which bytes a
@@ -629,7 +705,13 @@ expansion_status expander::expand_text(std::string_view text, expand_context ctx
 							continue;
 						}
 					}
-					if (ctx.pattern && ctx.double_quoted)
+					// Inside double quotes every literal byte arrived QUOTED, so it is
+					// data to a matcher: escaped into the field where the field IS the
+					// pattern, and into the pattern form beside it where one is being
+					// built - `echo "a*b"*` matches the file literally called `a*b` and
+					// nothing else (#210). The two channels are append_quoted's to
+					// choose between; this only has to route the byte to it.
+					if (ctx.double_quoted && (ctx.pattern || _pattern != nullptr))
 						append_quoted(body.substr(i, 1), ctx);
 					else if (ctx.split && ctx.substituted)
 						append_split(body.substr(i, 1), out);
@@ -1227,12 +1309,22 @@ std::string_view expander::expand_to_value(std::string_view text,
 	arena_array<char>* const outer_current = _current;
 	const bool outer_started = _field_started;
 	const bool outer_globbable = _field_globbable;
+	// A VALUE is not pathname-expanded, so it needs no pattern form - and the
+	// enclosing word's must be put aside rather than written into: the fields this
+	// produces go to `discard`, so a pattern form pushed here would leave
+	// _pattern_fields one entry ahead of the `out` it is indexed against.
+	arena_array<char>* const outer_pattern = _pattern;
+	arena_array<std::string_view>* const outer_pattern_fields = _pattern_fields;
+	const bool outer_escaped = _field_escaped;
 
 	arena_array<char> accumulator{_pool, 64};
 	arena_array<std::string_view> discard{_pool, 4};
 	_current = &accumulator;
 	_field_started = false;
 	_field_globbable = false;
+	_pattern = nullptr;
+	_pattern_fields = nullptr;
+	_field_escaped = false;
 	const split_run outer_run = _run;
 	const bool outer_run_closed = _run_closed_a_field;
 	_run = split_run::none;
@@ -1249,6 +1341,9 @@ std::string_view expander::expand_to_value(std::string_view text,
 	_current = outer_current;
 	_field_started = outer_started;
 	_field_globbable = outer_globbable;
+	_pattern = outer_pattern;
+	_pattern_fields = outer_pattern_fields;
+	_field_escaped = outer_escaped;
 	_run = outer_run;
 	_run_closed_a_field = outer_run_closed;
 	return {block, n};
@@ -1310,6 +1405,19 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	arena_array<char> accumulator{_pool, 64};
 	_current = &accumulator;
 	_field_started = false;
+	// The escaped form of each field, for the walk to read. Built only where it
+	// could be read: a one_value role is not pathname-expanded, and `set -f`
+	// switches pathname expansion off entirely - in both cases the field is the
+	// only answer anyone wants, and the buffers are sized so that asking for them
+	// costs one arena byte.
+	const bool build_pattern = _glob_enabled && !one_value;
+	arena_array<char> pattern_accumulator{_pool, build_pattern ? 64u : 1u};
+	arena_array<std::string_view> pattern_fields{_pool, build_pattern ? 4u : 1u};
+	if (build_pattern) {
+		_pattern = &pattern_accumulator;
+		_pattern_fields = &pattern_fields;
+	}
+	_field_escaped = false;
 	// One word, one separator state: a run left over from the previous word would
 	// swallow the first byte of this one.
 	_run = split_run::none;
@@ -1323,11 +1431,23 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	const expansion_status status = expand_text(text, ctx, out);
 	finish_field(out, /*even_if_empty=*/one_value);
 
-	if (_glob_enabled && _field_globbable) {
+	// `build_pattern` rather than `_glob_enabled` alone, which is the same test:
+	// every site that sets _field_globbable is guarded by ctx.split, and a
+	// one_value role has it off - so a word with no pattern form could not have
+	// been glob-eligible either, and saying so keeps the indexing below in range
+	// however that changes.
+	if (build_pattern && _field_globbable) {
+		// finish_field pushed one pattern form per field, in the same order, so the
+		// two arrays are indexed together. Nothing between the two loops emits a
+		// field, which is what makes that an invariant rather than a hope.
+		LESH_ASSERT(pattern_fields.size() == out.size() - before_fields);
 		arena_array<std::string_view> globbed{_pool, out.size() - before_fields + 4};
 		bool any = false;
 		for (size_t i = before_fields; i < out.size(); ++i) {
-			if (expand_pathnames(_pool, out[i], globbed))
+			// The walk reads the escaped form and falls back to the field: `a\*b*`
+			// matches the file literally called `a*b` and nothing else, and `echo
+			// a\*b*` with no such file prints `a*b` (#210).
+			if (expand_pathnames(_pool, pattern_fields[i - before_fields], out[i], globbed))
 				any = true;
 			else
 				globbed.push(out[i]);
@@ -1340,6 +1460,8 @@ expansion_status expander::expand_word(const syntax::tree& t, syntax::node_index
 	}
 
 	_current = nullptr;
+	_pattern = nullptr;
+	_pattern_fields = nullptr;
 	return status;
 }
 

@@ -179,7 +179,8 @@ link failure, not a review comment. Two rules are load-bearing and worth saying
 out loud — **leshper never includes `ui/` or `runtime/`** (the editor declares
 shapes; the host fills them in over shell state), and `lesh_ui` is the ONE
 library that links both halves. The editor/host line runs between the last two:
-`loop`, `tty`, `workers` and `shell_actor` are `src/ui/` (#168 Phase A), so
+`loop`, `tty`, the reactor fibers and the shell handoff are `src/ui/` (#168
+Phase A; #202), so
 nothing under `src/leshper/` holds a thread, a descriptor or a clock; the
 highlighter, the autosuggester, the history search and the completion sources are
 `src/ui/` too (#168 Phase B), so **`lesh_leshper` links `lesh_substrate` and
@@ -255,7 +256,7 @@ _Avoid_: front end, dialect.
 Two senses, and both are in use. The layer as a whole is everything an
 interactive shell has that `lesh -c` does not — leshper, prompts, rendering.
 `src/ui/` is the narrower thing: the **host**. It owns the poll loop, the
-terminal, the timers, the workers, the shell handoff, and the session that runs
+terminal, the timers, the reactor fibers, the shell handoff, and the session that runs
 an interactive shell to its end; it drives leshper by sending **events** and
 performing **effects**, and by nothing else. It also holds every piece of
 KNOWLEDGE the editing experience needs (#168 Phase B): the highlighter and the
@@ -279,6 +280,9 @@ side is the **UI**; the legacy-or-next axis is gone entirely - #28 deleted
 `src/legacy/`, the `LESH_FRONTEND` variable and `spec_run.py --frontend` with
 it, so there is one shell and nothing to select between.
 _Avoid_: the word itself, in every sense.
+_Note_: the one `LESH_*` variable that selects anything today is
+`LESH_EXECUTION=inline` (#208), and it selects an **execution mode** inside the
+one shell rather than a shell — the accept path's stack, nothing else.
 
 **Shell state** _[lesh]_:
 Variables, scopes, functions, aliases, options, working directory, and `$?`. Read by
@@ -397,7 +401,8 @@ adding a mode is registering keymaps and actions.
 
 **Reactor** _[lesh]_:
 A subscriber to editor state-change events that computes derived state —
-decorations and proposals — asynchronously on a worker. Never mutates buffer,
+decorations and proposals — on a **fiber** of its own, sliced by the loop
+(#202; it was a helper thread until then). Never mutates buffer,
 cursor or selection. The highlighter and the autosuggester are reactors, and both
 are the **host**'s (`src/ui/reactors.cpp`, #168 Phase B) because what they compute
 is knowledge; they reach the editor through the ABI, the way a Lua reactor would.
@@ -460,7 +465,7 @@ empty so a copied **state** compares and costs the same as the original.
 
 **Host** _[lesh]_:
 Whatever drives the editor — `src/ui/` in the shell, a fake in a test. It owns
-the loop, the terminal, the timers, the workers and the shell handoff; it owns
+the loop, the terminal, the timers, the reactor fibers and the shell handoff; it owns
 **everything the editor is not allowed to know** — the shell's tables, the
 history, the syntax, the completion sources, the reactors that use them; and it
 sends **events** in and performs the **effects** that come back. The editor never
@@ -468,8 +473,8 @@ calls it except through the one interface it declares for exactly that,
 `leshper::host` (`host.h`): a borrowed pointer on the registry, answering
 `lesh_request_command_kind` and carrying out `want_completion`. A question raised
 there is an **effect** value and its answer is an **event** value, the same
-vocabulary the deferred half uses, so a question that moves to a worker later is
-a change on the host's side and nowhere else.
+vocabulary the deferred half uses, so a question that moves off the host's own
+stack later is a change on the host's side and nowhere else.
 _Avoid_: calling the host "leshper", or a driver "the editor"; a second interface
 between the two — there is one door and it is `leshper::host`.
 
@@ -548,37 +553,183 @@ A counter bumped on every buffer mutation. An async result carries the
 generation it was computed against; a stale result is dropped, structurally.
 
 **Topic** _[lesh]_:
-A source of loop events — `tty`, `signal`, `worker`, `timer`. The loop polls
+A source of loop events — `tty`, `signal`, `timer`, `watch`. Four since #202,
+which took the `worker` topic with the pool that wrote to it. The loop polls
 topics and drains each into events; a topic's file descriptor or deadline
 is its implementation detail. A plugin's fd-readable hook is one more topic.
 _Avoid_: naming the fd; the topic is what the editor sees.
 
 **Quiesce** _[lesh]_:
-Parking every worker at a known-idle point, holding no lock, before the
-loop thread forks — the only thing that makes `fork()` safe in a threaded
-shell, since the child inherits every other thread's held locks frozen.
-Resumed after the command is reaped. Needed because lesh runs shell code in
-forked children (subshells); fish, which only ever execs, does not park and
-relies on the child touching nothing before exec — lesh does both.
+Handing the terminal back and parking the **emitters** group before the fork,
+plus superseding whatever those fibers had in flight. It used to be parking every
+WORKER THREAD at a known-idle point holding no lock — the only thing that made
+`fork()` safe in a threaded shell, since the child inherits every other thread's
+held locks frozen — and #202 made that structural instead: a lesh process has one
+thread, so a fork here is taken from a single-threaded moment by construction.
+What parking still buys is F-22's rule, that nothing computes for a line which
+has already run and nothing it computed is applied. Resumed after the command is
+reaped.
 
-**Shell thread** _[lesh]_:
-The main thread: the one owner of shell state. Executes at accept; while a
-line is edited it serves three latest-wins slots — `execute`, `port_call`,
-`highlight` — one at a time, so a writing action and a reading highlighter
-never overlap. Everything else in the process is stateless or owns only
-editor state.
-_Avoid_: reading shell state from any other thread; a definitions version or
-concurrent collection for it — one owner makes both unnecessary (ADR-0009).
+**Fiber** _[lesh]_:
+A stackful coroutine in the loop's own `fiber::scheduler` (`src/fiber/`, #198;
+minicoro under `third_party/`). Long-lived and never called: it parks on a
+channel, the host is the only thing that resumes it, and every yield returns to
+the host — there is no fiber call stack (#145). Since #202 every **reactor** has
+one, in the `emitters` **group**, and a turn gives each runnable one a slice
+before and after the UI part; since #208 EXECUTION has one too, in a lane of its
+own, and a turn slices both sets with one mask because they are never runnable at
+the same time.
+_Avoid_: a fiber per event; calling a fiber; resuming one from inside another.
 
-**Loop thread** _[lesh]_:
-The **host's** spawned thread — `src/ui/loop.cpp`, not leshper's (#168): owns
-editor state and the tty while editing, waits in `poll` on its topics, blocks
-across execution, and drops any shell-thread message whose generation is not
-current. It keeps the previous frame's INPUT beside the previous frame, so that
-a resize can re-lay it at the new size and answer where the terminal has moved
-that frame's top row to (#185; `loop_options::assume_reflow` picks the model).
-That it is a thread at all is the host's private choice; the editor it drives is
-told nothing about it.
+**Slice** _[lesh]_:
+One resume of one fiber: it runs until it yields, parks or returns (#198). The
+unit the tick hands out — a turn gives every runnable **emitter** one before the
+UI part and one after — and the unit the debug watchdog measures, because a slice
+that runs 50 ms without yielding is a frozen terminal. A slice is bounded by the
+fiber's OWN cancellation poll and never by the host: there is no preemption.
+_Avoid_: "a task", "a job"; and never assume a compute is one slice.
+
+**Emitter** _[lesh]_:
+A **reactor** whose output is a function of a buffer state and whose lifetime is
+the LINE's: the highlighter and the autosuggester (#145, ADR-0011). Superseded on
+every edit, cancelled and parked at accept, alive for the next line. Fed by a
+**slot**, so latest-wins is correct for it.
+_Avoid_: calling one a worker; "effect" (leshper already uses that for the
+editor's outbound commands).
+
+**Observer** _[lesh]_:
+A **reactor** that consumes EVENTS rather than buffer states — a line was
+accepted — and whose lifetime is the SESSION's: history persistence, and
+recording or telemetry plugins later (#145, ADR-0011). Latest-wins is a BUG for
+one: it must see every event, in order. Its channel is an ordered `queue<T,N>`,
+its group stays runnable through `boundary`, and it has no members yet.
+_Avoid_: giving an observer a **slot**; cancelling one on supersede.
+
+**Cooperation** _[lesh]_:
+What the runtime wants of whatever is hosting it — `runtime::cooperation`
+(`src/runtime/cooperation.h`, #199). Three verbs: `on_command_boundary()`, called
+where the executor already polls `g_pending`; `wait_child(pid, flags, status)`
+(#208), whose no-op implementation IS `::waitpid`; and `await_readable(fd)` (#209),
+said by `read` before each blocking read, whose no-op implementation is EMPTY —
+which is why neither of the last two moved a behaviour. NEVER NULL: `shell_state` starts with a static no-op, so
+`lesh -c`, a script, a test and a forked child all cooperate with nobody at the
+cost of an indirect call. The name says "cooperation" and never "fibers" on
+purpose - the runtime must not learn what is on the other side.
+_Avoid_: a null check; a template parameter; naming a scheduler from the runtime;
+a `waitpid` anywhere in `src/runtime/` except `reap`'s one line; giving
+`await_readable` a return value — a verb that could report an error would put the
+host inside `read`'s POSIX behaviour.
+
+**Reap** _[lesh]_:
+`tree_walking_executor::reap(pid, flags, &status)`, the runtime's ONE wait (#208).
+All seven former direct `waitpid` calls go through it and it is nothing but
+`_state.cooperation().wait_child(...)`. `WUNTRACED` stays where the file already
+had it: the foreground simple command and the foreground `( )`, which are the two
+waits Ctrl-Z can reach.
+_Avoid_: adding a wait beside it; a null check; taking `WUNTRACED` off a
+foreground wait "for symmetry".
+
+**Block-or-park** _[lesh]_:
+`fiber::scheduler::block_or_park(slot, run_blocking, enlist)` — the ONE place in
+the tree where "is there a fiber to park" is asked (#208). Null `current()` runs
+the blocking thing inline and answers with it; on a fiber it enlists the caller's
+`await_slot`, parks, and answers with what the completer stored. Completing from
+inside `enlist` means the fiber never parks. `src/fiber/` sees no pid and no fd:
+the waiter table is the host's, on the awaiting fiber's own frozen frame.
+_Avoid_: a second `current() == nullptr` branch anywhere; putting a pid or an fd
+in `src/fiber/`; reaping `-1`.
+
+**Awaiter** _[lesh]_:
+One outstanding wait, on the waiting fiber's own frozen frame — a probe
+(`bool(void* self, intptr_t& answer)`), the `void*` it reads, the descriptor the
+turn's poll set needs (`-1` for a child, whose wake is the SIGCHLD byte) and the
+`await_slot`. ONE TABLE FOR EVERY KIND OF WAIT since #211: `event_loop::_awaits`
+is a fixed array of eight pointers, `service_awaits()` is the one servicer, and
+`awaited()` the one counter. The pid, its flags, the status pointer and the fd
+live in the caller's frame, so `src/fiber/` still sees neither.
+
+**Fd interest** _[lesh]_:
+One fiber's question about one descriptor, for the length of one wait (#209) — an
+`awaiter` whose `fd` is set, appended to the poll set each turn. It is NOT a
+topic: nothing drains it, so the byte that ended the wait is still in the kernel
+for the waiter's own `::read`. That is also how the tty gets back into the poll
+set during `executing`, where #208 took its topic out.
+_Avoid_: draining an interest; a `revents` mapping back from the poll set
+(`service_awaits` asks per waiter, which is what gives it the enlist probe for
+free); waiting on a descriptor `poll` reports POLLNVAL for.
+
+**Group** _[lesh]_:
+A scheduler tag, eight of them, that parks a SET of fibers with one bit (#200).
+Also called a LANE when the point is which kind of work it holds rather than how
+it is parked - #145's word, and the reason `loop.h` calls a reactor's fiber,
+slot and storage its `reactor_lane`.
+`emitters = 0` are the per-line reactors — the highlighter and the autosuggester,
+superseded on every edit and parked at accept; `observers = 1` is reserved for the
+session-lived kind (history persistence, telemetry) and has no members yet;
+`execution = 2` holds the one execution fiber and is NEVER parked by phase, because
+it is what the phase is about (#208). Which of the other groups are runnable is
+derived from the **phase** and never written beside it.
+
+**Phase** _[lesh]_:
+Where an interactive session is: `editing`, `executing`, `boundary`
+(`ui/loop.h`, #202). Written at exactly two places — `quiesce()`, which is the
+accept path's park, and `resume_after_execution()`, which runs when `execute`
+returns — and the emitters group's bit is written FROM it. Since #208 it also says
+what a turn polls: while `executing` the tty and timer topics are OUT of the poll
+set, render is suppressed, and the signal topic's events are deferred rather than
+dispatched.
+
+**Execution fiber** _[lesh]_:
+The fiber an accepted line runs on (#208): `for(;;){ line = inbox.recv();
+done.send(shell.execute(line)); }`, in the `execution` lane, 8 MB of reserve stack
+(16 under ASan), spawned on the first accepted line and parked on its inbox
+between commands. Its point is that `reap` can PARK: the host keeps turning while
+a command runs, so the signal topic and the history's watch stay alive — and since
+#209 an interactive `read` parks there too, so the loop is live for as long as a
+user is willing to think.
+_Avoid_: a second one; calling it; assuming a line is one slice — a line with a
+foreground command in it is at least two.
+
+**Execution mode** _[lesh]_:
+Which of the two ways the host runs an accepted line (`loop_options::execution`,
+`LESH_EXECUTION=inline`, #208). `on_a_fiber` is the default; `inline_` runs
+`execute` on the host's own stack with `current()` null throughout and every wait a
+blocking `::waitpid`, which is the shell exactly as it ran before #208. Both are
+first-class and both are covered by `UiLoop*` and `UiPty*`. The inline path is
+also what an action's `port_call` and the EXIT trap take regardless of the mode,
+because neither has a fiber under it.
+_Avoid_: calling `inline_` a fallback in code; branching on the mode below
+`event_loop`.
+
+**Slot** _[lesh]_:
+A capacity-one conflating channel, `fiber::slot<T>` (`src/fiber/slot.h`, #198).
+The UI writes into one per reactor and OVERWRITE IS CANCELLATION: every send bumps
+a counter that supersedes every outstanding token, which the reactor reads at its
+next cancellation poll. The only channel v1 has; an ordered `queue<T,N>` arrives
+with its first customer, which is the `observers` group.
+
+**Shell side** _[lesh]_:
+The one owner of shell state — `shell_side::execute` and `port_call` over the
+executor (`src/ui/session.cpp`). It executes at accept and runs an action's
+shell code, and nothing reads shell state while either is running. It was the
+main THREAD serving three latest-wins slots (`execute`, `port_call`,
+`highlight`) until #201 deleted them: the loop calls the two verbs, so the
+serialization is a call stack rather than a channel. Everything else in the
+process is stateless or owns only editor state.
+_Avoid_: reading shell state from another thread; a definitions version or
+concurrent collection for it — one owner makes both unnecessary (ADR-0011). There
+is no other thread to read from since #202.
+
+**Loop** _[lesh]_:
+The **host's** poll loop — `src/ui/loop.cpp`, not leshper's (#168): owns editor
+state and the tty while editing, waits in `poll` on its topics, and drops any
+result whose generation is not current. It runs ON MAIN since #201 (it was a
+spawned thread, and `run()` is now what `session::run` calls), which makes the
+shell-state reactor a call in place rather than a message. It keeps the previous
+frame's INPUT beside the previous frame, so that a resize can re-lay it at the
+new size and answer where the terminal has moved that frame's top row to (#185;
+`loop_options::assume_reflow` picks the model). Which thread it is on is the
+host's private choice; the editor it drives is told nothing about it.
 
 **Replay file** _[lesh]_:
 The structured (jsonl) record of every loop input — key events, resize,

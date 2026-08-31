@@ -93,8 +93,8 @@ struct uuidv7 {
 }
 
 // The injected clock (#196), and the flag that says whether there is one. Not
-// atomic and not a member: it is test-only, it is read on the loop thread with
-// every other piece of `add`'s state, and a shipping build never writes it.
+// atomic and not a member: it is test-only, it is read wherever `add` reads the
+// rest of its state, and a shipping build never writes it.
 bool g_now_overridden = false;
 std::uint64_t g_now_override = 0;
 
@@ -280,9 +280,9 @@ private:
 
 // One dedup table per thread, reused across walks.
 //
-// THREAD-LOCAL AND NOT A MEMBER, because two workers can walk the same history
-// at the same time and a member would be shared scratch on a lock-free read
-// path. Not a stack array either, because a fixed capacity would mean a long
+// THREAD-LOCAL AND NOT A MEMBER, because two walks can be in flight at once - a
+// reactor fiber suspended mid-walk while another reactor's slice starts one of
+// its own - and a member would be shared scratch on a lock-free read path. Not a stack array either, because a fixed capacity would mean a long
 // history silently stops deduplicating - and "the newest wins" would become
 // "the newest usually wins", which is not a rule.
 //
@@ -291,11 +291,12 @@ private:
 thread_local seen_commands t_seen;
 thread_local bool t_seen_in_use = false;
 
-// Borrows the thread's table, or brings its own if a walk is already using it.
+// Borrows the table, or brings its own if a walk is already using it.
 //
-// A NESTED WALK IS NOT A THING THAT HAPPENS TODAY - the searcher's sink does
-// not walk history - but the failure if it ever did would be silent and would
-// look like a dedup bug three layers away. Five lines here instead.
+// AN OVERLAPPING WALK IS NOT A THING THAT HAPPENS TODAY - the searcher's sink
+// does not walk history, and the two reactors that do never hold a walk across
+// each other's slices - but the failure if one ever did would be silent and
+// would look like a dedup bug three layers away. Five lines here instead.
 class seen_scope {
 public:
 	seen_scope() {
@@ -654,8 +655,9 @@ void store::resolve_pending(std::int32_t exit_code) {
 		return;
 
 	// COPY-ON-WRITE. Views hold `shared_ptr<const item>`, so a walk that is in
-	// flight on another thread is reading the item as it was; the resolution
-	// replaces the pointer and only the NEXT view sees it.
+	// flight - suspended in a fiber, or a future I/O thread's - is reading the
+	// item as it was; the resolution replaces the pointer and only the NEXT view
+	// sees it.
 	auto resolved = std::make_shared<item>(*_new_items.back());
 	resolved->pending = false;
 	resolved->exit_code = exit_code;
@@ -984,8 +986,8 @@ auto store::snapshot() const noexcept -> std::shared_ptr<const view> {
 void store::for_each_merged_newest_first(
 	const std::function<bool(const merged_entry&)>& fn) const {
 	// ONCE, AT THE TOP. Everything below reads a graph that nothing will modify
-	// - a mutation on the loop thread builds a new view and swaps the pointer,
-	// and this one keeps its mapping alive by refcount until the walk returns.
+	// - a mutation builds a new view and swaps the pointer, and this one keeps
+	// its mapping alive by refcount until the walk returns.
 	const std::shared_ptr<const view> taken = snapshot();
 	if (!taken)
 		return;

@@ -12,7 +12,6 @@
 #include <functional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace {
@@ -33,13 +32,14 @@ using lesh::leshper::virtual_text;
 // only agreement left to keep is #138's - already asserted beside the pager
 // doors below.
 
-// A thread's identity as a plain integer, so no header needs <thread> to hold
-// one. Never zero, because zero means "no owner" on a dead handle.
-std::uint64_t current_thread_key() noexcept {
-	const std::uint64_t key =
-		static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-	return key == 0 ? 1 : key;
-}
+// THERE IS NO THREAD KEY (#211 §1.3). `current_thread_key` hashed
+// `std::this_thread::get_id()` and every handle and token mint stamped it -
+// unconditionally, in release - so that `handle_is_live` and `token_is_live`
+// could refuse an accessor called from the wrong thread. There is no other
+// thread: #201 put the loop on main and #202 turned the helper pool into fibers,
+// which run on main too. What is left of the check is `call_token`, which is the
+// half that catches the bug ADR-0008 is actually about - an action stashing the
+// handle and using it after the call.
 
 // ---------------------------------------------------------------------------
 // Handle validity (ADR-0008: valid for the receiving call, loop thread only).
@@ -1195,6 +1195,14 @@ int32_t lesh_request_superseded(const lesh_request* request, int32_t* out) {
 	LESH_REQUEST_HANDLE(request);
 	if (out == nullptr)
 		return LESH_ERR_INVAL;
+	// THE POLL IS ALSO THE YIELD (#202). See `lesh_request::cooperate` for why
+	// this hangs off the cancellation poll rather than off a verb of its own, and
+	// why it runs BEFORE the flag is read: the host may dispatch a keystroke while
+	// this call is suspended, and that keystroke is what sets the flag. Null - a
+	// reactor running on the host's own stack - and the load below is the whole
+	// function, exactly as it was.
+	if (request->cooperate != nullptr)
+		request->cooperate(request->cooperate_userdata);
 	*out = request->superseded != nullptr
 	       && request->superseded->load(std::memory_order_relaxed) ? 1 : 0;
 	return LESH_OK;
@@ -1614,12 +1622,11 @@ difference diff_of(std::string_view was, std::string_view now) noexcept {
 } // namespace
 
 bool handle_is_live(const editor_handle* handle) noexcept {
-	return handle != nullptr && handle->live() && handle->target != nullptr
-	    && handle->owner_thread == current_thread_key();
+	return handle != nullptr && handle->live() && handle->target != nullptr;
 }
 
 bool token_is_live(const request_token* token) noexcept {
-	return token != nullptr && token->live() && token->owner_thread == current_thread_key();
+	return token != nullptr && token->live();
 }
 
 action_result loop_harness::invoke(state& target, std::string_view name,
@@ -1634,6 +1641,17 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	const generation before = target.gen;
 	const position cursor_before = target.cursor;
+	// THE PAGER'S IDENTITY, for the repaint rule at the bottom (#214). A pager
+	// open, cycle, refilter or close changes neither the generation nor the
+	// cursor - the two things that rule compares - so without this snapshot the
+	// menu waited, invisible, for the next unrelated repaint, and Tab read as a
+	// hang. Sizes rather than contents: every mutation the pager can undergo
+	// moves at least one of these five.
+	const bool pager_open_before = target.pager.open;
+	const std::size_t pager_selected_before = target.pager.selected;
+	const std::uint16_t pager_scroll_before = target.pager.scroll_row;
+	const std::size_t pager_matching_before = target.pager.matching.size();
+	const std::size_t pager_filter_before = target.pager.filter.size();
 
 	// The handle is a member, reused: dispatch happens once per keystroke and
 	// N-2 wants the hot path free of allocation the loop did not have to do.
@@ -1660,7 +1678,6 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	_handle.outcome = static_cast<std::uint8_t>(loop_outcome::none);
 	_handle.exit_status = 0;
 	_handle.depth = 0;
-	_handle.owner_thread = current_thread_key();
 	_handle.call_token = ++_registry->calls;
 
 	lesh_invocation crossing{};
@@ -1679,7 +1696,6 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 	// receiving call" that a check can catch. What follows is the loop reading
 	// its own staging area, which it owns and which no handle guards.
 	_handle.call_token = 0;
-	_handle.owner_thread = 0;
 
 	const difference change = diff_of(target.buffer.text(), _handle.staged);
 
@@ -1801,8 +1817,15 @@ action_result loop_harness::invoke(state& target, std::string_view name,
 
 	// The same rule the enum path follows: an action that changed nothing asks
 	// for nothing, a mutation asks the reactors to recompute, and a bare cursor
-	// move asks only for a redraw (A-10).
-	if (target.gen != before || result.cursor_moved) {
+	// move asks only for a redraw (A-10). The pager is the third thing on screen
+	// that an action can move (#214), and it asks ONLY for the redraw: a menu is
+	// not a buffer mutation, so the reactors have nothing to recompute.
+	const bool pager_changed = target.pager.open != pager_open_before
+	                           || target.pager.selected != pager_selected_before
+	                           || target.pager.scroll_row != pager_scroll_before
+	                           || target.pager.matching.size() != pager_matching_before
+	                           || target.pager.filter.size() != pager_filter_before;
+	if (target.gen != before || result.cursor_moved || pager_changed) {
 		result.produced.push_back(render_request{});
 		if (target.gen != before)
 			result.produced.push_back(worker_request{target.gen});
@@ -1843,7 +1866,6 @@ std::vector<reactor_batch> loop_harness::react(const state& target, std::uint32_
 		token.spans = &batch.spans;
 		token.texts = &batch.texts;
 		token.proposals = &batch.proposals;
-		token.owner_thread = current_thread_key();
 		token.call_token = ++_registry->calls;
 
 		batch.status = entry.fn(&token, entry.userdata);

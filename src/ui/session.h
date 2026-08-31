@@ -25,10 +25,11 @@
 // WHAT HAPPENED TO `read(providers) -> line`. #94 fixed leshper's entry as
 // `read(providers) -> line`: a call that takes a provider bundle and answers one
 // accepted line. ADR-0009 arrived after it and inverted the ownership - the LOOP
-// is a thread and drives the read; the shell is the main thread and serves the
-// loop's slots - so the accepted line is DELIVERED to `shell_side::execute`
-// rather than returned to a caller that is, by then, parked in
-// `shell_actor::run`. What survives unchanged is the part #94 was actually
+// drives the read - so the accepted line is DELIVERED to `shell_side::execute`
+// rather than returned to a caller. #201 took the thread out of that sentence
+// and left the inversion: the loop runs on main and CALLS `execute`, so the
+// delivery is a call the loop makes rather than a slot the shell serves. What
+// survives unchanged is the part #94 was actually
 // about: the bundle. `run_interactive_shell` takes one, the four providers are
 // named types (history is filled in by the ui itself when left null - it is
 // editor state, not a shell fact, #193), and #102's `vared` passes a different bundle to the nested read
@@ -83,9 +84,9 @@ using history_recorder = history::store;
 // `vared` can be handed the trivially-complete one (F-17) without a second code
 // path - which is #94's own acceptance test for A-5.
 //
-// SYNCHRONOUS, ON THE THREAD THAT ASKS. #94's recorded exception: 38.7 us
-// against N-1's 1 ms budget, and F-35's accept-or-insert decision cannot wait
-// for a worker, because the user has already pressed Enter.
+// SYNCHRONOUS, IN THE CALL THAT ASKS. #94's recorded exception: 38.7 us against
+// N-1's 1 ms budget, and F-35's accept-or-insert decision cannot wait for a
+// reactor's next slice, because the user has already pressed Enter.
 class syntax_layer {
 public:
 	syntax_layer() = default;
@@ -227,8 +228,8 @@ struct provider_bundle {
 
 	// The OTHER half of #94's `HistoryStore`, and the only non-const member here.
 	// `history_source` above is the read side, which is all the searcher and the
-	// autosuggester ever need; recording an accepted line is the shell's, on the
-	// shell thread, and it is a different verb with a different owner. Null means
+	// autosuggester ever need; recording an accepted line is the shell's, at the
+	// boundary, and it is a different verb with a different owner. Null means
 	// nothing is recorded - F-17's `vared`, and every test that must not write to
 	// the user's own history.
 	//
@@ -270,13 +271,16 @@ struct provider_bundle {
 //
 // WHAT IT BUILDS, and it builds all of it here because a non-interactive shell
 // must build NONE of it (#101): the editing context (actions, reactors, the
-// autosuggester, the default keymaps), the helper pool, the signal hub, the
-// event loop, the shell actor, and the four adapters over `shell_state`.
+// autosuggester, the default keymaps), the history, the signal hub, the event
+// loop - which brings a `fiber::scheduler` and one fiber per reactor with it -
+// and the four adapters over `shell_state`.
 //
 // WHAT IT DOES, in order: install the fatal-signal terminal restore, take the
-// dispositions, spawn the loop thread, and serve the loop's slots on THIS
-// thread - which is the main thread and the owner of `shell_state` - until the
-// editor is finished. Then join, restore the terminal, and return.
+// dispositions, and RUN THE LOOP on this thread - which is main, the thread that
+// forks and the owner of `shell_state` - until the editor is finished. Then
+// restore the terminal and return. There is nothing to spawn and nothing to
+// join (#201, #202): the loop calls `execute` where it used to fill a slot, and
+// the reactors are fibers it slices.
 //
 // `in` and `out` are the descriptors the loop is a function over; nothing here
 // opens `/dev/tty`, which is what lets the pty test drive the whole session.

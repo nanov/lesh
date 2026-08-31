@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/cooperation.h"
 #include "runtime/expander.h"
 #include "runtime/signals.h"
 #include "syntax/parser.h"
@@ -574,6 +575,35 @@ public:
 		// and -1 it stays.
 		if (role == subshell_role::detached)
 			_tty_fd = -1;
+
+		// A FOURTH FACT, AND IT IS NOT ROLE-DEPENDENT (#202, the question #199
+		// recorded): A CHILD COOPERATES WITH NOBODY.
+		//
+		// `_cooperation` is a pointer into the PARENT's host, and `fork()` copies
+		// it. While the only implementation was the static no-op that could not
+		// matter; the moment a real host is installed it does, because a forked
+		// non-exec child - a subshell, `&` on shell code, a non-external pipeline
+		// stage, a command substitution - goes on running shell code and reaches a
+		// command boundary at every command it runs. Left inherited, the child
+		// would call into an object describing its parent's session: a scheduler
+		// whose fibers do not exist in this address space in any runnable sense, a
+		// terminal it does not own, and a queue whose other end is a process that
+		// will never read it.
+		//
+		// UNCONDITIONAL, unlike the fd above. The fd has one exception because a
+		// foreground `( )` genuinely manages the terminal for the jobs it runs; there
+		// is no matching exception here, because nothing a child can do makes its
+		// parent's host the right thing to talk to. The verb is the same for every
+		// role: cooperate with nobody, which is what every non-interactive shell
+		// does anyway.
+		//
+		// WHERE THIS IS NOT ENOUGH, written down rather than discovered later: the
+		// child of an `exec`less fork whose parent installed a host is covered
+		// because every such fork runs through this function (executor.cpp's two
+		// `enter_subshell` call sites plus `run_pipeline`'s). A future fork site that
+		// runs shell code WITHOUT calling `enter_subshell` would inherit the pointer,
+		// and the fix then is to call this, not to null-check at the boundary.
+		_cooperation = &noop_cooperation();
 	}
 
 	[[nodiscard]] signal_state& signals() noexcept { return _signals; }
@@ -636,6 +666,32 @@ public:
 		_prompt_console = console;
 	}
 	[[nodiscard]] prompt_console* prompts() const noexcept { return _prompt_console; }
+
+	// --- cooperation (#199, step 1a of #145) -----------------------------------
+	//
+	// WHOEVER IS HOSTING THIS SHELL, and the third thing installed on the consoles'
+	// terms above with ONE difference that decides the shape: it is NEVER NULL. See
+	// runtime/cooperation.h for why - "nobody is waiting for a command boundary" is
+	// a behaviour with an empty body, not an absence to be null-checked at a call
+	// site inside the command loop.
+	//
+	// NON-OWNING and per-shell, like the consoles: the interactive wiring site owns
+	// the host and lends this view of it for the life of the session. A shell nobody
+	// installed anything on - `lesh -c`, a script, a unit test - keeps
+	// `noop_cooperation()`, which has static storage duration and nothing to free.
+	//
+	// A REFERENCE parameter rather than a pointer, so there is no spelling for
+	// installing null. Taking it away again is `set_cooperation(noop_cooperation())`
+	// and reads as what it is.
+	//
+	// AND A FORKED CHILD COOPERATES WITH NOBODY (#202, answering the question #199
+	// recorded here). `enter_subshell` resets this to `noop_cooperation()` for
+	// every role, beside the `_tty_fd` clear it already did for the same class of
+	// reason - see the argument there. So a `( )`, an `&`, a `$( )` and a pipeline
+	// stage all run their shell code cooperating with nobody, which is what a
+	// non-interactive shell does anyway.
+	void set_cooperation(runtime::cooperation& host) noexcept { _cooperation = &host; }
+	[[nodiscard]] runtime::cooperation& cooperation() const noexcept { return *_cooperation; }
 
 	// --- extension builtins (#165) ---------------------------------------------
 	//
@@ -738,6 +794,9 @@ private:
 	// which is what a prompt-configuration builtin will answer "no line editor"
 	// from, exactly as `bind` does today.
 	prompt_console* _prompt_console = nullptr;
+	// Non-owning; see set_cooperation. NEVER NULL - the static no-op is what a
+	// shell nobody hosts cooperates with, so the runtime has no null check for it.
+	runtime::cooperation* _cooperation = &noop_cooperation();
 	// Non-owning; see set_extension_builtins. A view of a `constexpr` array with
 	// static storage duration, held as a pointer and a count rather than a
 	// `std::span` member so that `extension_builtin` may stay incomplete here.

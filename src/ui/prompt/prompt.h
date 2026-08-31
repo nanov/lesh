@@ -1027,13 +1027,12 @@ enum class place_result : std::uint8_t {
 // re-read - a slot that is not due is copied, not recomputed. A changed `$?` or a
 // changed `$PWD` is a NEW PROMPT and goes through `render_full`.
 //
-// LOOP-THREAD ONLY, like every other registry here (#93). No locking anywhere,
-// and the rule is really "one thread at a time": #157's wiring calls
-// `render_full` from the SHELL thread, in the window ADR-0009 gives it while the
-// loop is blocked in `wait_on_shell` - the same window `loop_options::prompt` has
-// been written in since #129. `render_tick` is the loop's own. See
-// `session::refresh_prompt` in `ui/session.cpp`, where the argument is made in
-// full.
+// ONE CALLER AT A TIME, like every other registry here (#93). No locking
+// anywhere: #157's wiring calls `render_full` from the shell side, inside the
+// `execute` the loop called - the same window `loop_options::prompt` has been
+// written in since #129, and one thread rather than two since #201.
+// `render_tick` is the loop's own. See `session::refresh_prompt` in
+// `ui/session.cpp`, where the argument is made in full.
 class engine {
 public:
 	engine();
@@ -1349,9 +1348,8 @@ inline std::int32_t set_placements(lesh_registry* registry, std::uint32_t surfac
 // `next_wake()`'s own zero carried through - a static prompt causes zero idle
 // wakeups (§6.10) and that has to survive this conversion.
 //
-// PURE, and in the header, because the wiring that arms the timer runs on the
-// loop thread inside a session and the arithmetic is the part worth testing on
-// its own. A wiring site is hard to reach from a test; a function is not.
+// PURE, and in the header, because the wiring that arms the timer runs inside a
+// session's loop and the arithmetic is the part worth testing on its own. A wiring site is hard to reach from a test; a function is not.
 //
 // PAST-DUE CLAMPS TO ONE TICK rather than to zero: a deadline that has already
 // gone by means the loop was busy, and the answer is "fire at the next

@@ -1,15 +1,15 @@
 #pragma once
 
-// The event loop: `poll(2)`, six topics, and quiesce (#129; #128's resolution;
-// architecture spec §4 and §4.1; ADR-0009).
+// The event loop: `poll(2)`, four topics, and quiesce (#129; #128's resolution;
+// architecture spec §4 and §4.1; ADR-0011).
 //
-// THE HOST'S, AND IN `src/ui/` SINCE #168. This file drives leshper; it is not
-// part of it. The editor is `step(state, event, now) -> effects` and knows no
-// thread, fd, poll, timer or mailbox; everything on this side of that sentence -
-// the loop, the tty, the workers, the timers, the shell handoff - is the host,
-// which sends events in and performs the effects that come back. `lesh_ui` links
-// both `lesh_leshper` and `lesh_runtime`, so the arrow that used to be a rule
-// about includes is now a rule about which target a file is compiled into.
+// THE HOST'S. This file drives leshper; it is not part of it. The editor is
+// `step(state, event, now) -> effects` and knows no thread, fd, poll, timer or
+// mailbox; everything on this side of that sentence - the loop, the tty, the
+// reactor fibers, the timers, the shell handoff - is the host, which sends events
+// in and performs the effects that come back. `lesh_ui` links both `lesh_leshper`
+// and `lesh_runtime`, so the arrow that used to be a rule about includes is a
+// rule about which target a file is compiled into.
 //
 // ONE BACKEND, AND NO SEAM FOR A SECOND. `poll(2)`, POSIX, one file. #115
 // measured wake-to-callback at 1.8-2.4 us on every backend with the run-to-run
@@ -20,35 +20,39 @@
 // the last of those specifically, because XNU doubles its slack and #115
 // measured the 2:1 timer gap that came of it.
 //
-// TOPICS ARE THE VOCABULARY (the owner's word). Six of them, and the fd is
-// each one's implementation detail:
+// TOPICS ARE THE VOCABULARY (the owner's word), and the fd is each one's
+// implementation detail:
 //
 //   `tty`     bytes from the terminal, decoded by #111's `input_decoder`.
 //   `signal`  a self-pipe. The handler saves errno, bumps a counter, writes one
 //             byte, and does nothing else that could be unsafe.
-//   `worker`  #126's completion queue. Answered with `drain()`, NEVER by
-//             reading the fd - see below, it is the one rule that loses a
-//             wakeup permanently when broken.
 //   `timer`   no fd at all: the poll timeout is `min(deadlines) - now` on a
 //             monotonic clock, and `lesh_timer_start` is the public door.
-//   `shell`   ADR-0009's wakeup pipe from the shell thread, drained the same
-//             way the worker topic is.
-//   `watch`   §8's `fd-readable` hook, and the sixth topic (#195). A descriptor
-//             somebody else owns plus a callback the loop runs ON THE LOOP
-//             THREAD when it is readable. Its one user is the history's
-//             directory watch (ADR-0010 §Locking and staleness), which is
-//             `inotify` on Linux and a `kqueue` on macOS, and which the loop
-//             deliberately knows nothing about: what it holds is an int and a
-//             function pointer.
+//   `watch`   §8's `fd-readable` hook (#195). A descriptor somebody else owns
+//             plus a callback the loop runs inside the turn when it is readable.
+//             Its one user is the history's directory watch (ADR-0010 §Locking
+//             and staleness), which is `inotify` on Linux and a `kqueue` on
+//             macOS, and which the loop deliberately knows nothing about: what
+//             it holds is an int and a function pointer.
 //
-// THAT IS WHAT "TOPIC" BOUGHT over "a list of descriptors": the sixth arrived as
-// two members and three lines in `turn`, and nothing that reasons about the tty
-// or the workers had to learn it exists.
+// THAT IS WHAT "TOPIC" BOUGHT over "a list of descriptors": one arrives as two
+// members and three lines in `turn`, and one leaves the same way, without
+// anything that reasons about the tty having to learn about it.
 //
-// A TURN: poll -> drain the topics into events -> `editor.step` each -> if
-// anything changed, `lay_out` -> `blit.update(previous, desired)` -> write. The
-// loop keeps the previous surface, because #112's blitter deliberately keeps no
-// "actual screen" of its own that could drift out of step with the terminal.
+// A TURN: a reactor slice each -> poll -> drain the topics into events ->
+// `editor.step` each -> a reactor slice each -> `lay_out` ->
+// `blit.update(previous, desired)` -> write. The loop keeps the previous
+// surface, because #112's blitter deliberately keeps no "actual screen" of its
+// own that could drift out of step with the terminal.
+//
+// THE REACTOR SLICES ARE THE TICK (ADR-0011). This loop owns a
+// `fiber::scheduler` and gives every registered reactor a long-lived fiber in
+// the `emitters` group; the poll timeout is 0 while any of them is still
+// runnable. CANCELLATION IS THE BUFFER-CHANGE GENERATION BUMP and nothing else
+// (#90's rule, unchanged): a cursor move that leaves the buffer alone cancels
+// nothing, and a reactor mid-walk notices the send at its next cancellation
+// poll - which is also the point at which it yields. A SLICE IS BOUNDED BY THE
+// REACTOR'S OWN POLL, not by the host.
 //
 // THE CORE IS A FUNCTION OVER FDS PASSED IN. Nothing here opens `/dev/tty` or
 // assumes `STDIN_FILENO`: the tests drive it over pipes and `openpty` pairs,
@@ -56,39 +60,44 @@
 // the identical path. That is the test contract #128 wrote, and it is the
 // reason the terminal rules live in tty.h where they can be exercised alone.
 //
-// TWO OWNER THREADS (ADR-0009). This loop is a SPAWNED thread. The shell is the
-// main thread and owns `shell_state`; the loop owns editor state and the
-// terminal while editing. It hosts neither the port nor the highlighter: an
-// action's shell code is `shell.post(port_call) ; wait on the shell topic`, and
-// the highlighter is submitted to the shell thread's `highlight` slot rather
-// than to the helper pool. The helpers keep the state-free work - history
-// search, the autosuggester, path checks.
+// THIS LOOP RUNS ON MAIN, AND MAIN IS THE ONLY THREAD. `run()` is what
+// `ui/session.cpp` calls. The loop owns editor state and the terminal, the shell
+// owns `shell_state`, and the loop reaches the shell by CALLING
+// `shell_side::execute` and `shell_side::port_call`. The highlighter and the
+// autosuggester run here too, each on a fiber of its own, so the process has no
+// helper threads and no locks at all.
 //
-// QUIESCE, AND WHY IT IS TWO LAYERS. `quiesce()` is helpers parked plus the
-// terminal restored and given up; the fork then happens on the shell thread
-// with the loop blocked in this same poll. Parking is the load-bearing layer
-// because lesh forks to RUN SHELL CODE - subshells, `&`, non-external pipeline
-// stages - which allocates in the child at once, and a child born beside a
-// thread holding malloc's lock deadlocks on its first allocation. fish does not
-// park and does not need to: every fish fork execs. The exec lanes take fish's
+// QUIESCE. `quiesce()` is the emitters group parked plus the terminal restored
+// and given up; the fork then happens inside the `execute` this loop calls, on
+// this thread, from a process that is single-threaded by construction. What
+// parking the group buys is F-22's rule: at accept every emitter is superseded
+// and its group is parked, so nothing computes for a line that has already run
+// and nothing it computed is applied. The exec lanes take fish's
 // async-signal-safe discipline anyway, and that half lives in
 // substrate/fork_guard.h.
 //
 // ALLOCATION (N-2, and tests/unit/allocation_tests.cpp is the gate). Everything
 // a turn touches is a member that keeps its capacity: the read buffer, the
-// event vector, the completion vector, the shell inbox, the blitter's output
-// string, the pollfd array. A warm turn allocates nothing.
+// event vector, each reactor lane's two snapshots and its batch, the blitter's
+// output string, the pollfd array. A warm turn allocates nothing - which is why
+// a lane owns TWO snapshots and swaps them at `recv` rather than moving one
+// through the slot: a moved-from string has given its capacity away.
 
 #include "leshper/blit.h"
 #include "leshper/decode.h"
 #include "leshper/editor.h"
 #include "leshper/layout.h"
+#include "leshper/host.h"
 #include "leshper/registry.h"
-#include "ui/shell_actor.h"
 #include "leshper/state.h"
 #include "leshper/surface.h"
+#include "fiber/scheduler.h"
+#include "fiber/slot.h"
+#include "runtime/cooperation.h"
+#include "ui/reactor_call.h"
+#include "ui/shell_knowledge.h"
+#include "ui/shell_side.h"
 #include "ui/tty.h"
-#include "ui/workers.h"
 #include "substrate/grapheme.h"
 
 #include <array>
@@ -97,11 +106,11 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <poll.h>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
 
 namespace lesh::ui {
@@ -117,28 +126,10 @@ namespace lesh::ui {
 // carries the same rule for the same reason).
 inline constexpr int kMaxTrackedSignal = 32;
 
-// Blocks the hub's caught set - SIGINT, SIGCHLD, SIGWINCH - on the CALLING
-// thread, and answers false if `pthread_sigmask` refused.
-//
-// DELIVERY IS PINNED TO THE SHELL THREAD, and this is the whole mechanism (#142).
-// A process-directed signal is delivered to any one thread that does not block
-// it, so before this existed a Ctrl-C could land on the loop thread, on a helper,
-// or on main, chosen by the kernel afresh each time. Every thread the host spawns
-// calls this first thing in its body; main does not, so main is the one thread
-// left unblocked and the handler runs there - which is where it ran before
-// leshper existed at all.
-//
-// THE INVARIANT, and it is the reason the block goes on the spawned threads
-// rather than on main: A SIGNAL MASK SURVIVES `execve`. A thread that forks and
-// execs must therefore stay unmasked, or every child inherits a shell's mask and
-// a `kill -INT` on a pipeline does nothing. Main is the only thread that forks
-// (ADR-0009), so the invariant holds by construction - but a future thread that
-// spawns children must not call this.
-//
-// The loop thread loses nothing by being deaf: its knowledge of a signal is
-// exactly the self-pipe byte the `signal` topic drains, which is an event like
-// any other. It never needed the EINTR.
-bool block_caught_signals_on_this_thread() noexcept;
+// MAIN TAKES NO SIGNAL MASK, and pays for it with an EINTR out of `poll` that
+// `turn` has always handled: the wakeup it acts on is the self-pipe byte, never
+// the EINTR. What a future background thread owes instead is ADR-0011's
+// background-thread contract.
 
 // The self-pipe, the pending set, and the resize counter.
 //
@@ -259,18 +250,17 @@ public:
 	//          default", and a user's trap outranks "we are a shell, we know
 	//          what is best".
 	//
-	// THE SHELL THREAD IS THE ONLY WRITER, and this call belongs to it (#142's
+	// THE SHELL SIDE IS THE ONLY WRITER, and this call belongs to it (#142's
 	// second amendment). `install`, `reassert` and `uninstall` all `sigaction`,
-	// which is process-wide state; the trap builtin writes the same state from
-	// the same thread; and `block_caught_signals_on_this_thread` leaves the shell
-	// thread as the only one a signal is delivered to. So the writer, the other
-	// writer, and the handler are one thread, and the loop thread only ever READS
-	// the hub - `drain`, `resize_count`, and the byte in the pipe.
+	// which is process-wide state, and the trap builtin writes the same state - so
+	// the writer, the other writer and the handler are one thread. That is why what
+	// the LOOP does with the hub is only READING it: `drain`, `resize_count`, and
+	// the byte in the pipe (`TheLoopNeverWritesADisposition`).
 	//
 	// The chain slots are atomic anyway (see `_chain`): a `sigprocmask` fence
 	// would have been no fence at all, because it masks the calling thread and
 	// says nothing about delivery elsewhere, and one lock-free pointer store
-	// costs nothing and stays correct if a thread is ever left unmasked.
+	// costs nothing and keeps the handler-versus-mainline race benign.
 	bool reassert() noexcept;
 
 	// THE HANDLER'S WHOLE BODY, async-signal-safe, exposed so a test can deliver
@@ -285,23 +275,30 @@ public:
 	// function rather than SIG_DFL or SIG_IGN. That is what keeps the shell's
 	// `g_pending` being set while the editor owns the dispositions, so a user's
 	// `trap INT` still fires (#98 decision 3, the zsh way) - during editing AND
-	// during a command, when the shell thread is running the command and
-	// draining no slots at all.
+	// during a command, when this thread is inside `run_input` and nothing of the
+	// editor's is running at all.
 	//
 	// `_chain`, NOT `_saved` (#142). The chain target is whatever the kernel had
 	// at the LAST take, so a `trap` typed five commands into the session is the
 	// thing called; `_saved` is the entry-time disposition and belongs to
 	// `uninstall` alone. See `reassert` for why one slot could not be both.
 	//
-	// THIS RUNS ON THE SHELL THREAD in a real session, not on the loop's - the
-	// spawned threads block the caught set, so main is the only thread a
-	// process-directed signal reaches. The loop hears about it as a byte.
-	//
 	// A previous handler installed with SA_SIGINFO is NOT chained: this entry
 	// point has only a signal number, and inventing a `siginfo_t` to pass it
 	// would be worse than saying so. Nothing lesh installs uses SA_SIGINFO, and
 	// the sanitizers' handlers are for signals this hub never takes.
 	void deliver(int signo) noexcept;
+
+	// WHETHER THIS HUB CURRENTLY HOLDS `signo` - ASKED OF THE KERNEL, not read off
+	// a member (#208). The question is "will a delivery of this signal ring my
+	// pipe", and only the kernel knows: a `trap '' CHLD` inside the command that
+	// is running RIGHT NOW has already replaced the disposition, and the next
+	// `reassert` (which is on the way out of that command) has not happened yet.
+	//
+	// The one caller is `event_loop::await_child`, which parks a fiber on a
+	// SIGCHLD it will never get if the answer is no - see the note there. One
+	// `sigaction` query per foreground command, which is nowhere near a keystroke.
+	[[nodiscard]] bool catches(int signo) const noexcept;
 
 	// One byte, no signal. What `event_loop::stop()` rings to wake a loop that
 	// is blocked in `poll` with nothing else to say.
@@ -363,9 +360,7 @@ private:
 enum class topic : std::uint8_t {
 	tty,
 	signal,
-	worker,
 	timer,
-	shell,
 	watch,
 	count_,
 };
@@ -376,6 +371,25 @@ enum class topic : std::uint8_t {
 struct loop_fds {
 	int input = -1;
 	int output = -1;
+};
+
+// HOW AN ACCEPTED LINE IS RUN (#208, and the owner's requirement on it).
+//
+// Both are first-class and both are tested. The choice is the HOST's, made once
+// per `execute`, and nothing below `event_loop` can tell which was taken: the
+// runtime sees `cooperation`, and `cooperation` sees `scheduler::block_or_park`,
+// which is where the one branch lives.
+enum class execution_mode : std::uint8_t {
+	// The default. `execute` runs on the execution fiber, so the foreground wait
+	// at the bottom of the interpreter can park and the loop stays alive: signals
+	// are drained, the history's watch is polled, and #209's awaits have somewhere
+	// to land.
+	on_a_fiber,
+	// `execute` on the host stack, `current() == nullptr` throughout, every wait a
+	// blocking `::waitpid`. Kept because it is the honest fallback if a fiber stack
+	// ever turns out to be the wrong place to fork from - and because a path that
+	// is not exercised is a path that does not work.
+	inline_,
 };
 
 struct loop_options {
@@ -390,12 +404,20 @@ struct loop_options {
 	leshper::style prompt_pen{};
 	leshper::style text_pen{};
 
-	// The reactor routed to the SHELL thread rather than to the helper pool
-	// (ADR-0009: the highlighter reads shell state, and shell state has one
-	// owner). A name rather than an ABI flag, because #93's registration tuple
-	// is fixed and adding a bit to it for one built-in would be the side door
-	// the whole registry design exists to prevent.
-	std::string shell_thread_reactor = "highlighter";
+	// The reactor that READS SHELL STATE (ADR-0009's keystone), NAMED FOR WHAT THE
+	// NAME DECIDES. Every reactor runs on this thread - there is no other - so what
+	// is left is the whole of what it ever decided: WHOSE HOST is stamped on the
+	// token. A name rather than an ABI flag, because #93's registration tuple is
+	// fixed and adding a bit to it for one built-in would be the side door the
+	// whole registry design exists to prevent.
+	std::string host_stamped_reactor = "highlighter";
+
+	// WHAT THE SCHEDULER'S WATCHDOG DOES when ANY slice runs 50 ms without
+	// yielding (#198) - it is the scheduler's, not a reactor's. `log` for a shell,
+	// where a frozen prompt is bad and a dead prompt is worse; the fiber-facing
+	// tests pass `abort_` because in a test a slice that never checks in is the
+	// defect under study.
+	fiber::watchdog_action watchdog = fiber::watchdog_action::log;
 
 	// What a SIGINT at the prompt runs (#98 decision 2). A name, so Ctrl-C is
 	// rebindable exactly as a key is (F-13), and dispatched by the loop rather
@@ -430,16 +452,17 @@ struct loop_options {
 	// a corrupted screen: `\r` plus ESC[J still leave the terminal in a state
 	// the next frame is painted correctly into.
 	//
-	// IT IS NOW ONLY ABOUT THE TERMINAL (#189). It used to be about us as well:
-	// the blitter positioned to every row, so every row of the frame was a hard
-	// line and nothing was soft for a reflowing terminal to rewrap - `true` was
-	// describing a frame we had not painted, which is why a grow after a shrink
-	// under-counted the rows and the walk-up stopped short. The blitter now
-	// writes soft rows through the wrap, so `true` is correct BY CONSTRUCTION on
-	// a terminal that reflows. The setting stays because the other kind still
-	// exists: on xterm and Terminal.app a soft-wrapped row is still where it was,
-	// and the old row count is still the answer.
+	// IT IS ONLY ABOUT THE TERMINAL (#189). The blitter writes soft rows through
+	// the wrap, so `true` is correct BY CONSTRUCTION on a terminal that reflows;
+	// the setting stays because the other kind still exists - on xterm and
+	// Terminal.app a soft-wrapped row is still where it was, and the old row count
+	// is still the answer.
 	bool assume_reflow = true;
+
+	// WHICH OF THE TWO WAYS AN ACCEPTED LINE IS RUN (#208). `LESH_EXECUTION=inline`
+	// picks the other one at the wiring site; every `UiLoop*` and `UiPty*` case
+	// that touches the accept path runs both.
+	execution_mode execution = execution_mode::on_a_fiber;
 
 	// The paste rule (#128's trap 4, fish's `read_normal_chars`): keep reading
 	// while a zero-timeout poll says the fd is still readable, so a paste is one
@@ -447,6 +470,58 @@ struct loop_options {
 	// process piping a gigabyte into the editor from being read in one turn.
 	std::size_t readahead_limit = 64 * 1024;
 };
+
+// WHERE THE SESSION IS, AND WHICH FIBERS MAY RUN (#202; #145's grilling record).
+//
+// Written at exactly two places - `quiesce()`, which is the accept path's park,
+// and `resume_after_execution()`, which is what runs when `execute` returns -
+// and read by nothing that decides anything: which groups are runnable is
+// derived from it rather than tracked beside it. `editing` and `executing` are
+// the two states a session is ever observed in; `boundary` exists for the
+// instant between them, where the history append has already happened inside
+// `session::execute` and the prompt is refreshed before the editor comes back.
+enum class phase : std::uint8_t {
+	editing,     // the emitters are runnable and the terminal is ours
+	executing,   // a command is running: the emitters group is parked
+	boundary,    // `execute` has returned; the prompt is being put back
+};
+
+[[nodiscard]] const char* name_of(phase which) noexcept;
+
+// THE SCHEDULER'S LANES, NAMED. `fiber::scheduler` is deliberately agnostic
+// about what its eight group indices mean (#200); these are the host's names for
+// the two the design has.
+//
+// `observers` HAS NO MEMBERS YET and the id is reserved on purpose: the owner's
+// framing of the two reactor kinds puts history persistence and telemetry there,
+// they are fed by an ordered `queue<T,N>` rather than by a conflating `slot`, and
+// they are the group that stays runnable through `boundary`. Naming the id here
+// is what keeps `emitters` from silently meaning "all fibers".
+enum class fiber_group : std::uint8_t {
+	emitters = 0,
+	observers = 1,
+	// THE EXECUTION LANE (#208), AND IT IS NEVER PARKED BY PHASE. Every other
+	// lane's bit is derived from where the session is; this one is what the phase
+	// is ABOUT, so deriving it would be circular - `executing` means "the
+	// execution fiber is the thing that may run". It holds exactly one fiber, and
+	// only in `execution_mode::on_a_fiber`.
+	execution = 2,
+};
+
+[[nodiscard]] inline constexpr std::uint8_t group_index(fiber_group which) noexcept {
+	return static_cast<std::uint8_t>(which);
+}
+
+[[nodiscard]] inline constexpr std::uint8_t group_mask(fiber_group which) noexcept {
+	return fiber::group_mask_of(group_index(which));
+}
+
+// One registered reactor's fiber, its slot, and the storage its compute serves
+// out of. Defined in loop.cpp - nothing outside it needs the shape, and holding
+// it behind a `unique_ptr` is what makes a lane's address stable for the life of
+// the loop, which the fiber's userdata and the slot's parked-receiver pointer
+// both require.
+struct reactor_lane;
 
 // What one turn did. A value rather than a log line, so a test can assert on it.
 struct turn_result {
@@ -472,8 +547,8 @@ public:
 	event_loop(const event_loop&) = delete;
 	event_loop& operator=(const event_loop&) = delete;
 
-	// THE EDITOR STATE, owned here. ADR-0009: the loop thread owns it, and
-	// nothing else may touch it while the loop is running.
+	// THE EDITOR STATE, owned here. ADR-0009: the loop owns it, and nothing else
+	// may touch it while the loop is running.
 	[[nodiscard]] leshper::state& editor() noexcept { return _state; }
 	[[nodiscard]] const leshper::state& editor() const noexcept { return _state; }
 
@@ -492,9 +567,36 @@ public:
 	// `attach_signals` repoints it at one the caller owns.
 	[[nodiscard]] signal_hub& signals() noexcept { return *_signals; }
 
-	void attach_helpers(worker_pool& pool) noexcept;
+	// The registry, which is what gives the loop reactors to spawn fibers for: a
+	// reactor is a fiber in this loop's own scheduler, spawned when the dispatch
+	// table is built.
 	void attach_registry(leshper::registry& reg) noexcept;
-	void attach_shell(shell_actor& shell) noexcept;
+
+	// THE SHELL, CALLED DIRECTLY. `execute` and `port_call` are made from
+	// `accept_current_line`, `finish_cancelled_line` and `call_port`, on this
+	// thread.
+	//
+	// `host` is the door to what the shell KNOWS (`leshper::host`), stamped on
+	// every token the host-stamped reactor is given - and it is a PARAMETER rather
+	// than a second attachment for the reason #151 wrote: a field that has to be
+	// filled in somewhere else is a field that can be forgotten there, and that
+	// one was, for a whole wave. Null is legal and means "no host attached" -
+	// every name classifies as LESH_COMMAND_UNKNOWN - but it has to be WRITTEN.
+	//
+	// `executing` is ADR-0009's tripwire, raised around the two calls. Null means
+	// the loop keeps raising its OWN, which nothing reads - the same arrangement
+	// `_own_signals` makes for the hub, and what lets the raise itself be
+	// unconditional (#211 §1.7).
+	//
+	// None of the three is owned and all must outlive the loop.
+	void attach_shell(shell_side& shell, const leshper::host* host = nullptr,
+	                  shell_executing_flag* executing = nullptr) noexcept;
+
+	// What every token this loop mints for the shell-thread reactor reads through.
+	// Exposed so the wiring site can assert the loop and the registry are looking
+	// at one object, which is the assertion #151 left behind.
+	[[nodiscard]] const leshper::host* shell_host() const noexcept { return _shell_host; }
+
 	void attach_signals(signal_hub& hub) noexcept;
 
 	// THE `watch` TOPIC (#195), which is §8's fd-readable hook and is one
@@ -507,10 +609,9 @@ public:
 	// captureless lambda plus the owner's address, which is three lines there
 	// and no allocation anywhere.
 	//
-	// `on_readable` RUNS ON THE LOOP THREAD, inside the turn, and is responsible
-	// for CONSUMING what made the fd readable - the same rule the worker topic
-	// has, and for the same reason: a hook that leaves its descriptor readable
-	// turns the poll into a spin. It must not block; the history's drain is a
+	// `on_readable` RUNS INSIDE THE TURN, on the one thread, and is responsible
+	// for CONSUMING what made the fd readable - a hook that leaves its descriptor
+	// readable turns the poll into a spin. It must not block; the history's drain is a
 	// non-blocking read, a `stat` and a pointer swap.
 	//
 	// The descriptor is BORROWED. The loop never closes it and never reads it;
@@ -521,17 +622,6 @@ public:
 	[[nodiscard]] int watch_fd() const noexcept { return _watch_fd; }
 	// Times the `watch` topic's hook has been run. A test waits on this.
 	[[nodiscard]] std::size_t watch_drains() const noexcept { return _watch_drains; }
-
-	// THERE IS NO `attach_shell_knowledge` (#151). #135 had one: the loop held
-	// the session's `shell_knowledge*` and put it on the snapshot of the
-	// shell-thread reactor, on no other, and the token built on the far side
-	// then dropped it. The pointer never described anything the LOOP knew - it
-	// is the shell's own tables, handed to the shell so the shell could find
-	// them - so it moved to `shell_actor`, which stamps it on every token it
-	// serves. What a helper's snapshot carries is unchanged: null, meaning "no
-	// host attached", which is the honest answer for a state-free reactor.
-	// (#168 Phase B: what is stamped is a `const leshper::host*` now, the one
-	// door the editor has; the tables are behind it with the `$PATH` sweep.)
 
 	// --- The read entry (#98, fish #9181) -----------------------------------
 
@@ -558,48 +648,58 @@ public:
 	// time. The `timer` topic IS this number: there is no timer fd.
 	[[nodiscard]] int poll_timeout_ms() const noexcept;
 
-	// Turns until the editor exits or `stop()` is called.
+	// Turns until the editor exits or `request_stop()` is called. THE READ, whole:
+	// `enter_read`, the first paint, turns, `leave_read`. On the caller's thread,
+	// which is main; there is nothing to start and nothing to join.
 	void run();
 
-	// --- The thread (#134 owns the sequencing; these are its two calls) ------
-
-	// Spawns the loop thread and returns at once.
-	void start();
-	// Asks the loop to leave and joins it. Idempotent, and safe to call from any
-	// thread: it sets a flag and rings the signal topic's pipe, which is the one
-	// wakeup that always exists.
-	void stop();
-	// The same ask WITHOUT the join, for the one caller that must not join: the
-	// shell thread, inside `execute`, having just run an `exit`. The loop is
-	// blocked waiting for that execution's reply, so joining it from there would
-	// be waiting for a thread that is waiting for us.
+	// Asks `run` to leave after the turn it is in. Set by Ctrl-D, by an `exit`
+	// the shell just ran (`session::execute`, from inside the `execute` call this
+	// loop made) and by a hangup; read by `run`'s own `while` and by
+	// `accept_current_line` immediately after the call returns.
 	void request_stop() noexcept;
-	[[nodiscard]] bool running() const noexcept;
 
-	// --- Quiesce (#91, #128, ADR-0009) --------------------------------------
+	// --- Quiesce (#91, #128, ADR-0011) --------------------------------------
 
-	// Helpers parked, the terminal restored and given up, the decoder's held
-	// bytes dropped. After this returns, a fork on the shell thread is legal.
+	// The emitters superseded and their group parked, the terminal restored and
+	// given up, the decoder's held bytes dropped. After this returns, a fork on
+	// this thread is legal.
 	//
-	// NESTS, because `worker_pool::park_all` does: two calls need two resumes.
+	// AND IT IS ONE OF THE TWO PHASE WRITERS (#202): this is the accept path's
+	// park, so it is where `editing` becomes `executing`. The supersede is F-22's
+	// rule - at accept a pending highlight is abandoned - and it is what makes
+	// "an emission computed for the dead line is never applied" a fact rather
+	// than a hope: the flag is up, so the fiber's own poll abandons the walk, and
+	// the receiver declines to apply a batch whose token was superseded.
+	//
+	// IDEMPOTENT, AND NOTHING NESTS. The two callers are `accept_current_line` and
+	// `finish_cancelled_line`, neither reachable from inside the other, and the
+	// nested case - `vared` running the editor from inside a command - is phase 2's
+	// nested await and not a second park. So a second call is a no-op and one
+	// resume is owed, which `resume_after_execution` asserts.
 	void quiesce();
 
-	// The other end: the terminal reclaimed, the editor's modes re-asserted, the
-	// helpers resumed, and the next render a full repaint - the screen is
+	// The other end, and the SECOND phase writer: `executing` becomes `boundary`
+	// the moment `execute` has returned - the history append already happened
+	// inside `session::execute` and the prompt is refreshed here - and `boundary`
+	// becomes `editing` when the terminal, the modes and the size are back and the
+	// emitters group is resumed. The next render is a full repaint: the screen is
 	// whatever the command left, so there is no `previous` to diff against.
 	void resume_after_execution();
 
-	// The debug assertion every fork-and-continue site carries (#91), asked of
-	// the loop rather than only of the pool, because the terminal half of
-	// quiesce is the loop's.
+	// The debug assertion every fork-and-continue site carries (#91), and it
+	// asserts the two things that are not already a store two lines up: NO EMITTER
+	// IS MID-SLICE, and the terminal is out of raw mode. The first is structurally
+	// true - the host is the only resumer, and nothing a reactor can reach forks -
+	// and is asserted anyway, because "structurally true" is a sentence and an
+	// assertion is a test; the second is the half only the loop can check.
 	void assert_quiesced() const noexcept;
-	[[nodiscard]] bool quiesced() const noexcept { return _park_depth > 0; }
+	[[nodiscard]] bool quiesced() const noexcept { return _quiesced; }
 
 	// --- Accept, and the port ------------------------------------------------
 
-	// The whole accept path: park, restore the terminal, post `execute`, block
-	// on the `shell` and `signal` topics, then reclaim, re-assert, resume and
-	// redraw with a fresh line.
+	// The whole accept path: park, restore the terminal, CALL `execute`, then
+	// reclaim, re-assert, resume and redraw with a fresh line.
 	//
 	// Answers the status the shell reported, or nothing when no shell is
 	// attached - in which case the line is still finished and cleared, which is
@@ -607,29 +707,55 @@ public:
 	std::optional<std::int32_t> accept_current_line();
 
 	// The other half of `cancel_line`: the shell sets `$?` = 130 and runs the
-	// user's INT trap (#98 decision 3). Posted through the `execute` slot as an
-	// empty line, on the same park-restore-post path an accepted line takes,
+	// user's INT trap (#98 decision 3). Delivered as an EMPTY LINE through the
+	// same `execute` an accepted line takes, on the same park-restore path,
 	// because a trap body may fork. A no-op with no shell attached.
 	void finish_cancelled_line();
 
-	// #92's port, from the loop's side: fill the `port_call` slot and block on
-	// the `shell` and `signal` topics until it answers. The action sees a
-	// synchronous call; the terminal keeps the EDITOR's modes throughout (fish
-	// #7770 - an action's shell code never gets ECHO back).
+	// #92's port, from the loop's side: call `shell_side::port_call` and answer
+	// what it said. The action sees a synchronous call because it IS one; the
+	// terminal keeps the EDITOR's modes throughout (fish #7770 - an action's shell
+	// code never gets ECHO back).
 	port_result call_port(std::string_view code);
 
-	// THERE IS NO `read_names` (#151). #139 gave the completer a round trip on
-	// the actor's `enumerate` slot; the owner's reading of ADR-0009 removed the
-	// need for one. The loop may read shell state directly while nothing
-	// executes, and while the loop is running an action nothing CAN execute:
-	// `execute` and `port_call` are the only writers and the loop is the thread
-	// that requests them and then blocks in `wait_on_shell` for the whole of
-	// each. So the completer holds a `const shell_knowledge*` and calls
-	// `enumerate` on it, on this thread, and `shell_writing_flag` asserts the
-	// premise on every read rather than leaving it as a paragraph. (#168 Phase B:
-	// the completer is `ui::shell_completer` and the loop reaches it through
-	// `ui::editor_host`, which is what `lesh_complete` raises `want_completion`
-	// at. Same thread, same premise, one fewer interface.)
+	// --- The foreground wait (#208) -----------------------------------------
+
+	// WHAT `cooperation::wait_child` BECOMES ON AN INTERACTIVE HOST, and the only
+	// thing in this class the runtime can reach. `loop_cooperation` below is the
+	// adapter; this is the implementation, and it is short because
+	// `scheduler::block_or_park` owns the one decision:
+	//
+	//   nobody to park (inline mode, an action's `port_call`, the EXIT trap after
+	//   `run()` has returned) -> a blocking `::waitpid`, exactly as before;
+	//   on the execution fiber -> the waiter goes into `_awaits`, the fiber parks,
+	//   and the SIGCHLD wake reaps it.
+	//
+	// ONLY AWAITED PIDS ARE EVER REAPED, never `-1`: a background child stays a
+	// zombie until `wait` asks for it, exactly as today, so no job-control
+	// semantics move in this ticket.
+	pid_t await_child(pid_t pid, int flags, int* status) noexcept;
+
+	// --- The input wait (#209) ----------------------------------------------
+
+	// WHAT `cooperation::await_readable` BECOMES ON AN INTERACTIVE HOST, and the
+	// sibling of `await_child` in every respect that matters: the same primitive
+	// owns the same one decision, the entry lives on the awaiting fiber's own
+	// frame, and this function is five lines because of it.
+	//
+	//   nobody to park -> nothing at all; the caller's `::read` blocks as today;
+	//   on the execution fiber -> the fd goes into `_awaits`, it joins the poll
+	//   set for exactly as long as the wait lasts, the fiber parks, and the
+	//   readiness wakes it.
+	//
+	// AND IT IS THE TTY'S WAY BACK INTO THE POLL SET WHILE A COMMAND RUNS. #208
+	// took the tty TOPIC out during `executing` - the bytes a user types belong to
+	// the command, not to an editor that is not on screen - and this puts the same
+	// descriptor back, as an INTEREST rather than as a topic: nothing drains it,
+	// nothing decodes it, and the byte that made the poll return is still in the
+	// kernel for the builtin's own `::read` to take. A key that arrives while
+	// nothing awaits the tty does exactly what it did before: nothing. It waits in
+	// the kernel buffer for the next `read` or for the next prompt.
+	void await_readable(int fd) noexcept;
 
 	// --- Rendering -----------------------------------------------------------
 
@@ -653,6 +779,55 @@ public:
 	// Batches dropped because their generation had moved on (N-4, counted).
 	[[nodiscard]] std::size_t dropped_batches() const noexcept { return _dropped; }
 	[[nodiscard]] std::size_t timer_dispatches() const noexcept { return _timer_dispatches; }
+
+	// --- The reactor fibers (#202) -------------------------------------------
+
+	[[nodiscard]] phase session_phase() const noexcept { return _phase; }
+	// Whether the execution fiber has been spawned. Null until the first line is
+	// accepted, and null for ever in `execution_mode::inline_` - which is what a
+	// test asserts to know which of the two paths it is on.
+	[[nodiscard]] bool has_execution_fiber() const noexcept { return _execution != nullptr; }
+	// WHETHER A COMMAND IS ON THAT FIBER RIGHT NOW, which is the one state this
+	// loop may never be destroyed in: `~scheduler` unmaps a parked stack without
+	// unwinding it, so an abandoned `execute` leaks the executor's frames, leaves
+	// its redirection fds open, orphans its child and never unwinds
+	// `shell_executing_flag::scope`. Between commands the fiber is parked in
+	// `recv` on its inbox, and the inbox's waiter is the whole of the evidence.
+	[[nodiscard]] bool has_execution_fiber_mid_command() const noexcept {
+		return _execution != nullptr && !_exec_inbox.has_waiter();
+	}
+	// THE ONLY WAY A TEST CAN REACH THE FATAL-POLL PATH. `poll(2)` answers
+	// POLLNVAL in `revents` for a closed descriptor and returns -1 only for
+	// conditions a test cannot arrange with a real fd, so the next `n` polls in
+	// `turn` answer -1 with EBADF instead - which is what a terminal that has gone
+	// away looks like from here. Zero, the default, is every shell.
+	void fail_next_polls(int n) noexcept { _fail_polls = n; }
+	// Slices the execution fiber has been given, and waits outstanding right now -
+	// a child's or a descriptor's, because since #211 §1.1 there is one table and
+	// it does not distinguish. Both are counters a test reads; neither decides
+	// anything, and a table that is not empty when a wait is over is a pointer
+	// into a frame that has returned.
+	[[nodiscard]] std::size_t execution_slices() const noexcept;
+	[[nodiscard]] std::size_t awaited() const noexcept { return _await_count; }
+	// THE SCHEDULER, and it is named for what it is: it holds the execution fiber
+	// as well, and `reactors()` had not been true of it since #208.
+	[[nodiscard]] const fiber::scheduler& scheduler() const noexcept { return _sched; }
+	// Lanes, which is one per reactor the dispatch table has ever held.
+	[[nodiscard]] std::size_t lanes() const noexcept { return _lanes.size(); }
+
+	// Per-reactor counters, by name; zero for a name with no fiber. `slices` is
+	// the scheduler's own count of resumes, which is what "a slice before AND
+	// after the UI part" is asserted with; `computes` counts `recv`s served,
+	// `abandoned` counts batches a supersede kept from being applied, and
+	// `yields` counts the mid-compute yields the cancellation poll performed.
+	[[nodiscard]] std::size_t reactor_slices(std::string_view reactor) const noexcept;
+	[[nodiscard]] std::size_t reactor_computes(std::string_view reactor) const noexcept;
+	[[nodiscard]] std::size_t reactor_abandoned(std::string_view reactor) const noexcept;
+	[[nodiscard]] std::size_t reactor_yields(std::string_view reactor) const noexcept;
+	// Sends into this reactor's slot, and the subset of them that dropped a
+	// notification nobody had picked up - `slot`'s own debug counters (#198).
+	[[nodiscard]] std::uint64_t reactor_sends(std::string_view reactor) const noexcept;
+	[[nodiscard]] std::size_t reactor_superseded_sends(std::string_view reactor) const noexcept;
 	[[nodiscard]] bool exiting() const noexcept { return _exiting; }
 	[[nodiscard]] std::int32_t exit_status() const noexcept { return _exit_status; }
 
@@ -661,8 +836,6 @@ private:
 
 	void drain_tty(leshper::input_instant now, turn_result& result);
 	void drain_signal_topic(turn_result& result);
-	void drain_worker_topic(turn_result& result);
-	void drain_shell_topic(turn_result& result);
 	void drain_watch_topic(turn_result& result);
 	void fire_timers(leshper::input_instant now, turn_result& result);
 
@@ -673,20 +846,117 @@ private:
 	void carry_out(const leshper::effects& produced);
 	// The effects an ABI verb queued on the registry with no dispatch to return
 	// them through - `lesh_timer_start` from the wiring site is the whole of it
-	// today. Taken on the loop thread, at the top of a turn.
+	// today. Taken at the top of a turn.
 	void drain_registry_effects();
+	// A buffer change, a cursor move or a selection change, SENT to every reactor
+	// whose mask asked for it. The send is the cancellation (#90's rule): it bumps
+	// the slot's counter, raises the lane's flag, and wakes the fiber.
 	void notify_reactors(std::uint32_t kinds);
+	// One slice for every runnable emitter, plus the batches those slices left.
+	// Called twice per turn - the "before and after the UI part" the owner asked
+	// for - and once more per pass while anything is still runnable.
+	//
+	// AND FOR THE EXECUTION FIBER TOO (#208), because the two sets are never
+	// runnable at the same time and the scheduler already skips a parked group:
+	// while a command runs the emitters' bit is down, and while a line is being
+	// edited the execution fiber is parked on its inbox. One tick, one mask.
+	//
+	// `void`, because `tick`'s answer - "is anything still runnable" - is a
+	// question the two call sites ask the scheduler for themselves, one turn later
+	// and with the mask in hand.
+	void tick_fibers();
+	// The lanes this loop ever gives a slice to. Not derived from the phase - the
+	// scheduler's own park bit is - so it is a constant, and it is a name only so
+	// that the three places that need it cannot disagree.
+	static constexpr std::uint8_t sliced_lanes =
+		static_cast<std::uint8_t>(group_mask(fiber_group::emitters)
+		                          | group_mask(fiber_group::execution));
 	// Rebuilds `_dispatch_table` from the registry's reactor map. Called only
 	// when the cheap staleness check in `notify_reactors` says the copy is out of
 	// date; the steady state never reaches it.
 	void refresh_dispatch_table();
 	void take_batch(leshper::reactor_batch& answer);
-	// Blocks in poll on the `shell` and `signal` topics only, until a message of
-	// `until` (and, for a port call, of `sequence`) arrives.
-	std::optional<std::int32_t> wait_on_shell(shell_message::kind until,
-	                                          std::uint64_t sequence);
-	void handle_shell_message(shell_message& answer);
+
+	// --- The reactor fibers (#202) -------------------------------------------
+
+	// The lane for `name`, created and its fiber spawned on first use. Lanes are
+	// never removed: a fiber cannot be cancelled in v1 (destroying a parked one
+	// does not unwind its stack), and a reactor is never unregistered, so a
+	// rebuilt dispatch table re-points at the lanes it already has.
+	reactor_lane& lane_for(std::string_view name);
+	// THE FIBER BODY: `for(;;){ recv; run_reactor_here; apply }`. A static member
+	// because `fiber::entry_fn` is a plain function pointer and a `void*`, which
+	// is the same shape `lesh_reactor_fn` has, and for the same reason.
+	static void reactor_body(fiber::scheduler& on, void* userdata);
+	// What the reactor's cancellation poll yields to. See
+	// `lesh_request::cooperate`.
+	static void reactor_yield(void* userdata);
+	// The receiver's half of the drop rule: apply the batch unless the token it
+	// was computed under has been superseded.
+	void apply_reactor_batch(reactor_lane& lane);
+	// The lane whose name is `reactor`, or null.
+	[[nodiscard]] const reactor_lane* lane_named(std::string_view reactor) const noexcept;
+	// Every emitter superseded, and every one of them run out to its next poll so
+	// that no fiber is left mid-compute. What the destructor calls, and the reason
+	// it is not optional: a stack unmapped mid-compute takes whatever that stack
+	// owned with it, which the leak gate would report and be right to.
+	void drain_emitters();
 	void refresh_size_from_terminal();
+
+	// --- The execution fiber and the waiter table (#208) ---------------------
+
+	// The two ways to run an accepted line, and the ONE place the choice is made.
+	// `accept_current_line` and `finish_cancelled_line` both call this and neither
+	// knows which it got.
+	std::int32_t run_the_line(std::string_view line);
+	// THE FIBER BODY: `for(;;){ line = inbox.recv(); done.send(shell.execute(line)); }`.
+	// A static member for the reason `reactor_body` is one: `fiber::entry_fn` is a
+	// plain function pointer and a `void*`.
+	static void execution_body(fiber::scheduler& on, void* userdata);
+	// ONE OUTSTANDING WAIT, ON THE WAITING FIBER'S OWN STACK - AND ONE TABLE FOR
+	// EVERY KIND OF WAIT (#208, #209; made one by #211 §1.1). The entry is a local
+	// in `await_child`'s or `await_readable`'s frame and the table holds its
+	// address, which is safe for precisely the length of the wait: the fiber is
+	// parked, so the frame is frozen, and the entry is removed before `complete`
+	// lets it run again. (coost's `io_event` shape, and the reason the table needs
+	// no allocation and no ownership rule.)
+	//
+	// WHAT IS BEING WAITED FOR LIVES IN THE CALLER'S OWN FRAME AND NOT HERE: a
+	// pid, its flags and the executor's `wait_status`; or a descriptor. What this
+	// loop keeps is a function that answers "has it happened, and with what" and
+	// the `void*` to ask it about - the same trade `lesh_reactor_fn` and the
+	// `watch` topic already make. It is what kept the second verb from being a
+	// second table, a second servicer, a second accessor and a second guard in
+	// `turn`, and it is what keeps the third from being those things either.
+	struct awaiter {
+		bool (*ready)(void* self, std::intptr_t& answer) noexcept = nullptr;
+		void* self = nullptr;
+		// The descriptor this wait needs in the turn's poll set, or -1 for a wait
+		// whose wake arrives some other way - a child's does, as the SIGCHLD byte
+		// on the signal topic.
+		int fd = -1;
+		fiber::await_slot slot;
+	};
+
+	// One entry into the table, and the probe that follows it. The `enlist` half of
+	// both verbs, so the capacity check and the ask-once are written once.
+	void enlist(awaiter& waiting) noexcept;
+
+	// Every outstanding wait asked whether it is over, and every one that is
+	// removed and its waiter woken. Run when the poll comes back - whatever made
+	// it come back - and once more from inside each verb's own `enlist`, which is
+	// how a thing that has ALREADY happened is noticed without a wake: the child
+	// that exited turns ago, the regular file that is always readable.
+	void service_awaits() noexcept;
+
+	// A FIXED CAPACITY AND AN ASSERT, because both verbs are reached through a
+	// `noexcept` interface and must not allocate on the way. EIGHT, where one is
+	// what today's shapes can produce: the execution fiber waits for one thing at
+	// a time and nothing else waits at all. The spare are for the nested read
+	// `vared` will want and the providers phase 2 will add; an overflow asserts and
+	// then DEGRADES to the no-op - the caller blocks, which is what it did before
+	// either verb existed - rather than writing past the end of the table.
+	static constexpr std::size_t kMaxAwaits = 8;
 
 	// How far above the cursor the top of the frame the terminal is showing sits
 	// (#185). `loop_options::assume_reflow` picks the model; the reflowing one
@@ -741,45 +1011,58 @@ private:
 	// comparison once the names have stopped arriving.
 	leshper::style_table _theme;
 
-	worker_pool* _helpers = nullptr;
 	leshper::registry* _registry = nullptr;
-	shell_actor* _shell = nullptr;
+	shell_side* _shell = nullptr;
+	// The executing shell's own door, stamped on every token the shell reactor is
+	// given, and the flag raised around the two calls that write shell state.
+	// Both arrive with the shell at `attach_shell`.
+	const leshper::host* _shell_host = nullptr;
+	// THE TRIPWIRE, AND THE LOOP ALWAYS HAS ONE. `_own_executing` when nothing
+	// attached its own, exactly as `_own_signals` backs `_signals` - which is what
+	// lets every raise be unconditional and `scope` take a reference (#211 §1.7).
+	shell_executing_flag _own_executing;
+	shell_executing_flag* _executing = &_own_executing;
+	// THE SIGNAL TOPIC ALWAYS EXISTS, so this is never null: the constructor
+	// builds `_own_signals` and points here at it, and `attach_signals` only ever
+	// repoints. Nothing tests it.
 	signal_hub* _signals = nullptr;
-	// THE LOOP HAS NO DISPATCHER OF ITS OWN any more (#168). `_dispatch` was a
-	// second `loop_harness`, minted at `attach_registry`, and it existed for one
-	// caller: a timer expiry, which the loop invoked by name itself. A timer is an
-	// event now (`timer_fired`), `step` dispatches it through the state's own
-	// context, and the last place where two harnesses could disagree about what
-	// had been applied (#144) is gone with it.
-	// Set when this loop constructed its own hub, which is the ordinary case;
-	// an attached one belongs to the caller.
+	// Set when this loop constructed its own hub, which is the ordinary case; an
+	// attached one belongs to the caller.
 	std::optional<signal_hub> _own_signals;
 
 	// --- Reused storage. Every one of these is why a warm turn allocates. ---
 	std::string _read_buffer;
 	std::vector<leshper::event> _events;
-	// THE BATCH BEING WALKED, swapped out of `_events` (#162). `handle` on an
-	// accepted line blocks in `wait_on_shell`, and a shell message that arrives
-	// there pushes onto `_events` - which reallocated the vector the walk held a
-	// reference into. Swapping first means the push lands in an empty `_events`
-	// and is walked by the next pass instead. A member, so the capacity survives
-	// the turn and the steady state allocates nothing.
+	// THE BATCH BEING WALKED, swapped out of `_events` (#162). `handle` pushes
+	// onto `_events` while the walk holds a reference into it - a shell message
+	// drained inside a blocked wait was the original, and the in-place shell
+	// reactor's `worker_result` was the one #201 re-pinned it on - which
+	// reallocates the vector out from under the walk. Swapping first means the
+	// push lands in an empty `_events` and is walked by the next pass instead. A
+	// member, so the capacity survives the turn and the steady state allocates
+	// nothing.
 	std::vector<leshper::event> _carried_events;
-	std::vector<leshper::event> _deferred;      // signals that arrived while executing
 	std::vector<int> _signal_numbers;
-	std::vector<completion> _completions;
-	std::vector<shell_message> _inbox;
+	// THE SIGNAL NUMBERS THAT ARRIVED WHILE A COMMAND WAS RUNNING, replayed on the
+	// first turn after it. The byte is consumed during the command - it is what
+	// ends the foreground wait - so the numbers are held here and the next ordinary
+	// turn makes exactly the events the byte would have made. What must NOT happen
+	// is dispatching them while `executing`: a SIGINT turned into `cancel_line`
+	// there would call `execute` from inside `execute`. DEDUPLICATED, because the
+	// hub's own `_pending` is a level and not a count, so this is bounded by
+	// `kMaxTrackedSignal` however long the command runs.
+	std::vector<int> _deferred_signals;
 	std::string _out;
 	std::string _accepted;
 	leshper::effects _carried;         // what the registry queued, taken per turn
 
-	// THE REACTOR TABLE, FLATTENED (the reorg cleanup). `notify_reactors` used to
-	// walk `registry::reactors` - a red-black tree - and string-compare
-	// `shell_thread_reactor` against every key, once per reactor per keystroke.
-	// This is the same table contiguous, with that comparison already made, and
-	// it is rebuilt only when the registry's `reactors_generation` moves (or the
-	// registry, or the shell-thread reactor's name, changes underneath it). The
-	// steady state is three scalar comparisons and a walk over a vector.
+	// THE REACTOR TABLE, FLATTENED. `registry::reactors` is a red-black tree keyed
+	// by name, and walking it per keystroke meant a string compare against
+	// `host_stamped_reactor` per reactor. This is the same table contiguous, with
+	// that comparison already made, rebuilt only when the registry's
+	// `reactors_generation` moves (or the registry, or the host-stamped reactor's
+	// name, changes underneath it). The steady state is three scalar comparisons
+	// and a walk over a vector.
 	//
 	// `name` BORROWS the registry's map key, which is safe for the reason a
 	// std::map key is: nodes are stable, and the only thing that adds one bumps
@@ -789,20 +1072,28 @@ private:
 		lesh_reactor_fn fn = nullptr;
 		void* userdata = nullptr;
 		std::uint32_t event_mask = 0;
-		bool on_shell_thread = false;
+		// Whether this reactor's tokens carry the shell's own host (#151), which
+		// since there is one thread is the whole of what the name decides.
+		bool host_stamped = false;
+		// THE FIBER'S LANE (#202). Owned by `_lanes`, which only ever grows, so
+		// this stays valid across every rebuild of the table above.
+		reactor_lane* lane = nullptr;
 	};
 	std::vector<reactor_dispatch> _dispatch_table;
 	const leshper::registry* _dispatch_built_from = nullptr;
 	std::uint64_t _dispatch_generation = 0;
-	std::string _dispatch_shell_reactor;
+	std::string _dispatch_host_stamped_reactor;
 	bool _dispatch_valid = false;
-	std::array<struct pollfd, static_cast<std::size_t>(topic::count_)> _poll{};
+	// THE TOPICS AND THE INTERESTS SHARE ONE ARRAY (#209). A turn's poll set is
+	// the fixed topics plus whatever descriptors `_awaits` names, so the array is
+	// sized for both and `turn` fills as many of its slots as this turn needs.
+	std::array<struct pollfd, static_cast<std::size_t>(topic::count_) + kMaxAwaits>
+		_poll{};
 
-	// One armed timer, WHOLE (#168). The declaration - the action's name and the
-	// interval - used to live in the registry and the due instant here, so arming
-	// was the loop diffing two tables on every turn and neither side owned a
-	// timer. The host owns them now: an `arm_timer` effect puts one here, a
-	// `disarm_timer` takes it away, and the registry keeps nothing but the id.
+	// One armed timer, WHOLE (#168), and the host owns it: an `arm_timer` effect
+	// puts one here, a `disarm_timer` takes it away, and the registry keeps nothing
+	// but the id. Split across the two - the declaration there and the due instant
+	// here - arming was the loop diffing two tables on every turn.
 	//
 	// The action is the registry's INTERNED HANDLE and not its name, for the
 	// reason the effect that delivered it carries one: nothing on the expiry path
@@ -826,16 +1117,104 @@ private:
 	std::size_t _watch_drains = 0;
 
 	unsigned _resizes_seen = 0;
-	std::size_t _park_depth = 0;
+	// PARKED, AND IT IS ONE BIT - see `quiesce` for why nothing nests. It is the
+	// terminal handoff's bookkeeping and nothing else: the emitters group's own bit
+	// is the scheduler's, derived from `_phase`.
+	bool _quiesced = false;
 	std::size_t _applied = 0;
 	std::size_t _dropped = 0;
 	std::size_t _timer_dispatches = 0;
 
+	// THE SCHEDULER, AND THE FIBERS IN IT. Declared after everything a fiber's body
+	// reaches through `this`, and BEFORE nothing - a fiber never outlives the loop,
+	// because `drain_emitters()` runs every one of them out to its next poll before
+	// this member is destroyed. A member and never a global: a scheduler is
+	// per-thread by construction.
+	fiber::scheduler _sched;
+	// One per reactor, keyed by name, APPEND-ONLY. Behind a `unique_ptr` because a
+	// lane's address is what the fiber's userdata and the slot's parked-receiver
+	// pointer both hold, and a vector that grew would move it.
+	std::vector<std::unique_ptr<reactor_lane>> _lanes;
+	// Where the session is. Two writers, named on `quiesce` and
+	// `resume_after_execution`.
+	phase _phase = phase::editing;
+
+	// THE EXECUTION FIBER (#208), SPAWNED ON THE FIRST LINE AND NEVER AGAIN. Null
+	// until then, and null for ever in `execution_mode::inline_`: a loop that
+	// never accepts a line - which is most of `ui_loop_tests.cpp` - reserves no
+	// stack at all.
+	fiber::fiber* _execution = nullptr;
+	// The two channels, and they are the only ones. `inbox` carries THE LINE
+	// ITSELF and not a view of `_accepted` (#211 §2.3): a view into a member that
+	// the next accept reassigns is safe only while `accept_current_line` cannot
+	// re-enter, which is an unwritten rule `vared`'s nested read is going to
+	// break. One move per accepted line, at human frequency, buys a message that
+	// owns what it carries - which is ADR-0007's rule and what `slot` is for.
+	// `done` carries the status back, and the host takes it with `try_recv`
+	// because the host cannot park.
+	fiber::slot<std::string> _exec_inbox{_sched};
+	fiber::slot<std::int32_t> _exec_done{_sched};
+	// WHO IS WAITING FOR WHAT. Pointers into the awaiting fibers' own frames - see
+	// `awaiter` - in a fixed array, because both verbs are reached through a
+	// `noexcept` interface with no constructor to reserve in. Nearly always empty,
+	// which is the fast path: a turn with nothing outstanding builds the poll set
+	// it always built and asks nobody anything.
+	std::array<awaiter*, kMaxAwaits> _awaits{};
+	std::size_t _await_count = 0;
+
+	// THE POLL HAS FAILED AND A COMMAND IS STILL RUNNING (#211 §4.1). Set once,
+	// never cleared: the turns that follow keep only the signal topic - the
+	// SIGCHLD byte is what ends the foreground wait - and the loop leaves as soon
+	// as the fiber has given the status back. See `turn` and `run_the_line`.
+	bool _poll_failed = false;
+	// Polls a test has asked to fail; see `fail_next_polls`.
+	int _fail_polls = 0;
+
 	bool _exiting = false;
 	std::int32_t _exit_status = 0;
 	bool _needs_render = false;
-	std::atomic<bool> _stopping{false};
-	std::thread _thread;
+	bool _stopping = false;
+};
+
+// THE RUNTIME'S HOST, AND THE WHOLE OF WHAT THE EXECUTOR LEARNS.
+//
+// The executor says `wait_child` because it has nothing to do until a child does
+// something, this hands the question to the loop, and the loop hands the DECISION
+// to `scheduler::block_or_park`. Nothing on this path branches on whether there
+// is a fiber; exactly one place in the tree does.
+//
+// A SEPARATE CLASS RATHER THAN `event_loop : public cooperation`, because the
+// direction of the dependency is the point: `src/runtime/` must be able to name
+// this interface without naming a loop, a scheduler or a topic, and a loop that
+// WAS a `cooperation` would put the runtime's vocabulary on the host's own
+// public surface. It is also what keeps the seam swappable - a cord, a replay
+// harness or a test can install a different one against the same `shell_state`.
+//
+// INSTALLED BY THE SESSION AND REMOVED BY IT (`session`'s constructor and
+// destructor). `enter_subshell` puts the no-op back in every forked child, which
+// is why a `( )`, a `$( )` and a non-exec pipeline stage all wait with a plain
+// `::waitpid` on their own stack and never touch a scheduler that is not theirs.
+class loop_cooperation final : public runtime::cooperation {
+public:
+	explicit loop_cooperation(event_loop& on) noexcept : _loop(&on) {}
+
+	// STILL EMPTY, deliberately (ADR-0011 §Deferred: "reactors running during
+	// execution (do not flip the bit)"). The boundary is the yield point the door
+	// is priced against; opening it is a later ticket, and doing it here would
+	// make this one about two things.
+	void on_command_boundary() noexcept override {}
+
+	pid_t wait_child(pid_t pid, int flags, int* status) noexcept override {
+		return _loop->await_child(pid, flags, status);
+	}
+
+	// THE SECOND FIVE-LINE ADAPTER (#209), and it reads as the first one does on
+	// purpose: the verb hands the question to the loop, and the loop hands the
+	// DECISION to `scheduler::block_or_park`. Two verbs, one branch, one place.
+	void await_readable(int fd) noexcept override { _loop->await_readable(fd); }
+
+private:
+	event_loop* _loop;
 };
 
 } // namespace lesh::ui

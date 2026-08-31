@@ -28,7 +28,7 @@
 //   directly when it wants the ranges (see below).
 //
 //   `history_search_compute` is the PROVIDER face - a `lesh_reactor_fn`,
-//   running on a worker against a request token it did not mint, emitting
+//   running inside a reactor's slice against a request token it did not mint, emitting
 //   through `lesh_propose` and polling the supersede flag between entries.
 //   It includes `abi.h` and nothing else from leshper, the same discipline
 //   `builtin_actions.cpp` is held to, so the searcher reaches the loop by
@@ -119,7 +119,7 @@ private:
 // so an incremental search that reruns on every keystroke settles into zero
 // further heap allocation instead of allocating three vectors per character.
 // It is NOT thread-safe and is not meant to be: one search, one searcher, on
-// the worker that is running it (see `history_search_compute`).
+// the stack of whatever is running it (see `history_search_compute`).
 //
 // ADR-0007: every member is a self-freeing standard container. Nothing here
 // needs an explicit teardown for the leak gate to expect zero.
@@ -201,15 +201,50 @@ public:
 	// May be empty, which means "never cancelled".
 	using cancel_poll = std::function<bool()>;
 
+	// HOW MANY ENTRIES THE WALK EXAMINES BETWEEN CANCELLATION POLLS (#206).
+	//
+	// An entry is FOUR NANOSECONDS of work (measured: a 5000-entry prefix walk is
+	// 20.1 us in release), and since #202 a cancellation poll is also a YIELD -
+	// the reactor hands the thread back to the host, which asks the terminal what
+	// arrived before it resumes the walk. That round trip is ~155 ns even with
+	// the host's turn made as cheap as it can be, so a poll per entry was 5000
+	// yields costing 760 us to protect 20 us of work: 25x, and every bit of it
+	// the poll rather than the walk.
+	//
+	// So the walk strides its poll to the size of its unit, which is what the
+	// highlighter's segment sweep already does over TOKENS with the same number
+	// (`kPollEvery` in reactors.cpp). The arithmetic that picks 256, release,
+	// this machine:
+	//
+	//   walk       20.1 us + (5000/256) x 0.155 us = 23.1 us, against 31.2 us for
+	//              the same walk polling every entry and never yielding - so the
+	//              interruptible walk is now FASTER than the uninterruptible one,
+	//              because the polls it no longer makes cost more than the yields
+	//   latency    256 x 4 ns = ~1 us before a keystroke is looked at, against a
+	//              100 us budget
+	//   waste      the same ~1 us of work done after a supersede nobody noticed
+	//
+	// A poll site whose unit is a SYSCALL must not stride: `classify_command`
+	// polls immediately before each command NAME, whose `$PATH` walk is a stat
+	// per directory (ADR-0009), and that is why this constant lives here, on the
+	// walk that knows its unit is nanoseconds, rather than on the yield itself.
+	// #212 measured that walk - 18-36 us over a 35-entry `$PATH`, worst keystroke
+	// wait 114 us against a 50 ms watchdog - and left it un-yielded inside.
+	//
+	// A power of two so the test is a mask.
+	static constexpr std::size_t poll_every = 256;
+	static_assert((poll_every & (poll_every - 1)) == 0, "the stride test is a mask");
+
 	history_search() = default;
 	explicit history_search(options opts) noexcept : _options(opts) {}
 
 	// Walks `source` newest first, calling `on_match` for each entry that
 	// matches `query` under the current mode.
 	//
-	// The cancel poll runs ONCE PER ENTRY, before that entry is examined -
-	// #94's "superseded poll between entries" - so a stale search dies at the
-	// next entry boundary rather than after the whole history.
+	// The cancel poll runs before the first entry and every `poll_every` entries
+	// after it - #94's "superseded poll between entries" on the stride #206
+	// measured - so a stale search dies a microsecond into the history rather
+	// than after the whole of it.
 	//
 	// An EMPTY query matches every entry, with no ranges. That is not a
 	// degenerate case to guard against, it is plain history navigation: F-33
@@ -266,8 +301,8 @@ private:
 // The registration-time context `history_search_compute` reads.
 //
 // IMMUTABLE for the duration of a request, and deliberately holding no scratch:
-// the loop thread fills this in once and workers only read it, so the searcher
-// itself is built on the worker's stack per compute. That costs the searcher's
+// the wiring site fills this in once and a compute only reads it, so the searcher
+// itself is built on the computing stack per request. That costs the searcher's
 // first allocations once per request - at recall frequency, which is what
 // §6.2's hot-path rule permits an override point - and buys that two requests
 // in flight cannot share a scratch buffer.
@@ -301,8 +336,8 @@ struct history_search_provider {
 // Emits one `lesh_propose` per match as it is found - streaming (F-31), so the
 // loop can show the first screenful while the walk is still running and a stale
 // stream dies mid-flight - and polls `lesh_request_superseded` between entries.
-// Answers LESH_ERR_SUPERSEDED when the poll noticed, which is a courtesy to the
-// worker and not a correctness mechanism: the loop drops a stale batch anyway.
+// Answers LESH_ERR_SUPERSEDED when the poll noticed, which is a courtesy and not
+// a correctness mechanism: the loop drops a stale batch anyway.
 std::int32_t history_search_compute(lesh_request* request, void* userdata);
 
 } // namespace lesh::ui

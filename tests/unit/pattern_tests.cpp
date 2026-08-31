@@ -183,6 +183,69 @@ TEST(Pattern, MetacharacterDetectionSkipsEscaped) {
 	EXPECT_TRUE(has_pattern_characters("a[bc]d"));
 	EXPECT_FALSE(has_pattern_characters("plain"));
 	EXPECT_FALSE(has_pattern_characters("a\\*b")) << "an escaped star is literal";
+	// It is asked of a SEGMENT, so it stays generous about `[`: a bracket
+	// expression can open in one segment and close in another. is_pattern below is
+	// the strict one, and the two differ on exactly this input.
+	EXPECT_TRUE(has_pattern_characters("[a")) << "a segment that may yet open one";
+}
+
+// --- the bracket rule at the glob gate (#204) --------------------------------
+//
+// POSIX 2.13.1: a '[' with no matching ']' later in the same word is an ordinary
+// character. The MATCHER has always known that - `pattern_match("[abc", "[abc")`
+// above is the same rule - but the gate that decides whether to walk the
+// filesystem at all did not, so `[ $i -lt 1 ]` opened the current directory twice
+// per loop iteration to match two words that could only ever match themselves.
+
+TEST(Pattern, AnUnterminatedBracketIsNotAPattern) {
+	EXPECT_FALSE(is_pattern("[")) << "nothing to close it";
+	EXPECT_FALSE(is_pattern("[abc"));
+	EXPECT_FALSE(is_pattern("a[b"));
+	// A ']' first is a MEMBER rather than the terminator, so `[]` opens a bracket
+	// expression whose first element is ']' and then runs out of word.
+	EXPECT_FALSE(is_pattern("[]"));
+	EXPECT_FALSE(is_pattern("[!"));
+	EXPECT_FALSE(is_pattern("[a\\]")) << "an escaped ']' does not close it either";
+}
+
+TEST(Pattern, ARightBracketAloneIsNeverAPattern) {
+	EXPECT_FALSE(is_pattern("]"));
+	EXPECT_FALSE(is_pattern("a]b"));
+	EXPECT_FALSE(is_pattern("]["));
+}
+
+TEST(Pattern, AWellFormedBracketIsStillAPattern) {
+	EXPECT_TRUE(is_pattern("[a]"));
+	EXPECT_TRUE(is_pattern("[!a]"));
+	EXPECT_TRUE(is_pattern("[^a]"));
+	EXPECT_TRUE(is_pattern("x[abc]z"));
+	EXPECT_TRUE(is_pattern("[a-z]"));
+	EXPECT_TRUE(is_pattern("[]a]")) << "a ']' first is a member, and the second closes";
+	EXPECT_TRUE(is_pattern("[a\\]]")) << "the escaped ']' is a member, the third closes";
+	EXPECT_TRUE(is_pattern("[[:alpha:]]"));
+	// The matcher re-reads from the byte after a '[' that opened nothing, so the
+	// first '[' here is literal and the SECOND opens a character class. Testing
+	// only the first '[' would call this word literal and stop globbing it.
+	EXPECT_TRUE(is_pattern("[[:alpha:]"));
+	EXPECT_TRUE(is_pattern("[[:]")) << "`[` then the bracket expression `[:]`";
+}
+
+TEST(Pattern, TheOtherMetacharactersAreUnaffectedByTheBracketRule) {
+	EXPECT_TRUE(is_pattern("*"));
+	EXPECT_TRUE(is_pattern("?"));
+	EXPECT_TRUE(is_pattern("[abc*")) << "the '[' is literal but the '*' is not";
+	EXPECT_FALSE(is_pattern("plain"));
+	EXPECT_FALSE(is_pattern(""));
+}
+
+TEST(Pattern, QuotingIsUnchangedByTheBracketRule) {
+	// `\[` was already literal and stays so; the rule adds nothing here. Quoting
+	// reaches the matcher as backslashes, which is the form the expander emits.
+	EXPECT_FALSE(is_pattern("\\["));
+	EXPECT_FALSE(is_pattern("\\[a\\]"));
+	EXPECT_FALSE(is_pattern("\\*"));
+	// ...and an escaped '[' does not open the expression a later ']' would close.
+	EXPECT_FALSE(is_pattern("\\[a]"));
 }
 
 // --- the ${x#pat} family -----------------------------------------------------
@@ -244,4 +307,173 @@ TEST(Pattern, ALiteralComponentPastAnUnsearchableDirectoryIsNotConfirmed) {
 	// Restore before temp_path's destructor tries to remove this directory's
 	// contents, or the scratch tree is left behind for every run after this one.
 	ASSERT_EQ(::chmod(dir.c_str(), 0755), 0);
+}
+
+// --- the bracket rule at the walk (#204) -------------------------------------
+
+TEST(Pattern, AnUnterminatedBracketDoesNotOpenADirectory) {
+	// The observable is expand_pathnames' RETURN VALUE. `false` is decided by
+	// is_pattern before the walk starts - it is the first statement in the
+	// function - so it is precisely the assertion that no opendir happened.
+	// Timing would prove nothing against a warm page cache, and counting through
+	// a fake filesystem would be asserting something about the fake.
+	lesh::testing::temp_path present;
+	// These files EXIST, which is the harder half: a word that names a real file
+	// must still not be walked to find it. The walk would produce the same
+	// pathname; what it would cost is the point.
+	for (const char* name : {"[", "]", "[abc", "a[b", "[]"}) {
+		std::ofstream touch(present.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+	lesh::testing::temp_path absent;  // ...and here none of them do.
+
+	lesh::buffer_pool pool{1024 * 32};
+	for (const lesh::testing::temp_path* scratch : {&present, &absent}) {
+		for (const char* name : {"[", "]", "[abc", "a[b", "[]", "\\["}) {
+			lesh::arena_array<std::string_view> out{pool, 4};
+			const std::string word = scratch->file(name);
+			EXPECT_FALSE(expand_pathnames(pool, word, out)) << word;
+			EXPECT_EQ(out.size(), 0u) << word;
+		}
+	}
+}
+
+TEST(Pattern, AWellFormedBracketStillWalksTheDirectory) {
+	// The control for the test above: the same directory, reached the same way, is
+	// scanned when the bracket expression actually closes - so `false` there is the
+	// rule at work and not a scratch directory nothing could ever match in.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a", "b"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	{
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("[a]"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("a"));
+	}
+	{
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("[!a]"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("b"));
+	}
+	{
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("[ab]"), out));
+		ASSERT_EQ(out.size(), 2u);
+		EXPECT_EQ(out[0], scratch.file("a"));
+		EXPECT_EQ(out[1], scratch.file("b"));
+	}
+}
+
+TEST(Pattern, ABracketExpressionCannotSpanAPathComponent) {
+	// `[a/b]` holds a '[' and a ']', but POSIX gives '/' to the path separator
+	// alone: neither component is a pattern, so neither directory is opened and
+	// the word names itself.
+	lesh::testing::temp_path scratch;
+	ASSERT_EQ(::mkdir(scratch.file("[a").c_str(), 0755), 0);
+	{
+		std::ofstream touch(scratch.file("[a/b]"));
+		ASSERT_TRUE(touch.good());
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	lesh::arena_array<std::string_view> out{pool, 4};
+	const std::string word = scratch.file("[a/b]");
+	// True, because the word-level test cannot see that the '/' separates them -
+	// but each COMPONENT is taken literally, so the walk extends the path by name
+	// and confirms it with lstat instead of scanning either directory.
+	EXPECT_TRUE(expand_pathnames(pool, word, out));
+	ASSERT_EQ(out.size(), 1u);
+	EXPECT_EQ(out[0], word);
+}
+
+// --- quote removal, and the two forms of one field (#210) ---------------------
+
+TEST(Pattern, RemovingEscapesKeepsTheEscapedByteAndDropsTheBackslash) {
+	// The inverse of the escaping the expander does on the way in. Sized for the
+	// worst case, which is the input length: unescaping only ever shortens.
+	const auto unescaped = [](std::string_view pattern) {
+		std::string out(pattern.size(), '\0');
+		out.resize(remove_pattern_escapes(pattern, out.data()));
+		return out;
+	};
+
+	EXPECT_EQ(unescaped("a\\*b"), "a*b");
+	EXPECT_EQ(unescaped("plain"), "plain");
+	EXPECT_EQ(unescaped("\\\\"), "\\") << "an escaped backslash is one backslash";
+	EXPECT_EQ(unescaped("a\\"), "a\\")
+		<< "a trailing lone backslash escapes nothing, so it stands for itself - "
+		   "which is exactly what match_here does with it";
+	EXPECT_EQ(unescaped(""), "");
+	// The whole escaped alphabet, since is_pattern_syntax is wider than the three
+	// metacharacters.
+	EXPECT_EQ(unescaped("\\*\\?\\[\\]\\-\\!\\^"), "*?[]-!^");
+}
+
+TEST(Pattern, AnEscapedMetacharacterIsNotAPatternAndOpensNoDirectory) {
+	// `a\*b` names one file. Nothing in it is live, so it is not a pattern at all
+	// and the walk is refused before it starts - the same observable #204 uses.
+	// The file EXISTS here, which is the harder half: the word must not be walked
+	// even though a scan would produce the very same pathname.
+	lesh::testing::temp_path scratch;
+	{
+		std::ofstream touch(scratch.file("a*b"));
+		ASSERT_TRUE(touch.good());
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	for (const char* name : {"a\\*b", "a\\?b", "\\[a\\]", "a\\*b\\*"}) {
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_FALSE(expand_pathnames(pool, scratch.file(name), out)) << name;
+		EXPECT_EQ(out.size(), 0u) << name;
+	}
+}
+
+TEST(Pattern, TheWalkReadsThePatternAndFallsBackToTheQuoteRemovedForm) {
+	// The two forms POSIX 2.6 hands to pathname expansion and to quote removal.
+	// A live `*` beside an escaped one makes the word a pattern; only the live one
+	// wildcards, so `a\*b*` selects the file literally called `a*b` and not `aXb`.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a*b", "aXb"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+
+	lesh::buffer_pool pool{1024 * 32};
+	{
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("a\\*b*"),
+		                             scratch.file("a*b*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("a*b"));
+	}
+	{
+		// Nothing matched, so the word expands to itself - and then quote removal
+		// runs on it, which is the second form and not the first. Passing the
+		// pattern here instead would print the backslash the user typed.
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, scratch.file("a\\*q*"),
+		                             scratch.file("a*q*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], scratch.file("a*q*"));
+	}
+	{
+		// A LITERAL component of a globbed word is extended by name, and the name is
+		// the unescaped one: the directory really is called `a*b`.
+		lesh::testing::temp_path tree;
+		ASSERT_EQ(::mkdir(tree.file("a*b").c_str(), 0755), 0);
+		std::ofstream touch(tree.file("a*b/f"));
+		ASSERT_TRUE(touch.good());
+
+		lesh::arena_array<std::string_view> out{pool, 4};
+		EXPECT_TRUE(expand_pathnames(pool, tree.file("a\\*b/*"),
+		                             tree.file("a*b/*"), out));
+		ASSERT_EQ(out.size(), 1u);
+		EXPECT_EQ(out[0], tree.file("a*b/f"));
+	}
 }

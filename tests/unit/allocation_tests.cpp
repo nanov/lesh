@@ -1,8 +1,7 @@
 #include "leshper/abi.h"
 #include "leshper/editor.h"
 #include "ui/loop.h"
-#include "ui/shell_actor.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 #include "leshper/event.h"
 #include "leshper/keymap.h"
 #include "leshper/host.h"
@@ -345,6 +344,14 @@ public:
 
 	[[nodiscard]] ui::event_loop& loop() const { return *_loop; }
 
+	// Bytes into the pipe the loop reads as its terminal.
+	void type(std::string_view bytes) const {
+		[&] {
+			ASSERT_EQ(::write(_in[1], bytes.data(), bytes.size()),
+			          static_cast<ssize_t>(bytes.size()));
+		}();
+	}
+
 	void drain_output() const {
 		char chunk[4096];
 		while (::read(_out[0], chunk, sizeof(chunk)) > 0) {
@@ -429,17 +436,9 @@ TEST_F(AllocationTest, ATimerExpiryCostsNoHeap) {
 	EXPECT_EQ(lesh_timer_stop(&actions, id), LESH_OK);
 }
 
-// --- The shell thread's highlight round (the reorg cleanup) ----------------
+// --- The shell-state reactor's round (the reorg cleanup; #201) -------------
 
 namespace {
-
-// A `shell_side` with nothing behind it: this test never accepts a line, and
-// `serve_highlight` is the only path it drives.
-class no_shell final : public ui::shell_side {
-public:
-	std::int32_t execute(std::string_view) override { return 0; }
-	std::int32_t port_call(std::string_view) override { return 0; }
-};
 
 // The highlighter's shape without the highlighter: one span over the line, which
 // is what makes the batch's vectors real rather than empty.
@@ -453,25 +452,25 @@ std::int32_t one_span_reactor(lesh_request* request, void*) {
 
 } // namespace
 
-TEST_F(AllocationTest, AWarmShellThreadHighlightRoundCostsNoHeap) {
-	// THE ONE REACTOR EVERY SESSION RUNS. ADR-0009 puts the highlighter on the
-	// shell thread because it reads the alias, function and builtin tables, so
-	// this round trip - post, take, serve, reply, drain, recycle - happens once
-	// per keystroke for the whole life of a shell.
+TEST_F(AllocationTest, AWarmShellReactorRoundCostsNoHeap) {
+	// THE ONE REACTOR EVERY SESSION RUNS. ADR-0009 runs the highlighter where
+	// shell state is owned, because it reads the alias, function and builtin
+	// tables - so this round happens once per keystroke for the whole life of a
+	// shell.
 	//
-	// It allocated twice per keystroke. `notify_reactors` built a
-	// `request_snapshot` with `snapshot_of` and MOVED it into the slot, freeing
-	// the buffer the slot held; and `serve_one` then moved the slot into a local
-	// and reset the member with `= highlight_slot{}`, freeing it again - which is
-	// what made `shell_actor.h`'s "their strings keep their capacity" untrue.
-	// `post_highlight` now assigns in place, `serve_one` SWAPS against a retained
-	// scratch slot, and `run_reactor_here` hands the buffer back when the reactor
-	// returns.
+	// AND IT IS TWO CALLS NOW (#201). It was post-take-serve-reply-drain-recycle
+	// across a thread; `event_loop::run_shell_reactor_here` is `take_snapshot`
+	// into a retained member and `run_reactor_here` out of it, which is what this
+	// drives. The three things that keep it at zero are unchanged and each was
+	// separately worth a malloc per keystroke: the snapshot is ASSIGNED into
+	// storage the caller already has rather than built and moved, the batch's
+	// vectors are CLEARED rather than replaced, and `run_reactor_here` HANDS THE
+	// BUFFER BACK when the reactor returns instead of letting the token's
+	// destructor free what it borrowed.
 	//
-	// ONE THREAD, DELIBERATELY. `serve_one` is what `run()` is written in terms
-	// of, so driving it here is the same path with no second thread inside the
-	// window - which is what lets a process-wide malloc counter mean "this round
-	// trip" rather than "this round trip and whatever a worker was doing".
+	// WHAT IS NOT MEASURED HERE is the apply and the `step` that follows, which
+	// `ApplyingAWarmHighlightBatchCostsNoHeap` and `AKeystrokeStepCostsNoHeap`
+	// pin separately - so a regression lands on the number that named it.
 	//
 	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
 	// object) and every round uses the same one, so a zero means capacity was
@@ -483,30 +482,33 @@ TEST_F(AllocationTest, AWarmShellThreadHighlightRoundCostsNoHeap) {
 	apply_edit(s, position{}, position{},
 	           "git log --oneline --graph --decorate --all | head -40");
 
-	no_shell nothing_behind_it;
-	ui::shell_actor actor{nothing_behind_it, nullptr};
-	std::vector<ui::shell_message> inbox;
+	// The loop's two members, by the same names.
+	ui::request_snapshot snapshot;
+	reactor_batch batch;
+	const std::atomic<bool> superseded{false};
+	std::size_t rounds = 0;
 
 	const auto round = [&] {
-		actor.post_highlight("highlighter", &one_span_reactor, nullptr, s,
-		                     LESH_EVENT_BUFFER_CHANGED);
-		actor.serve_one();
-		actor.replies().drain(inbox);
-		actor.replies().recycle(inbox);
+		ui::take_snapshot(snapshot, s, LESH_EVENT_BUFFER_CHANGED);
+		snapshot.host = nullptr;
+		ui::run_reactor_here("highlighter", &one_span_reactor, nullptr, snapshot,
+		                     superseded, batch);
+		++rounds;
 	};
 
-	// Warm: the slot's buffer, the message pool's spare list, the batch's span
-	// vector and the inbox all take their capacity in the first few rounds.
+	// Warm: the snapshot's buffer, the batch's span vector and its reactor name
+	// all take their capacity in the first few rounds.
 	for (int i = 0; i < 4; ++i)
 		round();
-	ASSERT_EQ(actor.served(), 4u) << "the rounds below would be measuring nothing";
+	ASSERT_EQ(rounds, 4u) << "the rounds below would be measuring nothing";
+	ASSERT_EQ(batch.spans.size(), 1u) << "the reactor emitted nothing to keep";
 
 	const size_t counted = mallocs_during([&] {
 		for (int i = 0; i < 100; ++i)
 			round();
 	});
-	EXPECT_EQ(counted, 0u) << "a warm shell-thread highlight round reached the heap";
-	EXPECT_EQ(actor.served(), 104u);
+	EXPECT_EQ(counted, 0u) << "a warm shell-state reactor round reached the heap";
+	EXPECT_EQ(rounds, 104u);
 }
 
 // --- The keystroke path (the reorg cleanup) --------------------------------
@@ -552,63 +554,111 @@ TEST_F(AllocationTest, AKeystrokeStepCostsNoHeapBeyondUndo) {
 	EXPECT_EQ(counted, 0u) << "a cursor-motion keystroke reached the heap";
 }
 
-// --- The submit path (the reorg cleanup) -----------------------------------
+// --- The fan-out (#202, where the submit path was) -------------------------
 
 namespace {
 
-// A reactor that does nothing, so what is measured is the CHANNEL and not a
-// reactor's own work.
+// A reactor that does nothing, so what is measured is the CHANNEL and the token
+// mint and not a reactor's own work.
 std::int32_t idle_reactor(lesh_request*, void*) { return LESH_OK; }
 
 } // namespace
 
-TEST_F(AllocationTest, SubmittingAWarmReactorRoundCostsNoHeap) {
-	// THE HOST'S HALF OF FANNING A KEYSTROKE OUT, and it is zero.
+TEST_F(AllocationTest, TwoReactorFibersAddNothingToWhatAKeystrokeAlreadyCost) {
+	// THE TICKET'S OWN NUMBER, AND IT IS A DELTA (#202). What the ticket asks is
+	// that the steady-state keystroke "must not allocate more than before", and the
+	// honest way to say that is to run the SAME keystroke through two loops that
+	// differ in one thing - whether any reactor is registered - and compare.
 	//
-	// It was not. `notify_reactors` called `snapshot_of`, which built a fresh
-	// `request_snapshot` - one malloc for its buffer - and `submit` then MOVED it
-	// into the slot, freeing the buffer the slot was already holding. One malloc
-	// and one free per reactor per keystroke, for a line whose length changes by
-	// one byte. The slot is now filled IN PLACE (`take_snapshot`), and the worker
-	// SWAPS the task out and hands the storage back at the end of `compute`
-	// instead of moving it away and resetting the slot.
+	// WHY NOT AN ABSOLUTE ZERO: a keystroke through the real loop costs TWO mallocs
+	// per key TODAY, in `input_decoder::feed`, and it cost them before this ticket
+	// too - `drain_tty`, `decode.cpp` and `tty.cpp` are byte-identical on this
+	// branch. Asserting zero here would fail for a reason that has nothing to do
+	// with fibers and would hide the number that does. The isolated compute is
+	// pinned at zero separately by `AWarmShellReactorRoundCostsNoHeap`, and the
+	// editor's own half by `AKeystrokeStepCostsNoHeapBeyondUndo`; this is the
+	// channel between them, and its contribution is what this measures.
 	//
-	// THE ROUND TRIPS BEFORE THE WINDOW ARE THE POINT, not a warm-up formality:
-	// they are what proves the storage came back. If `compute` stopped returning
-	// the buffer, the slot would be empty here and the first submit below would
-	// allocate.
+	// EACH HALF OF THAT ZERO WAS SEPARATELY WORTH A MALLOC PER KEYSTROKE, and each
+	// is a decision this test is the pin for:
+	//
+	//   - the snapshot is ASSIGNED into the lane's own storage (`take_snapshot`),
+	//     never built at the call site and moved in;
+	//   - the slot carries the EVENT MASK and not the snapshot, because
+	//     `slot<T>::send` takes `T` by value and a moved-from `std::string` has
+	//     given its capacity away - so the lane owns two snapshots and SWAPS them
+	//     at `recv`, which is where the compute's storage comes back;
+	//   - `run_reactor_here` HANDS THE BUFFER BACK when the reactor returns rather
+	//     than letting the token's destructor free what it borrowed;
+	//   - the batch's vectors are SWAPPED into the decoration layer rather than
+	//     copied, so the storage cycles both ways.
+	//
+	// A CURSOR MOTION AND NOT AN INSERT, for the reason
+	// `AKeystrokeStepCostsNoHeapBeyondUndo` gives: an insertion records an undo
+	// entry, which owns the replaced and inserted text. So the key is Ctrl-B -
+	// `backward_char`, one byte, no escape sequence to disambiguate - the cursor is
+	// put back by assignment between rounds (two integers), and the reactors are
+	// registered for `cursor_moved`.
 	//
 	// THE LINE IS LONGER THAN A SHORT STRING (libc++ keeps 22 bytes inside the
-	// object) and every submit uses the SAME line, so a zero means capacity was
-	// reused rather than never needed.
+	// object) and every round uses the same one, so a matching pair of numbers
+	// means capacity was reused rather than never needed.
 	using namespace lesh::leshper;
+	log::shutdown();
 
-	state s;
-	apply_edit(s, position{}, position{},
-	           "git log --oneline --graph --decorate --all | head -40");
+	// How many mallocs 100 identical keystrokes cost a loop with `reactors`
+	// reactors registered, and how many computes those keystrokes reached.
+	const auto measure = [&](int reactors, std::size_t& computes) {
+		registry reg;
+		if (reactors >= 1) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		if (reactors >= 2) {
+			EXPECT_EQ(lesh_reactor_register(&reg, "autosuggester", LESH_EVENT_CURSOR_MOVED,
+			                                &idle_reactor, nullptr),
+			          LESH_OK);
+		}
+		loop_over_a_pipe driven;
+		driven.loop().attach_registry(reg);
+		apply_edit(driven.loop().editor(), position{}, position{},
+		           "git log --oneline --graph --decorate --all | head -40");
+		const position end = driven.loop().editor().buffer.end_position();
 
-	ui::worker_pool helpers{1};
-	std::vector<ui::completion> done;
-	for (int round = 0; round < 5; ++round) {
-		helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
-		ASSERT_GE(helpers.completions().wait_and_drain(done, 1), 1u);
-		for (ui::completion& one : done)
-			one.recycle();
-		done.clear();
-	}
+		const auto round = [&] {
+			driven.loop().editor().cursor = end;
+			driven.type("\x02");
+			(void)driven.loop().turn(0);
+		};
+		// Warm: the two lanes, their fibers, their snapshots and their batches all
+		// take their capacity here. The fibers are SPAWNED in one of these rounds,
+		// which mmaps a stack - not a malloc, and once.
+		for (int i = 0; i < 8; ++i)
+			round();
+		const size_t counted = mallocs_during([&] {
+			for (int i = 0; i < 100; ++i)
+				round();
+		});
+		computes = driven.loop().reactor_computes("highlighter");
+		return counted;
+	};
 
-	// PARKED FOR THE WINDOW. A worker running inside it would be counting its
-	// own allocations, which are the compute's and not the submit's; parked, the
-	// only thing that moves is the slot.
-	helpers.park_all();
-	const size_t counted = mallocs_during([&] {
-		for (int i = 0; i < 100; ++i)
-			helpers.submit("probe", s, LESH_EVENT_BUFFER_CHANGED, &idle_reactor, nullptr);
-	});
-	helpers.resume();
-	EXPECT_EQ(counted, 0u) << "a warm submit reached the heap";
+	std::size_t none_computed = 0;
+	std::size_t both_computed = 0;
+	const size_t without = measure(0, none_computed);
+	const size_t with = measure(2, both_computed);
 
-	helpers.supersede_all();
+	EXPECT_EQ(none_computed, 0u) << "the control loop ran a reactor";
+	EXPECT_GE(both_computed, 100u) << "the rounds did not each reach the reactor";
+	EXPECT_EQ(with, without)
+		<< "two reactor fibers added " << (with - without)
+		<< " allocations to a keystroke that already cost " << without;
+	// AND THE ABSOLUTE NUMBER IS PINNED TOO, so that the pre-existing cost cannot
+	// grow behind the delta: two mallocs per key, in the decoder, unchanged by this
+	// ticket. A change here is a finding either way and belongs in whatever moves
+	// it, not in a number nobody re-derives.
+	EXPECT_EQ(without, 200u) << "a keystroke's own allocation count moved";
 }
 
 // --- The reactor channel and the completion channel (#168 Phase B) ---------

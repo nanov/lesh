@@ -722,6 +722,19 @@ TEST(UiHistoryVacuumCorrupt, OursAndBrokenIsMovedAsideAndRebuilt) {
 	ASSERT_FALSE(report.tier1_mapped);
 	ASSERT_TRUE(report.tier1_corrupt);
 	ASSERT_TRUE(storage.may_rewrite_tier1());
+	// THE COUNTDOWN IS RANDOM (`maybe_vacuum`, `store.h`'s own warning on
+	// `set_automatic_vacuum`): its first period starts at a random value in
+	// `[0, k_vacuum_frequency)`, so one run in twenty-five the SINGLE
+	// `run_command` below would itself land on zero and run a vacuum inside
+	// `resolve_pending` - moving the broken file aside and rebuilding it
+	// before this test ever calls `vacuum_now()` itself. `corrupt_moved_aside`
+	// is a one-shot signal on THAT CALL's `vacuum_result`, so a vacuum that
+	// already happened leaves it false on the second, redundant call and the
+	// assertion below fails for a reason that has nothing to do with the
+	// policy under test - exactly the flake #205 chased through three
+	// "load-only" sightings before landing here. Off, so the only vacuum in
+	// this test is the one the assertions are about.
+	storage.set_automatic_vacuum(false);
 	run_command(storage, "a command worth keeping");
 
 	const vacuum_result done = storage.vacuum_now();

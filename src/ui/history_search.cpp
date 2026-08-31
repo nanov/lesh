@@ -196,10 +196,11 @@ history_search::outcome history_search::run(std::string_view query,
 		lex_into(query, _query_tokens);
 
 	source.for_each_newest_first([&](std::string_view entry) -> bool {
-		// #94's supersede poll, between entries. Before the entry rather than
+		// #94's supersede poll, between entries, every `poll_every` of them since
+		// #206 - see the constant for the arithmetic. Before the entry rather than
 		// after it, so `cancelled` means nothing was examined half-way and the
 		// sink was not called for work that is about to be thrown away.
-		if (cancelled && cancelled()) {
+		if (cancelled && (result.entries_examined & (poll_every - 1)) == 0 && cancelled()) {
 			result.cancelled = true;
 			return false;
 		}

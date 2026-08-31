@@ -3,12 +3,16 @@
 // The fork-child discipline, enforced rather than commented (#129, the owner's
 // scope note on #128's correction; architecture spec §4).
 //
-// TWO LAYERS, AND THIS IS THE SECOND ONE. The load-bearing layer is PARKING:
+// TWO LAYERS, AND THIS IS THE SECOND ONE. The first layer was PARKING - #91's
 // `worker_pool::park_all()` before a fork, so a child that goes on to run shell
-// code - a subshell, `&` on shell code, a non-external pipeline stage - is born
-// from a genuinely single-threaded moment and can allocate. That is #91's, it
-// lives in workers.h, and it is what makes lesh's forks legal where fish's rule
-// would not have been (fish has no subshells; every fork execs).
+// code (a subshell, `&` on shell code, a non-external pipeline stage) was born
+// from a genuinely single-threaded moment and could allocate. #202 made that
+// property STRUCTURAL: there are no helper threads left, both reactors are
+// fibers on the forking thread, and a lesh process has one thread. What is left
+// of the layer is `event_loop::quiesce()`, which parks the emitters group so that
+// nothing computes for a line that has already run, and
+// `event_loop::assert_quiesced()`, which is still the assertion every
+// fork-and-continue site carries.
 //
 // This file is the OTHER layer, applied to the exec lanes anyway as defense in
 // depth: between `fork()` and `execve()` the child touches only raw libc, stack
@@ -30,7 +34,7 @@
 //
 // WHY A HEADER IN THE SUBSTRATE. The exec lanes are the shell's - the executor
 // forks, and those lanes never enter the editor - while the quiesce-boundary
-// assertion is the host's (`src/ui/workers.cpp`). Both sides need the same
+// assertion is the host's (`src/ui/loop.cpp`). Both sides need the same
 // guard, and the substrate is the one layer below both. It depends on POSIX and
 // on substrate/arena.h, and on nothing above itself.
 
@@ -83,7 +87,7 @@ inline void install_fork_child_detection() noexcept {
 }
 
 // The assertion the spawn-without-fork paths carry: this code is NOT running in
-// a forked child. The mirror of `worker_pool::assert_quiesced()`, and the other
+// a forked child. The mirror of `event_loop::assert_quiesced()`, and the other
 // half of the lane-aware pair the owner's scope note names -
 // `assert_quiesced()` at `fork_continue` sites, this on `fork_exec` paths.
 inline void assert_not_in_forked_child() noexcept {

@@ -61,9 +61,10 @@ struct reactor_batch;
 // names instead of a second sweep of the filesystem.
 //
 // FIXED AND INLINE, which is a departure from #130's "memoized in the request's
-// arena" and stronger than it: a token minted on the loop thread has no arena at
-// all (`current_worker_arena()` is null off a worker, which is every test that
-// drives a reactor through `loop_harness`), and an array inside the token
+// arena" and stronger than it: no token has a per-request arena at all any more
+// (the pool that handed one out went with #202; the highlighter carries its own,
+// and a reactor reached through `loop_harness` never had one), and an array
+// inside the token
 // allocates nothing anywhere rather than allocating cheaply in one of the two
 // places. Its life is exactly the request's, which is what "per request" asked
 // for.
@@ -178,10 +179,11 @@ struct lesh_registry {
 	// handed is the smallest thing that reaches the driver, and it keeps the ABI
 	// signature frozen (abi.h grows additively or not at all).
 	//
-	// LOOP-THREAD-ORDERED, not synchronised, exactly as the timer table it
-	// replaces was: the shell thread touches this only while the driver is parked
-	// in `wait_on_shell`, which is ADR-0008's "the registry is the loop's" holding
-	// rather than being bent.
+	// LOOP-ORDERED, not synchronised, exactly as the timer table it replaces was:
+	// the shell side touches this only from inside the `execute` the driver
+	// called, which is ADR-0008's "the registry is the loop's" holding rather than
+	// being bent. It was a second thread and a `wait_on_shell` until #201; the
+	// ordering argument is the one that mattered and it is unchanged.
 	lesh::leshper::effects pending;
 
 	// Interned style names. Index 0 is LESH_STYLE_NONE and is never a name.
@@ -308,7 +310,6 @@ struct lesh_editor {
 	// give us, and the ABI says "valid for the receiving call" rather than
 	// pretending otherwise.
 	std::uint64_t call_token = 0;
-	std::uint64_t owner_thread = 0;
 
 	// Action recursion depth (#92's ceiling of 64).
 	int depth = 0;
@@ -329,6 +330,36 @@ struct lesh_request {
 
 	// Cooperative cancellation. Points at the loop's flag; never owned.
 	const std::atomic<bool>* superseded = nullptr;
+
+	// THE MID-COMPUTE YIELD (#202), AND WHY IT HANGS OFF THE CANCELLATION POLL.
+	//
+	// A reactor that runs on a fiber must give the host the thread back often
+	// enough that a keystroke is not left waiting behind a `$PATH` walk. The place
+	// a reactor ALREADY checks in is `lesh_request_superseded` - #124's
+	// `kPollEvery` in the token sweep, the per-entry poll in the autosuggester's
+	// history walk, the poll adjacent to every command NAME `classify_command`
+	// classifies (#212: the `$PATH` walk it then makes is the un-yielded unit) - so
+	// THE POLL IS THE YIELD, which is #145's record in its own words. Every one of
+	// those sites becomes a yield point at no cost to the published interface:
+	// `abi.h` is unchanged, `lesh_reactor_fn` is unchanged, and a reactor written
+	// against the header gains a yield it never asked for and cannot misuse.
+	//
+	// CALLED BEFORE THE FLAG IS READ, never after. The host's reason for wanting
+	// the thread back is that it may then dispatch a keystroke, and a keystroke
+	// that changes the buffer is what SETS the flag - so a poll that read first
+	// and yielded second would answer with news one yield out of date and walk one
+	// more block for a line the user has already left.
+	//
+	// NULL IS THE ORDINARY CASE and means "there is nobody to yield to": a reactor
+	// dispatched from `loop_harness::react` runs on the host's own stack, where
+	// yielding would be yielding to itself. Only `run_reactor_here` called from
+	// inside a fiber fills these in.
+	//
+	// A FUNCTION POINTER AND A `void*`, not a `std::function`, for the reason
+	// every other seam in this file is: the token is minted per call on a path
+	// that runs per keystroke, and a capturing lambda would allocate there.
+	void (*cooperate)(void* userdata) = nullptr;
+	void* cooperate_userdata = nullptr;
 
 	// THE HOST (#168 Phase B; host.h). Never owned.
 	//
@@ -361,7 +392,6 @@ struct lesh_request {
 	std::vector<lesh::leshper::proposal>* proposals = nullptr;
 
 	std::uint64_t call_token = 0;
-	std::uint64_t owner_thread = 0;
 
 	[[nodiscard]] bool live() const noexcept { return call_token != 0; }
 };

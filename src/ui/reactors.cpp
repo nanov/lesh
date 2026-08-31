@@ -29,19 +29,22 @@
 // and since Phase B it is the client from OUTSIDE the editor, which is why
 // `lesh_leshper` no longer links `lesh_syntax` at all.
 //
-// WHY THIS RUNS ON A WORKER (F-22): classifying a command name touches the
-// filesystem - a PATH sweep with a stat per candidate - and that cannot sit on
-// the keystroke path. Everything else here is one re-parse, measured at 38.7 us
-// per 4 KiB (#95, #104), which is inside N-1's millisecond on its own; the
-// filesystem is the part that is not.
+// WHY THIS IS A REACTOR AND NOT A KEYSTROKE'S WORK (F-22): classifying a command
+// name touches the filesystem - a PATH sweep with a stat per candidate - and that
+// cannot sit on the keystroke path. Everything else here is one re-parse,
+// measured at 38.7 us per 4 KiB (#95, #104), which is inside N-1's millisecond on
+// its own; the filesystem is the part that is not. Since #202 the sweep runs on
+// this reactor's own fiber and every `superseded` poll below is also a yield, so
+// a cold `$PATH` costs turns rather than a frozen terminal.
 //
-// THE ARENA. #90 settled "arena per worker, reset per request", and until the
-// worker pool lands (#126) the request token hands out no arena, so the
-// highlighter carries its own in the registration-time context pointer and
-// rewinds it to a mark at the top of every compute. Nothing points into it once
-// compute returns - emit copies at the call site - which is the lifetime rule
-// #90 made the whole design rest on. When the pool lands, this member moves to
-// the worker and nothing else here changes.
+// THE ARENA. #90 settled "arena per unit of work, reset per request", and the
+// request token hands out none - the helper pool that was to own them never
+// landed and #202 deleted its ticket's remains - so the highlighter carries its
+// own in the registration-time context pointer and rewinds it to a mark at the
+// top of every compute. Nothing points into it once compute returns - emit copies
+// at the call site - which is the lifetime rule #90 made the whole design rest
+// on, and it is what makes the arena survivable across a yield: the fiber that
+// owns the arena is the fiber that is suspended in it.
 
 #include "ui/reactors.h"
 
@@ -103,9 +106,9 @@ struct highlighter {
 	// Where the arena stands with nothing in it. Every compute rewinds here.
 	char* mark = pool.at();
 
-	// F-21's classes, interned once at registration on the loop thread, because
-	// that is where interning is allowed and because a worker wants a plain
-	// integer (ADR-0008). A reactor never names a colour: the theme maps these
+	// F-21's classes, interned once at registration, because that is where
+	// interning is allowed and because a reactor wants a plain integer
+	// (ADR-0008). A reactor never names a colour: the theme maps these
 	// names at render, which is what makes F-21's "independently themeable" a
 	// property of the design rather than a promise.
 	std::uint32_t command_unknown = LESH_STYLE_NONE;
@@ -239,9 +242,10 @@ private:
 		}
 	}
 
-	// The cooperative poll (ADR-0008). Not checking would be safe - the loop
-	// drops a stale batch either way - it would just waste the worker on a line
-	// the user has already typed past.
+	// The cooperative poll (ADR-0008), and since #202 the YIELD as well. Not
+	// checking would be safe - the loop drops a stale batch either way - it would
+	// just spend slices on a line the user has already typed past, and hold the
+	// thread while it did.
 	[[nodiscard]] bool superseded() const noexcept {
 		std::int32_t out = 0;
 		return lesh_request_superseded(_request, &out) == LESH_OK && out != 0;
@@ -332,7 +336,13 @@ private:
 			// A token has no such unit, so this counts: often enough that a
 			// 100 KiB paste gives up promptly, rare enough that the atomic load
 			// is not the sweep's cost.
-			if ((i & (kPollEvery - 1)) == 0 && i != 0 && superseded())
+			//
+			// BEFORE THE FIRST TOKEN AS WELL, which is `history_search`'s spelling
+			// of the same stride and now the only one (#211 §4.4). The two used to
+			// differ by an `i != 0` here, so one walk asked before its first item
+			// and the other did not - a difference nothing wanted and nobody could
+			// have named the reason for.
+			if ((i & (kPollEvery - 1)) == 0 && superseded())
 				return LESH_ERR_SUPERSEDED;
 			const token& t = _tree->token_at(i);
 			if (!is_real(t))
@@ -475,6 +485,14 @@ private:
 	// delays the next highlight, never a keystroke). The node pass already polls
 	// at each simple_command; this makes the poll immediately adjacent to the
 	// filesystem, which is what the ADR asks for.
+	//
+	// AND THE WALK ITSELF STAYS UN-YIELDED, ON PURPOSE AND ON NUMBERS (#212).
+	// One name's walk is the unit this poll cannot break up: 18-36 us over a real
+	// 35-entry `$PATH` in release, worst keystroke wait 114 us through the loop,
+	// against a 50 ms watchdog - so threading a yield down into the walk would
+	// spend ~35 yields to shorten a 35 us slice, and would still not help the one
+	// case it was proposed for, since a yield between stats cannot shorten a
+	// single stat that blocks. `tools/bench.cpp` holds the measurement.
 	[[nodiscard]] std::int32_t classify_command(const node& n,
 	                                            std::uint32_t& style) const noexcept {
 		style = LESH_STYLE_NONE;
@@ -595,8 +613,8 @@ highlighter* highlighter_create() { return new highlighter{}; }
 void highlighter_destroy(highlighter* self) noexcept { delete self; }
 
 std::size_t register_reactors(lesh_registry& reg, highlighter& self) {
-	// Interning is loop-thread only (ADR-0008), so a reactor interns everything
-	// it will ever emit at registration and carries plain integers to the worker.
+	// Interning is the loop's (ADR-0008), so a reactor interns everything it will
+	// ever emit at registration and carries plain integers into its compute.
 	for (const style_slot& slot : kStyles) {
 		std::uint32_t id = LESH_STYLE_NONE;
 		if (lesh_style_intern(&reg, slot.name, &id) == LESH_OK)
@@ -647,7 +665,7 @@ std::size_t register_reactors(lesh_registry& reg, highlighter& self) {
 // `cd` suggestion whose directory no longer exists. It needs the cwd and a path
 // check, and both are the SHELL's - #130's door on the request token, which does
 // not exist yet. The follow-up is recorded on #130 rather than guessed at here;
-// a `stat` against the worker's own cwd would answer a different question than
+// a `stat` against the process's own cwd would answer a different question than
 // the one the user's line asks.
 //
 // The completion-derived fallback F-24 lists as a SHOULD waits on the completion
@@ -675,8 +693,8 @@ struct autosuggester {
 	// (#125); the tests hand in a `vector_history_source`.
 	const history_source* source = nullptr;
 
-	// F-21's one name for this reactor, interned once at registration on the
-	// loop thread. The theme decides what `suggestion` looks like - muted, in
+	// F-21's one name for this reactor, interned once at registration. The
+	// theme decides what `suggestion` looks like - muted, in
 	// every implementation anyone has shipped - and a reactor that said "grey"
 	// here would be the thing F-21 exists to prevent.
 	std::uint32_t suggestion = LESH_STYLE_NONE;
@@ -832,8 +850,8 @@ autosuggester* autosuggester_create(const history_source* source) {
 void autosuggester_destroy(autosuggester* self) noexcept { delete self; }
 
 std::size_t register_autosuggester(lesh_registry& reg, autosuggester& self) {
-	// Interning is loop-thread only (ADR-0008), so the one id this reactor will
-	// ever emit is interned here and carried to the worker as a plain integer.
+	// Interning is the loop's (ADR-0008), so the one id this reactor will ever
+	// emit is interned here and carried into its compute as a plain integer.
 	std::uint32_t id = LESH_STYLE_NONE;
 	if (lesh_style_intern(&reg, "suggestion", &id) == LESH_OK)
 		self.suggestion = id;

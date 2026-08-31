@@ -18,11 +18,12 @@
 //
 // ONE OWNER, NO VERSION. #130 resolved this over a copy-on-write definitions
 // version held by the request token, because the highlighter then ran on a
-// worker while the loop mutated the tables. ADR-0009 dissolved that: the shell
-// is the main thread, it owns `shell_state`, and a highlight, a port call and an
-// execution are serialized on it. So the implementation may hand back views into
-// the state's own storage - there is no second thread that could invalidate one
-// mid-call - and this interface is a plain const reference, not a refcounted
+// helper thread while the loop mutated the tables. ADR-0009 dissolved that and
+// ADR-0011 keeps it: the shell is the main thread, it owns `shell_state`, and a
+// highlight, a port call and an execution are serialized on it - the highlight
+// because it is a fiber the host resumes on that same thread, never beside it.
+// So the implementation may hand back views into the state's own storage - there
+// is nothing that could invalidate one mid-call - and this interface is a plain const reference, not a refcounted
 // snapshot. The only version left is the editor's generation, already on the
 // token.
 //
@@ -39,7 +40,6 @@
 // because a cost cache that can never change an answer belongs with the caller
 // (#168 Phase B).
 
-#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -91,7 +91,8 @@ enum class name_domain : std::uint8_t {
 	path_directory = 4,
 };
 
-// ADR-0009's rule, made checkable (#151).
+// ADR-0009's rule, made checkable (#151) - AND IT IS ABOUT EXECUTION, NOT ABOUT
+// ONE WRITE (#211 §2.2, which is where the name came from).
 //
 // THE RULE IS "THE SHELL WRITES ITS OWN STATE, AND NOBODY READS IT WHILE IT
 // DOES". Everything above depends on it - the bare pointers on the request
@@ -99,50 +100,47 @@ enum class name_domain : std::uint8_t {
 // version of #130 - and until this type existed it was a paragraph in an ADR
 // that a future reader could only obey by remembering. What makes the rule
 // checkable is that there are exactly TWO writers, `shell_side::execute` and
-// `shell_side::port_call`, and both are entered from one place: `shell_actor`
-// serving a slot. So the actor raises this flag around them and every read
-// through an adapter that holds one asserts it is down.
+// `shell_side::port_call`, and both are entered from one place: the loop
+// calling them (`event_loop::accept_current_line`, `finish_cancelled_line`,
+// `call_port`).
 //
-// WHY AN ATOMIC WHEN THE CLAIM IS THAT THERE IS NO CONCURRENCY. Because the
-// claim is exactly what is being checked: the flag is written on the shell
-// thread and read wherever a reader happens to be - the shell thread for the
-// highlighter, the LOOP thread for the completer (see `enumerate` below) - and
-// a plain `bool` read across those would be the data race the assertion exists
-// to catch, which is a poor way to catch it. Relaxed on both sides: this is a
-// tripwire, not a handshake, and it orders nothing.
+// IT IS UP FOR A WHOLE COMMAND'S WALL-CLOCK, including every turn the host takes
+// while the execution fiber is parked in a wait - so what it says is not "a write
+// is in progress" but "the shell is executing, and a read taken now would be a
+// read of state a command owns". The load-bearing guard against a reactor doing
+// that is the emitters group's park; this is the tripwire that says so out loud.
+//
+// A PLAIN BOOL. It was an atomic because the flag was written on the shell
+// thread and read wherever a reader happened to be, and a `bool` across those
+// would have been the data race the assertion exists to catch. There is one
+// thread.
 //
 // DEBUG-ONLY COST. The load lives inside `LESH_ASSERT` and compiles out in
-// release; what remains is two relaxed stores per execution or port call, which
-// is per COMMAND and not per keystroke.
-class shell_writing_flag {
+// release; what remains is two stores per execution or port call, which is per
+// COMMAND and not per keystroke.
+class shell_executing_flag {
 public:
-	[[nodiscard]] bool writing() const noexcept {
-		return _writing.load(std::memory_order_relaxed);
-	}
+	[[nodiscard]] bool executing() const noexcept { return _executing; }
 
-	// Raised for the length of one write, ON THE SHELL THREAD. RAII rather than
-	// a pair of calls, because the write it brackets is a `virtual` the shell
-	// implements and may leave by throwing.
+	// Raised for the length of one execution. RAII rather than a pair of calls,
+	// because what it brackets is a `virtual` the shell implements and may leave
+	// by throwing.
 	class scope {
 	public:
-		explicit scope(shell_writing_flag* flag) noexcept : _flag(flag) {
-			if (_flag != nullptr)
-				_flag->_writing.store(true, std::memory_order_relaxed);
+		explicit scope(shell_executing_flag& flag) noexcept : _flag(&flag) {
+			_flag->_executing = true;
 		}
-		~scope() {
-			if (_flag != nullptr)
-				_flag->_writing.store(false, std::memory_order_relaxed);
-		}
+		~scope() { _flag->_executing = false; }
 
 		scope(const scope&) = delete;
 		scope& operator=(const scope&) = delete;
 
 	private:
-		shell_writing_flag* _flag;
+		shell_executing_flag* _flag;
 	};
 
 private:
-	std::atomic<bool> _writing{false};
+	bool _executing = false;
 };
 
 // The shell's tables, asked one name at a time.
@@ -193,23 +191,24 @@ public:
 	// makes the lifetime the caller's. #137 records a cached command list as the
 	// v2 that makes it free.
 	//
-	// ASKED FROM THE LOOP THREAD (#151), and that is legal by ADR-0009 rather
+	// ASKED FROM INSIDE AN ACTION (#151), and that is legal by ADR-0009 rather
 	// than in spite of it. The loop reads shell state while nothing EXECUTES,
-	// and nothing can: `execute` and `port_call` are the only writers, the loop
-	// itself is what requests them, and it is blocked in `wait_on_shell` for the
-	// whole of each. #139 routed this through a round trip on the actor's
-	// `enumerate` slot; #151 deleted the slot, because a copy the loop makes for
-	// itself and a copy the shell thread makes for it are the same copy with one
-	// less protocol. `shell_writing_flag` above is the tripwire that keeps the
-	// argument true.
+	// and nothing can: `execute` and `port_call` are the only writers, and the
+	// loop is what CALLS them - so a dispatch is by construction not inside
+	// either (it was "blocked in `wait_on_shell` for the whole of each" until
+	// #201, which is the same argument with a thread in it). #139 routed this
+	// through a round trip on the actor's `enumerate` slot; #151 deleted the
+	// slot, because a copy the loop makes for itself and a copy the shell makes
+	// for it are the same copy with one less protocol. `shell_executing_flag`
+	// above is the tripwire that keeps the argument true.
 	//
 	// NO `$PATH` WALK HERE, for the same reason #135 gave for splitting `path`
 	// out of `classify`: the walk is a readdir per directory and it belongs on
-	// the side that memoizes it - which is the completer, on the loop, where the
+	// the side that memoizes it - which is the completer, in the loop, where the
 	// directory walk it is already doing lives. `path_directory` hands over the
 	// SPLIT of the value and stops there. Folding the sweep in would put a
-	// filesystem walk on the shell thread, serialized ahead of the next
-	// execution, to answer a question the loop was about to walk anyway.
+	// filesystem walk on the shell's side of the two roles, serialized ahead of
+	// the next execution, to answer a question the loop was about to walk anyway.
 	//
 	// A DEFAULTED BODY, not a pure virtual: this arrived after two
 	// implementations and several fakes, and #130's growth rule for this door is
@@ -229,9 +228,9 @@ public:
 // silent `getenv` inside the ABI, so that "where did that PATH come from" has an
 // object to point at.
 //
-// The environment belongs to the shell thread, which is the only thread that
-// writes it; a reader on any other thread is reading a table that could be
-// changing under it. That is a pre-existing property of `getenv`, unchanged
+// The environment belongs to the shell, which is the only side that writes it;
+// a reader that is not the shell is reading a table that could be changing under
+// it. That is a pre-existing property of `getenv`, unchanged
 // here, and it is one more reason the wired-up path passes a real
 // `shell_knowledge` instead.
 class environment_knowledge final : public shell_knowledge {

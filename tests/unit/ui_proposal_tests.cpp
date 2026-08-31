@@ -2,7 +2,7 @@
 #include "leshper/proposal.h"
 #include "leshper/registry.h"
 #include "ui/loop.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 
 #include "ui_fakes.h"
 
@@ -63,6 +63,13 @@ bool turn_until(event_loop& loop, Predicate predicate, int budget = 200) {
 struct offer {
 	std::string candidate = "git status";
 	std::uint32_t kind = LESH_PROPOSAL_AUTOSUGGESTION;
+	// WHETHER THE COMPUTE YIELDS IN THE MIDDLE. `lesh_request_superseded` is the
+	// cancellation poll and since #202 the poll IS the yield, so one call suspends
+	// this compute and hands the thread back - which is what lets a test move the
+	// editor's generation between the snapshot this compute was handed and the
+	// batch it emits. Off by default: every other case here wants the answer in
+	// the turn that asked for it.
+	bool yield_mid_compute = false;
 };
 
 int32_t offering_reactor(lesh_request* request, void* userdata) {
@@ -71,6 +78,10 @@ int32_t offering_reactor(lesh_request* request, void* userdata) {
 	std::size_t length = 0;
 	if (lesh_request_buffer(request, typed, sizeof(typed), &length) != LESH_OK)
 		return LESH_OK;
+	if (what.yield_mid_compute) {
+		int32_t superseded = 0;
+		(void)lesh_request_superseded(request, &superseded);
+	}
 	const std::string_view line{typed, length};
 	if (line.empty() || line.size() >= what.candidate.size()
 	    || std::string_view{what.candidate}.substr(0, line.size()) != line)
@@ -99,7 +110,7 @@ int32_t probing_action(lesh_editor* editor, const lesh_invocation*, void* userda
 	return LESH_OK;
 }
 
-// A loop, its helpers, and the editing context they all share.
+// A loop and the editing context it and its reactor fibers share.
 //
 // THE CONTEXT IS THE LOOP'S EDITOR'S, which is the wiring #134 does in
 // `ui/session.cpp` and the only wiring that works: `editor.cpp` dispatches a key
@@ -107,7 +118,6 @@ int32_t probing_action(lesh_editor* editor, const lesh_invocation*, void* userda
 // context's or a bound key reaches a different table than the reactors do.
 struct looped {
 	fake_tty tty;
-	worker_pool helpers{1};
 	event_loop loop{tty.fds(), pipe_options()};
 	offer what;
 	probe seen;
@@ -121,7 +131,6 @@ struct looped {
 		                               &seen),
 		          LESH_OK);
 		loop.attach_registry(context.actions());
-		loop.attach_helpers(helpers);
 		// A size, so a turn paints: the pipe has no winsize to report.
 		loop.editor().columns = 40;
 		loop.editor().rows = 6;
@@ -137,7 +146,8 @@ struct looped {
 		map->bind(encoded, action);
 	}
 
-	// Type, and wait for the offer to come back from the helper and be applied.
+	// Type, and wait for the offer to come back from the reactor's fiber and be
+	// applied.
 	[[nodiscard]] bool show(std::string_view typed) {
 		const std::size_t before = loop.applied_batches();
 		tty.type(typed);
@@ -161,7 +171,7 @@ struct looped {
 // ===========================================================================
 
 TEST(UiProposal, AKeyBoundToAcceptPutsTheAppliedProposalInTheBuffer) {
-	// THE WHOLE TRAIL, and the one #144 found broken: reactor -> worker ->
+	// THE WHOLE TRAIL, and the one #144 found broken: reactor -> its fiber ->
 	// `take_batch` -> `state::proposals` -> `lesh_proposal_read` -> a staged
 	// write the loop commits. Nothing here dispatches through the harness by
 	// hand; the key is bound and typed, exactly as a user's `bind` would be.
@@ -240,9 +250,17 @@ TEST(UiProposal, ABatchFromASupersededGenerationIsNeverReadable) {
 	looped driven;
 	driven.bind("<C-y>", "probe_proposal");
 
-	driven.helpers.submit("offerer",
-	                      snapshot_of(driven.loop.editor(), LESH_EVENT_BUFFER_CHANGED),
-	                      &offering_reactor, &driven.what);
+	// THE STALE BATCH, BUILT MID-COMPUTE. The reactor yields at its cancellation
+	// poll, the editor's generation moves on while the fiber is suspended there,
+	// and what comes back is an offer about text the buffer no longer holds.
+	//
+	// IT USED TO BE ARRANGED WITH `quiesce()` - a parked group, a send that queued
+	// its wake, a bump, a resume - and #208 took that away: while `executing` the
+	// tty topic is out of the poll set, because the terminal belongs to the running
+	// command, so a keystroke typed after a `quiesce` is never read. The yield is
+	// the production shape of the same race in any case.
+	driven.what.yield_mid_compute = true;
+	driven.press("x");
 	driven.loop.editor().gen.bump();
 	ASSERT_TRUE(turn_until(driven.loop, [&] { return driven.loop.dropped_batches() > 0; }));
 

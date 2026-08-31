@@ -109,9 +109,17 @@ std::string read_all(std::istream& in) {
 // the session is constructed first and started second.
 //
 // NON-INTERACTIVE SHELLS REACH NONE OF THIS. Not the rc, not the history file,
-// not the editor, not a second thread. That is #101's decision and it is also
-// what keeps `-c` fast and the conformance score honest: the two paths share
-// `shell_state`, the parser and the executor, and nothing else.
+// not the editor, and not one fiber: `lesh -c` and a script construct no
+// scheduler, no stack and no channel (ADR-0011). That is #101's decision and it
+// is also what keeps `-c` fast and the conformance score honest: the two paths
+// share `shell_state`, the parser and the executor, and nothing else.
+//
+// AND THE INTERACTIVE ONE SPAWNS NO THREAD AT ALL (#201, #202). The loop runs on
+// this thread - `run_interactive_shell` returns when the read is over - and what
+// an interactive session adds to the process is a `fiber::scheduler` with one
+// fiber per reactor on that same thread. Main is still the thread that forks,
+// execs and reaps, still the one a signal is delivered to, and now the only one
+// there is.
 int run_interactive(lesh::runtime::shell_state& state, lesh::buffer_pool& pool,
                     const char* term) {
 	// #97 decision 3: below the floor, leshper never starts. One line, exit 2,

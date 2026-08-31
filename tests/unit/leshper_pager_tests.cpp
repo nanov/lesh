@@ -920,3 +920,57 @@ TEST(LeshperPagerReplay, AClosedPagerCompareEqualToOneThatNeverOpened) {
 	press(one, escape_key);
 	EXPECT_TRUE(one == two);
 }
+
+// ---------------------------------------------------------------------------
+// #214: the pager is the third thing on screen an action can move, and every
+// move must ask for a repaint. Before the fix the menu opened invisibly - no
+// generation bump, no cursor move, so `invoke`'s rule emitted nothing and Tab
+// read as a hang until the next unrelated repaint.
+// ---------------------------------------------------------------------------
+
+bool asks_for_repaint(const effects& out) {
+	for (const effect& one : out)
+		if (std::holds_alternative<render_request>(one))
+			return true;
+	return false;
+}
+
+TEST(LeshperPagerRepaint, OpeningThePagerAsksForARepaint) {
+	state s = sized_state();
+	feed what = words({"alpha", "beta"});
+	registry& reg = context_of(s).actions();
+	ASSERT_EQ(lesh_action_register(&reg, "test_fill_pager_repaint", &feed_action, &what),
+	          LESH_OK);
+	const action_result ran =
+		context_of(s).loop().invoke(s, "test_fill_pager_repaint", invocation{});
+	ASSERT_EQ(what.outcome, static_cast<std::uint32_t>(LESH_PAGER_OPENED));
+	EXPECT_TRUE(asks_for_repaint(ran.produced))
+		<< "an invisible menu is a hang to the person waiting for it";
+}
+
+TEST(LeshperPagerRepaint, CyclingTheSelectionAsksForARepaint) {
+	state s = sized_state();
+	feed what = words({"aa", "bb", "cc"});
+	ASSERT_EQ(fill(s, what), LESH_PAGER_OPENED);
+	EXPECT_TRUE(asks_for_repaint(press(s, tab_key)))
+		<< "Tab moved the selection; the screen must follow";
+}
+
+TEST(LeshperPagerRepaint, ClosingThePagerAsksForARepaint) {
+	state s = sized_state();
+	feed what = words({"aa", "bb"});
+	ASSERT_EQ(fill(s, what), LESH_PAGER_OPENED);
+	EXPECT_TRUE(asks_for_repaint(press(s, escape_key)))
+		<< "a dismissed menu must leave the screen, not linger";
+}
+
+TEST(LeshperPagerRepaint, ANoOpPagerActionStillAsksForNothing) {
+	// The counterweight: the fix compares pager identity, it does not emit
+	// unconditionally. `pager_next` with no pager open changes nothing and must
+	// keep asking for nothing.
+	state s = sized_state();
+	const action_result ran =
+		context_of(s).loop().invoke(s, "pager_next", invocation{});
+	EXPECT_EQ(ran.status, LESH_OK);
+	EXPECT_FALSE(asks_for_repaint(ran.produced));
+}

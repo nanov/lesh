@@ -115,6 +115,10 @@ enable_testing()
 #
 # `lesh_leshper` is the EDITOR and `lesh_ui` is the HOST that drives it (#168).
 #
+# `lesh_fiber` (#198) hangs off `lesh_substrate` BESIDE `lesh_leshper`, and since
+# #202 `lesh_ui` links it: `event_loop` owns the scheduler and every reactor is a
+# fiber in it. `lesh_bench` names it too.
+#
 # THE EDITOR HANGS OFF THE SUBSTRATE AND NOTHING ELSE, since #168 Phase B. It
 # used to link `lesh_syntax` for the highlighter's parse and the completer's lex;
 # both moved to `lesh_ui` with the rest of the knowledge, and a `syntax/` include
@@ -175,6 +179,8 @@ add_library(lesh_runtime STATIC
 	src/runtime/arithmetic.h
 	src/runtime/builtins.cpp
 	src/runtime/builtins.h
+	src/runtime/cooperation.cpp
+	src/runtime/cooperation.h
 	src/runtime/executor.cpp
 	src/runtime/executor.h
 	src/runtime/expander.cpp
@@ -196,7 +202,7 @@ target_link_libraries(lesh_runtime PUBLIC lesh_syntax)
 # leshper: the line editor's state machine, its events and its effects.
 #
 # THE EDITOR, AND NOTHING THAT DRIVES IT (#168). `loop`, `tty`, `workers` and
-# `shell_actor` were here and are `lesh_ui`'s now: leshper is
+# the shell handoff were here and are `lesh_ui`'s now: leshper is
 # `step(state, event, now) -> effects` with no thread, fd, poll, timer or
 # mailbox in it, and a host sends it events and performs its effects. What is
 # left here has no `<poll.h>`, no `<termios.h>`, and no thread, fd or clock of
@@ -265,6 +271,45 @@ add_library(lesh_leshper STATIC
 	src/leshper/undo.h)
 target_link_libraries(lesh_leshper PUBLIC lesh_substrate)
 
+# fiber: stackful cooperative fibers - the switcher, guard-page stacks, an
+# instantiable scheduler and the one channel type v1 needs (#198, part of #82).
+#
+# BESIDE lesh_leshper, NOT ABOVE IT, and for the same reason: it links
+# lesh_substrate AND NOTHING ELSE. That is the whole sweep-exemption argument for
+# `Fiber*`, made enforceable the way every other rule here is - this target does
+# not link lesh_syntax, lesh_runtime or lesh_ui, so a fiber that reached for a
+# parse tree, a shell variable or a file descriptor would fail to link rather
+# than fail review. What it depends on is assertions, the logger and libc.
+#
+# NOTHING LINKS IT YET. Step 0 is the probe and the scaffold: `lesh_tests` runs
+# `Fiber*` and `lesh_bench` times a switch, and the shell binary does not name
+# this target at all. Step 1 (#145) is what puts the scheduler inside
+# `event_loop` and makes the reactors fibers; until then no shipped behaviour
+# depends on a single line here.
+#
+# The vendored switcher is PRIVATE: `src/fiber/minicoro.cpp` is the one
+# translation unit that compiles minicoro, and no header above it names an
+# `mco_*` type - `stack.h` and `scheduler.h` forward-declare `struct mco_coro`
+# and stop there. SYSTEM plus `-w` on that one source keeps the vendoring promise
+# at the top of this file: somebody else's single-header library is neither held
+# to our warning policy nor allowed to fail a `-Werror` release build. It IS
+# instrumented, deliberately and unlike the other vendored trees - minicoro's
+# `__sanitizer_*_switch_fiber` annotations are compiled in from
+# `__has_feature(address_sanitizer)`, so a TU built without `-fsanitize=address`
+# would hand ASan no fiber annotations at all and the gate would be measuring
+# nothing.
+add_library(lesh_fiber STATIC
+	src/fiber/minicoro.cpp
+	src/fiber/scheduler.cpp
+	src/fiber/scheduler.h
+	src/fiber/slot.h
+	src/fiber/stack.cpp
+	src/fiber/stack.h)
+target_link_libraries(lesh_fiber PUBLIC lesh_substrate)
+target_include_directories(lesh_fiber SYSTEM PRIVATE
+	"${PROJECT_SOURCE_DIR}/third_party/minicoro")
+set_source_files_properties(src/fiber/minicoro.cpp PROPERTIES COMPILE_OPTIONS "-w")
+
 
 # ui: THE HOST. The session that runs an interactive shell, the loop that drives
 # the editor, the terminal, the workers, the timers, and the adapters that carry
@@ -323,19 +368,22 @@ add_library(lesh_ui STATIC
 	src/ui/prompt/module_status.h
 	src/ui/prompt/module_time.h
 	src/ui/prompt/modules.h
+	src/ui/reactor_call.cpp
+	src/ui/reactor_call.h
 	src/ui/reactors.cpp
 	src/ui/reactors.h
 	src/ui/session.cpp
 	src/ui/session.h
 	src/ui/shell_knowledge.h
-	src/ui/shell_actor.cpp
-	src/ui/shell_actor.h
+	src/ui/shell_side.h
 	src/ui/shell_state_knowledge.h
 	src/ui/tty.cpp
-	src/ui/tty.h
-	src/ui/workers.cpp
-	src/ui/workers.h)
-target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime)
+	src/ui/tty.h)
+# `lesh_fiber` since #202: `event_loop` owns a `fiber::scheduler` and gives every
+# registered reactor a fiber in it, so the target that was named by nothing above
+# `lesh_substrate` is now named by the host. PUBLIC because `ui/loop.h` includes
+# `fiber/scheduler.h` and every consumer of the loop compiles it.
+target_link_libraries(lesh_ui PUBLIC lesh_leshper lesh_runtime lesh_fiber)
 # The vendored FlatBuffers runtime (#191, ADR-0010): Tier 1 of the history is
 # one mmap'd FlatBuffer, and `src/ui/history/blob.cpp` plus the committed
 # `history_generated.h` are the only files in the tree that include it.
@@ -420,6 +468,7 @@ add_executable(lesh_tests
 	tests/unit/arithmetic_tests.cpp
 	tests/unit/builtin_registry_tests.cpp
 	tests/unit/cd_tests.cpp
+	tests/unit/cooperation_tests.cpp
 	tests/unit/arena_tests.cpp
 	tests/unit/lexer_tests.cpp
 	tests/unit/leshper_selection_tests.cpp
@@ -442,7 +491,7 @@ add_executable(lesh_tests
 	tests/unit/leshper_proposal_tests.cpp
 	tests/unit/ui_proposal_tests.cpp
 	tests/unit/ui_loop_tests.cpp
-	tests/unit/ui_workers_tests.cpp
+	tests/unit/ui_reactor_fiber_tests.cpp
 	tests/unit/args_tests.cpp
 	tests/unit/executor_tests.cpp
 	tests/unit/getopts_tests.cpp
@@ -465,6 +514,7 @@ add_executable(lesh_tests
 	tests/unit/measure_tests.cpp
 	tests/unit/options_tests.cpp
 	tests/unit/expander_tests.cpp
+	tests/unit/fiber_tests.cpp
 	tests/unit/pattern_tests.cpp
 	tests/unit/parser_tests.cpp
 	tests/unit/prompt_builtin_tests.cpp
@@ -473,6 +523,10 @@ add_executable(lesh_tests
 	tests/unit/test_builtin_tests.cpp
 	tests/unit/signal_tests.cpp
 	tests/unit/substrate_contract_tests.cpp)
+# `lesh_fiber` IS NO LONGER NAMED HERE (#202). It used to be, because nothing
+# else in the tree linked it; `lesh_ui` links it PUBLIC now, so it arrives
+# transitively through `lesh_leshnici`, and naming it as well makes the linker say
+# "ignoring duplicate libraries" on every build.
 target_link_libraries(lesh_tests PRIVATE lesh_leshnici gtest_main)
 # The grapheme tests read the vendored UCD conformance file rather than a
 # generated fixture, so a stale table cannot be validated by an equally stale
@@ -498,6 +552,35 @@ add_dependencies(lesh_tests lesh)
 
 add_test(NAME lesh_tests COMMAND lesh_tests)
 
+# THE LSan POSITIVE CONTROL (#198). `FiberLsan.ABlockHeldOnlyByAParkedFiberStackIsNotReported`
+# asserts that LeakSanitizer does NOT report a block reachable only from a parked
+# fiber's mmap'd stack - and a negative assertion about a detector is worthless
+# unless something proves the detector was awake. This is that something: the
+# same allocation, on the same kind of fiber frame, with the stack unmapped
+# underneath it, run in a process of its own.
+#
+# WILL_FAIL inverts the verdict, so the case passes when the process exits
+# non-zero (LSan reported the leak) and FAILS when the process exits clean. The
+# day LSan stops seeing this shape - a sanitizer upgrade, a platform change, a
+# stray `detect_leaks=0` - this case goes red on an otherwise green gate, which
+# is the only way the negative control's silence keeps meaning anything.
+#
+# Debug only: there is no LeakSanitizer in the other configurations, so the
+# process would exit 0 and WILL_FAIL would report a failure that is really just
+# "you are not running the gate".
+#
+# The test itself is DISABLED_ in the binary, so the ordinary `lesh_tests` run
+# does not deliberately leak 500 KB; only this case runs it, by name.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+	add_test(NAME fiber_lsan_positive_control
+		COMMAND lesh_tests
+			--gtest_also_run_disabled_tests
+			--gtest_filter=FiberLsanPositiveControl.DISABLED_DroppedBlockIsReported)
+	set_tests_properties(fiber_lsan_positive_control PROPERTIES
+		WILL_FAIL TRUE
+		ENVIRONMENT "ASAN_OPTIONS=detect_leaks=1")
+endif()
+
 # Differential conformance: every snippet in tests/spec runs through lesh and
 # through a reference shell, and stdout plus exit status must match. dash is
 # authoritative for the POSIX floor (ADR-0001); zsh only for the curated layer.
@@ -512,6 +595,7 @@ file(GLOB_RECURSE LESH_PUBLIC_HEADERS
 	RELATIVE ${PROJECT_SOURCE_DIR}/src
 	${PROJECT_SOURCE_DIR}/src/substrate/*.h
 	${PROJECT_SOURCE_DIR}/src/syntax/*.h
+	${PROJECT_SOURCE_DIR}/src/fiber/*.h
 	${PROJECT_SOURCE_DIR}/src/leshper/*.h
 	${PROJECT_SOURCE_DIR}/src/leshnici/*.h
 	${PROJECT_SOURCE_DIR}/src/runtime/*.h

@@ -720,7 +720,7 @@ int tree_walking_executor::run_redirections_only(const tree& t, node_index n) {
 	// command or reaching an exec, so nothing the user typed is in it to stop and
 	// there is no pid they could have named. Reaping a stop here would report a
 	// "stopped: pid N" the shell then had no way to explain.
-	waitpid(pid, &wait_status, 0);
+	(void)reap(pid, 0, &wait_status);
 	const int status = status_from_wait(wait_status);
 	if (status != 0)
 		return status;
@@ -820,6 +820,12 @@ void tree_walking_executor::interrupt_at_prompt() {
 	if (_flow == control_flow::interrupted)
 		_flow = control_flow::normal;
 	_state.set_last_status(128 + SIGINT);
+	// A CANCELLED LINE IS A BOUNDARY TOO (#199): no command ran, but the shell is
+	// between commands and about to read again, which is the whole of what the
+	// host is told. LAST, not beside the `run_pending_traps` above, because the
+	// two lines after it are what settle `$?` - a host that renders a prompt at a
+	// boundary would otherwise read a status this function is still fixing up.
+	_state.cooperation().on_command_boundary();
 }
 
 // A REGULAR file and nothing else. POSIX confines the rule to a seekable input,
@@ -1039,6 +1045,19 @@ int tree_walking_executor::run_command_list(const tree& t, node_index list,
 		status = run_node(t, t.child_of(self, i));
 		_state.set_last_status(status);
 		run_pending_traps();
+		// THE COMMAND BOUNDARY (#199, step 1a of #145). One call per command, here
+		// because this is THE command loop - the shell's own input, an `eval`, a
+		// `.`, a trap body, a command substitution and every compound body in the
+		// language all run their commands through it, so a loop body's iterations
+		// and a `;` list's commands are boundaries by construction rather than by a
+		// second call site somebody has to remember. AFTER the traps: a trap body
+		// is itself commands, and what the host is told about is the state they
+		// left behind.
+		//
+		// Before the `_exit_requested` and interrupt tests below, and deliberately:
+		// the command finished, which is the fact being reported. What the shell
+		// does next is the next statement's business.
+		_state.cooperation().on_command_boundary();
 		// The status is re-read rather than kept: when a TRAP BODY exited, the
 		// status the shell leaves with is the body's and not this command's.
 		if (_exit_requested) {
@@ -1945,7 +1964,7 @@ int tree_walking_executor::run_subshell(const tree& t, node_index n) {
 	// stop here would hang the shell exactly as it did at the simple-command wait -
 	// which Ctrl-Z can now reach, because #160 gave this fork the terminal the way
 	// #159 gave it to a simple command.
-	waitpid(pid, &wait_status, WUNTRACED);
+	(void)reap(pid, WUNTRACED, &wait_status);
 	// The same two debts the simple-command and pipeline waits pay, in the same
 	// order (#158 decisions 2 and 3, #160). `(nvim .); read x` needs the first for
 	// the reason `nvim .; read x` does, and the second is what keeps `(sleep 5);
@@ -2925,7 +2944,7 @@ int tree_walking_executor::run_wait(char* const* argv) {
 		// so nothing here can be the stop-and-return-to-a-prompt case #161 is about.
 		for (const pid_t pid : _background) {
 			int wait_status = 0;
-			(void)waitpid(pid, &wait_status, 0);
+			(void)reap(pid, 0, &wait_status);
 		}
 		_background.clear();
 		return 0;
@@ -2954,7 +2973,7 @@ int tree_walking_executor::run_wait(char* const* argv) {
 		const pid_t target = static_cast<pid_t>(parsed.value);
 		int wait_status = 0;
 		// No WUNTRACED, for the reason given at the no-operand form above.
-		if (waitpid(target, &wait_status, 0) > 0) {
+		if (reap(target, 0, &wait_status) > 0) {
 			status = status_from_wait(wait_status);
 		} else {
 			// POSIX DEFINES the answer for a pid that is not a child: status 127.
@@ -3298,7 +3317,7 @@ int tree_walking_executor::run_simple_command(const tree& t, node_index n) {
 	// Ctrl-Z genuinely stop a foreground command - and a plain `waitpid` does not
 	// report a stop, so the shell blocked here forever on a process that was never
 	// going to exit. This is the one wait in the file that Ctrl-Z can reach.
-	waitpid(pid, &wait_status, WUNTRACED);
+	(void)reap(pid, WUNTRACED, &wait_status);
 	// IMMEDIATELY, not at end of line (#158 decision 2). `nvim .; read x` is the
 	// case: the loop's reclaim in resume_after_execution runs once the whole line
 	// is done, and by then `read` has already met EIO on a terminal it was not the
@@ -3607,7 +3626,7 @@ int tree_walking_executor::run_pipeline(const tree& t, node_index n) {
 	int rightmost_failure_wait = 0;
 	for (size_t i = 0; i < pids.size(); ++i) {
 		int wait_status = 0;
-		waitpid(pids[i], &wait_status, WUNTRACED);
+		(void)reap(pids[i], WUNTRACED, &wait_status);
 		const int status = foreground_status(pids[i], wait_status);
 		if (status != 0) {
 			rightmost_failure = status;
@@ -3779,7 +3798,7 @@ substitution_result tree_walking_executor::capture(std::string_view code,
 	// the shell is still in the middle of expanding, and a stop has no status the
 	// enclosing command could be finished with. The read above has already drained
 	// the pipe to EOF, so by here the child is on its way out regardless.
-	waitpid(pid, &wait_status, 0);
+	(void)reap(pid, 0, &wait_status);
 	_state.set_last_status(status_from_wait(wait_status));
 	++_substitutions;
 	return substitution_result::ok;

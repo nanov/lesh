@@ -2,8 +2,11 @@
 
 #include "syntax/parser.h"
 
+#include "temp_path.h"
+
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <map>
 #include <string>
 #include <tuple>
@@ -1262,4 +1265,167 @@ TEST_F(ExpanderTest, DollarSingleQuoteIsLiteralInsideDoubleQuotes) {
 	// zsh alike, and the same rule that makes `echo "it's"` print `it's`.
 	EXPECT_EQ(expand("echo \"$'a\\nb'\""),
 	          (std::vector<std::string>{"echo", "$'a\\nb'"}));
+}
+
+// --- POSIX 2.13.1's bracket rule at the field level (#204) -------------------
+
+TEST_F(ExpanderTest, AnUnterminatedBracketIsAnOrdinaryCharacterInAField) {
+	// The word names itself, and - the point of #204 - reaches that answer without
+	// a directory scan. `[ $i -lt 1 ]` is two such words per loop iteration.
+	EXPECT_EQ(expand("echo ["), (std::vector<std::string>{"echo", "["}));
+	EXPECT_EQ(expand("echo ]"), (std::vector<std::string>{"echo", "]"}));
+	EXPECT_EQ(expand("echo [abc"), (std::vector<std::string>{"echo", "[abc"}));
+	EXPECT_EQ(expand("echo a[b"), (std::vector<std::string>{"echo", "a[b"}));
+	EXPECT_EQ(expand("echo []"), (std::vector<std::string>{"echo", "[]"}));
+	EXPECT_EQ(expand("echo [ $i -lt 1 ]"),
+	          (std::vector<std::string>{"echo", "[", "-lt", "1", "]"}));
+}
+
+TEST_F(ExpanderTest, QuotingABracketIsUnchangedByTheRule) {
+	// `\[` and `"["` were literal before the rule and are literal after it - by a
+	// different mechanism, which is why both spellings are pinned here: quoting
+	// never sets the glob-eligible flag at all, so the rule is never consulted.
+	EXPECT_EQ(expand("echo \\[a\\]"), (std::vector<std::string>{"echo", "[a]"}));
+	EXPECT_EQ(expand("echo \"[a]\""), (std::vector<std::string>{"echo", "[a]"}));
+	EXPECT_EQ(expand("echo '[a]'"), (std::vector<std::string>{"echo", "[a]"}));
+}
+
+TEST_F(ExpanderTest, ABracketExpressionMayBeASSEMBLEDFromSeveralSegments) {
+	// The reason the strict test lives at the WALK and not at the segment gate. A
+	// segment test strict enough to reject `[a` on its own would refuse this word
+	// pathname expansion entirely, and `[a]` is a perfectly good pattern once the
+	// value of $x has arrived.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a", "b"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+	params.vars["x"] = "]";
+
+	EXPECT_EQ(expand("echo " + scratch.file("[a$x")),
+	          (std::vector<std::string>{"echo", scratch.file("a")}));
+	// ...and the same word without the closing half is literal, in the same
+	// directory, so this is the rule and not an unreachable scratch tree.
+	EXPECT_EQ(expand("echo " + scratch.file("[a")),
+	          (std::vector<std::string>{"echo", scratch.file("[a")}));
+}
+
+// --- quoting survives into pathname expansion (#210) -------------------------
+//
+// Every case here is a REAL file in a scratch directory, because the bug was
+// invisible to a test that only inspected the field: the escape was removed at
+// exactly the right moment for quote removal and one step too early for the
+// walk, so the field was always right and only the set of files it selected was
+// wrong. All ten spellings below were checked byte-for-byte against /bin/dash.
+
+TEST_F(ExpanderTest, AnEscapedMetacharacterIsLiteralInAGlob) {
+	// POSIX 2.13.1: a quoted or escaped metacharacter is an ordinary character.
+	// The escape has to REACH the matcher for that to be true of a glob, and until
+	// #210 it was removed with the rest of quote removal BEFORE the walk - so
+	// `a\*b*` arrived as `a*b*` and the escaped asterisk wildcarded again.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a*b", "aXb", "ab", "a[b]"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+	const std::string a_star_b = scratch.file("a*b");
+
+	// The UNESCAPED `*` at the end is what makes each word a pattern at all - an
+	// escaped one is not a metacharacter, so `a\*b` on its own opens no directory.
+	// The escaped one beside it must select the file literally called `a*b`, where
+	// a live one would take `aXb` and `ab` as well.
+	EXPECT_EQ(expand("echo " + scratch.file("a\\*b") + "*"),
+	          (std::vector<std::string>{"echo", a_star_b}))
+		<< "a backslash-escaped metacharacter";
+	EXPECT_EQ(expand("echo \"" + scratch.file("a*b") + "\"*"),
+	          (std::vector<std::string>{"echo", a_star_b}))
+		<< "the same asterisk inside double quotes";
+	EXPECT_EQ(expand("echo '" + scratch.file("a*") + "'*"),
+	          (std::vector<std::string>{"echo", a_star_b}))
+		<< "and inside single quotes";
+	EXPECT_EQ(expand("echo " + scratch.file("a\\*[b]")),
+	          (std::vector<std::string>{"echo", a_star_b}))
+		<< "a bracket expression makes the word a pattern just as well";
+	EXPECT_EQ(expand("echo " + scratch.file("a\\*[bc]")),
+	          (std::vector<std::string>{"echo", a_star_b}))
+		<< "the case from #210's report, where escape and metacharacter differ";
+
+	// An escaped `[` is not a bracket expression, so `a\[b]` names `a[b]`.
+	EXPECT_EQ(expand("echo " + scratch.file("a\\[b]") + "*"),
+	          (std::vector<std::string>{"echo", scratch.file("a[b]")}));
+	// A metacharacter quoted INSIDE a bracket expression is a member of the set,
+	// which is what is_pattern_syntax being wider than the three metacharacters is
+	// for: `[\*]` is the one-character set holding an asterisk.
+	EXPECT_EQ(expand("echo " + scratch.file("a[\\*]b")),
+	          (std::vector<std::string>{"echo", a_star_b}));
+	EXPECT_EQ(expand("echo " + scratch.file("[a]Xb")),
+	          (std::vector<std::string>{"echo", scratch.file("aXb")}))
+		<< "the control: an unquoted bracket expression still wildcards";
+}
+
+TEST_F(ExpanderTest, AnUnmatchedGlobExpandsToTheQuoteRemovedWord) {
+	// POSIX leaves an unmatched pattern UNCHANGED - and then quote removal runs on
+	// it, so what comes out is the field and not the pattern the walk was given.
+	// The escaped asterisk loses its backslash here even though the matcher needed
+	// it a moment earlier, which is why the two forms are kept side by side rather
+	// than one being unescaped back into the other.
+	lesh::testing::temp_path scratch;
+	EXPECT_EQ(expand("echo " + scratch.file("a\\*b") + "*"),
+	          (std::vector<std::string>{"echo", scratch.file("a*b") + "*"}));
+	EXPECT_EQ(expand("echo \"" + scratch.file("a*b") + "\"*"),
+	          (std::vector<std::string>{"echo", scratch.file("a*b") + "*"}));
+}
+
+TEST_F(ExpanderTest, ABackslashFromAVALUEIsNotQuotingAndIsNotRemoved) {
+	// The reason the pattern form is a second buffer instead of the field escaped
+	// in place. Both words below reach the matcher as `*\Q`; only one of the two
+	// backslashes was ever quoting.
+	//
+	// A backslash the USER typed is quoting, and quote removal takes it out. One
+	// that arrived in a VARIABLE'S VALUE was never quoting - POSIX removes only
+	// what was in the original word - so it survives into the unmatched word, and
+	// dash and bash both print it. One backslash in one buffer cannot say which of
+	// the two it is, and unescaping the field at the end would have removed both.
+	lesh::testing::temp_path scratch;
+	{
+		std::ofstream touch(scratch.file("aQ"));
+		ASSERT_TRUE(touch.good());
+	}
+	params.vars["x"] = "\\Q";
+
+	// Matching first, because the value's backslash IS a live pattern escape: the
+	// pattern `*\Q` selects the file called `aQ`, exactly as `*\Q` typed out does.
+	EXPECT_EQ(expand("echo " + scratch.file("*$x")),
+	          (std::vector<std::string>{"echo", scratch.file("aQ")}));
+	EXPECT_EQ(expand("echo " + scratch.file("*\\Q")),
+	          (std::vector<std::string>{"echo", scratch.file("aQ")}));
+
+	// ...and now the same two spellings where nothing matches. `"-"` is a quoted
+	// byte, so the word has a pattern form of its own and the fallback is a real
+	// choice rather than the same string twice.
+	EXPECT_EQ(expand("echo " + scratch.file("*\"-\"$x")),
+	          (std::vector<std::string>{"echo", scratch.file("*-\\Q")}))
+		<< "the value's backslash is data and stays";
+	EXPECT_EQ(expand("echo " + scratch.file("*\"-\"\\Q")),
+	          (std::vector<std::string>{"echo", scratch.file("*-Q")}))
+		<< "the typed one was quoting and goes";
+}
+
+TEST_F(ExpanderTest, QuotingStillSuppressesTheWalkEntirely) {
+	// The pattern form exists for words that ARE patterns. A fully quoted
+	// metacharacter never made the field glob-eligible in the first place, so the
+	// escapes go into a buffer nobody reads and the field is unchanged - which is
+	// what these assert, in a directory where a walk would have found something.
+	lesh::testing::temp_path scratch;
+	for (const char* name : {"a*b", "aXb"}) {
+		std::ofstream touch(scratch.file(name));
+		ASSERT_TRUE(touch.good()) << name;
+	}
+	EXPECT_EQ(expand("echo \"" + scratch.file("a*b") + "\""),
+	          (std::vector<std::string>{"echo", scratch.file("a*b")}));
+	EXPECT_EQ(expand("echo " + scratch.file("a\\*b")),
+	          (std::vector<std::string>{"echo", scratch.file("a*b")}));
+	EXPECT_EQ(expand("echo " + scratch.file("a\\Xb")),
+	          (std::vector<std::string>{"echo", scratch.file("aXb")}))
+		<< "an escape before an ordinary byte is removed too, and opens nothing";
 }

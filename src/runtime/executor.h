@@ -534,6 +534,26 @@ private:
 	// shell's children keep the dispositions their invoker chose.
 	static void reset_job_control_signals(int tty_fd) noexcept;
 
+	// THE ONE WAIT (#208, phase 2a of #145). Every `waitpid` this file used to
+	// make - seven of them, the two `WUNTRACED` foreground ones included - is this
+	// call, and this call is `cooperation::wait_child`.
+	//
+	// IT IS NOT AN ABSTRACTION OVER THE SYSCALL. The no-op cooperation IS
+	// `::waitpid(pid, status, flags)`, so a script, `lesh -c`, a unit test and
+	// every forked child reach the identical syscall with the identical arguments
+	// through one indirect call; what the seam buys is that an INTERACTIVE host
+	// can answer the same question by parking a fiber and letting its event loop
+	// keep running, without one line of this file knowing that fibers exist.
+	//
+	// WHY A FUNCTION AND NOT SEVEN CALLS TO `_state.cooperation().wait_child`: so
+	// that "how many places in the runtime can block on a child" has one answer,
+	// and `Cooperation*`'s counting double can assert it. The flags stay the call
+	// site's - `WUNTRACED` is a property of a wait that Ctrl-Z can reach, and only
+	// two of the seven are.
+	pid_t reap(pid_t pid, int flags, int* status) noexcept {
+		return _state.cooperation().wait_child(pid, flags, status);
+	}
+
 	// The other half, on the shell thread: takes the terminal back the instant a
 	// foreground job's wait returns (#158 decision 2).
 	//

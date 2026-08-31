@@ -2,9 +2,11 @@
 #include "ui/reactors.h"
 #include "leshper/keymap.h"
 #include "ui/loop.h"
-#include "ui/shell_actor.h"
+
+#include "ui/history/store.h"
+#include "ui/shell_side.h"
 #include "ui/tty.h"
-#include "ui/workers.h"
+#include "ui/reactor_call.h"
 #include "substrate/fork_guard.h"
 #include "substrate/log.h"
 
@@ -22,6 +24,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <memory>
 #include <poll.h>
 #include <sstream>
 #include <sys/ioctl.h>
@@ -42,7 +45,13 @@ using namespace lesh::ui;
 using lesh::testing::fake_tty;
 namespace log = lesh::log;
 
-// THE EVENT LOOP (#129): poll(2), six topics since #195, quiesce.
+// THE EVENT LOOP (#129): poll(2), five topics, quiesce.
+//
+// ONE THREAD SINCE #201. There is no `loop.start()` and no shell thread to
+// spawn beside it: `run()` is a call on the calling thread, and the loop reaches
+// the shell by calling `shell_side` - so a test that used to post to a slot,
+// start the actor and wait for a byte now calls the loop and asserts on what
+// came back. `fake_shell` is unchanged, which is the point of the interface.
 //
 // EVERY TEST HERE DRIVES FDS THE TEST OWNS. Pipes for the ordinary path,
 // `openpty` where real termios is the point, and never the process's own
@@ -84,6 +93,17 @@ int32_t counting_reactor(lesh_request* request, void* userdata) {
 	if (userdata != nullptr)
 		*static_cast<std::size_t*>(userdata) = length;
 	return LESH_OK;
+}
+
+// A REACTOR THAT YIELDS ONCE MID-COMPUTE. `lesh_request_superseded` is the
+// cancellation poll, and since #202 the poll IS the yield - so one call hands the
+// thread back to the host in the middle of the compute, which is the only moment
+// at which the editor's generation can move between the snapshot a compute was
+// handed and the batch it emits. That is N-4's drop rule in its real shape.
+int32_t yielding_reactor(lesh_request* request, void* userdata) {
+	int32_t superseded = 0;
+	(void)lesh_request_superseded(request, &superseded);
+	return counting_reactor(request, userdata);
 }
 
 // --- An action, for the timer topic ----------------------------------------
@@ -536,10 +556,13 @@ TEST(UiLoopSignals, TheLoopNeverWritesADisposition) {
 	guards.child().default_action();
 
 	fake_tty tty;
-	// THE HUB IS DECLARED BEFORE THE LOOP, for the reason `session` states about
-	// its actor: `~event_loop` calls `request_stop`, which pokes the attached
-	// hub's pipe. A hub declared after the loop dies first and that poke is a use
-	// after scope - ASan says so immediately, which is how this line got written.
+	// THE HUB IS STILL DECLARED BEFORE THE LOOP. It had to be while `~event_loop`
+	// called `request_stop` and `request_stop` poked the attached hub's pipe - a
+	// hub declared after the loop died first and that poke was a use after scope,
+	// which ASan said immediately and is how this line got written. #201 deleted
+	// both the destructor's call and the poke; the declaration order stays,
+	// because the loop borrows the hub either way and a borrowed thing outliving
+	// its borrower is not a rule worth re-deriving per member.
 	signal_hub hub;
 	event_loop loop{tty.fds(), pipe_options()};
 	ASSERT_TRUE(hub.install());
@@ -589,16 +612,16 @@ TEST(UiLoopSignals, SighupIsNeverTakenAtAll) {
 }
 
 // ===========================================================================
-// The worker topic
+// The reactors (#202: fibers, where this section used to be the `worker` topic)
 // ===========================================================================
 
-TEST(UiLoopWorkers, AReadableFdIsAnsweredWithDrain) {
-	// #126's rule, written in its own header: answer the readable fd with
-	// `drain()`, never by reading it. Reading it would leave the queue armed and
-	// the next wakeup would be lost forever.
+TEST(UiLoopReactors, AnEmissionLandsInTheEditorsOwnDecorations) {
+	// What the `worker` topic's drain rule used to be asserted through. There is
+	// no descriptor and no queue: the reactor's fiber applies its own batch inside
+	// the turn, so the assertion is about where the answer LANDS, which is the
+	// part that never depended on how it travelled.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	std::size_t seen = 0;
 	ASSERT_EQ(lesh_reactor_register(&reg, "counter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, &seen),
@@ -606,40 +629,50 @@ TEST(UiLoopWorkers, AReadableFdIsAnsweredWithDrain) {
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
 	tty.type("ab");
 	loop.turn(50);
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
-	EXPECT_TRUE(helpers.completions().empty());
-	EXPECT_FALSE(helpers.completions().armed()) << "drain disarms; a read would not have";
+	EXPECT_EQ(seen, 2u) << "the compute saw the whole line";
 	// #141: a taken batch lands in the editor's own decorations, namespaced by
 	// the reactor that emitted it. There is no loop-side store any more.
 	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
 	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "counter");
 }
 
-TEST(UiLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
-	// N-4, and the loop is the only applier, so this is the only place the rule
-	// is decided.
+TEST(UiLoopReactors, ABatchComputedAgainstAnOlderGenerationIsDropped) {
+	// N-4, and the loop is the only applier, so this is the only place the rule is
+	// decided. The staleness is arranged MID-COMPUTE: the reactor yields at its
+	// cancellation poll, the host moves the editor's generation on while the fiber
+	// is suspended there, and the batch that comes back is about a buffer the
+	// editor has left behind.
+	//
+	// THIS USED TO USE `quiesce()` TO PARK THE GROUP, and #208 took that away: the
+	// tty topic is out of the poll set while `executing`, so a keystroke typed
+	// after a `quiesce` is not read at all - which is the point of the exclusion,
+	// the terminal being the running command's. The yield is a better arrangement
+	// anyway: a fiber suspended in the middle of a walk is the production shape,
+	// where a parked group with a queued wake was a stand-in for it.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	ASSERT_EQ(lesh_reactor_register(&reg, "counter", LESH_EVENT_BUFFER_CHANGED,
-	                                &counting_reactor, nullptr),
+	                                &yielding_reactor, nullptr),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
-	// Submit against the generation the editor is at, then move the editor on
-	// before the answer is drained.
-	helpers.submit("counter", snapshot_of(loop.editor(), LESH_EVENT_BUFFER_CHANGED),
-	               &counting_reactor, nullptr);
+	tty.type("a");
+	loop.turn(50);
+	// The fiber took the notification, started computing and yielded at its poll:
+	// runnable, not finished, and nothing applied yet.
+	ASSERT_TRUE(loop.scheduler().runnable(group_mask(fiber_group::emitters)))
+		<< "the reactor should be suspended mid-compute at its cancellation poll";
+	ASSERT_EQ(loop.applied_batches(), 0u);
+
 	loop.editor().gen.bump();
 
 	ASSERT_TRUE(turn_until(loop, [&] { return loop.dropped_batches() > 0; }));
@@ -647,32 +680,31 @@ TEST(UiLoopWorkers, ABatchComputedAgainstAnOlderGenerationIsDropped) {
 	EXPECT_TRUE(loop.editor().marks.layers().empty());
 }
 
-TEST(UiLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
+TEST(UiLoopReactors, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 	// #154's regression anchor for F-25 on the REAL loop path - the deterministic
 	// in-harness cousin of the pty accept test, with no terminal timing in it.
-	// The autosuggester runs on a HELPER worker; the whole point of the ticket is
-	// that its proposal, not only its virtual text, survives the completion-queue
-	// handoff into `state::proposals` where `lesh_proposal_read` walks. Type a
-	// prefix, let the batch drain, dispatch the DEFAULT accept key, and the
-	// buffer must become the whole candidate with one undo entry for the accept.
+	// The autosuggester runs on ITS OWN FIBER since #202 (it was a helper worker,
+	// and before that a pool submission); the whole point of the ticket is that its
+	// proposal, not only its virtual text, reaches `state::proposals` where
+	// `lesh_proposal_read` walks. Type a prefix, let the batch land, dispatch the
+	// DEFAULT accept key, and the buffer must become the whole candidate with one
+	// undo entry for the accept.
 	//
 	// The unit suite drove the accepting actions through `loop_harness::react` +
 	// `apply_batch` - a fake scheduler on the test thread - so it never exercised
-	// the worker pool, the pipe and `take_batch` end to end. This does, which is
-	// the seam #154 was filed against.
+	// the real notify-compute-apply path end to end. This does, which is the seam
+	// #154 was filed against.
 	fake_tty tty;
 	registry reg;
-	worker_pool helpers{1};
 	vector_history_source history{{"echo hello"}};
 	owned_autosuggester self{&history};
 	ASSERT_EQ(register_autosuggester(reg, self.get()), 1u);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
-	// Type a prefix of the remembered line and let the helper's batch arrive.
+	// Type a prefix of the remembered line and let the reactor's batch arrive.
 	tty.type("ec");
 	ASSERT_TRUE(turn_until(loop, [&] {
 		return loop.applied_batches() > 0 && !loop.editor().proposals.empty();
@@ -702,139 +734,85 @@ TEST(UiLoopWorkers, AcceptingAnAutosuggestionOnTheRealLoopCommitsTheLine) {
 }
 
 // ===========================================================================
-// The shell topic (ADR-0009)
+// The shell, called directly (ADR-0009 as amended by #201)
 // ===========================================================================
 
-TEST(UiLoopShell, TheHighlighterRunsOnTheShellThreadAndComesBackOverTheTopic) {
+TEST(UiLoopShell, TheShellStateReactorRunsInPlaceAndLandsWithinTheTurn) {
+	// ADR-0009's keystone, with the thread taken out of it (#201): the reactor
+	// that reads the alias, function and builtin tables runs on the thread that
+	// owns them, and that is this one. What used to be post-serve-reply-drain
+	// across a pipe is a call inside `notify_reactors`, so the batch is applied
+	// before the turn that produced the keystroke returns - one turn, not two.
 	fake_tty tty;
 	registry reg;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
 	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
 	                                &counting_reactor, nullptr),
 	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
 	loop.attach_registry(reg);
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	tty.type("x");
 	loop.turn(50);
-	EXPECT_FALSE(actor.idle()) << "the highlight went to the shell thread's slot";
 
-	// The shell thread, run by hand: `serve_one` is what `run()` is written in
-	// terms of, so driving it here exercises the same path.
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_TRUE(actor.replies().armed());
-
-	ASSERT_TRUE(turn_until(loop, [&] { return loop.applied_batches() > 0; }));
+	EXPECT_EQ(loop.applied_batches(), 1u) << "the same turn applied it";
+	EXPECT_EQ(loop.dropped_batches(), 0u);
 	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
 	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "highlighter");
-	EXPECT_FALSE(actor.replies().armed()) << "drain disarms the shell topic too";
 }
 
-TEST(UiLoopShell, ANewerHighlightOverwritesAPendingOne) {
-	// ADR-0009: "a newer highlight overwrites a pending one, which is the
-	// cancellation." There is no cancel call in the seam, and that is the point.
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-
-	state target;
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-	target.gen.bump();
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-
-	EXPECT_EQ(actor.dropped(), 1u);
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_FALSE(actor.serve_one()) << "one slot, depth one, latest wins";
-
-	std::vector<shell_message> inbox;
-	ASSERT_EQ(actor.replies().drain(inbox), 1u);
-	EXPECT_EQ(inbox.front().computed_against, target.gen);
-	actor.replies().recycle(inbox);
-}
-
-TEST(UiLoopShell, ExecuteOutranksAPendingHighlight) {
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-
-	state target;
-	actor.post_highlight("highlighter", &counting_reactor, nullptr,
-	                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-	actor.post_execute("echo hi", target.gen);
-
-	ASSERT_TRUE(actor.serve_one());
-	EXPECT_EQ(shell.executed, "echo hi") << "priority order: execute, port_call, highlight";
-}
-
-TEST(UiLoopShell, MessagesAreRecycledRatherThanReallocated) {
-	fake_shell shell;
-	shell_actor actor{shell, nullptr};
-	state target;
-
-	std::vector<shell_message> inbox;
-	for (int round = 0; round < 5; ++round) {
-		actor.post_highlight("highlighter", &counting_reactor, nullptr,
-		                     snapshot_of(target, LESH_EVENT_BUFFER_CHANGED));
-		ASSERT_TRUE(actor.serve_one());
-		ASSERT_EQ(actor.replies().drain(inbox), 1u);
-		actor.replies().recycle(inbox);
-		EXPECT_TRUE(inbox.empty());
-	}
-	EXPECT_EQ(actor.served(), 5u);
-}
-
-TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
-	// #92's contract, unchanged by the thread split: the action blocks, the loop
-	// waits on the `shell` and `signal` topics, and the terminal keeps the
-	// EDITOR's modes throughout (fish #7770).
+TEST(UiLoopShell, EveryKeystrokesHighlightIsFinishedBeforeTheNextOneIsRead) {
+	// WHAT REPLACED LATEST-WINS. ADR-0009 gave the `highlight` slot depth one and
+	// said "a newer highlight overwrites a pending one, which is the
+	// cancellation"; with the reactor run in place there is never a pending one to
+	// overwrite, because the call returns before the loop can read the next key.
+	// Five keystrokes are five batches applied and none dropped - and the store
+	// still holds one layer, because latest-wins lives there and always did.
+	//
+	// THE COST OF THIS IS THE NEXT TICKET'S. A reactor that walks `$PATH` holds
+	// the keystroke it was computed for until it returns; the fiber step is what
+	// gives the walk a yield point back.
 	fake_tty tty;
+	registry reg;
 	fake_shell shell;
-	shell.port_status = 3;
-	shell_actor actor{shell, nullptr};
+	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
+	                                &counting_reactor, nullptr),
+	          LESH_OK);
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_registry(reg);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
-	std::thread shell_thread{[&] { actor.run(); }};
-	const port_result answered = loop.call_port("echo from an action");
-	actor.stop();
-	shell_thread.join();
+	for (const char* key : {"e", "c", "h", "o", " "}) {
+		tty.type(key);
+		loop.turn(50);
+	}
 
-	EXPECT_TRUE(answered.answered);
-	EXPECT_EQ(answered.status, 3);
-	EXPECT_EQ(shell.called, "echo from an action");
+	EXPECT_EQ(loop.applied_batches(), 5u);
+	EXPECT_EQ(loop.dropped_batches(), 0u);
+	EXPECT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(buffer_of(loop), "echo ");
 }
 
-TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
-	// #162, and it is a heap-use-after-free rather than a tidiness point. The
-	// turn walked `_events` by reference; handling an accept blocks in
-	// `wait_on_shell`, and a shell message arriving there goes to
-	// `handle_shell_message`, which PUSHES onto that same vector. Once the push
-	// reallocates, the walk's iterator points into freed storage.
-	//
-	// The repro is arithmetic, not luck. `enter_read` reserves exactly sixteen
-	// events, so sixteen bytes read in one go fill the queue to its capacity and
-	// the next push is guaranteed to reallocate - and the accept is put in the
-	// MIDDLE of them so that the walk still has elements to dereference
-	// afterwards. Under ASan the old code fails here; a user reaches the same
-	// place by typing a second line before the first one's prompt comes back
-	// while a background job reports in.
+TEST(UiLoopShell, AcceptCallsExecuteOnThisThreadBeforeTheTurnReturns) {
+	// THE WHOLE OF #201 IN ONE ASSERTION. `execute` used to be a message filled in
+	// on this thread and run on another, with the loop blocked in a second poll
+	// until the reply came back. It is a call now: it happens inside the turn that
+	// carried the accept, on the thread that made it.
 	fake_tty tty;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
+	shell.execute_status = 42;
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	// Enter is the session's binding, not a default (F-35), so the accepting key
-	// is bound here the way `ui_session_tests.cpp` binds one: Ctrl-A, one byte,
-	// so the byte count and the event count are the same number.
+	// is bound here the way `ui_session_tests.cpp` binds one.
 	editing_context& context = context_of(loop.editor());
 	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", &accepting_action, nullptr),
 	          LESH_OK);
@@ -844,116 +822,186 @@ TEST(UiLoopShell, AShellMessageArrivingMidAcceptDoesNotDangleTheEventWalk) {
 	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
 	map->bind(encoded, "ask_accept");
 
-	// From inside `execute`, on the shell thread: replies the loop is not waiting
-	// for. `wait_on_shell` matches on `execute_done` and hands everything else to
-	// `handle_shell_message`. A default generation is deliberate - the batch is
-	// dropped by the generation rule, and the event is pushed either way.
-	shell.on_execute = [&] {
-		for (int i = 0; i < 4; ++i) {
-			shell_message extra = actor.replies().acquire();
-			extra.which = shell_message::kind::highlight_done;
-			extra.computed_against = generation{};
-			actor.replies().post(std::move(extra));
-		}
-	};
+	std::thread::id ran_on;
+	shell.on_execute = [&] { ran_on = std::this_thread::get_id(); };
 
-	std::thread shell_thread{[&] { actor.run(); }};
+	tty.type("echo hi\x01");
+	const turn_result result = loop.turn(50);
+
+	EXPECT_EQ(shell.executed, "echo hi") << "no second turn was needed";
+	EXPECT_EQ(ran_on, std::this_thread::get_id()) << "and no second thread";
+	EXPECT_EQ(loop.exit_status(), 42);
+	EXPECT_EQ(buffer_of(loop), "") << "the line is finished and the editor is fresh";
+	EXPECT_FALSE(result.exiting);
+}
+
+TEST(UiLoopShell, APortCallIsSynchronousFromTheActionsPointOfView) {
+	// #92's contract, and the implementation change #92 predicted, twice: ADR-0009
+	// made it a cross-thread round trip, #201 made it a call. The action blocks
+	// either way, and the terminal keeps the EDITOR's modes throughout (fish
+	// #7770).
+	fake_tty tty;
+	fake_shell shell;
+	shell.port_status = 3;
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_shell(shell);
+	loop.enter_read();
+
+	const port_result answered = loop.call_port("echo from an action");
+
+	EXPECT_TRUE(answered.answered);
+	EXPECT_EQ(answered.status, 3);
+	EXPECT_EQ(shell.called, "echo from an action");
+}
+
+TEST(UiLoopShell, ASixteenKeyTurnWithAnAcceptInTheMiddleLosesNothing) {
+	// WHAT #162 LEFT BEHIND, AND WHERE THE HAZARD WENT (#202). #162 was a
+	// heap-use-after-free: the turn walked `_events` by reference while `handle`
+	// pushed onto it, and the push reallocated the vector out from under the walk.
+	// Two producers found it in turn - a shell message drained inside
+	// `wait_on_shell` (deleted by #201) and the in-place shell reactor's own
+	// `worker_result` (deleted here) - and the reactor's push now happens from a
+	// FIBER SLICE, which `turn` runs between its two event walks rather than inside
+	// one. So the hazard has no producer left; the swap stays as the rule, and this
+	// is the test that says the SEQUENCE is still lossless.
+	//
+	// The arithmetic is still the anchor. `event_loop` reserves exactly sixteen
+	// events, so sixteen bytes read in one go fill the queue to its capacity - and
+	// the accept is in the MIDDLE of them, so the walk still has elements to
+	// dereference after a `quiesce` has parked the emitters group underneath it.
+	fake_tty tty;
+	registry reg;
+	fake_shell shell;
+	// DECLARED BEFORE THE LOOP so it outlives it: `~event_loop` runs the emitters
+	// out to their next poll, and that poll reads the reactor's userdata.
+	std::size_t seen_length = 0;
+	ASSERT_EQ(lesh_reactor_register(&reg, "highlighter", LESH_EVENT_BUFFER_CHANGED,
+	                                &counting_reactor, &seen_length),
+	          LESH_OK);
+
+	event_loop loop{tty.fds(), pipe_options()};
+	loop.attach_registry(reg);
+	loop.attach_shell(shell);
+	loop.enter_read();
+
+	editing_context& context = context_of(loop.editor());
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_accept", &accepting_action, nullptr),
+	          LESH_OK);
+	keymap* map = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(map, nullptr);
+	std::string encoded;
+	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
+	map->bind(encoded, "ask_accept");
+
 	tty.type("12345678\x01" "abcdefg");
 	const turn_result result = loop.turn(50);
-	actor.stop();
-	shell_thread.join();
 
 	EXPECT_EQ(shell.executed, "12345678");
 	EXPECT_EQ(buffer_of(loop), "abcdefg")
 		<< "the seven keys typed after the accept still reached the fresh line";
-	EXPECT_EQ(result.events, 20u)
-		<< "sixteen keys plus the four mid-walk arrivals: swapping the batch out "
-		   "must not drop what is pushed while it is being walked";
+	// SIXTEEN KEYS PLUS ONE. Fifteen of the sixteen change the buffer - the accept
+	// itself changes none - and all fifteen send into a capacity-one conflating
+	// slot, so there is ONE compute and ONE `worker_result`, pushed by the trailing
+	// slice and walked by the pass after it. It was 31 and 15 when every keystroke
+	// had a worker of its own; the drop to 17 and 1 is latest-wins arriving where
+	// #90 always said it should.
+	EXPECT_EQ(result.events, 17u)
+		<< "the event a trailing slice pushed was dropped rather than walked";
+	EXPECT_EQ(loop.applied_batches(), 1u);
+	// AND THE ONE COMPUTE IS FOR THE LINE THAT SURVIVED. Seven of the fifteen sends
+	// landed while the group was parked for the execution; the resume replayed the
+	// wake, and what the fiber then received was the newest of them.
+	ASSERT_EQ(loop.editor().marks.layers().size(), 1u);
+	EXPECT_EQ(loop.editor().marks.layers().front().reactor, "highlighter");
+	EXPECT_EQ(seen_length, 7u) << "the batch was computed for `abcdefg`";
 }
 
 // ===========================================================================
 // Accept and quiesce
 // ===========================================================================
 
-TEST(UiLoopQuiesce, AcceptParksTheHelpersBeforeTheShellRuns) {
+TEST(UiLoopQuiesce, AcceptParksTheEmittersBeforeTheShellRuns) {
 	// The whole of quiesce, asserted from inside the execution: by the time
-	// `execute` runs on the shell thread, the helpers are parked and the loop is
-	// blocked in its poll. That is the moment a fork is legal.
+	// `execute` runs, the emitters group is parked and the terminal has been handed
+	// back. That is the moment a fork is legal - and since #201 the fork happens
+	// one stack frame below this assertion rather than on another thread, which
+	// makes the ordering the call's own. #202 turned "the helper pool is parked"
+	// into one scheduler bit and left the ordering alone.
 	fake_tty tty;
 	fake_shell shell;
-	worker_pool helpers{2};
-	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_helpers(helpers);
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
 	bool parked_during_execute = false;
-	shell.on_execute = [&] { parked_during_execute = helpers.is_quiesced(); };
+	shell.on_execute = [&] {
+		parked_during_execute =
+			loop.scheduler().group_parked(group_index(fiber_group::emitters));
+	};
 	shell.execute_status = 42;
 
 	tty.type("echo hi");
 	loop.turn(50);
 	ASSERT_EQ(buffer_of(loop), "echo hi");
 
-	std::thread shell_thread{[&] { actor.run(); }};
 	const std::optional<std::int32_t> status = loop.accept_current_line();
-	actor.stop();
-	shell_thread.join();
 
-	EXPECT_TRUE(parked_during_execute) << "quiesce is the helpers parked plus the terminal";
+	EXPECT_TRUE(parked_during_execute) << "quiesce is the emitters parked plus the terminal";
 	ASSERT_TRUE(status.has_value());
 	EXPECT_EQ(*status, 42);
 	EXPECT_EQ(shell.executed, "echo hi");
 	// The line is finished and the editor is fresh, in one edit so undo does not
 	// walk back into a command that has already run.
 	EXPECT_EQ(buffer_of(loop), "");
-	// Parking NESTS and resume released it: the pool is live again.
-	EXPECT_FALSE(helpers.is_quiesced());
+	// And the resume released it: the group is runnable again.
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 	EXPECT_FALSE(loop.quiesced());
 }
 
-TEST(UiLoopQuiesce, QuiesceNestsAndAssertsBothHalves) {
+TEST(UiLoopQuiesce, QuiesceIsIdempotentAndOneResumeUndoesIt) {
+	// #203: the depth counter is a bit. Two parks used to need two resumes, which
+	// was #91's apparatus for a set of threads that could each ask for one; the
+	// two callers are `accept_current_line` and `finish_cancelled_line` and
+	// neither is reachable from inside the other, so what a second call means now
+	// is "nothing to do".
 	fake_tty tty;
-	worker_pool helpers{1};
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_helpers(helpers);
 	loop.enter_read();
 
 	loop.quiesce();
 	EXPECT_TRUE(loop.quiesced());
 	loop.assert_quiesced();
 	loop.quiesce();
+	EXPECT_TRUE(loop.quiesced()) << "a second park is a no-op, not a second park";
 	loop.assert_quiesced();
 
 	loop.resume_after_execution();
-	EXPECT_TRUE(loop.quiesced()) << "two parks need two resumes";
-	loop.resume_after_execution();
-	EXPECT_FALSE(loop.quiesced());
-	EXPECT_FALSE(helpers.is_quiesced());
+	EXPECT_FALSE(loop.quiesced()) << "one resume undoes both calls";
+	EXPECT_FALSE(loop.scheduler().group_parked(group_index(fiber_group::emitters)));
 }
 
-TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsDeferredNotLost) {
+TEST(UiLoopQuiesce, ASignalArrivingDuringExecutionIsNotLost) {
+	// #201 moved the mechanism and kept the fact. The loop used to be blocked in a
+	// second poll over the `shell` and `signal` topics for the whole execution and
+	// pushed what arrived onto `_deferred`; now nothing polls while `execute` runs,
+	// and what holds the signal is the self-pipe byte the handler wrote. Either
+	// way the next ordinary turn delivers it: nothing is dropped because the
+	// editor was not there to receive it.
 	fake_tty tty;
 	fake_shell shell;
-	shell_actor actor{shell, nullptr};
 
 	event_loop loop{tty.fds(), pipe_options()};
-	loop.attach_shell(actor);
+	loop.attach_shell(shell);
 	loop.enter_read();
 
-	// Delivered from inside `execute`, which is exactly the window where the
-	// loop is blocked on the `shell` and `signal` topics only.
+	// Delivered from inside `execute`, which is the window where the editor does
+	// not exist as far as the terminal is concerned.
 	shell.on_execute = [&] { loop.signals().deliver(SIGINT); };
 
-	std::thread shell_thread{[&] { actor.run(); }};
 	loop.accept_current_line();
-	actor.stop();
-	shell_thread.join();
 
-	// The next ordinary turn delivers it: nothing is dropped because the editor
-	// was not there to receive it.
 	const turn_result result = loop.turn(0);
 	EXPECT_EQ(result.events, 1u);
 }
@@ -1250,20 +1298,52 @@ TEST(UiLoopRender, TheFirstPaintOfAReadErasesNothing) {
 }
 
 // ===========================================================================
-// The thread (#134's two calls)
+// Running (#134's sequencing; ONE call since #201)
 // ===========================================================================
 
-TEST(UiLoopThread, StopWakesALoopBlockedInPoll) {
+namespace {
+
+std::thread::id g_action_thread{};
+
+int32_t stopping_action(lesh_editor*, const lesh_invocation*, void* self) {
+	g_action_thread = std::this_thread::get_id();
+	static_cast<event_loop*>(self)->request_stop();
+	return LESH_OK;
+}
+
+} // namespace
+
+TEST(UiLoopRun, RunTurnsOnTheCallingThreadUntilRequestStop) {
+	// WHAT REPLACED `start()`/`stop()`/`running()`. There is no loop thread and
+	// nothing to join: `run()` turns on the caller's thread - which in a real
+	// session is main - and leaves when `request_stop` has been set, which is what
+	// Ctrl-D, an `exit` and a hangup all do. The action below stands in for all
+	// three, and records the thread it ran on to say which one that is.
 	fake_tty tty;
 	event_loop loop{tty.fds(), pipe_options()};
 
-	loop.start();
-	EXPECT_TRUE(loop.running());
-	// Blocked in `poll` with nothing to say: `stop` rings the signal topic's own
-	// pipe, which is the wakeup that always exists.
-	std::this_thread::sleep_for(std::chrono::milliseconds{10});
-	loop.stop();
-	EXPECT_FALSE(loop.running());
+	editing_context& context = context_of(loop.editor());
+	ASSERT_EQ(lesh_action_register(&context.actions(), "ask_stop", &stopping_action, &loop),
+	          LESH_OK);
+	keymap* map = context.keymaps().find(keymap_registry::emacs);
+	ASSERT_NE(map, nullptr);
+	std::string encoded;
+	ASSERT_TRUE(parse_key_notation("<C-a>", encoded));
+	map->bind(encoded, "ask_stop");
+
+	g_action_thread = std::thread::id{};
+	// In the pipe before the first poll, so `run` reads it on its first turn
+	// rather than blocking for a key that would never come.
+	tty.type("\x01");
+	loop.run();
+
+	EXPECT_EQ(g_action_thread, std::this_thread::get_id());
+	// `run` left the read on its way out, which is what every exit path owes the
+	// terminal - and the prompt it painted before the first poll is proof it got
+	// as far as a turn at all.
+	// The prompt's trailing space is an ESC[K and a move rather than a byte, so
+	// what is asserted is the character the prompt starts with.
+	EXPECT_NE(tty.painted().find('>'), std::string::npos);
 }
 
 // ===========================================================================
@@ -1736,4 +1816,1031 @@ TEST(UiLoopWatch, AnFdWithNoHookIsNotATopic) {
 
 	::close(pipe_fds[0]);
 	::close(pipe_fds[1]);
+}
+
+// ===========================================================================
+// EXECUTION: ON A FIBER, OR ON THE HOST'S OWN STACK (#208)
+// ===========================================================================
+//
+// BOTH MODES ARE FIRST-CLASS AND BOTH ARE TESTED, which is the owner's
+// requirement on this ticket rather than a nicety. Every case below runs twice,
+// once per `execution_mode`, and the ones that differ say what differs and why.
+//
+// THE SHELL IN THESE TESTS REALLY FORKS AND REALLY WAITS, through
+// `event_loop::await_child` - which is the same function
+// `cooperation::wait_child` reaches one indirect call away. A `fake_shell` that
+// returns without waiting cannot exercise any of this: the park only happens at a
+// wait, and the loop only stays alive because something parked.
+//
+// AND THE FORK IS ON THE FIBER STACK in `on_a_fiber` mode, under ASan, which is
+// the first-contact risk #202 flagged. That it is a plain test here rather than a
+// separate experiment is the finding.
+
+namespace {
+
+loop_options pipe_options_with(execution_mode how) {
+	loop_options options = pipe_options();
+	options.execution = how;
+	return options;
+}
+
+const char* name_of(execution_mode how) {
+	return how == execution_mode::on_a_fiber ? "on_a_fiber" : "inline_";
+}
+
+// A shell that forks a child, awaits it through the host's verb, and reports what
+// it saw while it was in there.
+class awaiting_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	// How long the child lives. Long enough that the host is certain to reach its
+	// poll before the SIGCHLD arrives, short enough not to make the suite slow.
+	unsigned child_ms = 40;
+	// A second child that is NEVER awaited, forked first and exiting at once - the
+	// background job whose zombie must survive this command.
+	bool fork_an_unawaited_child = false;
+	// Bytes typed into the test's own tty from inside the command, which is the
+	// only way a single-threaded test can type "while a command runs".
+	std::string type_during;
+	fake_tty* tty = nullptr;
+
+	pid_t awaited = -1;
+	pid_t unawaited = -1;
+	pid_t reaped = -1;
+	int wait_status = 0;
+	std::size_t executes = 0;
+	phase phase_inside = phase::editing;
+	bool on_a_fiber_inside = false;
+	std::size_t watch_drains_before = 0;
+
+	std::int32_t execute(std::string_view) override {
+		++executes;
+		phase_inside = loop->session_phase();
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
+		watch_drains_before = loop->watch_drains();
+		if (tty != nullptr && !type_during.empty())
+			tty->type(type_during);
+		if (fork_an_unawaited_child) {
+			unawaited = ::fork();
+			if (unawaited == 0)
+				::_exit(4);
+			// Given a moment to become a zombie, so that a sweep reaping `-1`
+			// would certainly have taken it.
+			::usleep(5 * 1000);
+		}
+		awaited = ::fork();
+		if (awaited == 0) {
+			::usleep(child_ms * 1000);
+			::_exit(9);
+		}
+		// A HEAP BLOCK WHOSE ONLY POINTER IS THIS FRAME, held across the wait -
+		// which is what the real executor's frames are, and what makes
+		// LeakSanitizer the judge of #211 §4.1: a fiber abandoned here has its
+		// stack unmapped without unwinding, so this block loses its last reference
+		// and is reported at process exit. Freed on the way out of every other
+		// case, which is every other case in this file.
+		const auto held = std::make_unique<std::vector<char>>(4096, 'x');
+		reaped = loop->await_child(awaited, 0, &wait_status);
+		return WIFEXITED(wait_status) && !held->empty() ? WEXITSTATUS(wait_status) : -1;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, BothModesRunTheLineWaitForTheChildAndReportItsStatus) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		const std::optional<std::int32_t> status = loop.accept_current_line();
+
+		ASSERT_TRUE(status.has_value()) << name_of(how);
+		EXPECT_EQ(*status, 9) << name_of(how) << ": the child's exit status";
+		EXPECT_EQ(shell.executes, 1u) << name_of(how);
+		EXPECT_EQ(shell.reaped, shell.awaited)
+			<< name_of(how) << ": the wait answered with the pid it was given";
+		EXPECT_TRUE(WIFEXITED(shell.wait_status)) << name_of(how);
+		EXPECT_EQ(WEXITSTATUS(shell.wait_status), 9) << name_of(how);
+		// PHASE IS STILL WRITTEN AT THE TWO HOST PLACES, and a command sees
+		// `executing` from inside itself whichever stack it is on.
+		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
+		EXPECT_EQ(loop.session_phase(), phase::editing)
+			<< name_of(how) << ": and `editing` again on the way out";
+		// AND THE WAITER TABLE IS EMPTY AGAIN. An entry left behind would be a
+		// pointer into a frame that has returned.
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, TheExecutionFiberIsNeverAbandonedWhenThePollFailsMidCommand) {
+	// #211 §4.1. `turn` used to answer a fatal poll error by setting `_exiting` and
+	// returning, and `run_the_line`'s `while (... && !_exiting)` then handed control
+	// back to `accept_current_line` with the execution fiber suspended INSIDE
+	// `execute`. `~scheduler` unmaps a parked stack without unwinding it, so what
+	// went with it was the executor's frames, its open redirection descriptors, its
+	// child - and the executing flag, never lowered. LeakSanitizer is the judge of
+	// the first of those and is why this case lives in the sanitized gate.
+	//
+	// THE FAILURE IS INJECTED because it cannot be provoked: `poll` reports a closed
+	// descriptor as POLLNVAL in `revents`, not as -1. One failure is the realistic
+	// shape - the descriptor that went is the watch or an interest, and the turns
+	// that follow poll the self-pipe alone.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	loop.fail_next_polls(1);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	// THE COMMAND FINISHED ANYWAY. The child still exits and SIGCHLD still rings
+	// the self-pipe, so the wait ends and the status comes back down the slot.
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 9);
+	EXPECT_EQ(shell.reaped, shell.awaited) << "and the child was reaped, not orphaned";
+	EXPECT_TRUE(WIFEXITED(shell.wait_status));
+	EXPECT_EQ(loop.awaited(), 0u) << "the waiter table is empty again";
+
+	// AND THE FIBER IS BACK ON ITS INBOX, which is the assertion `~event_loop`
+	// carries and the whole of what the leak gate is about to check.
+	EXPECT_TRUE(loop.has_execution_fiber());
+	EXPECT_FALSE(loop.has_execution_fiber_mid_command());
+
+	// THEN IT LEAVES. A terminal that has gone is not a terminal to paint a fresh
+	// prompt onto.
+	EXPECT_TRUE(loop.exiting());
+
+	loop.leave_read();
+	hub.uninstall();
+}
+
+namespace {
+
+// THE HISTORY, RECORDED THE WAY `session::execute` RECORDS IT (#211 §2.4): the
+// entry goes in as PENDING before the command runs and is resolved with its exit
+// status after. What is under test is the window between those two, which #208
+// opened and `store.h` used to deny existed.
+class recording_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	lesh::ui::history::store* history = nullptr;
+	std::string directory;
+
+	std::size_t watch_drains_inside = 0;
+	bool pending_was_visible_inside = false;
+	std::size_t entries_visible_inside = 0;
+
+	std::int32_t execute(std::string_view line) override {
+		history->add(line, "/nowhere", true);
+
+		// A SIBLING SHELL TOUCHES THE DATA DIRECTORY. The watch is on the
+		// directory - a `rename` over a file never fires on that file - so any
+		// creation in it makes the descriptor readable, which is exactly the
+		// spurious wake `drain_watch` calls the common case.
+		{
+			std::ofstream sibling{directory + "/history.data.tmp.sibling"};
+			sibling << 'x';
+		}
+
+		const pid_t child = ::fork();
+		if (child == 0) {
+			::usleep(40 * 1000);
+			::_exit(7);
+		}
+		int status = 0;
+		(void)loop->await_child(child, 0, &status);
+
+		// WHAT THE WATCH DID WHILE WE WERE PARKED, and what a walk taken at this
+		// instant - after the drain, before the resolve - can see.
+		watch_drains_inside = loop->watch_drains();
+		history->for_each_merged_newest_first(
+			[&](const lesh::ui::history::merged_entry& one) {
+				++entries_visible_inside;
+				const std::string_view text{
+					reinterpret_cast<const char*>(one.what.cmd.data()), one.what.cmd.size()};
+				if (text == line)
+					pending_was_visible_inside = true;
+				return true;
+			});
+
+		history->resolve_pending(7);
+		return 7;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, TheHistoryWatchFiresBetweenAddPendingAndResolvePending) {
+	// #211 §2.4. `store.h` claimed the loop polls nothing while it is inside
+	// `shell_side::execute`; #208 made that false, and this is the window it
+	// opened - `drain_watch`, and the `publish` and Tier 1 remap behind it,
+	// landing between `add(pending)` and `resolve_pending`.
+	//
+	// The invariant that replaced the claim is the second assertion: `publish`
+	// excludes pending items from every view it builds, so however many views the
+	// drain rebuilds in that window, the command being recorded is in none of them.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	lesh::testing::temp_path scratch;
+	lesh::ui::history::store history;
+	(void)history.open(scratch.dir());
+	if (history.watch_fd() < 0)
+		GTEST_SKIP() << "this data directory gives out no notification descriptor";
+
+	// One older entry, resolved, so the walk inside the command has something to
+	// find and "saw nothing at all" cannot pass for "saw no pending item".
+	history.add("echo older", "/nowhere", true);
+	history.resolve_pending(0);
+
+	fake_tty tty;
+	signal_hub hub;
+	recording_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	loop.attach_watch(
+		history.watch_fd(),
+		[](void* userdata) { static_cast<lesh::ui::history::store*>(userdata)->drain_watch(); },
+		&history);
+	shell.loop = &loop;
+	shell.history = &history;
+	shell.directory = scratch.dir();
+	loop.enter_read();
+
+	tty.type("echo pending");
+	(void)loop.turn(0);
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	ASSERT_TRUE(status.has_value());
+	EXPECT_EQ(*status, 7);
+	// THE WINDOW IS REAL: the watch fired while the command was running.
+	EXPECT_GE(shell.watch_drains_inside, 1u)
+		<< "the watch topic is polled during a command since #208";
+	// AND NOTHING IN IT COULD SEE THE PENDING ITEM.
+	EXPECT_GE(shell.entries_visible_inside, 1u) << "the walk did run over something";
+	EXPECT_FALSE(shell.pending_was_visible_inside)
+		<< "publish excludes pending items from every view it builds";
+
+	// And the resolve is what puts it in.
+	bool resolved_is_visible = false;
+	history.for_each_merged_newest_first([&](const lesh::ui::history::merged_entry& one) {
+		const std::string_view text{reinterpret_cast<const char*>(one.what.cmd.data()),
+		                            one.what.cmd.size()};
+		if (text == "echo pending")
+			resolved_is_visible = true;
+		return true;
+	});
+	EXPECT_TRUE(resolved_is_visible);
+
+	loop.detach_watch();
+	loop.leave_read();
+	hub.uninstall();
+}
+
+TEST(UiLoopExecution, TheModeDecidesWhetherThereIsAFiberAtAll) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// NOTHING IS SPAWNED UNTIL A LINE IS ACCEPTED, in either mode: a loop that
+		// only ever edits reserves no execution stack.
+		EXPECT_FALSE(loop.has_execution_fiber()) << name_of(how);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_TRUE(loop.has_execution_fiber());
+			EXPECT_TRUE(shell.on_a_fiber_inside)
+				<< "`execute` ran on a fiber, so `current()` is not null inside it";
+			// TWO SLICES AT LEAST FOR ONE LINE, and that is the park made visible:
+			// one slice runs down to the wait, another resumes it after the wake.
+			EXPECT_GE(loop.execution_slices(), 2u)
+				<< "one slice would mean the wait never parked";
+		} else {
+			EXPECT_FALSE(loop.has_execution_fiber());
+			EXPECT_EQ(loop.execution_slices(), 0u);
+			EXPECT_FALSE(shell.on_a_fiber_inside)
+				<< "`current()` must be null throughout the inline path";
+		}
+
+		// A SECOND LINE REUSES THE FIBER. It is spawned once and parks on its
+		// inbox between commands; a second one would be a second 8 MB reserve and
+		// a second thing to drain at shutdown.
+		const std::size_t fibers = loop.scheduler().fiber_count();
+		(void)loop.accept_current_line();
+		EXPECT_EQ(loop.scheduler().fiber_count(), fibers) << name_of(how);
+		EXPECT_EQ(shell.executes, 2u) << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnAFiberTheLoopIsALIVEWhileACommandRunsAndInlineItIsNot) {
+	// THE WHOLE POINT OF THE TICKET, and the one observable that separates the two
+	// modes at a glance: the `watch` topic. The child makes the watched descriptor
+	// readable and then takes its time dying, so a loop that is turning during the
+	// command drains it DURING the command and a loop that is blocked in a
+	// `waitpid` drains it only afterwards.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int watch_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(watch_fds), 0);
+		ASSERT_EQ(::fcntl(watch_fds[0], F_SETFL, O_NONBLOCK), 0);
+		watch_probe probe;
+		probe.fd = watch_fds[0];
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		loop.attach_watch(watch_fds[0], &watch_probe::on_readable, &probe);
+		shell.loop = &loop;
+		// The write happens in the child, AFTER the fork, so the byte is there
+		// while the parent is inside its wait.
+		const int notify_fd = watch_fds[1];
+		shell.child_ms = 60;
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// One byte written by the test just before the accept is enough: what is
+		// under test is WHEN the loop notices it, not who wrote it.
+		const char one = 'x';
+		ASSERT_EQ(::write(notify_fd, &one, 1), 1);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_GE(probe.runs, 1u)
+				<< "the loop polled the watch topic while the command was running";
+			EXPECT_GE(loop.watch_drains(), 1u);
+		} else {
+			EXPECT_EQ(probe.runs, 0u)
+				<< "the inline path blocks in `waitpid`: nothing polls anything";
+			EXPECT_EQ(loop.watch_drains(), 0u);
+			// AND IT IS NOT LOST - the first ordinary turn afterwards drains it,
+			// which is exactly what happened before this ticket existed.
+			(void)loop.turn(0);
+			EXPECT_GE(probe.runs, 1u);
+		}
+
+		loop.detach_watch();
+		loop.leave_read();
+		hub.uninstall();
+		::close(watch_fds[0]);
+		::close(watch_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, TheTtyTopicIsOutOfTheTurnWhileACommandRuns) {
+	// Point 4: the terminal is the child's. A loop that read it would earn a
+	// SIGTTIN in a real session, and the bytes it took would be the command's
+	// input rather than the editor's. So they are LEFT IN THE DESCRIPTOR, and the
+	// first turn after the command picks them up - which is the same thing that
+	// happened when nothing polled at all.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.tty = &tty;
+		shell.type_during = "ab";
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(buffer_of(loop), "")
+			<< name_of(how) << ": nothing typed during the command reached the editor";
+		const turn_result after = loop.turn(0);
+		// TWO KEYSTROKES AND THE CHILD'S OWN SIGCHLD, which is three events and
+		// not two: the SIGCHLD that ended the wait reaches the editor on this turn
+		// exactly as it did before this ticket, when the byte simply stayed in the
+		// self-pipe for the length of the command.
+		EXPECT_GE(after.events, 2u)
+			<< name_of(how) << ": and both bytes were still in the descriptor";
+		EXPECT_EQ(buffer_of(loop), "ab") << name_of(how);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, TheTimerTopicIsOutOfTheTurnWhileACommandRuns) {
+	// The other half of point 4, and the reason is not symmetry: a timer expiring
+	// during a command would dispatch an ACTION into an editor that is not on
+	// screen and whose terminal belongs to the child.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.child_ms = 60;
+
+		registry& reg = context_of(loop.editor()).actions();
+		loop.attach_registry(reg);
+		g_action_runs.store(0, std::memory_order_relaxed);
+		ASSERT_EQ(lesh_action_register(&reg, "tick", &counting_action, nullptr), LESH_OK);
+		std::uint64_t id = 0;
+		ASSERT_EQ(lesh_timer_start(&reg, 1, "tick", &id), LESH_OK);
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(loop.timer_dispatches(), 0u)
+			<< name_of(how) << ": a 1 ms timer must not fire inside a 60 ms command";
+		// ARMED THROUGHOUT, not disarmed: the very next turn fires it.
+		ASSERT_TRUE(turn_until(loop, [&] { return loop.timer_dispatches() > 0; }));
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, ASignalDeliveredDuringACommandIsReplayedWhenTheEditorIsBack) {
+	// #201's fact, kept through a change of mechanism for the second time. The
+	// byte used to sit in the self-pipe for the whole command; now the command's
+	// own turns consume it - it is what ends the foreground wait - so the NUMBER
+	// is held and the first ordinary turn makes the same event of it.
+	//
+	// WHAT MUST NOT HAPPEN is the event being dispatched during the command: a
+	// SIGINT turned into `cancel_line` there would call `execute` from inside
+	// `execute`. `executes == 1` is that assertion.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		// Delivered to the hub the way the handler delivers it, with no signal
+		// raised at the process: the child's own SIGCHLD is the other byte in
+		// there, and both have to come out of one drain.
+		hub.deliver(SIGINT);
+
+		(void)loop.accept_current_line();
+		EXPECT_EQ(shell.executes, 1u)
+			<< name_of(how) << ": the deferred SIGINT must not re-enter `execute`";
+
+		const turn_result after = loop.turn(0);
+		EXPECT_GE(after.events, 1u)
+			<< name_of(how) << ": the signal reaches the editor once it exists again";
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnlyAwaitedPidsAreEverReaped) {
+	// Point 5, and it is what keeps this ticket free of job-control consequences: a
+	// sweep that reaped `-1` would take the `&` child the script has not waited
+	// for yet, and `wait` would then answer 127 for a job it started. So the
+	// unawaited child is STILL A ZOMBIE when the command is over, and this test is
+	// the one that can prove it - it reaps it itself.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.fork_an_unawaited_child = true;
+		shell.child_ms = 60;
+		loop.enter_read();
+
+		(void)loop.accept_current_line();
+
+		ASSERT_GT(shell.unawaited, 0);
+		int leftover = 0;
+		EXPECT_EQ(::waitpid(shell.unawaited, &leftover, WNOHANG), shell.unawaited)
+			<< name_of(how) << ": the loop reaped a pid nobody had awaited";
+		EXPECT_TRUE(WIFEXITED(leftover));
+		EXPECT_EQ(WEXITSTATUS(leftover), 4);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, WithNoSIGCHLDToWakeItTheWaitIsTakenInline) {
+	// The park is paid for by exactly one wake, and that wake is the hub's
+	// self-pipe byte. `reassert`'s rule 3 leaves an inherited SIG_IGN and a
+	// `trap '' CHLD` alone - both legitimate, both meaning nothing will ever ring
+	// the pipe again - so `await_child` asks the kernel first and blocks on its own
+	// if the answer is no. Without this the shell hangs on `trap '' CHLD; sleep 1`.
+	const every_hub_disposition guards;
+	guards.child().ignore();   // what a parent that ignored SIGCHLD hands us
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	// Rule 3: the newest ignore stands, so the hub did NOT take SIGCHLD.
+	ASSERT_FALSE(hub.catches(SIGCHLD));
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	const std::optional<std::int32_t> status = loop.accept_current_line();
+
+	ASSERT_TRUE(status.has_value());
+	EXPECT_TRUE(loop.has_execution_fiber()) << "still on the fiber - only the WAIT differs";
+	// ONE SLICE, because the wait never parked: the fiber ran the whole command in
+	// the slice it was given.
+	EXPECT_EQ(loop.execution_slices(), 1u);
+	EXPECT_EQ(loop.awaited(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
+}
+
+TEST(UiLoopExecution, AndTheHubKnowsWhetherItHoldsASignal) {
+	// `catches` is asked of the KERNEL, which is the only side that knows: a
+	// `trap` inside the command that is running now has already replaced the
+	// disposition and the reassert on the way out has not happened yet.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	signal_hub hub;
+	EXPECT_FALSE(hub.catches(SIGCHLD)) << "nothing installed yet";
+	ASSERT_TRUE(hub.install());
+	EXPECT_TRUE(hub.catches(SIGCHLD));
+	EXPECT_TRUE(hub.catches(SIGINT));
+	// The IGNORED set is never the hub's to hold: its SIG_IGN was only "better
+	// than the default".
+	EXPECT_FALSE(hub.catches(SIGTSTP));
+	// And a `trap` typed a moment ago takes it away, which is the case this
+	// function exists for.
+	install_handler(SIGCHLD, trap_style_handler);
+	EXPECT_FALSE(hub.catches(SIGCHLD));
+
+	hub.uninstall();
+}
+
+TEST(UiLoopExecution, ACancelledLineTakesTheSameDoorAsAnAcceptedOne) {
+	// `finish_cancelled_line` delivers an EMPTY line through the same `execute`,
+	// on the same path, because an INT trap body is arbitrary shell code and may
+	// fork - so it must fork from wherever an ordinary command forks.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		fake_tty tty;
+		signal_hub hub;
+		awaiting_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		loop.enter_read();
+
+		loop.finish_cancelled_line();
+
+		EXPECT_EQ(shell.executes, 1u) << name_of(how);
+		EXPECT_EQ(shell.phase_inside, phase::executing) << name_of(how);
+		EXPECT_EQ(loop.exit_status(), 9) << name_of(how) << ": the status is kept";
+		EXPECT_EQ(loop.session_phase(), phase::editing) << name_of(how);
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
+		if (how == execution_mode::on_a_fiber)
+			EXPECT_GE(loop.execution_slices(), 2u);
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, APortCallNeverParksBecauseThereIsNoFiberUnderIt) {
+	// `port_call` stays a direct call (point 3): the execution fiber is parked in
+	// `recv` whenever an action runs, so an action's shell code runs on the HOST's
+	// stack and every wait under it is a blocking `::waitpid` - `current() == null`
+	// throughout, with no branch anywhere saying so.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	awaiting_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	loop.enter_read();
+
+	// One accepted line first, so the fiber exists and is parked on its inbox.
+	(void)loop.accept_current_line();
+	ASSERT_TRUE(loop.has_execution_fiber());
+	const std::size_t slices = loop.execution_slices();
+
+	// A wait taken from the host, through the same verb the runtime reaches.
+	const pid_t child = ::fork();
+	if (child == 0)
+		::_exit(5);
+	int status = 0;
+	EXPECT_EQ(loop.await_child(child, 0, &status), child);
+	EXPECT_TRUE(WIFEXITED(status));
+	EXPECT_EQ(WEXITSTATUS(status), 5);
+	EXPECT_EQ(loop.execution_slices(), slices)
+		<< "the execution fiber was not resumed for a wait that was not its own";
+	EXPECT_EQ(loop.awaited(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
+}
+
+// ===========================================================================
+// THE INPUT WAIT (#209, phase 2b of #145)
+// ===========================================================================
+//
+// `await_readable` is `await_child`'s sibling, so these are that block's cases
+// read across: the same two modes, the same "the table is empty again", the same
+// watch-topic observable for "the loop is ALIVE". What is new is the shape of
+// the answer - readiness rather than a status - and the three descriptor kinds
+// the seam promises something about: a pipe that becomes readable later, a
+// regular file that is readable already, and a descriptor the host cannot ask
+// about at all.
+
+namespace {
+
+// A shell that awaits a descriptor through the host's verb and then reads it.
+//
+// THE BYTE COMES FROM A FORKED CHILD, which is the only way a single-threaded
+// test can make a descriptor readable WHILE the awaiting side is parked - the
+// same trick `awaiting_shell` uses to make a child exit mid-command.
+class reading_shell : public shell_side {
+public:
+	event_loop* loop = nullptr;
+	int read_fd = -1;
+	int write_fd = -1;
+	// How long before the byte appears. Zero means "it is already there", which
+	// is the path where the await must not park at all.
+	unsigned byte_after_ms = 40;
+	bool write_from_a_child = true;
+
+	pid_t writer = -1;
+	char got = '\0';
+	ssize_t read_answer = -2;
+	bool on_a_fiber_inside = false;
+	std::size_t slices_at_the_await = 0;
+
+	std::int32_t execute(std::string_view) override {
+		on_a_fiber_inside = loop->scheduler().current() != nullptr;
+		if (write_from_a_child) {
+			writer = ::fork();
+			if (writer == 0) {
+				::usleep(byte_after_ms * 1000);
+				const char one = 'x';
+				[[maybe_unused]] const ssize_t wrote = ::write(write_fd, &one, 1);
+				::_exit(0);
+			}
+		}
+		slices_at_the_await = loop->execution_slices();
+		loop->await_readable(read_fd);
+		// AND THE READ AFTER IT DOES NOT BLOCK, which is the whole promise of the
+		// verb: this test would hang rather than fail if it did.
+		read_answer = ::read(read_fd, &got, 1);
+		if (writer > 0) {
+			int ignored = 0;
+			(void)loop->await_child(writer, 0, &ignored);
+		}
+		return 0;
+	}
+
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+} // namespace
+
+TEST(UiLoopExecution, BothModesAwaitADescriptorAndTheReadAfterItDoesNotBlock) {
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int pipe_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(pipe_fds), 0);
+
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.read_fd = pipe_fds[0];
+		shell.write_fd = pipe_fds[1];
+		loop.enter_read();
+
+		// EMPTY BEFORE, so the count afterwards is evidence rather than a constant.
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
+
+		(void)loop.accept_current_line();
+
+		EXPECT_EQ(shell.read_answer, 1) << name_of(how) << ": the read did not get its byte";
+		EXPECT_EQ(shell.got, 'x') << name_of(how);
+		// AND THE TABLE IS EMPTY AGAIN. An entry left behind would be a pointer
+		// into a frame that has returned.
+		EXPECT_EQ(loop.awaited(), 0u) << name_of(how);
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_TRUE(shell.on_a_fiber_inside) << "`execute` ran on a fiber";
+			// TWO SLICES AT LEAST, AND THAT IS THE PARK MADE VISIBLE: the byte is
+			// 40 ms away, so the await cannot answer inside the slice that asked.
+			EXPECT_GE(loop.execution_slices(), shell.slices_at_the_await + 1)
+				<< "one slice for the whole command would mean the await never parked";
+		} else {
+			EXPECT_FALSE(loop.has_execution_fiber()) << name_of(how);
+			EXPECT_FALSE(shell.on_a_fiber_inside) << name_of(how);
+		}
+
+		loop.leave_read();
+		hub.uninstall();
+		::close(pipe_fds[0]);
+		::close(pipe_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, ADescriptorThatIsREADYALREADYNeverParks) {
+	// The common case by a long way - the second byte of a line, a regular file,
+	// a pipe with the rest of the line still in it - and it must not cost a
+	// switch. `await_readable`'s enlist asks once on the spot and completes the
+	// slot there, so `block_or_park`'s loop returns without parking: exactly the
+	// "completing from inside enlist is legal" property #208 built the primitive
+	// around.
+	//
+	// ONE SLICE FOR THE WHOLE COMMAND is what says so. The fiber body's `recv`,
+	// the `execute`, the `send` and the park on the next `recv` are all inside a
+	// single resume unless something in the middle of them parks.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	int pipe_fds[2] = {-1, -1};
+	ASSERT_EQ(::pipe(pipe_fds), 0);
+	const char one = 'x';
+	ASSERT_EQ(::write(pipe_fds[1], &one, 1), 1);
+
+	fake_tty tty;
+	signal_hub hub;
+	reading_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	shell.read_fd = pipe_fds[0];
+	shell.write_fd = pipe_fds[1];
+	shell.write_from_a_child = false;
+
+	loop.enter_read();
+	(void)loop.accept_current_line();
+
+	EXPECT_EQ(shell.read_answer, 1);
+	EXPECT_EQ(shell.got, 'x');
+	EXPECT_EQ(loop.execution_slices(), 1u)
+		<< "a descriptor that was readable already cost a park";
+	EXPECT_EQ(loop.awaited(), 0u);
+
+	loop.leave_read();
+	hub.uninstall();
+	::close(pipe_fds[0]);
+	::close(pipe_fds[1]);
+}
+
+TEST(UiLoopExecution, ARegularFileIsAlwaysReadableAndAClosedOneIsNeverWaitedOn) {
+	// The two descriptor kinds the seam promises something about beside a pipe,
+	// and they are one test because they share the answer: DO NOT PARK.
+	//
+	// A regular file is always readable, so `read x < file` behaves exactly as it
+	// did. A CLOSED descriptor - `read x 0<&-` - is what the answer has to be
+	// deliberate about: `poll` reports POLLNVAL, which is not a readable bit, and
+	// a host that waited for one would wait for ever on a shell that used to
+	// report an error and carry on.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	const lesh::testing::temp_path dir;
+	const std::string path = dir.file("input");
+	{
+		std::ofstream out{path};
+		out << "from-a-file\n";
+	}
+	for (const bool a_file : {true, false}) {
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		shell.loop = &loop;
+		shell.write_from_a_child = false;
+		loop.enter_read();
+
+		// MINTED LAST, AFTER EVERYTHING ELSE HAS TAKEN ITS DESCRIPTORS, and that is
+		// not fussiness - it cost this test an hour. A closed descriptor is a
+		// NUMBER, and the pipes a `fake_tty` and a `signal_hub` open are handed the
+		// lowest free one: a number closed before they were constructed is one of
+		// THEIRS by the time it is awaited, and the await then waits for ever on a
+		// perfectly open pipe nobody is going to write to.
+		int fd = -1;
+		if (a_file) {
+			fd = ::open(path.c_str(), O_RDONLY);
+			ASSERT_GE(fd, 0);
+		} else {
+			int pipe_fds[2] = {-1, -1};
+			ASSERT_EQ(::pipe(pipe_fds), 0);
+			fd = pipe_fds[0];
+			::close(pipe_fds[0]);
+			::close(pipe_fds[1]);
+		}
+		shell.read_fd = fd;
+
+		// The assertion is that this RETURNS. A park with nothing to wake it would
+		// hang the suite, which is the failure mode worth having here.
+		(void)loop.accept_current_line();
+
+		const char* which = a_file ? "a regular file" : "a closed descriptor";
+		EXPECT_EQ(loop.awaited(), 0u) << which;
+		EXPECT_EQ(loop.execution_slices(), 1u) << which << ": it parked";
+		if (a_file) {
+			EXPECT_EQ(shell.got, 'f') << "the file's first byte";
+			::close(fd);
+		} else {
+			EXPECT_EQ(shell.read_answer, -1) << "a closed descriptor still answers EBADF";
+		}
+
+		loop.leave_read();
+		hub.uninstall();
+	}
+}
+
+TEST(UiLoopExecution, OnAFiberTheLoopIsALIVEWhileAREADWaitsAndInlineItIsNot) {
+	// THE VISIBLE RESULT OF THE TICKET, asserted with the same observable
+	// `OnAFiberTheLoopIsALIVEWhileACommandRuns...` uses: an interactive `read`
+	// used to freeze the loop for as long as a user was willing to think, and on
+	// a fiber it does not.
+	for (const execution_mode how : {execution_mode::on_a_fiber, execution_mode::inline_}) {
+		const every_hub_disposition guards;
+		guards.child().default_action();
+
+		int pipe_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(pipe_fds), 0);
+		int watch_fds[2] = {-1, -1};
+		ASSERT_EQ(::pipe(watch_fds), 0);
+		ASSERT_EQ(::fcntl(watch_fds[0], F_SETFL, O_NONBLOCK), 0);
+		watch_probe probe;
+		probe.fd = watch_fds[0];
+
+		fake_tty tty;
+		signal_hub hub;
+		reading_shell shell;
+		event_loop loop{tty.fds(), pipe_options_with(how)};
+		ASSERT_TRUE(hub.install());
+		loop.attach_signals(hub);
+		loop.attach_shell(shell);
+		loop.attach_watch(watch_fds[0], &watch_probe::on_readable, &probe);
+		shell.loop = &loop;
+		shell.read_fd = pipe_fds[0];
+		shell.write_fd = pipe_fds[1];
+		shell.byte_after_ms = 60;
+		loop.enter_read();
+
+		const char one = 'w';
+		ASSERT_EQ(::write(watch_fds[1], &one, 1), 1);
+
+		(void)loop.accept_current_line();
+
+		if (how == execution_mode::on_a_fiber) {
+			EXPECT_GE(probe.runs, 1u)
+				<< "the loop polled the watch topic while a `read` was waiting";
+		} else {
+			EXPECT_EQ(probe.runs, 0u)
+				<< "the inline path blocks in `::read`: nothing polls anything";
+			// AND IT IS NOT LOST, which is what makes the inline path a mode and
+			// not a bug: the first ordinary turn afterwards drains it.
+			(void)loop.turn(0);
+			EXPECT_GE(probe.runs, 1u);
+		}
+
+		loop.detach_watch();
+		loop.leave_read();
+		hub.uninstall();
+		::close(pipe_fds[0]);
+		::close(pipe_fds[1]);
+		::close(watch_fds[0]);
+		::close(watch_fds[1]);
+	}
+}
+
+TEST(UiLoopExecution, AwaitingTheTTYPUTSITBACKInThePollSetWithoutMakingItATopic) {
+	// POINT 2 OF THE TICKET, and the reason an interest is not a topic. #208 took
+	// the tty topic out of the turn during `executing` - the bytes belong to the
+	// command, not to an editor that is not on screen - and `await_readable(0)`
+	// puts the same descriptor back for the length of one `read`.
+	//
+	// TWO ASSERTIONS, and the second is the one that could go wrong: the byte
+	// reaches the COMMAND's own read, and the editor never saw it. A host that
+	// re-armed the topic instead would decode the keystroke into the buffer and
+	// the builtin would then block for ever on input somebody else had eaten.
+	const every_hub_disposition guards;
+	guards.child().default_action();
+
+	fake_tty tty;
+	signal_hub hub;
+	reading_shell shell;
+	event_loop loop{tty.fds(), pipe_options_with(execution_mode::on_a_fiber)};
+	ASSERT_TRUE(hub.install());
+	loop.attach_signals(hub);
+	loop.attach_shell(shell);
+	shell.loop = &loop;
+	shell.read_fd = tty.fds().input;
+	shell.write_from_a_child = false;
+	loop.enter_read();
+
+	// TYPED BEFORE THE ACCEPT rather than during it, because the point is not the
+	// timing: a byte in the descriptor while the phase is `executing` is a byte
+	// the editor must not take, whenever it arrived.
+	tty.type("k");
+
+	(void)loop.accept_current_line();
+
+	EXPECT_EQ(shell.read_answer, 1) << "the command's own read did not get the byte";
+	EXPECT_EQ(shell.got, 'k');
+	EXPECT_EQ(loop.awaited(), 0u);
+	EXPECT_TRUE(buffer_of(loop).empty())
+		<< "the loop decoded a keystroke that belonged to the command: "
+		<< buffer_of(loop);
+
+	loop.leave_read();
+	hub.uninstall();
 }
