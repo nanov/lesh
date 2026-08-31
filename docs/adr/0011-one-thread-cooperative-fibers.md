@@ -325,8 +325,25 @@ has held for all five steps.
   1.2x its no-yield time, ~1 µs of latency before a keystroke is looked at, and
   ~1 µs of work done past a supersede nobody noticed. **The stride is on the WALK
   and not on the yield**, because `classify_command` polls immediately before
-  each `$PATH` stat precisely so that a stat storm yields between stats — a
-  stride on `lesh_request::cooperate` would have been a stride over syscalls.
+  each command NAME it classifies — one `$PATH` walk, not one stat — and a stride
+  on `lesh_request::cooperate` would have been a stride over syscalls.
+- **AND THE `$PATH` WALK IS THE ONE SLICE THAT STAYS UN-YIELDED, MEASURED AND
+  LEFT ALONE (#212).** The unit `classify_command` cannot interrupt is one name's
+  whole walk, a `::stat` plus, on a hit, an `::access` per `$PATH` entry, and the
+  numbers say leave it: over this machine's real 35-entry `$PATH`, release, a
+  full miss is 18–36 µs (a name the kernel has been asked about before against
+  one it has not — a typed prefix is always the second, since `g`, `gi` and `git`
+  are three names), a hit mid-`$PATH` is 8 µs, and a name a table answers is
+  10 ns with no walk at all. Through the real loop the worst keystroke wait
+  observed was **114 µs** — and that under load average 34, with three other
+  agents on the machine — against a 50 ms watchdog. An ordinary line walks one
+  to four times — once per pipeline stage — and the token's memo makes a repeated
+  name free within the highlight. Yielding per stat would spend ~35 yields
+  (~0.22 µs each) to shorten a 35 µs slice, which is the stride rule above read
+  backwards; and it would not buy the thing the ticket feared, because a yield
+  BETWEEN stats cannot shorten one stat that blocks — a hung mount in `$PATH`
+  freezes the loop for the length of that single syscall either way. The measurement
+  is `tools/bench.cpp`, section "`$PATH` walk on the highlighting path".
 
 ## Deferred — phase 2, priced and not built
 
@@ -375,8 +392,6 @@ group park that this ADR is mostly about.
   root-region registration; the registration is unconditional, so it should be
   right either way, and the fix if it is not is `__lsan_ignore_object` on parked
   stacks rather than a redesign.
-- The cold-cache `$PATH` sweep's contribution to keystroke latency has not been
-  measured once, as ADR-0009's third amendment asked.
 
 ## References
 
