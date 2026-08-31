@@ -337,7 +337,8 @@ struct lesh_request {
 	// enough that a keystroke is not left waiting behind a `$PATH` walk. The place
 	// a reactor ALREADY checks in is `lesh_request_superseded` - #124's
 	// `kPollEvery` in the token sweep, the per-entry poll in the autosuggester's
-	// history walk, the poll adjacent to every `stat` in `classify_command` - so
+	// history walk, the poll adjacent to every command NAME `classify_command`
+	// classifies (#212: the `$PATH` walk it then makes is the un-yielded unit) - so
 	// THE POLL IS THE YIELD, which is #145's record in its own words. Every one of
 	// those sites becomes a yield point at no cost to the published interface:
 	// `abi.h` is unchanged, `lesh_reactor_fn` is unchanged, and a reactor written

@@ -485,6 +485,14 @@ private:
 	// delays the next highlight, never a keystroke). The node pass already polls
 	// at each simple_command; this makes the poll immediately adjacent to the
 	// filesystem, which is what the ADR asks for.
+	//
+	// AND THE WALK ITSELF STAYS UN-YIELDED, ON PURPOSE AND ON NUMBERS (#212).
+	// One name's walk is the unit this poll cannot break up: 27-78 us over a real
+	// 35-entry `$PATH` in release, worst keystroke wait 114 us through the loop,
+	// against a 50 ms watchdog - so threading a yield down into the walk would
+	// spend ~35 yields to shorten a 40 us slice, and would still not help the one
+	// case it was proposed for, since a yield between stats cannot shorten a
+	// single stat that blocks. `tools/bench.cpp` holds the measurement.
 	[[nodiscard]] std::int32_t classify_command(const node& n,
 	                                            std::uint32_t& style) const noexcept {
 		style = LESH_STYLE_NONE;
