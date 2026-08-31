@@ -26,16 +26,20 @@
 #include "substrate/grapheme.h"
 #include "syntax/lexer.h"
 #include "syntax/parser.h"
+#include "ui/editor_host.h"
 #include "ui/history_search.h"
 #include "ui/loop.h"
 #include "ui/reactors.h"
+#include "ui/shell_side.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <tuple>
 #include <string_view>
@@ -148,6 +152,111 @@ struct driven_loop {
 	ui::loop_options options;
 	int _in[2]{-1, -1};
 	int _null = -1;
+};
+
+// ---------------------------------------------------------------------------
+// THE `$PATH` WALK (#212), and the harness it needs
+// ---------------------------------------------------------------------------
+//
+// ADR-0011 §Open carried "the cold-cache `$PATH` sweep's contribution to
+// keystroke latency has not been measured once" from ADR-0009's third amendment.
+// This is the measurement. What is being priced is the one un-yielded slice on
+// the highlighting path: `classify_command` polls (and therefore yields)
+// immediately BEFORE each `lesh_request_command_kind`, so the unit that cannot
+// be interrupted is ONE name's walk - a `::stat` plus, on a hit, an `::access`
+// per `$PATH` entry.
+//
+// THREE NAMES, THREE COSTS, and the difference between them is the kernel's name
+// cache and not this code:
+//
+//   a name IN A TABLE   no walk at all - an alias, a function or a builtin is
+//                       answered before the filesystem is touched
+//   a name that HITS    the walk stops at the first entry that has it, so `ls`
+//                       costs the prefix of `$PATH` above `/bin`
+//   a name that MISSES  every entry, which is the walk in full - and the case a
+//                       typed prefix is in, because `g`, `gi` and `git` are
+//                       three different names and the first two are nowhere
+//
+// COLD CACHE, HONESTLY. `purge` needs sudo and is not used. What the negative
+// name cache actually caches is a (directory, name) pair, so asking for a name
+// this machine has never been asked about - which is what a typed prefix IS -
+// defeats it without any privileged help, and that is the "unique" column
+// below. The remaining warm thing is the directory's own vnode and catalog
+// pages, and the synthetic row prices those by pointing the walk at twenty
+// directories created seconds ago.
+struct path_knowledge final : public ui::shell_knowledge {
+	explicit path_knowledge(std::string value) : _value(std::move(value)) {}
+
+	[[nodiscard]] ui::command_kind classify(std::string_view name) const override {
+		// One alias, so the "answered by a table" row is a real answer rather
+		// than a walk that happened to be short.
+		return name == "ll" ? ui::command_kind::alias : ui::command_kind::unknown;
+	}
+
+	// COUNTED, because "how long is one walk" is only half the question and
+	// "how many walks does one keystroke take" is the other half. `path` is
+	// asked exactly once per name that reaches the filesystem - after the
+	// tables have declined it and after the token's memo has missed - so this
+	// counter IS the number of walks.
+	[[nodiscard]] bool path(std::string_view& out) const override {
+		++walks;
+		out = _value;
+		return true;
+	}
+
+	std::string _value;
+	mutable std::size_t walks = 0;
+};
+
+// Nothing executes in this file; `attach_shell` needs a shell to name.
+struct idle_shell final : public ui::shell_side {
+	std::int32_t execute(std::string_view) override { return 0; }
+	std::int32_t port_call(std::string_view) override { return 0; }
+};
+
+// The process `$PATH`, split the way `resolves_on_path` splits it.
+std::vector<std::string> path_entries() {
+	const char* const value = std::getenv("PATH");
+	std::vector<std::string> out;
+	const std::string all = value == nullptr ? std::string{} : std::string{value};
+	std::size_t at = 0;
+	while (at <= all.size()) {
+		std::size_t colon = all.find(':', at);
+		if (colon == std::string::npos)
+			colon = all.size();
+		std::string one = all.substr(at, colon - at);
+		out.push_back(one.empty() ? std::string{"."} : std::move(one));
+		at = colon + 1;
+	}
+	return out;
+}
+
+// Twenty directories that did not exist a moment ago, as a `$PATH` value.
+// Per-pid and removed again, so a second run of the bench measures the same
+// thing the first did rather than a tree the first one warmed.
+struct synthetic_path {
+	explicit synthetic_path(std::size_t entries)
+		: root("/tmp/lesh-bench-path-" + std::to_string(::getpid())), count(entries) {
+		::mkdir(root.c_str(), 0755);
+		for (std::size_t i = 0; i < entries; ++i) {
+			const std::string one = root + "/d" + std::to_string(i);
+			::mkdir(one.c_str(), 0755);
+			if (!value.empty())
+				value += ':';
+			value += one;
+		}
+	}
+	~synthetic_path() {
+		for (std::size_t i = 0; i < count; ++i)
+			::rmdir((root + "/d" + std::to_string(i)).c_str());
+		::rmdir(root.c_str());
+	}
+	synthetic_path(const synthetic_path&) = delete;
+	synthetic_path& operator=(const synthetic_path&) = delete;
+
+	std::string root;
+	std::size_t count;
+	std::string value;
 };
 
 } // namespace
@@ -462,6 +571,164 @@ int main() {
 		std::printf("  %-40s p50 %.2f us  p95 %.2f us  max %.2f us\n",
 		            "keystroke wait (gap between polls)", at(0.5) / 1000.0,
 		            at(0.95) / 1000.0, gaps.empty() ? 0.0 : gaps.back() / 1000.0);
+	}
+
+	// THE `$PATH` WALK'S CONTRIBUTION TO KEYSTROKE LATENCY (#212, ADR-0011
+	// §Open). Four groups: one walk on its own, one walk over twenty
+	// directories made seconds ago, how many walks a line takes, and the whole
+	// thing through the real loop - where the number that matters is the GAP
+	// BETWEEN TERMINAL POLLS, because that is what a keystroke waits.
+	//
+	// Measured on the dev machine when this landed (#212), release, arm64,
+	// macOS, APFS, `$PATH` with 35 entries:
+	//
+	//   one stat+access, name asked before          0.61 us
+	//   one stat+access, name never asked           1.17 us
+	//   full walk, 35 entries, name asked before   21.3  us
+	//   full walk, 35 entries, name never asked    41.1  us
+	//   full walk, 20 fresh empty directories      38.8  us
+	//   walks per keystroke, ordinary lines            1-3
+	//   keystroke wait through the loop, max       ~45    us
+	//
+	// So the un-yielded slice is tens of microseconds against a 50 ms watchdog
+	// and a 160 us keystroke budget: three orders of magnitude of headroom, and
+	// a yield inside the walk would buy ~40 us of latency for a syscall's worth
+	// of poll per stat. #212 changed nothing on the strength of these numbers.
+	//
+	// WHAT THESE NUMBERS DO NOT SAY, and it is the issue's own scenario: a
+	// yield BETWEEN stats cannot help a single stat that blocks. The un-yielded
+	// unit is one `::stat`, so a hung mount in `$PATH` freezes the loop for as
+	// long as that one call takes no matter how often the walk polls. The fix
+	// for that is not a yield; it is not stat'ing an unresponsive mount.
+	std::printf("\n$PATH walk on the highlighting path (#212)\n");
+	{
+		const std::vector<std::string> entries = path_entries();
+		std::printf("  process $PATH: %zu entries\n", entries.size());
+
+		// One stat+access pair, which is what a `$PATH` entry costs, measured
+		// against the one directory every machine this runs on has.
+		{
+			struct stat info;
+			const int N = 20000;
+			const auto once = [&](const char* p) {
+				if (::stat(p, &info) == 0 && S_ISREG(info.st_mode))
+					benchmark_sink += ::access(p, X_OK) == 0 ? 1 : 0;
+			};
+			once("/usr/bin/zzz-lesh-bench-absent");
+			const double warm = time_ns(N, [&] { once("/usr/bin/zzz-lesh-bench-absent"); });
+			char name[128];
+			int k = 0;
+			const double fresh = time_ns(N, [&] {
+				std::snprintf(name, sizeof(name), "/usr/bin/zzz-lesh-bench-%d", k++);
+				once(name);
+			});
+			std::printf("  %-44s %10.2f us\n", "one stat+access, name asked before",
+			            warm / 1000.0);
+			std::printf("  %-44s %10.2f us\n", "one stat+access, name never asked",
+			            fresh / 1000.0);
+		}
+
+		// And the walk itself, through the real resolution - tables, then
+		// filesystem - so the "answered by a table" row is the same call.
+		const auto walk = [](const ui::shell_knowledge& knowledge, const char* label,
+		                     bool unique, const char* fixed) {
+			char name[64];
+			int k = 0;
+			const double ns = time_ns(unique ? 2000 : 20000, [&] {
+				if (unique)
+					std::snprintf(name, sizeof(name), "zqx%dnope", k++);
+				benchmark_sink += static_cast<int>(
+					ui::classify_command_name(knowledge, unique ? name : fixed));
+			});
+			std::printf("  %-44s %10.2f us\n", label, ns / 1000.0);
+		};
+
+		{
+			const char* const value = std::getenv("PATH");
+			const path_knowledge real{value == nullptr ? "" : value};
+			walk(real, "answered by a table (an alias), no walk", false, "ll");
+			walk(real, "walk that hits mid-$PATH (`ls`)", false, "ls");
+			walk(real, "full walk, misses, name asked before", false, "zzz-lesh-bench-absent");
+			walk(real, "full walk, misses, name never asked", true, nullptr);
+		}
+		{
+			const synthetic_path made{20};
+			const path_knowledge fresh{made.value};
+			walk(fresh, "full walk, 20 directories made just now", true, nullptr);
+		}
+
+		// HOW MANY WALKS ONE KEYSTROKE TAKES. The token's memo makes a repeated
+		// name free within one highlight, so this counts DISTINCT unknown
+		// command names on the line - which for ordinary shell lines is the
+		// number of stages in the pipeline.
+		std::printf("  walks per keystroke, by line:\n");
+		{
+			const char* const value = std::getenv("PATH");
+			const path_knowledge knowledge{value == nullptr ? "" : value};
+			ui::editor_host host{&knowledge};
+			leshper::registry reg;
+			ui::owned_highlighter hl;
+			std::ignore = ui::register_reactors(reg, hl.get());
+			reg.host = &host;
+			leshper::loop_harness harness{reg};
+			for (const Case& c : kCases) {
+				leshper::state typed;
+				typed.buffer.replace(typed.buffer.begin_position(),
+				                     typed.buffer.begin_position(), c.source);
+				typed.cursor = typed.buffer.end_position();
+				typed.gen.bump();
+				const std::size_t before = knowledge.walks;
+				std::ignore = harness.react(typed, LESH_EVENT_BUFFER_CHANGED).size();
+				std::printf("    %-40s %6zu\n", c.name, knowledge.walks - before);
+			}
+		}
+
+		// AND THROUGH THE HOST, which is the shell's real number. Each keystroke
+		// extends a name nothing on `$PATH` has, so every one of them is a full
+		// walk on a name the machine has never been asked about - the worst case
+		// a person can type without trying to.
+		{
+			const char* const value = std::getenv("PATH");
+			const path_knowledge knowledge{value == nullptr ? "" : value};
+			ui::editor_host host{&knowledge};
+			driven_loop driver;
+			leshper::registry reg;
+			ui::owned_highlighter hl;
+			idle_shell shell;
+			ui::event_loop loop{driver.fds(), driver.options};
+			loop.attach_registry(reg);
+			std::ignore = ui::register_reactors(reg, hl.get());
+			loop.attach_shell(shell, &host);
+			loop.enter_read();
+
+			constexpr std::size_t kKeystrokes = 30;
+			std::vector<double> gaps;
+			gaps.reserve(1u << 12);
+			for (std::size_t k = 0; k < kKeystrokes; ++k) {
+				const std::size_t before = loop.reactor_computes("highlighter");
+				driver.type("q");
+				auto last = steady_clock::now();
+				while (loop.reactor_computes("highlighter") == before
+				       || loop.scheduler().runnable(ui::group_mask(ui::fiber_group::emitters))) {
+					benchmark_sink += loop.turn(0).events;
+					const auto now = steady_clock::now();
+					gaps.push_back(static_cast<double>(
+						duration_cast<nanoseconds>(now - last).count()));
+					last = now;
+				}
+			}
+			std::sort(gaps.begin(), gaps.end());
+			const auto at = [&gaps](double p) {
+				return gaps.empty() ? 0.0 : gaps[static_cast<std::size_t>(
+					static_cast<double>(gaps.size() - 1) * p)];
+			};
+			std::printf("  %-44s p50 %.2f us  p95 %.2f us  max %.2f us\n",
+			            "keystroke wait (gap between polls)", at(0.5) / 1000.0,
+			            at(0.95) / 1000.0, gaps.empty() ? 0.0 : gaps.back() / 1000.0);
+			std::printf("  %-44s %6zu slices, %zu yields, %zu walks\n",
+			            "for those keystrokes", loop.reactor_slices("highlighter"),
+			            loop.reactor_yields("highlighter"), knowledge.walks);
+		}
 	}
 
 	// Command-boundary cost. THE OTHER HALF OF THE COOPERATIVE DESIGN'S PRICE
